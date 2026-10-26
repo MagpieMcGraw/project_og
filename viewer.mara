@@ -1,0 +1,249 @@
+// The viewer: the game's window showing a mesh or a cell, a camera flown
+// around it, and doors that lead to other cells.
+//
+// W, A, S, D fly, Left Shift faster; the right mouse button turns mouse
+// look on and off; E goes through the door nearest the camera; Escape quits.
+module sooblivion
+
+use mara.core
+use mara.math
+use mara.memory
+use mara.sdl
+use mara.time
+use nif
+use bsa
+use model
+use world
+use scene
+use sdl_platform
+render :: use render
+
+// How high above the floor the camera is when arriving through a door: a
+// person's eyes, in Oblivion's units.
+EYE_HEIGHT :: 120
+// How near a door must be to go through it.
+DOOR_REACH :: 300
+
+// What the viewer commands share: the archives, the window, drawing, and
+// what's drawn.
+Viewer :: struct {
+	meshes: Archive
+	textures: Archive
+	platform: Platform
+	renderer: render.Renderer
+	scene: Scene
+	room: Load_Room
+	camera: render.Camera
+}
+
+// Opens the archives (their directories into directory_storage) and the
+// window, and sets up drawing, into viewer. The rooms for loading are
+// given views of the storages after.
+viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte) -> err {
+	viewer.meshes = open_archive(data_path("Oblivion - Meshes.bsa"), directory_storage)?
+	viewer.textures = open_archive(data_path("Oblivion - Textures - Compressed.bsa"), directory_storage)?
+	platform_open(&viewer.platform, "sooblivion", 1280, 720)?
+	renderer_init(&viewer.renderer)?
+	scene_clear(&viewer.scene)
+	viewer.camera = render.Camera(){position = Vec3{0, 0, 0}, yaw = 0, pitch = 0}
+}
+
+viewer_close :: fun(viewer: ^Viewer) {
+	platform_close(&viewer.platform)
+	close_archive(&viewer.textures)
+	close_archive(&viewer.meshes)
+}
+
+// The viewer's loop: draws the scene from the camera until Escape or the
+// window closes (-1), or E is pressed near a door: that door's index in
+// the scene's doors. Flying goes speed units a second.
+view_loop :: fun(viewer: ^Viewer, speed: f32) -> i64 {
+	platform := &viewer.platform
+	camera := &viewer.camera
+	input : Input
+	frame_start := time_now()
+	for true {
+		read_input(platform, &input)
+		if input.quit or input.pressed[Escape] do return -1
+		if input.mouse_pressed[3] do set_mouse_look(platform, not platform.mouse_look)
+		if input.pressed[E] {
+			door := nearest_door(&viewer.scene, camera.position)
+			if door >= 0 do return door
+		}
+
+		seconds, now := time_since(frame_start)
+		frame_start = now
+		if platform.mouse_look {
+			camera.yaw += input.mouse_moved_x * 0.003
+			camera.pitch -= input.mouse_moved_y * 0.003
+			if camera.pitch > 1.5 do camera.pitch = 1.5
+			if camera.pitch < -1.5 do camera.pitch = -1.5
+		}
+		forward, right, up := camera_axes(camera^)
+		step := f32(seconds) * speed
+		if input.held[LShift] do step *= 4
+		if input.held[W] do camera.position = camera.position + forward * step
+		if input.held[S] do camera.position = camera.position - forward * step
+		if input.held[D] do camera.position = camera.position + right * step
+		if input.held[A] do camera.position = camera.position - right * step
+
+		shown := &viewer.scene
+		draw_instances(&viewer.renderer, &shown.models, &shown.instances, &shown.lights, shown.lighting,
+			camera^, platform.width, platform.height)
+		present(platform)
+	}
+	return -1
+}
+
+// The door nearest a place, within reach of it: its index in the scene's
+// doors, or -1. (A door's place is at its foot; the eyes are above it.)
+nearest_door :: fun(shown: ^Scene, place: Vec3) -> i64 {
+	nearest : i64 = -1
+	nearest_distance : f32 = DOOR_REACH
+	for door, i in shown.doors {
+		distance := vec3_length(door.position + Vec3{0, 0, EYE_HEIGHT} - place)
+		if distance < nearest_distance {
+			nearest = i
+			nearest_distance = distance
+		}
+	}
+	return nearest
+}
+
+// `sooblivion view <mesh>`: shows a mesh in the window.
+command_view :: fun(what: []utf8) {
+	directory_storage : [64 * MB]byte
+	viewer : Viewer
+	open_error := viewer_open(&viewer, &directory_storage)
+	if open_error {
+		print("couldn't open the viewer: %", open_error)
+		return
+	}
+	defer viewer_close(&viewer)
+	file_room : [64 * MB]byte
+	block_room : [16 * MB]byte
+	model_room : [64 * MB]byte
+	texture_room : [64 * MB]byte
+	viewer.room = load_room(&file_room, &block_room, &model_room, &texture_room)
+
+	shown := &viewer.scene
+	model_index := scene_model(shown, &viewer.renderer, &viewer.meshes, &viewer.textures, what, &viewer.room)
+	if model_index < 0 {
+		print("couldn't load %", what)
+		return
+	}
+	&shown.instances + render.Instance{model = model_index, world = mat4_identity()}
+
+	// Start back from the model's middle, far enough to see all of it.
+	gpu_model := shown.models[model_index]
+	viewer.camera.position = gpu_model.center - Vec3{0, gpu_model.radius * 2, 0}
+	_ = view_loop(&viewer, gpu_model.radius)
+}
+
+// The rooms loading uses, as views of storages the caller keeps: each up
+// to its cap ([:] would stop at its len, 0 here).
+load_room :: fun(file_room: ^[]byte, block_room: ^[]byte, model_room: ^[]byte, texture_room: ^[]byte) -> Load_Room {
+	return Load_Room{
+		file = file_room[0 : file_room.cap],
+		blocks = block_room[0 : block_room.cap],
+		model = model_room[0 : model_room.cap],
+		texture = texture_room[0 : texture_room.cap],
+		reader = nif_reader(file_room[0:0])}
+}
+
+// `sooblivion view-cell <editor id>`: shows an interior cell in the
+// window; its doors lead on to others.
+command_view_cell :: fun(name: []utf8) {
+	data_storage : [400 * MB]byte
+	index_storage : [64 * MB]byte
+	plugin, load_error := load_oblivion(&data_storage, &index_storage)
+	if load_error {
+		print("couldn't load the plugin: %", load_error)
+		return
+	}
+	scratch : [16 * MB]byte
+	cell, cell_error := find_interior_cell(&plugin, name, &scratch)
+	if cell_error {
+		print("no interior cell %", name)
+		return
+	}
+
+	directory_storage : [64 * MB]byte
+	viewer : Viewer
+	open_error := viewer_open(&viewer, &directory_storage)
+	if open_error {
+		print("couldn't open the viewer: %", open_error)
+		return
+	}
+	defer viewer_close(&viewer)
+	file_room : [64 * MB]byte
+	block_room : [16 * MB]byte
+	model_room : [64 * MB]byte
+	texture_room : [64 * MB]byte
+	viewer.room = load_room(&file_room, &block_room, &model_room, &texture_room)
+
+	go_to_cell(&viewer, &plugin, cell)
+	start_in_cell(&viewer, &plugin)
+	for true {
+		door := view_loop(&viewer, 400)
+		if door < 0 do break
+
+		// Through the door: to the cell the door at its other end is in.
+		scratch.len = 0
+		there, leads := door_destination(&plugin, viewer.scene.doors[door].reference, &scratch)
+		if not leads do continue
+		target := cell_of_reference(&plugin, there.door)
+		if target == 0 {
+			print("that door's other side isn't in any cell found")
+			continue
+		}
+		go_to_cell(&viewer, &plugin, target)
+		viewer.camera.position = there.position + Vec3{0, 0, EYE_HEIGHT}
+		viewer.camera.yaw = there.rotation.z
+		viewer.camera.pitch = 0
+	}
+}
+
+// Puts a cell in the viewer's scene in place of the one there, and its
+// name in the window's title.
+go_to_cell :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
+	shown := &viewer.scene
+	scene_clear_cell(shown)
+	start := time_now()
+	add_error := add_cell(shown, plugin, cell, &viewer.renderer, &viewer.meshes, &viewer.textures, &viewer.room)
+	if add_error do print("reading the cell stopped: %", add_error)
+
+	scratch : [1 * MB]byte
+	title : str256
+	record, record_error := find_record(plugin, cell, &scratch)
+	if not record_error {
+		full_name, has_name := find_field(record.data, "FULL")
+		if has_name do &title + field_text(full_name)
+		else do &title + editor_id(record.data)
+	}
+	_ = SetWindowTitle(viewer.platform.window, cstring(title))
+	print("% : % instances, % lights, % doors; % models loaded so far (% meshes failed), in % ms",
+		title, shown.instances.len, shown.lights.len, shown.doors.len, shown.models.len, shown.failed_paths, elapsed_ms(start))
+}
+
+// Puts the camera where one arrives in the scene's cell through a door;
+// failing that, in the middle of what's placed.
+start_in_cell :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	entrance, found := scene_entrance(&viewer.scene, plugin)
+	if found {
+		viewer.camera.position = entrance.position + Vec3{0, 0, EYE_HEIGHT}
+		viewer.camera.yaw = entrance.rotation.z
+		viewer.camera.pitch = 0
+		return
+	}
+	low := Vec3{1000000, 1000000, 1000000}
+	high := Vec3{-1000000, -1000000, -1000000}
+	for instance in viewer.scene.instances {
+		for axis in 0:3 {
+			place := instance.world[3][axis]
+			if place < low[axis] do low[axis] = place
+			if place > high[axis] do high[axis] = place
+		}
+	}
+	viewer.camera.position = (low + high) * 0.5
+}

@@ -283,3 +283,116 @@ clockwise :: fun(angle: f32, axis: i64) -> Mat4 {
 	m[b][b] = c
 	return m
 }
+
+// ---- a cell's light, the lights in it, and its doors ---------------------------
+
+// An interior cell's light (its XCLL): an ambient color, a directional
+// light, and fog. Colors 0 to 1.
+Cell_Lighting :: struct {
+	ambient: Vec3
+	directional: Vec3
+	direction: Vec3     // where the directional light comes from
+	fog_color: Vec3
+	fog_near: f32
+	fog_far: f32
+}
+
+// The lighting an exterior cell or a cell without XCLL is drawn with,
+// until weather is read: daylight.
+DAYLIGHT :: Cell_Lighting{
+	ambient = Vec3{0.4, 0.42, 0.45},
+	directional = Vec3{0.75, 0.72, 0.65},
+	direction = Vec3{0.3, -0.4, 0.85},
+	fog_color = Vec3{0.45, 0.6, 0.8},
+	fog_near = 0,
+	fog_far = 0}
+
+// A color as a cell or light record stores it: red, green, blue bytes.
+byte_color :: fun(data: []byte, at: i64) -> Vec3 {
+	red : u8 = data[at]
+	green : u8 = data[at + 1]
+	blue : u8 = data[at + 2]
+	return Vec3{f32(red) / 255, f32(green) / 255, f32(blue) / 255}
+}
+
+// A cell's lighting: its XCLL, or daylight when it has none.
+cell_lighting :: fun(plugin: ^Plugin, cell: u32, scratch: ^[]byte) -> Cell_Lighting {
+	record, record_error := find_record(plugin, cell, scratch)
+	if record_error do return DAYLIGHT
+	field, found := find_field(record.data, "XCLL")
+	if not found or field.len < 36 do return DAYLIGHT
+	fog_near : f32 = field[12]
+	fog_far : f32 = field[16]
+	// The directional light's angles, in degrees: around z, and up from level.
+	around : i32 = field[20]
+	up : i32 = field[24]
+	around_radians := f32(around) * 0.0174533
+	up_radians := f32(up) * 0.0174533
+	return Cell_Lighting{
+		ambient = byte_color(field, 0),
+		directional = byte_color(field, 4),
+		direction = Vec3{sin_f32(around_radians) * cos_f32(up_radians), cos_f32(around_radians) * cos_f32(up_radians), sin_f32(up_radians)},
+		fog_color = byte_color(field, 8),
+		fog_near = fog_near,
+		fog_far = fog_far}
+}
+
+// A light's flags (LIGH's DATA).
+LIGHT_NEGATIVE       :: 0x4    // takes light away
+LIGHT_OFF_BY_DEFAULT :: 0x20
+
+// A light placed in a cell: where, how far it reaches, its color.
+Point_Light :: struct {
+	position: Vec3
+	radius: f32
+	color: Vec3
+}
+
+// The light a LIGH base object gives, placed by a reference; false when
+// it gives none (off, negative, or no data).
+light_of :: fun(base: Record, reference: Reference) -> Point_Light, bool {
+	none := Point_Light{position = reference.position, radius = 0, color = Vec3{0, 0, 0}}
+	if base.header.kind[:] != "LIGH" do return none, false
+	field, found := find_field(base.data, "DATA")
+	if not found or field.len < 16 do return none, false
+	radius : u32 = field[4]
+	flags : u32 = field[12]
+	if flags & (LIGHT_NEGATIVE | LIGHT_OFF_BY_DEFAULT) != 0 or radius == 0 do return none, false
+	return Point_Light{position = reference.position, radius = f32(radius) * reference.scale, color = byte_color(field, 8)}, true
+}
+
+// Where a door leads (a reference's XTEL): the door at the other end, and
+// where and facing which way one arrives.
+Door_Destination :: struct {
+	door: u32
+	position: Vec3
+	rotation: Vec3
+}
+
+// A reference's destination, and false when it leads nowhere.
+door_destination :: fun(plugin: ^Plugin, reference: u32, scratch: ^[]byte) -> Door_Destination, bool {
+	none := Door_Destination{door = 0, position = Vec3{0, 0, 0}, rotation = Vec3{0, 0, 0}}
+	record, record_error := find_record(plugin, reference, scratch)
+	if record_error do return none, false
+	field, found := find_field(record.data, "XTEL")
+	if not found or field.len < 28 do return none, false
+	door : u32 = field[0]
+	position : Vec3 = field[4]
+	rotation : Vec3 = field[16]
+	return Door_Destination{door = door, position = position, rotation = rotation}, true
+}
+
+// The cell a reference is in: the one whose group of references holds its
+// record. 0 when none does.
+cell_of_reference :: fun(plugin: ^Plugin, reference: u32) -> u32 {
+	at, found := index_get(&plugin.records, reference)
+	if not found do return 0
+	cells := &plugin.cell_children
+	for key, slot in cells.keys {
+		if key == 0 do continue
+		group_at := i64(cells.places[slot])
+		group_header : Group_Header = plugin.data[group_at]
+		if at > group_at and at < group_at + i64(group_header.size) do return key
+	}
+	return 0
+}

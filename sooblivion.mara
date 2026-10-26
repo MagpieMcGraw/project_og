@@ -310,195 +310,6 @@ command_textures :: fun(name: []utf8) {
 	}
 }
 
-// `sooblivion view <mesh>`: shows a mesh in the game's window. W, A, S, D
-// move, the right mouse button turns mouse look on and off, Escape quits.
-command_view :: fun(what: []utf8) {
-	meshes_path := data_path("Oblivion - Meshes.bsa")
-	textures_path := data_path("Oblivion - Textures - Compressed.bsa")
-	directory_storage : [64 * MB]byte
-	meshes, meshes_error := open_archive(meshes_path, &directory_storage)
-	if meshes_error {
-		print("couldn't open %: %", meshes_path, meshes_error)
-		return
-	}
-	defer close_archive(&meshes)
-	textures, textures_error := open_archive(textures_path, &directory_storage)
-	if textures_error {
-		print("couldn't open %: %", textures_path, textures_error)
-		return
-	}
-	defer close_archive(&textures)
-
-	index, found := find_file(&meshes, what)
-	if not found {
-		print("no % in %", what, meshes_path)
-		return
-	}
-	storage : [64 * MB]byte
-	data, read_error := read_file(&meshes, index, &storage)
-	if read_error {
-		print("couldn't read %: %", what, read_error)
-		return
-	}
-	nif_storage : [16 * MB]byte
-	reader := nif_reader(data)
-	failure := Nif_Failure{block = 0, type_name = storage[0:0]}
-	mesh, nif_error := read_nif(&reader, &nif_storage, &failure)
-	if nif_error {
-		print("couldn't read % as a NIF: % at block % (%)", what, nif_error, failure.block, failure.type_name)
-		return
-	}
-	model_storage : [64 * MB]byte
-	built, model_error := build_model(&mesh, &model_storage)
-	if model_error {
-		print("couldn't make a model of %: %", what, model_error)
-		return
-	}
-
-	platform : Platform
-	open_error := platform_open(&platform, "sooblivion", 1280, 720)
-	if open_error {
-		print("couldn't open the window: %", open_error)
-		return
-	}
-	defer platform_close(&platform)
-
-	renderer : render.Renderer
-	init_error := renderer_init(&renderer)
-	if init_error {
-		print("couldn't set up drawing: %", init_error)
-		return
-	}
-	scratch : [64 * MB]byte
-	models : [1]Gpu_Model
-	upload_model(&renderer, built, &textures, &scratch, next(&models))
-	instances : [1]Instance
-	&instances + Instance{model = 0, world = mat4_identity()}
-
-	// Start back from the model's middle, far enough to see all of it.
-	center := (built.bounds_min + built.bounds_max) * 0.5
-	size := vec3_length(built.bounds_max - built.bounds_min)
-	camera := Camera(){position = center - Vec3{0, size, 0}, yaw = 0, pitch = 0}
-
-	view_loop(&platform, &renderer, &models, &instances, camera, size * 0.5)
-}
-
-// The viewer's loop: draws the instances from the camera until Escape or
-// the window closes. W, A, S, D move it, speed units a second; the right
-// mouse button turns mouse look on and off.
-view_loop :: fun(platform: ^Platform, renderer: ^render.Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, start: Camera, speed: f32) {
-	camera := start
-	input : Input
-	frame_start := time_now()
-	for true {
-		read_input(platform, &input)
-		if input.quit or input.pressed[Escape] do break
-		if input.mouse_pressed[3] do set_mouse_look(platform, not platform.mouse_look)
-
-		seconds, now := time_since(frame_start)
-		frame_start = now
-		if platform.mouse_look {
-			camera.yaw += input.mouse_moved_x * 0.003
-			camera.pitch -= input.mouse_moved_y * 0.003
-			if camera.pitch > 1.5 do camera.pitch = 1.5
-			if camera.pitch < -1.5 do camera.pitch = -1.5
-		}
-		forward, right, up := camera_axes(camera)
-		step := f32(seconds) * speed
-		if input.held[LShift] do step *= 4
-		if input.held[W] do camera.position = camera.position + forward * step
-		if input.held[S] do camera.position = camera.position - forward * step
-		if input.held[D] do camera.position = camera.position + right * step
-		if input.held[A] do camera.position = camera.position - right * step
-
-		draw_instances(renderer, models, instances, camera, platform.width, platform.height)
-		present(platform)
-	}
-}
-
-// `sooblivion view-cell <editor id>`: shows an interior cell in the game's
-// window, as the viewer does a mesh.
-command_view_cell :: fun(name: []utf8) {
-	data_storage : [400 * MB]byte
-	index_storage : [64 * MB]byte
-	plugin, load_error := load_oblivion(&data_storage, &index_storage)
-	if load_error {
-		print("couldn't load the plugin: %", load_error)
-		return
-	}
-	scratch : [16 * MB]byte
-	cell, cell_error := find_interior_cell(&plugin, name, &scratch)
-	if cell_error {
-		print("no interior cell %", name)
-		return
-	}
-
-	directory_storage : [64 * MB]byte
-	meshes, meshes_error := open_archive(data_path("Oblivion - Meshes.bsa"), &directory_storage)
-	if meshes_error {
-		print("couldn't open the meshes: %", meshes_error)
-		return
-	}
-	defer close_archive(&meshes)
-	textures, textures_error := open_archive(data_path("Oblivion - Textures - Compressed.bsa"), &directory_storage)
-	if textures_error {
-		print("couldn't open the textures: %", textures_error)
-		return
-	}
-	defer close_archive(&textures)
-
-	platform : Platform
-	open_error := platform_open(&platform, "sooblivion", 1280, 720)
-	if open_error {
-		print("couldn't open the window: %", open_error)
-		return
-	}
-	defer platform_close(&platform)
-	renderer : render.Renderer
-	init_error := renderer_init(&renderer)
-	if init_error {
-		print("couldn't set up drawing: %", init_error)
-		return
-	}
-
-	file_room : [64 * MB]byte
-	block_room : [16 * MB]byte
-	model_room : [64 * MB]byte
-	texture_room : [64 * MB]byte
-	// (Each room's view up to its cap: [:] stops at its len, 0 here.)
-	room := Load_Room{
-		file = file_room[0 : file_room.cap],
-		blocks = block_room[0 : block_room.cap],
-		model = model_room[0 : model_room.cap],
-		texture = texture_room[0 : texture_room.cap],
-		reader = nif_reader(file_room[0:0])}
-	world_scene : Scene
-	world_scene.models.len = 0
-	world_scene.paths.len = 0
-	world_scene.instances.len = 0
-	world_scene.failed_paths = 0
-	start := time_now()
-	cell_error2 := add_cell(&world_scene, &plugin, cell, &renderer, &meshes, &textures, &room)
-	if cell_error2 do print("reading the cell stopped: %", cell_error2)
-	print("% instances of % models (% meshes failed) in % ms",
-		world_scene.instances.len, world_scene.models.len, world_scene.failed_paths, elapsed_ms(start))
-	if world_scene.instances.len == 0 do return
-
-	// Start in the middle of what's placed, looking north.
-	low := Vec3{1000000, 1000000, 1000000}
-	high := Vec3{-1000000, -1000000, -1000000}
-	for instance in world_scene.instances {
-		for axis in 0:3 {
-			place := instance.world[3][axis]
-			if place < low[axis] do low[axis] = place
-			if place > high[axis] do high[axis] = place
-		}
-	}
-	center := (low + high) * 0.5
-	camera := Camera(){position = center, yaw = 0, pitch = 0}
-	view_loop(&platform, &renderer, &world_scene.models, &world_scene.instances, camera, 400)
-}
-
 // `sooblivion texture <file> [archive]`: decodes a texture's largest image
 // and writes it out as a PNG in the current folder, for looking at.
 command_texture :: fun(what: []utf8, name: []utf8) {
@@ -666,6 +477,29 @@ command_cell :: fun(name: []utf8) {
 		}
 	}
 	print("% of them have a mesh", with_model)
+
+	lighting := cell_lighting(&plugin, cell, &scratch)
+	print("lighting: ambient %, directional % from %, fog % from % to %", lighting.ambient,
+		lighting.directional, lighting.direction, lighting.fog_color, lighting.fog_near, lighting.fog_far)
+	light_count : i64 = 0
+	for reference in references {
+		base, base_error := find_record(&plugin, reference.base, &scratch)
+		if base_error do continue
+		light, gives_light := light_of(base, reference)
+		if gives_light {
+			light_count += 1
+			if light_count <= 3 do print("  light % at %, radius %, color %", editor_id(base.data), light.position, light.radius, light.color)
+		}
+		if base.header.kind[:] != "DOOR" do continue
+		there, leads := door_destination(&plugin, reference.form_id, &scratch)
+		if not leads do continue
+		target := cell_of_reference(&plugin, there.door)
+		target_name : str256
+		target_record, target_error := find_record(&plugin, target, &scratch)
+		if not target_error do &target_name + editor_id(target_record.data)
+		print("  door % leads to cell % (%), arriving at % facing %", editor_id(base.data), target, target_name, there.position, there.rotation.z)
+	}
+	print("% lights", light_count)
 
 	// Every mesh the cell needs, read and made a model, as the viewer
 	// would (without the graphics card).

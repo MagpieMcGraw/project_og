@@ -19,12 +19,38 @@ Loaded_Path :: struct {
 	model: i64     // in the scene's models; -1 when it couldn't be loaded
 }
 
-// The models on the card and their instances.
+// A door in the scene that leads somewhere.
+Scene_Door :: struct {
+	reference: u32
+	position: Vec3
+}
+
+// The models on the card, and the cell drawn with them: its instances,
+// lights, doors and lighting. Models stay loaded from cell to cell.
 Scene :: struct {
 	models: [1024]Gpu_Model
 	paths: [1024]Loaded_Path
-	instances: [16384]Instance
 	failed_paths: i64
+	instances: [16384]Instance
+	lights: [1024]Point_Light
+	doors: [256]Scene_Door
+	lighting: Cell_Lighting
+}
+
+// An empty scene, its lighting daylight.
+scene_clear :: fun(scene: ^Scene) {
+	scene.models.len = 0
+	scene.paths.len = 0
+	scene.failed_paths = 0
+	scene_clear_cell(scene)
+}
+
+// The scene without its cell: the models kept.
+scene_clear_cell :: fun(scene: ^Scene) {
+	scene.instances.len = 0
+	scene.lights.len = 0
+	scene.doors.len = 0
+	scene.lighting = DAYLIGHT
 }
 
 // The rooms loading uses: for a mesh's file, its blocks, its model, and
@@ -87,20 +113,45 @@ is_marker :: fun(path: []utf8) -> bool {
 	return starts_with(path, "meshes\\marker")
 }
 
-// Places a cell's references in the scene, loading the models they need.
+// Places a cell's references in the scene — their models, the lights
+// they give and the doors that lead somewhere — and takes its lighting.
 add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, renderer: ^Renderer, meshes: ^Archive, textures: ^Archive, room: ^Load_Room) -> err {
 	references : [8192]Reference
 	cell_references(plugin, cell, &references)?
 	scratch : [4 * MB]byte
+	scene.lighting = cell_lighting(plugin, cell, &scratch)
 	for reference in references {
 		if reference.flags & RECORD_DISABLED != 0 do continue
 		scratch.len = 0
 		base, base_error := find_record(plugin, reference.base, &scratch)
 		if base_error do continue
+
+		light, gives_light := light_of(base, reference)
+		if gives_light and scene.lights.len < scene.lights.cap do &scene.lights + light
+		if base.header.kind[:] == "DOOR" and scene.doors.len < scene.doors.cap {
+			_, leads := door_destination(plugin, reference.form_id, &scratch)
+			if leads do &scene.doors + Scene_Door{reference = reference.form_id, position = reference.position}
+		}
+
 		path := model_path(base)
 		if path.len == 0 or is_marker(path[:]) do continue
 		model_index := scene_model(scene, renderer, meshes, textures, path[:], room)
 		if model_index < 0 or scene.instances.len == scene.instances.cap do continue
 		next(&scene.instances)^ = Instance{model = model_index, world = reference_transform(reference)}
 	}
+}
+
+// Where one arrives in the scene's cell through one of its doors: the
+// other side of a door here says where. False when no door here leads
+// anywhere that leads back.
+scene_entrance :: fun(scene: ^Scene, plugin: ^Plugin) -> Door_Destination, bool {
+	scratch : [4 * MB]byte
+	for door in scene.doors {
+		scratch.len = 0
+		there, leads := door_destination(plugin, door.reference, &scratch)
+		if not leads do continue
+		back, leads_back := door_destination(plugin, there.door, &scratch)
+		if leads_back and back.door == door.reference do return back, true
+	}
+	return Door_Destination{door = 0, position = Vec3{0, 0, 0}, rotation = Vec3{0, 0, 0}}, false
 }
