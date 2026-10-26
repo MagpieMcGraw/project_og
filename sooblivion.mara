@@ -734,8 +734,8 @@ command_map :: fun(name: []utf8) {
 			water_height, has_water := cell_water(&plugin, cell, &scratch)
 			if has_water {
 				known := -1
-				for height, k in water_heights {
-					if height == water_height do known = k
+				for known_height, k in water_heights {
+					if known_height == water_height do known = k
 				}
 				if known >= 0 {
 					water_counts[known] += 1
@@ -782,7 +782,7 @@ command_map :: fun(name: []utf8) {
 	write_error := write_entire_file("map.png", png_storage[:])
 	if write_error do print("couldn't write map.png: %", write_error)
 	else do print("wrote map.png: % x %, % cells with land", width, height, lands)
-	for height, k in water_heights do print("  water at %: % cells", height, water_counts[k])
+	for known_height, k in water_heights do print("  water at %: % cells", known_height, water_counts[k])
 	print("% trees; the most in a cell: % in % %", trees, most_trees, most_trees_x, most_trees_y)
 }
 
