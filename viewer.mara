@@ -98,6 +98,7 @@ Viewer :: struct {
 	drawing_time: u64    // the CPU's: what draw_frame took
 	card_time: u64       // the card's: waiting for it to finish drawing
 	waiting_time: u64    // showing it: the swap, and vsync's wait for the refresh
+	swap_time: u64       // of that, the swap call itself
 	loading_time: u64
 	crossing_time: u64
 	drawn: Frame_Stats
@@ -144,7 +145,7 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.sky_world = 0
 	viewer.hour = START_HOUR
 	viewer.look = Sky_Look{state = Sky_State{0}, cloud_lower = 0, cloud_upper = 0, sun = 0,
-		cloud_lower_offset = 0, cloud_upper_offset = 0, outside = false, time = 0, water = DEFAULT_WATER}
+		cloud_lower_offset = 0, cloud_upper_offset = 0, outside = false, time = 0, water = DEFAULT_WATER, wind = 0}
 	viewer.water = DEFAULT_WATER
 	viewer.frame_start = time_now()
 	viewer.next_frame = viewer.frame_start
@@ -156,6 +157,7 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.drawing_time = 0
 	viewer.card_time = 0
 	viewer.waiting_time = 0
+	viewer.swap_time = 0
 	viewer.last_shown = time_now()
 	viewer.loading_time = 0
 	viewer.crossing_time = 0
@@ -286,7 +288,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	wait_for_card()
 	waiting_start := time_now()
 	viewer.card_time = waiting_start - card_start
-	present(platform)
+	viewer.swap_time = present(platform)
 	shown_at := time_now()
 	viewer.waiting_time = shown_at - waiting_start
 	// The time since the last frame was shown: what's seen. (Loading and
@@ -390,6 +392,9 @@ note_slow_frame :: fun(viewer: ^Viewer, frame_length: u64) {
 	note(journal, i64(viewer.card_time / 1000000))
 	note(journal, ", showing ")
 	note(journal, i64(viewer.waiting_time / 1000000))
+	note(journal, " (the swap ")
+	note(journal, i64(viewer.swap_time / 1000000))
+	note(journal, ")")
 	note(journal, ", loading ")
 	note(journal, i64(viewer.loading_time / 1000000))
 	note(journal, ", placing ")
@@ -453,6 +458,7 @@ pass_time :: fun(viewer: ^Viewer, seconds: f32, hurried: bool) {
 	most_fog : f32 = CELL_SIZE * (EXTERIOR_RADIUS + 0.5)
 	if has_distant_land(viewer) do most_fog = 1000000
 	look.state = sky_at(viewer.climate, &viewer.weather, viewer.hour, most_fog)
+	look.wind = viewer.weather.wind_speed
 	look.cloud_lower_offset += seconds * scale / TIME_SCALE * viewer.weather.cloud_speed_lower
 	look.cloud_upper_offset += seconds * scale / TIME_SCALE * viewer.weather.cloud_speed_upper
 	shown.lighting = look.state.lighting

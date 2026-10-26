@@ -81,6 +81,10 @@ GRASS_PER_CELL :: 4096
 GRASS_RUNS :: 32
 GRASS_FADE_START :: 7000
 GRASS_FADE_END :: 8000
+// How far the wind sways grass at its tips, in units, from no wind to the
+// most (fGrassWindMagnitudeMin and Max).
+GRASS_WIND_LEAST :: 5
+GRASS_WIND_MOST :: 125
 
 // The cells left out of the far land and water — those drawn in full —
 // are a bit each, HIDDEN_SIDE x HIDDEN_SIDE of them around the camera's.
@@ -427,10 +431,13 @@ void main() {
 "
 
 // Grass: each blade an instance of its grass's mesh (from the shared mesh
-// buffers), turned about z, scaled, stood along the way it stands, swaying
-// — the higher, the more — in a wave across the field; lit as the land
-// under it is. Past fade_start blades go, each at its own distance, till
-// none are left at fade_end.
+// buffers), turned about z, scaled, stood along the way it stands. After
+// the game's grass shaders (GRASS2020.vso, GRASS2002.pso): a vertex's
+// color's alpha is how much it sways (squared: the tips, not the roots),
+// in a wave across the field as strong as the weather's wind; its color
+// shades the sun's light on it, lit by the land's normal under it, and
+// the ambient light comes on top. Past fade_start blades go, each at its
+// own distance, till none are left at fade_end.
 GRASS_VERTEX_SHADER :: "
 layout(location = 0) in vec3 position;
 layout(location = 1) in vec3 normal;
@@ -446,13 +453,15 @@ uniform vec3 camera_position;
 uniform float time;
 uniform float fade_start;
 uniform float fade_end;
+uniform float wind;            // how far the tips sway, in units
+uniform vec3 sun_direction;
+uniform vec3 sun_color;
 out vec3 world_position;
 out vec2 texture_uv;
-out vec4 vertex_color;
-out vec3 land_normal;
-flat out float brightness;
+out vec3 sunlight;             // the sun's light on it
 flat out float threshold;
 flat out uvec2 texture_handle;
+const vec2 wind_direction = vec2(0.8, 0.6);
 
 void main() {
 	float away = distance(camera_position.xy, place.xy);
@@ -463,8 +472,6 @@ void main() {
 		return;
 	}
 	vec3 local = position * vec3(stand.w, stand.w, lit_by.w);
-	float sway = sin(time * 6.2831853 / max(look.z * 0.1, 0.5) + dot(place.xy, vec2(0.004, 0.003)));
-	local.xy += vec2(0.8, 0.6) * sway * 0.1 * max(local.z, 0.0);
 	float c = cos(place.w);
 	float s = sin(place.w);
 	local.xy = vec2(c * local.x - s * local.y, s * local.x + c * local.y);
@@ -476,11 +483,13 @@ void main() {
 		axis /= sin_angle;
 		local = local * up.z + cross(axis, local) * sin_angle + axis * dot(axis, local) * (1.0 - up.z);
 	}
+	// The wave: along the field (the game's 0.0078 a unit of x + y), at
+	// the grass's own pace.
+	float sway = sin(time * 6.2831853 / max(look.z * 0.1, 0.5) + (place.x + place.y) * 0.0078);
+	local.xy += wind_direction * sway * wind * color.a * color.a;
 	world_position = place.xyz + local;
 	texture_uv = uv;
-	vertex_color = color;
-	land_normal = lit_by.xyz;
-	brightness = look.x;
+	sunlight = sun_color * color.rgb * look.x * max(dot(normalize(lit_by.xyz), sun_direction), 0.0);
 	threshold = look.y;
 	texture_handle = texture_in;
 	gl_Position = view_projection * vec4(world_position, 1.0);
@@ -490,21 +499,28 @@ void main() {
 GRASS_FRAGMENT_SHADER :: "
 in vec3 world_position;
 in vec2 texture_uv;
-in vec4 vertex_color;
-in vec3 land_normal;
-flat in float brightness;
+in vec3 sunlight;
 flat in float threshold;
 flat in uvec2 texture_handle;
 
+// The picture, its alpha raised a quarter for each mipmap level down: the
+// smaller mipmaps average the blades' alpha with the gaps', which would
+// fall under the threshold and eat far grass away.
 #ifdef BINDLESS
-vec4 picture() { return texture(sampler2D(texture_handle), texture_uv); }
+vec4 picture() {
+	vec4 color = texture(sampler2D(texture_handle), texture_uv);
+	color.a *= 1.0 + max(textureQueryLod(sampler2D(texture_handle), texture_uv).x, 0.0) * 0.25;
+	return color;
+}
 #else
 uniform sampler2D picture_texture;
-vec4 picture() { return texture(picture_texture, texture_uv); }
+vec4 picture() {
+	vec4 color = texture(picture_texture, texture_uv);
+	color.a *= 1.0 + max(textureQueryLod(picture_texture, texture_uv).x, 0.0) * 0.25;
+	return color;
+}
 #endif
 
-uniform vec3 sun_direction;
-uniform vec3 sun_color;
 uniform vec3 ambient_color;
 uniform vec3 camera_position;
 uniform vec3 fog_color;
@@ -514,10 +530,9 @@ uniform float fog_far;
 out vec4 fragment_color;
 
 void main() {
-	vec4 color = picture() * vertex_color;
+	vec4 color = picture();
 	if (color.a < threshold) discard;
-	vec3 normal = normalize(land_normal);
-	vec3 lit = color.rgb * brightness * (ambient_color + sun_color * max(dot(normal, sun_direction), 0.0));
+	vec3 lit = color.rgb * (ambient_color + sunlight);
 	if (fog_far > fog_near) {
 		float fog = clamp((length(world_position - camera_position) - fog_near) / (fog_far - fog_near), 0.0, 1.0);
 		lit = mix(lit, fog_color, fog);
@@ -779,8 +794,9 @@ Sky_Look :: struct {
 	cloud_lower_offset: f32
 	cloud_upper_offset: f32
 	outside: bool        // the sky is drawn only outside
-	time: f32            // seconds, for the water's ripples
+	time: f32            // seconds, for the water's ripples and the grass's swaying
 	water: Water_Type    // its colors lit by the hour's light
+	wind: f32            // the weather's wind, 0 to 1
 }
 
 // The sky program and where its uniforms are.
@@ -926,6 +942,7 @@ Grass_Program :: struct {
 	time_at: i32
 	fade_start_at: i32
 	fade_end_at: i32
+	wind_at: i32
 }
 
 // A tree program, and where its uniforms are.
@@ -1316,6 +1333,7 @@ make_grass_program :: fun(made: ^Grass_Program, bindless: bool) -> err {
 	made.time_at = GetUniformLocation(made.program, "time")
 	made.fade_start_at = GetUniformLocation(made.program, "fade_start")
 	made.fade_end_at = GetUniformLocation(made.program, "fade_end")
+	made.wind_at = GetUniformLocation(made.program, "wind")
 	UseProgram(made.program)
 	if not bindless do Uniform1i(GetUniformLocation(made.program, "picture_texture"), 0)
 }
@@ -1789,7 +1807,7 @@ upload_grass :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, blades: ^[]Placed
 // Draws the grass in view and near enough (fade_end): bindless, in one
 // call; else a call for each run, its texture bound.
 draw_grass :: fun(renderer: ^Renderer, grass_cells: ^[]Gpu_Grass, planes: ^View_Planes, view_projection: Mat4,
-	lighting: Cell_Lighting, sun: Vec3, camera: Camera, time: f32, fade_start: f32, fade_end: f32, stats: ^Frame_Stats)
+	lighting: Cell_Lighting, sun: Vec3, camera: Camera, look: ^Sky_Look, fade_start: f32, fade_end: f32, stats: ^Frame_Stats)
 {
 	renderer.grass_commands.len = 0
 	for &cell in grass_cells {
@@ -1809,7 +1827,8 @@ draw_grass :: fun(renderer: ^Renderer, grass_cells: ^[]Gpu_Grass, planes: ^View_
 	made := &renderer.grass_programs[which_program(renderer)]
 	UseProgram(made.program)
 	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
-	Uniform1f(made.time_at, time)
+	Uniform1f(made.time_at, look.time)
+	Uniform1f(made.wind_at, GRASS_WIND_LEAST + (GRASS_WIND_MOST - GRASS_WIND_LEAST) * look.wind)
 	Uniform1f(made.fade_start_at, fade_start)
 	Uniform1f(made.fade_end_at, fade_end)
 	BindVertexArray(renderer.grass_vertex_array)
@@ -2334,7 +2353,7 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 	draw_mesh_runs(renderer, view_projection, lighting, sun, camera, false, &stats)
 	if look.outside and tree_cells.len > 0 do draw_trees(renderer, tree_cells, &near_cells, true, &planes, view_projection, lighting, sun, camera, &stats)
 	if look.outside and grass_cells.len > 0 {
-		draw_grass(renderer, grass_cells, &planes, view_projection, lighting, sun, camera, look.time, GRASS_FADE_START, GRASS_FADE_END, &stats)
+		draw_grass(renderer, grass_cells, &planes, view_projection, lighting, sun, camera, look, GRASS_FADE_START, GRASS_FADE_END, &stats)
 	}
 	if waters.len > 0 do draw_water(renderer, waters, &planes, look, view_projection, lighting, camera, &stats)
 	draw_mesh_runs(renderer, view_projection, lighting, sun, camera, true, &stats)

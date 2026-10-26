@@ -44,6 +44,7 @@ Weather :: struct {
 	cloud_upper: [160]utf8
 	cloud_speed_lower: f32     // how fast each layer drifts, in its texture's widths a second
 	cloud_speed_upper: f32
+	wind_speed: f32            // 0 to 1
 }
 
 // A climate: the weather it brings (its likeliest), and the sun's hours.
@@ -146,7 +147,7 @@ texture_path_of :: fun(name: []utf8, path: ^[160]utf8) {
 // each time of day, red, green, blue and a byte unused.
 read_weather :: fun(plugin: ^Plugin, weather_id: u32, scratch: ^[]byte) -> Weather {
 	weather := Weather{colors = [], fog_day_near = 4096, fog_day_far = 40000, fog_night_near = 2048, fog_night_far = 20000,
-		cloud_lower = [], cloud_upper = [], cloud_speed_lower = 0, cloud_speed_upper = 0}
+		cloud_lower = [], cloud_upper = [], cloud_speed_lower = 0, cloud_speed_upper = 0, wind_speed = 0.1}
 	for c in 0:WEATHER_COLORS {
 		for t in 0:4 do weather.colors[c][t] = Vec3{0.5, 0.6, 0.8}
 	}
@@ -170,7 +171,10 @@ read_weather :: fun(plugin: ^Plugin, weather_id: u32, scratch: ^[]byte) -> Weath
 	upper_clouds, has_upper := find_field(record.data, "DNAM")
 	if has_upper do texture_path_of(field_text(upper_clouds), &weather.cloud_upper)
 	data, has_data := find_field(record.data, "DATA")
+	// DATA: the wind's speed, the clouds' speeds (lower, upper), …: bytes.
 	if has_data and data.len >= 3 {
+		wind_speed : u8 = data[0]
+		weather.wind_speed = f32(wind_speed) / 255
 		lower_speed : u8 = data[1]
 		upper_speed : u8 = data[2]
 		weather.cloud_speed_lower = f32(lower_speed) * 0.00004

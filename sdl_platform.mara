@@ -3,6 +3,7 @@
 module sdl_platform
 
 use mara.core
+use mara.time
 use mara.sdl
 use mara.open_gl
 
@@ -152,10 +153,14 @@ wait_for_card :: fun() {
 
 // Shows what was drawn this frame, then waits for the card to finish it,
 // so no frames queue up behind it: the next frame starts from input read
-// after this one is up.
-present :: fun(platform: ^Platform) {
+// after this one is up. How long the swap itself took, in nanoseconds
+// (the rest was the wait after it).
+present :: fun(platform: ^Platform) -> u64 {
+	start := time_now()
 	_ = GL_SwapWindow(platform.window)
+	swapped := time_now()
 	Finish()
+	return swapped - start
 }
 
 // Turns waiting for the display's refresh on or off.
