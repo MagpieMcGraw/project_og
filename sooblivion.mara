@@ -159,23 +159,18 @@ write_entire_file :: fun(path: []utf8, data: []byte) -> err {
 	}
 }
 
-// A block type the nifs command counted.
-Type_Count :: struct {
-	name: str64
-	blocks: i64   // how many blocks of the type, in all the files
-	files: i64    // how many files have one
-}
-
-// A NIF version the nifs command counted.
-Version_Count :: struct {
-	version: u32
-	user_version: u32
-	stream_version: u32
+// A kind of failure the nifs command counted: the block type a NIF's
+// reading stopped at, and why.
+Failure_Count :: struct {
+	type_name: str64
+	reason: err
 	files: i64
+	example: str256   // the first file it happened in
 }
 
-// `sooblivion nifs [archive]`: reads the header of every NIF in an archive
-// and counts the versions and block types they use.
+// `sooblivion nifs [archive]`: reads every NIF in an archive, all its
+// blocks, and counts the ones that don't read cleanly to their end, by the
+// block type where they went wrong.
 command_nifs :: fun(name: []utf8) {
 	path := data_path(name)
 	directory_storage : [64 * MB]byte
@@ -186,17 +181,16 @@ command_nifs :: fun(name: []utf8) {
 	}
 	defer close_archive(&archive)
 
-	types : [512]Type_Count
-	versions : [32]Version_Count
+	failures : [256]Failure_Count
 	storage : [128 * MB]byte
-	header_storage : [4 * MB]byte
+	reader := nif_reader(storage[0:0])
+	nif_storage : [16 * MB]byte
 	nif_count : i64 = 0
 	failed : i64 = 0
+	block_total : i64 = 0
+	with_trailing : i64 = 0   // read cleanly, with bytes left after their end
 	start := time_now()
 
-	// (Out here, not in the loop: the header keeps views of its data, and
-	// the checker counts them as views of the reader.)
-	reader := Nif_Reader{data = storage[0:0], at = 0, broken = false, version = 0, user_version = 0, stream_version = 0}
 	for file, i in archive.files {
 		if not ends_with(file_name(&archive, file), ".nif") do continue
 		nif_count += 1
@@ -206,67 +200,42 @@ command_nifs :: fun(name: []utf8) {
 			failed += 1
 			continue
 		}
-		reader = Nif_Reader{data = data, at = 0, broken = false, version = 0, user_version = 0, stream_version = 0}
-		header_storage.len = 0
-		header, header_error := read_header(&reader, &header_storage)
-		if header_error {
-			failed += 1
-			if failed <= 10 do print("  % : %", file_name(&archive, file), header_error)
+		nif_storage.len = 0
+		failure := Nif_Failure{block = 0, type_name = storage[0:0]}
+		reader = nif_reader(data)
+		model, nif_error := read_nif(&reader, &nif_storage, &failure)
+		if not nif_error {
+			block_total += model.blocks.len
+			if model.trailing_bytes > 0 do with_trailing += 1
 			continue
 		}
-
-		found_version := false
-		for &entry in versions {
-			if entry.version == header.version and entry.user_version == header.user_version and entry.stream_version == header.stream_version {
-				entry.files += 1
-				found_version = true
-			}
-		}
-		if not found_version and versions.len < versions.cap {
-			next(&versions)^ = Version_Count{version = header.version, user_version = header.user_version, stream_version = header.stream_version, files = 1}
-		}
-
-		for type_name, t in header.type_names {
-			blocks : i64 = 0
-			for block_type in header.block_types {
-				if i64(block_type) == t do blocks += 1
-			}
-			entry := type_entry(&types, type_name)
-			entry.blocks += blocks
-			entry.files += 1
+		failed += 1
+		entry := failure_entry(&failures, failure.type_name, nif_error)
+		entry.files += 1
+		if entry.files == 1 {
+			&entry.example + folder_name(&archive, archive.folders[file.folder])
+			&entry.example + "\\"
+			&entry.example + file_name(&archive, file)
 		}
 	}
-	print("% NIFs, % failed, in % ms", nif_count, failed, elapsed_ms(start))
-	for entry in versions {
-		print("  version % user % stream %: % files", version_text(entry.version), entry.user_version, entry.stream_version, entry.files)
-	}
-
-	// Most used first.
-	for i in 1:types.len {
-		k := i
-		for k > 0 and types[k - 1].blocks < types[k].blocks {
-			swapped := types[k]
-			types[k] = types[k - 1]
-			types[k - 1] = swapped
-			k -= 1
-		}
-	}
-	print("% block types:", types.len)
-	for entry in types {
-		print("  %  % blocks in % files", entry.name, entry.blocks, entry.files)
+	print("% NIFs read, % blocks, % failed, % with bytes after their end, in % ms",
+		nif_count, block_total, failed, with_trailing, elapsed_ms(start))
+	for entry in failures {
+		print("  % files stopped at %: %   (first: %)", entry.files, entry.type_name, entry.reason, entry.example)
 	}
 }
 
-// The entry for a block type's name, made when it's the first of its name.
-type_entry :: fun(types: ^[]Type_Count, name: []utf8) -> ^Type_Count {
-	for &entry in types {
-		if entry.name[:] == name do return entry
+// The entry for a failure at a block type, made when it's the first.
+failure_entry :: fun(failures: ^[]Failure_Count, type_name: []utf8, reason: err) -> ^Failure_Count {
+	for &entry in failures {
+		if entry.type_name[:] == type_name and entry.reason == reason do return entry
 	}
-	entry := next(types)
-	entry^.name.len = 0
-	&entry^.name + name
-	entry^.blocks = 0
+	entry := next(failures)
+	entry^.type_name.len = 0
+	&entry^.type_name + type_name
+	entry^.reason = reason
 	entry^.files = 0
+	entry^.example.len = 0
 	return entry
 }
 

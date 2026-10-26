@@ -1,0 +1,322 @@
+// Reading the blocks of a NIF's animations: keys over time, interpolators
+// that turn them into values, and controllers that put those values on
+// objects. For now they are read to get past them; nothing is kept.
+module nif
+
+use mara.core
+
+// Key types: how a value goes from one key to the next.
+KEY_LINEAR    :: 1
+KEY_QUADRATIC :: 2   // each key has tangents in and out
+KEY_TBC       :: 3   // each key has tension, continuity and bias
+KEY_XYZ       :: 4   // rotations as three separate angle tracks
+KEY_CONSTANT  :: 5
+
+// Steps over count keys of a type whose values take value_size bytes.
+skip_keys :: fun(reader: ^Nif_Reader, count: i64, key_type: i64, value_size: i64) {
+	if count == 0 do return
+	key_size : i64 = 0
+	if key_type == KEY_LINEAR or key_type == KEY_CONSTANT {
+		key_size = 4 + value_size              // time, value
+	elif key_type == KEY_QUADRATIC
+		key_size = 4 + value_size * 3          // time, value, tangents in and out
+	elif key_type == KEY_TBC
+		key_size = 4 + value_size + 12         // time, value, tension, continuity, bias
+	else
+		reader.broken = true
+		return
+	}
+	skip(reader, count * key_size)
+}
+
+// A group of keys: their count, their type when there are any, the keys.
+skip_key_group :: fun(reader: ^Nif_Reader, value_size: i64) {
+	count := i64(read_u32(reader))
+	if count == 0 do return
+	key_type := i64(read_u32(reader))
+	skip_keys(reader, count, key_type, value_size)
+}
+
+// NiFloatData, NiPosData, NiColorData, NiBoolData: one group of keys.
+read_key_data :: fun(reader: ^Nif_Reader, value_size: i64) -> Block {
+	skip_key_group(reader, value_size)
+	return .Other
+}
+
+// NiKeyframeData, NiTransformData: rotation, translation and scale keys.
+read_keyframe_data :: fun(reader: ^Nif_Reader) -> Block {
+	rotation_count := i64(read_u32(reader))
+	if rotation_count != 0 {
+		rotation_type := i64(read_u32(reader))
+		if rotation_type == KEY_XYZ {
+			if reader.version <= VERSION_10_1_0_0 do skip(reader, 4)   // axis order
+			for axis in 0:3 do skip_key_group(reader, 4)
+		elif rotation_type == KEY_QUADRATIC
+			skip(reader, rotation_count * 20)   // quaternions have no tangents
+		else
+			skip_keys(reader, rotation_count, rotation_type, 16)
+		}
+	}
+	skip_key_group(reader, 12)   // translations
+	skip_key_group(reader, 4)    // scales
+	return .Other
+}
+
+// ---- interpolators ------------------------------------------------------------
+
+// NiFloatInterpolator, NiBoolInterpolator, NiPoint3Interpolator: a value
+// to hold, and keys for it.
+read_value_interpolator :: fun(reader: ^Nif_Reader, value_size: i64) -> Block {
+	skip(reader, value_size)
+	_ = read_ref(reader)   // data
+	return .Other
+}
+
+// A transform as interpolators write it: translation, rotation (a
+// quaternion), scale; before 10.1.0.110, whether each part is used.
+skip_quat_transform :: fun(reader: ^Nif_Reader) {
+	skip(reader, 32)
+	if reader.version < VERSION_10_1_0_110 do skip(reader, 3)
+}
+
+read_transform_interpolator :: fun(reader: ^Nif_Reader) -> Block {
+	skip_quat_transform(reader)
+	_ = read_ref(reader)   // data
+	return .Other
+}
+
+// NiPathInterpolator: moves an object along a path.
+read_path_interpolator :: fun(reader: ^Nif_Reader) -> Block {
+	skip(reader, 2)    // flags
+	skip(reader, 4)    // bank direction
+	skip(reader, 8)    // most bank angle, smoothing
+	skip(reader, 2)    // follow axis
+	_ = read_ref(reader)   // path data
+	_ = read_ref(reader)   // percent data
+	return .Other
+}
+
+// One interpolator an NiBlendInterpolator blends.
+skip_blend_item :: fun(reader: ^Nif_Reader) {
+	_ = read_ref(reader)   // interpolator
+	skip(reader, 8)        // weight, normalized weight
+	if reader.version < VERSION_10_1_0_110 do skip(reader, 4)   // priority
+	else do skip(reader, 1)
+	skip(reader, 4)        // ease spinner
+}
+
+// NiBlendInterpolator: what blends several interpolators into one value.
+skip_blend_interpolator :: fun(reader: ^Nif_Reader) {
+	if reader.version >= VERSION_10_1_0_112 {
+		flags := read_u8(reader)
+		item_count := i64(read_u8(reader))
+		skip(reader, 4)   // weight threshold
+		if flags & 1 == 0 {
+			skip(reader, 4)    // interpolator count, single index, high priorities
+			skip(reader, 16)   // single time, weight sums, ease spinner
+			for i in 0:item_count do skip_blend_item(reader)
+		}
+		return
+	}
+	item_count := i64(read_u16(reader))
+	skip(reader, 2)   // grow by
+	for i in 0:item_count do skip_blend_item(reader)
+	skip(reader, 1)   // manager controlled
+	skip(reader, 4)   // weight threshold
+	skip(reader, 1)   // only use the highest weight
+	skip(reader, 4)   // interpolator count, single index
+	skip(reader, 8)   // high priority, next high priority
+}
+
+// NiBlendBoolInterpolator, NiBlendFloatInterpolator, NiBlendPoint3Interpolator.
+read_blend_value_interpolator :: fun(reader: ^Nif_Reader, value_size: i64) -> Block {
+	skip_blend_interpolator(reader)
+	skip(reader, value_size)
+	return .Other
+}
+
+read_blend_transform_interpolator :: fun(reader: ^Nif_Reader) -> Block {
+	skip_blend_interpolator(reader)
+	if reader.version <= VERSION_10_1_0_109 do skip_quat_transform(reader)
+	return .Other
+}
+
+// ---- controllers -----------------------------------------------------------------
+
+// NiTimeController: what every controller starts with.
+skip_time_controller :: fun(reader: ^Nif_Reader) {
+	_ = read_ref(reader)   // next controller
+	skip(reader, 2)        // flags
+	skip(reader, 16)       // frequency, phase, start and stop times
+	_ = read_ref(reader)   // target
+}
+
+// NiInterpController: a controller that can be driven by a manager.
+skip_interp_controller :: fun(reader: ^Nif_Reader) {
+	skip_time_controller(reader)
+	if reader.version >= VERSION_10_1_0_104 and reader.version <= VERSION_10_1_0_108 do skip(reader, 1)
+}
+
+// NiSingleInterpController: a controller with one interpolator.
+skip_single_interp_controller :: fun(reader: ^Nif_Reader) {
+	skip_interp_controller(reader)
+	if reader.version >= VERSION_10_1_0_104 do _ = read_ref(reader)   // interpolator
+}
+
+// NiPSysUpdateCtlr, NiPSysResetOnLoopCtlr: nothing beyond a time controller.
+read_plain_controller :: fun(reader: ^Nif_Reader) -> Block {
+	skip_time_controller(reader)
+	return .Other
+}
+
+// NiTransformController: moves an object.
+read_transform_controller :: fun(reader: ^Nif_Reader) -> Block {
+	skip_single_interp_controller(reader)
+	if reader.version <= VERSION_10_1_0_103 do _ = read_ref(reader)   // data
+	return .Other
+}
+
+read_bs_keyframe_controller :: fun(reader: ^Nif_Reader) -> Block {
+	skip_single_interp_controller(reader)
+	if reader.version <= VERSION_10_1_0_103 do _ = read_ref(reader)   // data
+	_ = read_ref(reader)   // a second set of keyframes
+	return .Other
+}
+
+// NiVisController, NiAlphaController: visibility, transparency.
+read_data_controller :: fun(reader: ^Nif_Reader) -> Block {
+	skip_single_interp_controller(reader)
+	if reader.version <= VERSION_10_1_0_103 do _ = read_ref(reader)   // data
+	return .Other
+}
+
+// NiMultiTargetTransformController: moves several objects for a manager.
+read_multi_target_controller :: fun(reader: ^Nif_Reader) -> Block {
+	skip_interp_controller(reader)
+	count := i64(read_u16(reader))
+	for i in 0:count do _ = read_ref(reader)
+	return .Other
+}
+
+// NiControllerManager: plays an object's animation sequences.
+read_controller_manager :: fun(reader: ^Nif_Reader) -> Block {
+	skip_time_controller(reader)
+	skip(reader, 1)        // cumulative
+	skip_refs(reader)      // sequences
+	_ = read_ref(reader)   // object palette
+	return .Other
+}
+
+// One block a sequence controls: an object's controller and interpolator.
+skip_controlled_block :: fun(reader: ^Nif_Reader) {
+	if reader.version <= VERSION_10_1_0_103 do _ = read_string(reader)   // target name
+	if reader.version >= VERSION_10_1_0_106 do _ = read_ref(reader)      // interpolator
+	_ = read_ref(reader)   // controller
+	if reader.version <= VERSION_10_1_0_103 do return
+	if reader.version >= VERSION_10_1_0_106 and reader.version <= VERSION_10_1_0_110 {
+		_ = read_ref(reader)   // blend interpolator
+		skip(reader, 2)        // blend index
+	}
+	if reader.version >= VERSION_10_1_0_106 and reader.stream_version > 0 do skip(reader, 1)   // priority
+	if reader.version >= VERSION_10_2_0_0 and reader.version <= VERSION_20_1_0_0 {
+		_ = read_ref(reader)   // string palette
+		skip(reader, 20)       // offsets of the names in it
+	else
+		for name in 0:5 do _ = read_string(reader)   // node, property, controller, its id, interpolator id
+	}
+}
+
+// NiControllerSequence: one animation — idle, walk, open — of an object.
+read_controller_sequence :: fun(reader: ^Nif_Reader) -> Block {
+	_ = read_string(reader)   // name
+	if reader.version <= VERSION_10_1_0_103 {
+		_ = read_string(reader)   // accumulation root's name
+		_ = read_ref(reader)      // text keys
+	}
+	block_count := i64(read_u32(reader))
+	if reader.version >= VERSION_10_1_0_106 do skip(reader, 4)   // grow by
+	for b in 0:block_count do skip_controlled_block(reader)
+	if reader.version <= VERSION_10_1_0_103 do return .Other
+
+	skip(reader, 4)           // weight
+	_ = read_ref(reader)      // text keys
+	skip(reader, 4)           // cycle type
+	skip(reader, 4)           // frequency
+	if reader.version <= VERSION_10_4_0_1 do skip(reader, 4)     // phase
+	skip(reader, 8)           // start and stop times
+	if reader.version == VERSION_10_1_0_106 do skip(reader, 1)   // play backwards
+	_ = read_ref(reader)      // manager
+	_ = read_string(reader)   // accumulation root's name
+	if reader.version >= VERSION_10_1_0_113 and reader.version <= VERSION_20_1_0_0 do _ = read_ref(reader)   // string palette
+	return .Other
+}
+
+// NiGeomMorpherController: blends a mesh between its morph shapes.
+read_geom_morpher_controller :: fun(reader: ^Nif_Reader) -> Block {
+	skip_interp_controller(reader)
+	if reader.version >= VERSION_10_0_1_2 do skip(reader, 2)   // morpher flags
+	_ = read_ref(reader)   // data
+	skip(reader, 1)        // always update
+	if reader.version < VERSION_10_1_0_106 do return .Other
+	skip_refs(reader)      // interpolators
+	if reader.version >= VERSION_10_2_0_0 and reader.stream_version >= 10 {
+		count := i64(read_u32(reader))
+		skip(reader, count * 4)
+	}
+	return .Other
+}
+
+// NiMaterialColorController: changes one of a material's colors.
+read_material_color_controller :: fun(reader: ^Nif_Reader) -> Block {
+	skip_single_interp_controller(reader)
+	if reader.version >= VERSION_10_1_0_0 do skip(reader, 2)   // which color
+	if reader.version <= VERSION_10_1_0_103 do _ = read_ref(reader)   // data
+	return .Other
+}
+
+// NiFlipController: steps a texture slot through a list of textures.
+read_flip_controller :: fun(reader: ^Nif_Reader) -> Block {
+	skip_single_interp_controller(reader)
+	skip(reader, 4)   // texture slot
+	if reader.version <= VERSION_10_1_0_103 do skip(reader, 8)   // start time, time between
+	skip_refs(reader) // the textures
+	return .Other
+}
+
+// NiTextureTransformController: slides or turns a texture.
+read_texture_transform_controller :: fun(reader: ^Nif_Reader) -> Block {
+	skip_single_interp_controller(reader)
+	skip(reader, 1)   // shader map
+	skip(reader, 4)   // texture slot
+	skip(reader, 4)   // which part of the transform
+	if reader.version <= VERSION_10_1_0_103 do _ = read_ref(reader)   // data
+	return .Other
+}
+
+// NiBSBoneLODController: which bones a skeleton uses at each distance.
+read_bone_lod_controller :: fun(reader: ^Nif_Reader) -> Block {
+	skip_time_controller(reader)
+	skip(reader, 4)   // level of detail
+	lod_count := i64(read_u32(reader))
+	skip(reader, 4)   // node group count
+	for l in 0:lod_count do skip_refs(reader)
+	if reader.stream_version == 0 {
+		group_count := i64(read_u32(reader))
+		for g in 0:group_count {
+			info_count := i64(read_u32(reader))
+			for i in 0:info_count {
+				_ = read_ref(reader)   // shape
+				_ = read_ref(reader)   // skin instance
+			}
+		}
+		skip_refs(reader)   // second shape groups
+	}
+	return .Other
+}
+
+// bhkBlendController: blends ragdoll collision with animation.
+read_blend_controller :: fun(reader: ^Nif_Reader) -> Block {
+	skip_time_controller(reader)
+	skip(reader, 4)   // key count, always 0
+	return .Other
+}

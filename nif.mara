@@ -15,13 +15,31 @@ module nif
 
 use mara.core
 use mara.string
+use mara.math
 
-// NIF versions, as the header writes them: one byte for each part.
-VERSION_10_0_1_2 :: 0x0A000102   // Oblivion's oldest files
-VERSION_10_1_0_0 :: 0x0A010000
-VERSION_10_2_0_0 :: 0x0A020000
-VERSION_20_0_0_4 :: 0x14000004
-VERSION_20_0_0_5 :: 0x14000005   // most of Oblivion's files
+// NIF versions, as the header writes them: one byte for each part. The
+// ones Oblivion's files have are 10.0.1.0, 10.0.1.2, 10.1.0.101, 10.1.0.106,
+// 10.2.0.0, 20.0.0.4 and 20.0.0.5; the others are where fields come and go.
+VERSION_10_0_1_0   :: 0x0A000100   // Oblivion's oldest files
+VERSION_10_0_1_2   :: 0x0A000102
+VERSION_10_1_0_0   :: 0x0A010000
+VERSION_10_1_0_101 :: 0x0A010065
+VERSION_10_1_0_103 :: 0x0A010067
+VERSION_10_1_0_104 :: 0x0A010068
+VERSION_10_1_0_106 :: 0x0A01006A
+VERSION_10_1_0_108 :: 0x0A01006C
+VERSION_10_1_0_109 :: 0x0A01006D
+VERSION_10_1_0_110 :: 0x0A01006E
+VERSION_10_1_0_112 :: 0x0A010070
+VERSION_10_1_0_113 :: 0x0A010071
+VERSION_10_1_0_114 :: 0x0A010072
+VERSION_10_2_0_0   :: 0x0A020000
+VERSION_10_4_0_1   :: 0x0A040001
+VERSION_20_0_0_2   :: 0x14000002
+VERSION_20_0_0_4   :: 0x14000004
+VERSION_20_0_0_5   :: 0x14000005   // most of Oblivion's files
+VERSION_20_1_0_0   :: 0x14010000
+VERSION_20_1_0_2   :: 0x14010002
 
 // Reads a NIF's bytes in order. A read past the end gives zeros and marks
 // the reader broken, so a block's reads can go on and be checked once.
@@ -32,6 +50,14 @@ Nif_Reader :: struct {
 	version: u32
 	user_version: u32
 	stream_version: u32   // Bethesda's own version, in the header's BS stream part
+	block_count: i64      // for checking references
+	bad_reference: bool   // a reference to no block: the reading went astray
+}
+
+// A reader at the start of a NIF's bytes.
+nif_reader :: fun(data: []byte) -> Nif_Reader {
+	return Nif_Reader{data = data, at = 0, broken = false, version = 0, user_version = 0,
+		stream_version = 0, block_count = 0, bad_reference = false}
 }
 
 // Whether n more bytes are there to read; if not, the reader is broken.
@@ -106,6 +132,61 @@ read_short_string :: fun(reader: ^Nif_Reader) -> []utf8 {
 	return read_text(reader, n)
 }
 
+// A bool: one byte in the versions Oblivion has.
+read_bool :: fun(reader: ^Nif_Reader) -> bool {
+	return read_u8(reader) != 0
+}
+
+// A reference to another block: its index, -1 for none.
+read_ref :: fun(reader: ^Nif_Reader) -> i64 {
+	index := i64(read_i32(reader))
+	if index < -1 or index >= reader.block_count do reader.bad_reference = true
+	return index
+}
+
+// A list of references to blocks, as the file has it: a count, then the
+// indexes as i32s (-1 for none) — kept as a view of the file.
+Refs :: struct {
+	count: i64
+	data: []byte
+
+	// The k-th reference.
+	at :: fun(refs: Self, k: i64) -> i64 {
+		index : i32 = refs.data[k * 4]
+		return i64(index)
+	}
+}
+
+read_refs :: fun(reader: ^Nif_Reader) -> Refs {
+	count := i64(read_u32(reader))
+	start := reader.at
+	for i in 0:count {
+		_ = read_ref(reader)
+		if reader.broken do return Refs{count = 0, data = reader.data[0:0]}
+	}
+	return Refs{count = count, data = reader.data[start : reader.at]}
+}
+
+// Steps over a list of references, kept nowhere.
+skip_refs :: fun(reader: ^Nif_Reader) {
+	_ = read_refs(reader)
+}
+
+read_vec3 :: fun(reader: ^Nif_Reader) -> Vec3 {
+	if not has(reader, 12) do return Vec3{0, 0, 0}
+	value : Vec3 = reader.data[reader.at]
+	reader.at += 12
+	return value
+}
+
+// n bytes of the file as they are: arrays of vertices, normals, indexes.
+read_view :: fun(reader: ^Nif_Reader, n: i64) -> []byte {
+	if not has(reader, n) do return reader.data[0:0]
+	start := reader.at
+	reader.at += n
+	return reader.data[start : start + n]
+}
+
 // A NIF's header: its versions, and the type of each of its blocks.
 Nif_Header :: struct {
 	title: []utf8              // "Gamebryo File Format, Version 20.0.0.5"
@@ -165,6 +246,7 @@ read_header :: fun(reader: ^Nif_Reader, storage: ^[]byte) -> Nif_Header, err {
 	reader.version = version
 	reader.user_version = user_version
 	reader.stream_version = stream_version
+	reader.block_count = block_count
 
 	type_count := i64(read_u16(reader))
 	if reader.broken or type_count > 1000 or block_count > 1000000 do return Nif_Header{0}, Broken_Header

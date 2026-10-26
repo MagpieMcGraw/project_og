@@ -1,0 +1,481 @@
+// Reading the blocks of a NIF's scene tree: nodes and shapes, their
+// geometry and skins, the properties they're drawn with, their textures,
+// and the extra data hung on them.
+module nif
+
+use mara.core
+use mara.math
+
+// ---- the parts many blocks start with ------------------------------------
+
+// NiObjectNET's fields: a name, extra data, and a controller. What every
+// object in the tree, property and texture starts with.
+Object_Net :: struct {
+	name: []utf8
+	extra_data: Refs
+	controller: i64
+}
+
+read_object_net :: fun(reader: ^Nif_Reader) -> Object_Net {
+	name := read_string(reader)
+	extra_data := read_refs(reader)
+	controller := read_ref(reader)
+	return Object_Net{name = name, extra_data = extra_data, controller = controller}
+}
+
+// NiAVObject: an object in the tree, placed relative to its parent.
+read_av_object :: fun(reader: ^Nif_Reader) -> Av_Object {
+	net := read_object_net(reader)
+	flags := read_u16(reader)
+	translation := read_vec3(reader)
+	rotation : [9!]f32
+	for i in 0:9 do rotation[i] = read_f32(reader)
+	scale := read_f32(reader)
+	properties := read_refs(reader)
+	collision := read_ref(reader)
+	return Av_Object{
+		name = net.name,
+		extra_data = net.extra_data,
+		controller = net.controller,
+		flags = flags,
+		translation = translation,
+		rotation = rotation,
+		scale = scale,
+		properties = properties,
+		collision = collision}
+}
+
+// ---- the scene tree ---------------------------------------------------------
+
+// NiNode: an object holding others.
+read_node :: fun(reader: ^Nif_Reader) -> Block {
+	object := read_av_object(reader)
+	children := read_refs(reader)
+	skip_refs(reader)   // effects: lights and the like it casts on its children
+	return Node{object = object, children = children, billboard = false}
+}
+
+// NiBillboardNode: a node that turns to face the camera.
+read_billboard_node :: fun(reader: ^Nif_Reader) -> Block {
+	object := read_av_object(reader)
+	children := read_refs(reader)
+	skip_refs(reader)   // effects
+	if reader.version >= VERSION_10_1_0_0 do skip(reader, 2)   // billboard mode
+	return Node{object = object, children = children, billboard = true}
+}
+
+// NiTriShape, NiTriStrips (NiGeometry): a mesh in the tree.
+read_shape :: fun(reader: ^Nif_Reader) -> Block {
+	object := read_av_object(reader)
+	data := read_ref(reader)
+	skin := read_ref(reader)
+	skip_material_data(reader)
+	return Shape{object = object, data = data, skin = skin}
+}
+
+// The shader a geometry names: Oblivion's files name none.
+skip_material_data :: fun(reader: ^Nif_Reader) {
+	if read_bool(reader) {
+		_ = read_string(reader)   // shader name
+		skip(reader, 4)           // its extra data
+	}
+}
+
+// NiCamera: a camera some cutscene meshes carry.
+read_camera :: fun(reader: ^Nif_Reader) -> Block {
+	_ = read_av_object(reader)
+	if reader.version >= VERSION_10_1_0_0 do skip(reader, 2)   // camera flags
+	skip(reader, 24)   // the frustum: left, right, top, bottom, near, far
+	if reader.version >= VERSION_10_1_0_0 do skip(reader, 1)   // orthographic
+	skip(reader, 16)   // the viewport: left, right, top, bottom
+	skip(reader, 4)    // level of detail adjustment
+	_ = read_ref(reader)   // scene
+	skip(reader, 8)    // screen polygon and texture counts, both 0
+	return .Other
+}
+
+// NiAmbientLight, NiDirectionalLight (NiLight).
+read_light :: fun(reader: ^Nif_Reader) -> Block {
+	_ = read_av_object(reader)
+	if reader.version >= VERSION_10_1_0_0 {
+		if reader.version >= VERSION_10_1_0_106 do skip(reader, 1)   // switched on
+		skip_refs(reader)   // the nodes it lights
+	}
+	skip(reader, 4)    // dimmer
+	skip(reader, 36)   // ambient, diffuse and specular colors
+	return .Other
+}
+
+// ---- geometry -----------------------------------------------------------
+
+// NiGeometryData: vertices and what goes with them.
+read_geometry_data :: fun(reader: ^Nif_Reader) -> Geometry {
+	if reader.version >= VERSION_10_1_0_114 do skip(reader, 4)   // group id
+	count := i64(read_u16(reader))
+	if reader.version >= VERSION_10_1_0_0 do skip(reader, 2)     // keep and compress flags
+	empty := reader.data[0:0]
+
+	vertices := empty
+	if read_bool(reader) do vertices = read_view(reader, count * 12)
+	// The low 6 bits: how many sets of uvs; bit 12: tangents follow the normals.
+	data_flags := i64(read_u16(reader))
+	normals := empty
+	if read_bool(reader) {
+		normals = read_view(reader, count * 12)
+		if data_flags & 0x1000 != 0 do skip(reader, count * 24)   // tangents, bitangents
+	}
+	center := read_vec3(reader)
+	radius := read_f32(reader)
+	colors := empty
+	if read_bool(reader) do colors = read_view(reader, count * 16)
+	uv_set_count := data_flags & 63
+	uvs := read_view(reader, uv_set_count * count * 8)
+	skip(reader, 2)   // consistency flags
+	if reader.version >= VERSION_20_0_0_4 do skip(reader, 4)   // additional data
+
+	return Geometry{
+		vertex_count = count,
+		vertices = vertices,
+		normals = normals,
+		colors = colors,
+		uv_set_count = uv_set_count,
+		uvs = uvs,
+		center = center,
+		radius = radius,
+		triangle_count = 0,
+		triangles = empty,
+		strip_count = 0,
+		strip_lengths = empty,
+		strips = empty}
+}
+
+// NiTriShapeData: a mesh's triangles, three vertex indexes each.
+read_tri_shape_data :: fun(reader: ^Nif_Reader) -> Block {
+	geometry := read_geometry_data(reader)
+	geometry.triangle_count = i64(read_u16(reader))
+	index_count := i64(read_u32(reader))
+	has_triangles := true
+	if reader.version > VERSION_10_0_1_2 do has_triangles = read_bool(reader)
+	if has_triangles do geometry.triangles = read_view(reader, index_count * 2)
+
+	// Match groups: vertices at one place, for smoothing seams.
+	group_count := i64(read_u16(reader))
+	for g in 0:group_count {
+		vertex_count := i64(read_u16(reader))
+		skip(reader, vertex_count * 2)
+	}
+	return Shape_Data{geometry = geometry}
+}
+
+// NiTriStripsData: a mesh's triangles as strips, each triangle after the
+// first two vertices made with the two before it.
+read_tri_strips_data :: fun(reader: ^Nif_Reader) -> Block {
+	geometry := read_geometry_data(reader)
+	geometry.triangle_count = i64(read_u16(reader))
+	geometry.strip_count = i64(read_u16(reader))
+	geometry.strip_lengths = read_view(reader, geometry.strip_count * 2)
+	has_points := true
+	if reader.version > VERSION_10_0_1_2 do has_points = read_bool(reader)
+	if has_points {
+		total : i64 = 0
+		for s in 0:geometry.strip_count {
+			strip_length : u16 = geometry.strip_lengths[s * 2]
+			total += i64(strip_length)
+		}
+		geometry.strips = read_view(reader, total * 2)
+	}
+	return Shape_Data{geometry = geometry}
+}
+
+// ---- skins and morphs --------------------------------------------------------
+
+// NiSkinInstance: which bones a skinned mesh follows.
+read_skin_instance :: fun(reader: ^Nif_Reader) -> Block {
+	_ = read_ref(reader)   // skin data
+	if reader.version >= VERSION_10_1_0_101 do _ = read_ref(reader)   // skin partition
+	_ = read_ref(reader)   // skeleton root
+	skip_refs(reader)      // bones
+	return .Other
+}
+
+// A transform as NiSkinData writes it: rotation, translation, scale.
+TRANSFORM_SIZE :: 52
+
+// NiSkinData: each bone's place, and the vertices it moves by how much.
+read_skin_data :: fun(reader: ^Nif_Reader) -> Block {
+	skip(reader, TRANSFORM_SIZE)   // the skin's transform
+	bone_count := i64(read_u32(reader))
+	if reader.version <= VERSION_10_1_0_0 do _ = read_ref(reader)   // skin partition
+	has_weights := read_bool(reader)
+	for b in 0:bone_count {
+		skip(reader, TRANSFORM_SIZE)   // the bone's transform
+		skip(reader, 16)               // a sphere around its vertices
+		vertex_count := i64(read_u16(reader))
+		if has_weights do skip(reader, vertex_count * 6)   // vertex index u16, weight f32
+	}
+	return .Other
+}
+
+// NiSkinPartition: a skinned mesh cut into parts that each need few bones.
+read_skin_partition :: fun(reader: ^Nif_Reader) -> Block {
+	partition_count := i64(read_u32(reader))
+	newer := reader.version >= VERSION_10_1_0_0
+	for p in 0:partition_count {
+		vertex_count := i64(read_u16(reader))
+		triangle_count := i64(read_u16(reader))
+		bone_count := i64(read_u16(reader))
+		strip_count := i64(read_u16(reader))
+		weights_per_vertex := i64(read_u16(reader))
+		skip(reader, bone_count * 2)
+		if not newer or read_bool(reader) do skip(reader, vertex_count * 2)                        // vertex map
+		if not newer or read_bool(reader) do skip(reader, vertex_count * weights_per_vertex * 4)   // weights
+		strip_lengths := read_view(reader, strip_count * 2)
+		if not newer or read_bool(reader) {
+			if strip_count != 0 {
+				for s in 0:strip_count {
+					strip_length : u16 = strip_lengths[s * 2]
+					skip(reader, i64(strip_length) * 2)
+				}
+			else
+				skip(reader, triangle_count * 6)
+			}
+		}
+		if read_bool(reader) do skip(reader, vertex_count * weights_per_vertex)   // bone indexes
+	}
+	return .Other
+}
+
+// NiMorphData: shapes a mesh's vertices can be blended toward (faces).
+read_morph_data :: fun(reader: ^Nif_Reader) -> Block {
+	morph_count := i64(read_u32(reader))
+	vertex_count := i64(read_u32(reader))
+	skip(reader, 1)   // relative targets
+	for m in 0:morph_count {
+		if reader.version >= VERSION_10_1_0_106 do _ = read_string(reader)   // frame name
+		if reader.version <= VERSION_10_1_0_0 {
+			// Keys, their type written even when there are none.
+			key_count := i64(read_u32(reader))
+			key_type := i64(read_u32(reader))
+			skip_keys(reader, key_count, key_type, 4)
+		}
+		if reader.version >= VERSION_10_1_0_104 and reader.version <= VERSION_20_1_0_2 and reader.stream_version < 10 {
+			skip(reader, 4)   // its weight
+		}
+		skip(reader, vertex_count * 12)
+	}
+	return .Other
+}
+
+// ---- properties ----------------------------------------------------------------
+
+// The properties that hold only flags: NiDitherProperty, NiWireframeProperty.
+read_flags_property :: fun(reader: ^Nif_Reader) -> Block {
+	_ = read_object_net(reader)
+	skip(reader, 2)
+	return .Other
+}
+
+// NiAlphaProperty: blending with what's behind, and leaving out pixels
+// below a threshold.
+read_alpha_property :: fun(reader: ^Nif_Reader) -> Block {
+	_ = read_object_net(reader)
+	flags := read_u16(reader)
+	threshold := read_u8(reader)
+	return Alpha{flags = flags, threshold = threshold}
+}
+
+// NiFogProperty.
+read_fog_property :: fun(reader: ^Nif_Reader) -> Block {
+	_ = read_object_net(reader)
+	skip(reader, 2)    // flags
+	skip(reader, 4)    // depth
+	skip(reader, 12)   // color
+	return .Other
+}
+
+// NiMaterialProperty: a surface's colors and shine.
+read_material_property :: fun(reader: ^Nif_Reader) -> Block {
+	_ = read_object_net(reader)
+	if reader.version <= VERSION_10_0_1_2 do skip(reader, 2)   // flags
+	ambient := read_vec3(reader)
+	diffuse := read_vec3(reader)
+	specular := read_vec3(reader)
+	emissive := read_vec3(reader)
+	glossiness := read_f32(reader)
+	alpha := read_f32(reader)
+	return Material{
+		ambient = ambient,
+		diffuse = diffuse,
+		specular = specular,
+		emissive = emissive,
+		glossiness = glossiness,
+		alpha = alpha}
+}
+
+// NiSpecularProperty: whether the material's specular color shows.
+read_specular_property :: fun(reader: ^Nif_Reader) -> Block {
+	_ = read_object_net(reader)
+	flags := read_u16(reader)
+	return Specular{enabled = flags & 1 != 0}
+}
+
+// NiStencilProperty: in Oblivion, mostly which sides of triangles are drawn.
+read_stencil_property :: fun(reader: ^Nif_Reader) -> Block {
+	_ = read_object_net(reader)
+	if reader.version <= VERSION_10_0_1_2 do skip(reader, 2)   // flags
+	skip(reader, 1)    // stencil test on
+	skip(reader, 24)   // function, reference, mask, and the actions on fail, depth fail, pass
+	draw_mode := read_u32(reader)
+	return Stencil{draw_mode = draw_mode}
+}
+
+// One texture of a NiTexturingProperty.
+read_texture_slot :: fun(reader: ^Nif_Reader) -> Texture_Slot {
+	slot := Texture_Slot{used = false, source = -1, clamp_mode = 0, filter_mode = 0, uv_set = 0}
+	if not read_bool(reader) do return slot
+	slot.used = true
+	slot.source = read_ref(reader)
+	slot.clamp_mode = read_u32(reader)
+	slot.filter_mode = read_u32(reader)
+	slot.uv_set = read_u32(reader)
+	if reader.version <= VERSION_10_4_0_1 do skip(reader, 4)   // PlayStation 2 settings
+	if reader.version >= VERSION_10_1_0_0 {
+		// A transform of its uvs: translation, scale, rotation, how, center.
+		if read_bool(reader) do skip(reader, 32)
+	}
+	return slot
+}
+
+// NiTexturingProperty: the textures a shape is drawn with, each in its slot.
+read_texturing_property :: fun(reader: ^Nif_Reader) -> Block {
+	_ = read_object_net(reader)
+	if reader.version <= VERSION_10_0_1_2 do skip(reader, 2)   // flags
+	apply_mode := read_u32(reader)
+	count := i64(read_u32(reader))
+	slots : [SLOT_COUNT!]Texture_Slot
+	for i in 0:SLOT_COUNT do slots[i] = Texture_Slot{used = false, source = -1, clamp_mode = 0, filter_mode = 0, uv_set = 0}
+	for i in 0:count {
+		slot := read_texture_slot(reader)
+		if i < SLOT_COUNT do slots[i] = slot
+		// The bump map's luminance scale and offset, and its 2x2 matrix.
+		if i == SLOT_BUMP and slot.used do skip(reader, 24)
+	}
+	shader_count := i64(read_u32(reader))
+	for i in 0:shader_count {
+		slot := read_texture_slot(reader)
+		if slot.used do skip(reader, 4)   // map id
+	}
+	return Texturing{apply_mode = apply_mode, slots = slots}
+}
+
+// NiVertexColorProperty: what a mesh's vertex colors are used for.
+read_vertex_color_property :: fun(reader: ^Nif_Reader) -> Block {
+	_ = read_object_net(reader)
+	skip(reader, 2)   // flags
+	vertex_mode := read_u32(reader)
+	lighting_mode := read_u32(reader)
+	return Vertex_Color{vertex_mode = vertex_mode, lighting_mode = lighting_mode}
+}
+
+// NiZBufferProperty: whether a shape is tested against and written to the
+// depth buffer.
+read_z_buffer_property :: fun(reader: ^Nif_Reader) -> Block {
+	_ = read_object_net(reader)
+	flags := read_u16(reader)
+	function := read_u32(reader)
+	return Z_Buffer{flags = flags, function = function}
+}
+
+// NiSourceTexture: a texture's file, or (never in Oblivion) its pixels.
+read_source_texture :: fun(reader: ^Nif_Reader) -> Block {
+	_ = read_object_net(reader)
+	external := read_u8(reader) != 0
+	internal := false
+	if reader.version <= VERSION_10_0_1_2 and not external do internal = read_u8(reader) != 0
+	file_name : []utf8 = reader.data[0:0]
+	if external or reader.version >= VERSION_10_1_0_0 do file_name = read_string(reader)
+	if reader.version > VERSION_10_0_1_2 or internal do _ = read_ref(reader)   // pixel data
+	skip(reader, 12)   // pixel layout, mipmaps, alpha format
+	skip(reader, 1)    // static
+	if reader.version >= VERSION_10_1_0_103 do skip(reader, 1)   // direct render
+	return Source_Texture{file_name = file_name}
+}
+
+// ---- extra data -------------------------------------------------------------------
+
+// NiExtraData's one field: its name.
+read_extra_name :: fun(reader: ^Nif_Reader) -> []utf8 {
+	return read_string(reader)
+}
+
+read_binary_extra :: fun(reader: ^Nif_Reader) -> Block {
+	_ = read_extra_name(reader)
+	size := i64(read_u32(reader))
+	skip(reader, size)
+	return .Other
+}
+
+read_boolean_extra :: fun(reader: ^Nif_Reader) -> Block {
+	_ = read_extra_name(reader)
+	skip(reader, 1)
+	return .Other
+}
+
+// NiIntegerExtraData, BSXFlags: a named number.
+read_integer_extra :: fun(reader: ^Nif_Reader) -> Block {
+	name := read_extra_name(reader)
+	value := read_u32(reader)
+	return Integer_Extra{name = name, value = value}
+}
+
+// NiStringExtraData: named text, like a mesh's "Prn" bone to hang it from.
+read_string_extra :: fun(reader: ^Nif_Reader) -> Block {
+	name := read_extra_name(reader)
+	value := read_string(reader)
+	return String_Extra{name = name, value = value}
+}
+
+// NiTextKeyExtraData: texts at times in an animation ("start", "hit"…).
+read_text_key_extra :: fun(reader: ^Nif_Reader) -> Block {
+	_ = read_extra_name(reader)
+	key_count := i64(read_u32(reader))
+	for k in 0:key_count {
+		skip(reader, 4)   // time
+		_ = read_string(reader)
+	}
+	return .Other
+}
+
+// BSBound: a box around a creature: its center and half its size.
+read_bound_extra :: fun(reader: ^Nif_Reader) -> Block {
+	_ = read_extra_name(reader)
+	skip(reader, 24)
+	return .Other
+}
+
+// BSFurnitureMarker: where and how an actor sits or lies on furniture.
+read_furniture_marker :: fun(reader: ^Nif_Reader) -> Block {
+	_ = read_extra_name(reader)
+	count := i64(read_u32(reader))
+	skip(reader, count * 16)   // offset, orientation, two position references
+	return .Other
+}
+
+// NiStringPalette: names an animation's blocks point into.
+read_string_palette :: fun(reader: ^Nif_Reader) -> Block {
+	size := i64(read_u32(reader))
+	skip(reader, size)
+	skip(reader, 4)   // the size again
+	return .Other
+}
+
+// NiDefaultAVObjectPalette: an animated mesh's objects by name.
+read_object_palette :: fun(reader: ^Nif_Reader) -> Block {
+	_ = read_ref(reader)   // scene
+	count := i64(read_u32(reader))
+	for i in 0:count {
+		_ = read_string(reader)
+		_ = read_ref(reader)
+	}
+	return .Other
+}

@@ -1,0 +1,276 @@
+// Reading the blocks of a NIF's particle systems — fire, smoke, sparks,
+// magic: the system itself, its particles' data, the modifiers that move
+// and age them, the emitters that make them and the controllers that drive
+// those. Read to get past them for now; nothing is kept.
+module nif
+
+use mara.core
+
+// ---- the system and its data -----------------------------------------------
+
+// NiParticleSystem, NiMeshParticleSystem: a geometry whose vertices are particles.
+read_particle_system :: fun(reader: ^Nif_Reader) -> Block {
+	_ = read_av_object(reader)
+	_ = read_ref(reader)   // data
+	_ = read_ref(reader)   // skin
+	skip_material_data(reader)
+	if reader.version >= VERSION_10_1_0_0 {
+		skip(reader, 1)     // in world space
+		skip_refs(reader)   // modifiers
+	}
+	return .Other
+}
+
+// NiParticlesData: a geometry's data, then each particle's size and turn.
+skip_particles_data :: fun(reader: ^Nif_Reader) -> i64 {
+	geometry := read_geometry_data(reader)
+	count := geometry.vertex_count
+	if reader.version <= VERSION_10_0_1_0 {
+		skip(reader, 4)   // one radius for all
+	else
+		if read_bool(reader) do skip(reader, count * 4)   // radii
+	}
+	skip(reader, 2)   // how many are active
+	if read_bool(reader) do skip(reader, count * 4)    // sizes
+	if read_bool(reader) do skip(reader, count * 16)   // rotations
+	if reader.version >= VERSION_20_0_0_4 {
+		if read_bool(reader) do skip(reader, count * 4)    // rotation angles
+		if read_bool(reader) do skip(reader, count * 12)   // rotation axes
+	}
+	return count
+}
+
+// NiPSysData: each particle's velocity, age and life.
+read_particle_system_data :: fun(reader: ^Nif_Reader) -> Block {
+	skip_particle_system_data(reader)
+	return .Other
+}
+
+skip_particle_system_data :: fun(reader: ^Nif_Reader) {
+	count := skip_particles_data(reader)
+	// Velocity, then (before 10.4.0.1) a rotation axis, then age, life
+	// span, last update, spawn generation and code.
+	info_size : i64 = 28
+	if reader.version <= VERSION_10_4_0_1 do info_size = 40
+	skip(reader, count * info_size)
+	if reader.version >= VERSION_20_0_0_2 {
+		if read_bool(reader) do skip(reader, count * 4)   // rotation speeds
+	}
+	skip(reader, 4)   // added particles: count, base
+}
+
+// NiMeshPSysData: particles that are each a mesh.
+read_mesh_particle_system_data :: fun(reader: ^Nif_Reader) -> Block {
+	skip_particle_system_data(reader)
+	if reader.version >= VERSION_10_2_0_0 {
+		skip(reader, 4)   // default pool size
+		skip(reader, 1)   // fill pools on load
+		generation_count := i64(read_u32(reader))
+		skip(reader, generation_count * 4)
+	}
+	_ = read_ref(reader)   // particle meshes
+	return .Other
+}
+
+// ---- modifiers --------------------------------------------------------------------
+
+// NiPSysModifier: what every modifier starts with.
+skip_modifier :: fun(reader: ^Nif_Reader) {
+	_ = read_string(reader)   // name
+	skip(reader, 4)           // order
+	_ = read_ref(reader)      // target
+	skip(reader, 1)           // active
+}
+
+// NiPSysPositionModifier: moves particles by their velocity.
+read_plain_modifier :: fun(reader: ^Nif_Reader) -> Block {
+	skip_modifier(reader)
+	return .Other
+}
+
+read_age_death_modifier :: fun(reader: ^Nif_Reader) -> Block {
+	skip_modifier(reader)
+	skip(reader, 1)        // spawn on death
+	_ = read_ref(reader)   // spawn modifier
+	return .Other
+}
+
+read_bomb_modifier :: fun(reader: ^Nif_Reader) -> Block {
+	skip_modifier(reader)
+	_ = read_ref(reader)   // bomb object
+	skip(reader, 12)       // axis
+	skip(reader, 8)        // decay, delta velocity
+	skip(reader, 8)        // decay type, symmetry type
+	return .Other
+}
+
+read_bound_update_modifier :: fun(reader: ^Nif_Reader) -> Block {
+	skip_modifier(reader)
+	skip(reader, 2)   // update skip
+	return .Other
+}
+
+read_color_modifier :: fun(reader: ^Nif_Reader) -> Block {
+	skip_modifier(reader)
+	_ = read_ref(reader)   // color data
+	return .Other
+}
+
+read_drag_modifier :: fun(reader: ^Nif_Reader) -> Block {
+	skip_modifier(reader)
+	_ = read_ref(reader)   // drag object
+	skip(reader, 12)       // axis
+	skip(reader, 12)       // percentage, range, range falloff
+	return .Other
+}
+
+read_gravity_modifier :: fun(reader: ^Nif_Reader) -> Block {
+	skip_modifier(reader)
+	_ = read_ref(reader)   // gravity object
+	skip(reader, 12)       // axis
+	skip(reader, 8)        // decay, strength
+	skip(reader, 4)        // force type
+	skip(reader, 8)        // turbulence, its scale
+	return .Other
+}
+
+read_grow_fade_modifier :: fun(reader: ^Nif_Reader) -> Block {
+	skip_modifier(reader)
+	skip(reader, 4)   // grow time
+	skip(reader, 2)   // grow generation
+	skip(reader, 4)   // fade time
+	skip(reader, 2)   // fade generation
+	return .Other
+}
+
+read_mesh_update_modifier :: fun(reader: ^Nif_Reader) -> Block {
+	skip_modifier(reader)
+	skip_refs(reader)   // meshes
+	return .Other
+}
+
+read_rotation_modifier :: fun(reader: ^Nif_Reader) -> Block {
+	skip_modifier(reader)
+	skip(reader, 4)   // speed
+	if reader.version >= VERSION_20_0_0_2 {
+		skip(reader, 12)   // speed variation, angle, angle variation
+		skip(reader, 1)    // random speed sign
+	}
+	skip(reader, 1)    // random axis
+	skip(reader, 12)   // axis
+	return .Other
+}
+
+read_spawn_modifier :: fun(reader: ^Nif_Reader) -> Block {
+	skip_modifier(reader)
+	skip(reader, 2)    // spawn generations
+	skip(reader, 4)    // percentage spawned
+	skip(reader, 4)    // fewest and most spawned, two u16s
+	skip(reader, 16)   // speed and direction variation, life span and its variation
+	return .Other
+}
+
+read_parent_velocity_modifier :: fun(reader: ^Nif_Reader) -> Block {
+	skip_modifier(reader)
+	skip(reader, 4)   // damping
+	return .Other
+}
+
+// BSWindModifier: Shivering Isles' wind on particles.
+read_wind_modifier :: fun(reader: ^Nif_Reader) -> Block {
+	skip_modifier(reader)
+	skip(reader, 4)   // strength
+	return .Other
+}
+
+read_collider_manager :: fun(reader: ^Nif_Reader) -> Block {
+	skip_modifier(reader)
+	_ = read_ref(reader)   // collider
+	return .Other
+}
+
+// ---- emitters and colliders -------------------------------------------------
+
+// NiPSysEmitter: what every emitter starts with.
+skip_emitter :: fun(reader: ^Nif_Reader) {
+	skip_modifier(reader)
+	skip(reader, 24)   // speed, declination, planar angle and each one's variation
+	skip(reader, 16)   // initial color
+	skip(reader, 4)    // initial radius
+	if reader.version >= VERSION_10_4_0_1 do skip(reader, 4)   // its variation
+	skip(reader, 8)    // life span, its variation
+}
+
+// NiPSysVolumeEmitter: an emitter that makes particles inside a shape.
+skip_volume_emitter :: fun(reader: ^Nif_Reader) {
+	skip_emitter(reader)
+	if reader.version >= VERSION_10_1_0_0 do _ = read_ref(reader)   // emitter object
+}
+
+read_box_emitter :: fun(reader: ^Nif_Reader) -> Block {
+	skip_volume_emitter(reader)
+	skip(reader, 12)   // width, height, depth
+	return .Other
+}
+
+read_cylinder_emitter :: fun(reader: ^Nif_Reader) -> Block {
+	skip_volume_emitter(reader)
+	skip(reader, 8)   // radius, height
+	return .Other
+}
+
+read_sphere_emitter :: fun(reader: ^Nif_Reader) -> Block {
+	skip_volume_emitter(reader)
+	skip(reader, 4)   // radius
+	return .Other
+}
+
+// BSPSysArrayEmitter: Bethesda's emitter from a list of points.
+read_array_emitter :: fun(reader: ^Nif_Reader) -> Block {
+	skip_volume_emitter(reader)
+	return .Other
+}
+
+read_mesh_emitter :: fun(reader: ^Nif_Reader) -> Block {
+	skip_emitter(reader)
+	skip_refs(reader)  // emitter meshes
+	skip(reader, 8)    // initial velocity type, emission type
+	skip(reader, 12)   // emission axis
+	return .Other
+}
+
+read_planar_collider :: fun(reader: ^Nif_Reader) -> Block {
+	skip(reader, 4)        // bounce
+	skip(reader, 2)        // spawn on collide, die on collide
+	_ = read_ref(reader)   // spawn modifier
+	_ = read_ref(reader)   // parent
+	_ = read_ref(reader)   // next collider
+	_ = read_ref(reader)   // collider object
+	skip(reader, 8)        // width, height
+	skip(reader, 24)       // x and y axes
+	return .Other
+}
+
+// ---- particle controllers ---------------------------------------------------------
+
+// NiPSysModifierCtlr: a controller of one of a system's modifiers, by name.
+skip_modifier_controller :: fun(reader: ^Nif_Reader) {
+	skip_single_interp_controller(reader)
+	_ = read_string(reader)   // modifier name
+}
+
+// NiPSysEmitterCtlr: switches an emitter on and off.
+read_emitter_controller :: fun(reader: ^Nif_Reader) -> Block {
+	skip_modifier_controller(reader)
+	if reader.version <= VERSION_10_1_0_103 do _ = read_ref(reader)   // data
+	if reader.version >= VERSION_10_1_0_104 do _ = read_ref(reader)   // visibility interpolator
+	return .Other
+}
+
+// The modifier controllers with a data block before 10.1.0.104: active,
+// speed, declination, initial radius, life span, gravity strength.
+read_modifier_data_controller :: fun(reader: ^Nif_Reader) -> Block {
+	skip_modifier_controller(reader)
+	if reader.version <= VERSION_10_1_0_103 do _ = read_ref(reader)   // data
+	return .Other
+}
