@@ -252,6 +252,16 @@ load_texture :: fun(archive: ^Archive, path: []utf8, scratch: ^[]byte) -> u32 {
 	return id
 }
 
+// Takes a model's parts off the card (its textures stay, cached).
+free_model :: fun(gpu: ^Gpu_Model) {
+	for &part in gpu.parts {
+		DeleteBuffers(1, &part.vertex_buffer)
+		DeleteBuffers(1, &part.index_buffer)
+		DeleteVertexArrays(1, &part.vertex_array)
+	}
+	gpu.parts.len = 0
+}
+
 // Puts a model's parts on the card, their textures read from the archive.
 upload_model :: fun(renderer: ^Renderer, built: Model, archive: ^Archive, scratch: ^[]byte, gpu: ^Gpu_Model) {
 	gpu.parts.len = 0

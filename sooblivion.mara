@@ -633,6 +633,72 @@ command_map :: fun(name: []utf8) {
 	else do print("wrote map.png: % x %, % cells with land", width, height, lands)
 }
 
+// `sooblivion area <world> <x> <y>`: what the viewer would load around a
+// cell outside — land models, references, persistent ones nearby — and
+// whether the land's textures are in the archive. No window.
+command_area :: fun(name: []utf8, x: i64, y: i64) {
+	data_storage : [400 * MB]byte
+	index_storage : [96 * MB]byte
+	plugin, load_error := load_oblivion(&data_storage, &index_storage)
+	if load_error {
+		print("couldn't load the plugin: %", load_error)
+		return
+	}
+	scratch : [16 * MB]byte
+	world_id := find_world(&plugin, name, &scratch)
+	if world_id == 0 {
+		print("no world %", name)
+		return
+	}
+	directory_storage : [64 * MB]byte
+	textures, textures_error := open_archive(data_path("Oblivion - Textures - Compressed.bsa"), &directory_storage)
+	if textures_error do return
+	defer close_archive(&textures)
+
+	area := area_around(x, y)
+	cell_land : Land
+	model_room : [16 * MB]byte
+	references : [16384]Reference
+	land_cells : i64 = 0
+	parts : i64 = 0
+	missing_textures : i64 = 0
+	for cell_y in area.low_y..area.high_y {
+		for cell_x in area.low_x..area.high_x {
+			cell := exterior_cell(&plugin, world_id, cell_x, cell_y)
+			if cell == 0 do continue
+			_ = cell_references(&plugin, cell, &references)
+			land_at, has_land := find_land(&plugin, cell)
+			if not has_land do continue
+			scratch.len = 0
+			record, record_error := record_at(&plugin, land_at, &scratch)
+			if record_error do continue
+			read_land(record.data, &cell_land)
+			model_room.len = 0
+			built := build_land_model(&plugin, &cell_land, cell_x, cell_y, &model_room)
+			land_cells += 1
+			for part in built.parts {
+				parts += 1
+				_, found := find_file(&textures, part.texture[:])
+				if not found {
+					missing_textures += 1
+					if missing_textures <= 5 do print("  no texture %", part.texture)
+				}
+			}
+		}
+	}
+	print("% land cells, % land parts (% textures missing), % references in the cells", land_cells, parts, missing_textures, references.len)
+	persistent := persistent_cell(&plugin, world_id)
+	references.len = 0
+	_ = cell_references(&plugin, persistent, &references)
+	nearby : i64 = 0
+	for reference in references {
+		if area_holds(area, reference.position) do nearby += 1
+	}
+	print("the world's persistent cell holds %, % of them in the area", references.len, nearby)
+	middle := Vec3{(f32(x) + 0.5) * CELL_SIZE, (f32(y) + 0.5) * CELL_SIZE, 0}
+	print("the ground in the middle of % % is at %", x, y, ground_height(&plugin, world_id, middle, &scratch))
+}
+
 usage :: fun() {
 	print("sooblivion esm [plugin]            what a plugin holds, by record type")
 	print("sooblivion bsa <archive>           an archive's folders and files")
@@ -661,6 +727,22 @@ main :: (args: [][]utf8) {
 		else do command_cells("")
 	elif command == "view-cell" and args.len > 2
 		command_view_cell(args[2])
+	elif command == "area" and args.len > 4
+		x, x_ok := parse_number(args[3])
+		y, y_ok := parse_number(args[4])
+		if x_ok and y_ok do command_area(args[2], i64(x), i64(y))
+		else do usage()
+	elif command == "view-world"
+		if args.len > 4 {
+			x, x_ok := parse_number(args[3])
+			y, y_ok := parse_number(args[4])
+			if x_ok and y_ok do command_view_world(args[2], i64(x), i64(y))
+			else do usage()
+		elif args.len > 2
+			command_view_world(args[2], 0, 0)
+		else
+			command_view_world("Tamriel", 0, 0)
+		}
 	elif command == "map"
 		if args.len > 2 do command_map(args[2])
 		else do command_map("Tamriel")
