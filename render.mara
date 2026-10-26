@@ -45,8 +45,8 @@ use sky
 
 // The lights the shader knows at once (a scene's first ones), and how many
 // light one object.
-SCENE_LIGHTS :: 256
-LIGHTS_PER_OBJECT :: 8
+SCENE_LIGHTS :: 4096
+LIGHTS_PER_OBJECT :: 16
 NO_LIGHT :: 0xFFFF
 
 // Room in the shared mesh buffers: vertices (48 bytes each) and indexes.
@@ -121,6 +121,8 @@ layout(location = 6) in vec4 world_z;
 layout(location = 7) in vec4 world_w;
 layout(location = 8) in uvec4 lights_first;
 layout(location = 9) in uvec4 lights_second;
+layout(location = 13) in uvec4 lights_third;
+layout(location = 14) in uvec4 lights_fourth;
 layout(location = 10) in vec4 material;    // alpha threshold, emissive color
 layout(location = 11) in uvec2 texture_handle;
 layout(location = 12) in uvec2 glow_handle;   // its glow map's (bindless; else 1 for one), 0 for none
@@ -133,6 +135,8 @@ out vec2 texture_uv;
 out vec4 vertex_color;
 flat out uvec4 light_set_first;
 flat out uvec4 light_set_second;
+flat out uvec4 light_set_third;
+flat out uvec4 light_set_fourth;
 flat out vec4 part_material;
 flat out uvec2 part_texture;
 flat out uvec2 part_glow;
@@ -147,6 +151,8 @@ void main() {
 	vertex_color = color;
 	light_set_first = lights_first;
 	light_set_second = lights_second;
+	light_set_third = lights_third;
+	light_set_fourth = lights_fourth;
 	part_material = material;
 	part_texture = texture_handle;
 	part_glow = glow_handle;
@@ -154,13 +160,14 @@ void main() {
 "
 
 MESH_FRAGMENT_SHADER :: "
-#define SCENE_LIGHTS 256
 in vec3 world_position;
 in vec3 world_normal;
 in vec2 texture_uv;
 in vec4 vertex_color;
 flat in uvec4 light_set_first;
 flat in uvec4 light_set_second;
+flat in uvec4 light_set_third;
+flat in uvec4 light_set_fourth;
 flat in vec4 part_material;
 flat in uvec2 part_texture;
 flat in uvec2 part_glow;
@@ -178,9 +185,14 @@ uniform sampler2D glow_texture;
 uniform vec3 sun_direction;       // where the light comes from
 uniform vec3 sun_color;
 uniform vec3 ambient_color;
-uniform vec3 light_positions[SCENE_LIGHTS];
-uniform vec3 light_colors[SCENE_LIGHTS];
-uniform float light_reaches[SCENE_LIGHTS];
+// The scene's lights: where each is and how far it reaches, its color now.
+struct Scene_Light {
+	vec4 place;
+	vec4 color;
+};
+layout(std430, binding = 3) readonly buffer Scene_Lights {
+	Scene_Light scene_lights[];
+};
 uniform vec3 camera_position;
 uniform vec3 fog_color;
 uniform float fog_near;
@@ -189,11 +201,12 @@ uniform float fog_far;            // no fog when it isn't past fog_near
 out vec4 fragment_color;
 
 vec3 point_light(uint index, vec3 normal) {
-	vec3 to_light = light_positions[index] - world_position;
+	Scene_Light light = scene_lights[index];
+	vec3 to_light = light.place.xyz - world_position;
 	float distance = length(to_light);
-	float reach = clamp(1.0 - distance / light_reaches[index], 0.0, 1.0);
+	float reach = clamp(1.0 - distance / light.place.w, 0.0, 1.0);
 	float facing = max(dot(normal, to_light / max(distance, 0.001)), 0.0);
-	return light_colors[index] * facing * reach * reach;
+	return light.color.rgb * facing * reach * reach;
 }
 
 void main() {
@@ -207,13 +220,14 @@ void main() {
 	vec3 emitted = part_material.yzw;
 	if (part_glow != uvec2(0u)) emitted *= texture(GLOW_TEXTURE, texture_uv).rgb;
 	vec3 light = ambient_color + emitted + sun_color * max(dot(normal, sun_direction), 0.0);
-	for (int i = 0; i < 4; i++) {
-		if (light_set_first[i] == 65535u) break;
-		light += point_light(light_set_first[i], normal);
-	}
-	for (int i = 0; i < 4; i++) {
-		if (light_set_second[i] == 65535u) break;
-		light += point_light(light_set_second[i], normal);
+	// Its lights, nearest first, till the first none (65535).
+	uvec4 sets[4] = uvec4[4](light_set_first, light_set_second, light_set_third, light_set_fourth);
+	for (int s = 0; s < 4; s++) {
+		if (sets[s].x == 65535u) break;
+		for (int i = 0; i < 4; i++) {
+			if (sets[s][i] == 65535u) break;
+			light += point_light(sets[s][i], normal);
+		}
 	}
 	vec3 color = base.rgb * light;
 	if (fog_far > fog_near) {
@@ -1055,9 +1069,6 @@ Shared_Uniforms :: struct {
 Mesh_Program :: struct {
 	program: u32
 	shared: Shared_Uniforms
-	light_position_at: [SCENE_LIGHTS!]i32
-	light_color_at: [SCENE_LIGHTS!]i32
-	light_reach_at: [SCENE_LIGHTS!]i32
 }
 
 // A land program, and where its uniforms are.
@@ -1143,6 +1154,9 @@ Renderer :: struct {
 	land_index_buffer: u32
 	land_indirect_buffer: u32
 	land_texture_buffer: u32                   // each quadrant's 9 handles (bindless)
+
+	// The scene's lights as the mesh programs read them (binding 3).
+	light_buffer: u32
 	land_quadrants: [LAND_QUADRANTS!]Quadrant_Slots
 
 	// Textures, found by their paths' hashes.
@@ -1296,11 +1310,6 @@ make_mesh_program :: fun(made: ^Mesh_Program, bindless: bool) -> err {
 	if not bindless {
 		UseProgram(made.program)
 		Uniform1i(GetUniformLocation(made.program, "glow_texture"), 1)
-	}
-	for i in 0:SCENE_LIGHTS {
-		made.light_position_at[i] = array_uniform(made.program, "light_positions[", i)
-		made.light_color_at[i] = array_uniform(made.program, "light_colors[", i)
-		made.light_reach_at[i] = array_uniform(made.program, "light_reaches[", i)
 	}
 }
 
@@ -1984,14 +1993,20 @@ setup_mesh_buffers :: fun(renderer: ^Renderer) {
 	EnableVertexAttribArray(9)
 	VertexAttribIPointer(9, 4, UNSIGNED_SHORT, instance_stride, 72)    // lights 5 to 8
 	VertexAttribDivisor(9, 1)
+	EnableVertexAttribArray(13)
+	VertexAttribIPointer(13, 4, UNSIGNED_SHORT, instance_stride, 80)   // lights 9 to 12
+	VertexAttribDivisor(13, 1)
+	EnableVertexAttribArray(14)
+	VertexAttribIPointer(14, 4, UNSIGNED_SHORT, instance_stride, 88)   // lights 13 to 16
+	VertexAttribDivisor(14, 1)
 	EnableVertexAttribArray(10)
-	VertexAttribPointer(10, 4, FLOAT, 0, instance_stride, 80)          // material
+	VertexAttribPointer(10, 4, FLOAT, 0, instance_stride, 96)          // material
 	VertexAttribDivisor(10, 1)
 	EnableVertexAttribArray(11)
-	VertexAttribIPointer(11, 2, UNSIGNED_INT, instance_stride, 96)     // texture handle
+	VertexAttribIPointer(11, 2, UNSIGNED_INT, instance_stride, 112)    // texture handle
 	VertexAttribDivisor(11, 1)
 	EnableVertexAttribArray(12)
-	VertexAttribIPointer(12, 2, UNSIGNED_INT, instance_stride, 104)    // glow map handle
+	VertexAttribIPointer(12, 2, UNSIGNED_INT, instance_stride, 120)    // glow map handle
 	VertexAttribDivisor(12, 1)
 	BindVertexArray(0)
 
@@ -2032,6 +2047,10 @@ setup_land_buffers :: fun(renderer: ^Renderer) {
 	GenBuffers(1, &renderer.land_texture_buffer)
 	BindBuffer(SHADER_STORAGE_BUFFER, renderer.land_texture_buffer)
 	BufferData(SHADER_STORAGE_BUFFER, LAND_QUADRANTS * QUADRANT_TEXTURES * 8, [], DYNAMIC_DRAW)
+
+	GenBuffers(1, &renderer.light_buffer)
+	BindBuffer(SHADER_STORAGE_BUFFER, renderer.light_buffer)
+	BufferData(SHADER_STORAGE_BUFFER, SCENE_LIGHTS * size_of(Light_Record), [], DYNAMIC_DRAW)
 }
 
 // ---- textures --------------------------------------------------------------------
@@ -2240,21 +2259,26 @@ choose_lights :: fun(instance: ^Instance, lights: ^[]Point_Light) {
 	}
 }
 
-// Gives the mesh programs the scene's lights: its first SCENE_LIGHTS.
+// A light as the mesh programs read it: where it is now and how far it
+// reaches, its color as bright as it is now.
+Light_Record :: struct {
+	place: [4!]f32
+	color: [4!]f32
+}
+
+// Gives the mesh programs the scene's lights, as they are now: its first
+// SCENE_LIGHTS, into the light buffer.
 set_scene_lights :: fun(renderer: ^Renderer, lights: ^[]Point_Light) {
-	last := lights.len
-	if last > SCENE_LIGHTS do last = SCENE_LIGHTS
-	programs : i64 = if renderer.bindless_available do 2 else 1
-	for which in 0:programs {
-		made := &renderer.mesh_programs[which]
-		UseProgram(made.program)
-		for i in 0:last {
-			light := lights[i]
-			Uniform3f(made.light_position_at[i], light.position.x, light.position.y, light.position.z)
-			Uniform3f(made.light_color_at[i], light.color.x, light.color.y, light.color.z)
-			Uniform1f(made.light_reach_at[i], light.radius)
-		}
+	records : [SCENE_LIGHTS]Light_Record
+	for &light in lights {
+		if records.len == records.cap do break
+		at := light.position + light.drift
+		shown := light.color * light.brightness
+		&records + Light_Record{place = [at.x, at.y, at.z, light.radius], color = [shown.x, shown.y, shown.z, 0]}
 	}
+	if records.len == 0 do return
+	BindBuffer(SHADER_STORAGE_BUFFER, renderer.light_buffer)
+	BufferSubData(SHADER_STORAGE_BUFFER, 0, records[:])
 }
 
 // ---- land ---------------------------------------------------------------------------------
@@ -2406,6 +2430,7 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 	planes := view_planes(view_projection)
 	sun := vec3_normalize(lighting.direction)
 
+	BindBufferBase(SHADER_STORAGE_BUFFER, 3, renderer.light_buffer)
 	if look.outside do draw_sky(renderer, look, view_projection, lighting, camera, &stats)
 	// The cells drawn in full: what the far pass leaves out.
 	near_cells := hidden_around(camera.position)

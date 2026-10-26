@@ -324,6 +324,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 
 	pass_time(viewer, f32(seconds), input.held[T])
 	swing_doors(shown, f32(seconds))
+	if change_lights(shown, f32(seconds)) do shown.lights_changed = true
 	drawing_start := time_now()
 	if shown.waters_changed {
 		upload_waters(&viewer.renderer, &shown.waters)

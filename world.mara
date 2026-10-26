@@ -403,26 +403,57 @@ cell_lighting :: fun(plugin: ^Plugin, cell: u32, scratch: ^[]byte) -> Cell_Light
 
 // A light's flags (LIGH's DATA).
 LIGHT_NEGATIVE       :: 0x4    // takes light away
+LIGHT_FLICKER        :: 0x8
 LIGHT_OFF_BY_DEFAULT :: 0x20
+LIGHT_FLICKER_SLOW   :: 0x40
+LIGHT_PULSE          :: 0x80
+LIGHT_PULSE_SLOW     :: 0x100
 
-// A light placed in a cell: where, how far it reaches, its color.
+// How a light's brightness changes: not at all, flickering (quickly or
+// slowly: toward new levels by chance), pulsing (between full and a
+// quarter).
+Light_Kind :: union {
+	steady = 0
+	flicker
+	flicker_slow
+	pulse
+	pulse_slow
+}
+
+// A light placed in a cell: where, how far it reaches, its color; how it
+// changes, and as it does, how bright it is now, toward what, and how far
+// it's moved off its place (a flickering one wavers).
 Point_Light :: struct {
 	position: Vec3
 	radius: f32
 	color: Vec3
+	kind: Light_Kind
+	brightness: f32
+	target: f32
+	drift: Vec3
+	drift_target: Vec3
 }
 
 // The light a LIGH base object gives, placed by a reference; false when
 // it gives none (off, negative, or no data).
 light_of :: fun(base: Record, reference: Reference) -> Point_Light, bool {
-	none := Point_Light{position = reference.position, radius = 0, color = Vec3{0, 0, 0}}
+	none := Point_Light{position = reference.position, radius = 0, color = Vec3{0, 0, 0}, kind = .steady,
+		brightness = 1, target = 1, drift = Vec3{0, 0, 0}, drift_target = Vec3{0, 0, 0}}
 	if base.header.kind != "LIGH" do return none, false
 	field, found := find_field(base.data, "DATA")
 	if not found or field.len < 16 do return none, false
 	radius : u32 = field[4]
 	flags : u32 = field[12]
 	if flags & (LIGHT_NEGATIVE | LIGHT_OFF_BY_DEFAULT) != 0 or radius == 0 do return none, false
-	return Point_Light{position = reference.position, radius = f32(radius) * reference.scale, color = byte_color(field, 8)}, true
+	kind := Light_Kind.steady
+	if flags & LIGHT_FLICKER != 0 do kind = .flicker
+	elif flags & LIGHT_FLICKER_SLOW != 0 do kind = .flicker_slow
+	elif flags & LIGHT_PULSE != 0 do kind = .pulse
+	elif flags & LIGHT_PULSE_SLOW != 0 do kind = .pulse_slow
+	// A changing light starts partway (as OpenMW has it): each its own way.
+	start : f32 = if kind == .steady do 1 else 0.675
+	return Point_Light{position = reference.position, radius = f32(radius) * reference.scale, color = byte_color(field, 8),
+		kind = kind, brightness = start, target = start, drift = Vec3{0, 0, 0}, drift_target = Vec3{0, 0, 0}}, true
 }
 
 // Where a door leads (a reference's XTEL): the door at the other end, and

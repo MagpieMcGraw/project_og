@@ -141,6 +141,7 @@ Scene :: struct {
 	instances: [32768]Instance
 	lights: [4096]Point_Light
 	lights_changed: bool         // since the renderer was last given them (set_scene_lights)
+	flicker_seed: u64            // for the flickering lights' chances
 	doors: [1024]Scene_Door
 	lighting: Cell_Lighting
 	world: u32                   // the world shown outside, 0 inside
@@ -698,6 +699,51 @@ load_land :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64, load
 	&scene.grounds + upload_land(loader.renderer, &mesh, x, y, slot, loader.textures, &room.texture)
 	scene.land_heights[slot] = cell_land.heights
 	load_grass(scene, plugin, cell, x, y, &cell_land, slot, loader)
+}
+
+// ---- lights that change ------------------------------------------------------------
+
+// How far a flickering light wavers off its place, at most (the game's
+// fFlickerMovement), and its pace: steps a second, and how far each takes
+// the brightness (as OpenMW has it, after the original games).
+FLICKER_MOVEMENT :: 8
+FLICKER_STEPS :: 15
+QUICK_STEP :: 0.1
+SLOW_STEP :: 0.05
+
+// Moves the lights that change on by a frame: each's brightness toward
+// its target, a new one when it's there — by chance for a flicker, the
+// other end for a pulse — and a flickering one's waver with it. True when
+// any changed (the renderer's to be given them).
+change_lights :: fun(scene: ^Scene, seconds: f32) -> bool {
+	steps := seconds * FLICKER_STEPS
+	changed := false
+	for &light in scene.lights {
+		if light.kind == .steady do continue
+		changed = true
+		quick := light.kind == .flicker or light.kind == .pulse
+		pace : f32 = if quick do QUICK_STEP else SLOW_STEP
+		if light.brightness >= light.target do light.brightness = max_f32(light.target, light.brightness - steps * pace)
+		else do light.brightness = min_f32(light.target, light.brightness + steps * pace)
+		flickers := light.kind == .flicker or light.kind == .flicker_slow
+		if abs_f32(light.brightness - light.target) < pace * 0.5 {
+			if flickers {
+				light.target = 0.25 + next_chance(&scene.flicker_seed) * 0.75
+				light.drift_target = Vec3{next_chance(&scene.flicker_seed) * 2 - 1, next_chance(&scene.flicker_seed) * 2 - 1,
+					next_chance(&scene.flicker_seed) * 2 - 1} * FLICKER_MOVEMENT
+			else
+				light.target = if light.target <= 0.5 do 1 else 0.25
+			}
+		}
+		if flickers do light.drift = light.drift + (light.drift_target - light.drift) * min_f32(1, steps * pace)
+	}
+	return changed
+}
+
+// A number from 0 to 1, the seed moved on.
+next_chance :: fun(seed: ^u64) -> f32 {
+	seed^ = seed^ *% 6364136223846793005 +% 1442695040888963407
+	return f32(seed^ >> 40) / 16777216
 }
 
 // ---- doors that open in place -------------------------------------------------------
