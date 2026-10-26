@@ -33,6 +33,7 @@ Model_Part :: struct {
 	billboard_mode: i64     // under a billboard node: its mode (Node's billboard_mode); -1 for none
 	billboard_node: Mat4    // that node's place in the model
 	alpha_blend: bool       // blended with what's behind it
+	depth_write: bool       // writes the depth buffer (blended too, unless its z-buffer property says not)
 	alpha_test: bool        // pixels whose alpha is below the threshold are left out
 	alpha_threshold: f32    // 0 to 1
 	two_sided: bool
@@ -78,6 +79,7 @@ Inherited :: struct {
 	material: i64
 	alpha: i64
 	stencil: i64
+	z_buffer: i64
 	billboard_mode: i64    // the nearest billboard node above: its mode, -1 for none
 	billboard_node: Mat4   // and its place in the model
 }
@@ -111,6 +113,8 @@ inherit :: fun(mesh: ^Nif, parent: Inherited, properties: Refs) -> Inherited {
 			result.alpha = index
 		Stencil
 			result.stencil = index
+		Z_Buffer
+			result.z_buffer = index
 		else
 		}
 	}
@@ -150,7 +154,7 @@ build_model_part :: fun(mesh: ^Nif, node: i64, left_out: []i64, storage: ^[]byte
 		flips = slice([:flip_count]Model_Flip, storage),
 		bounds_min = Vec3{1000000, 1000000, 1000000},
 		bounds_max = Vec3{-1000000, -1000000, -1000000}}
-	none := Inherited{texturing = -1, material = -1, alpha = -1, stencil = -1, billboard_mode = -1, billboard_node = mat4_identity()}
+	none := Inherited{texturing = -1, material = -1, alpha = -1, stencil = -1, z_buffer = -1, billboard_mode = -1, billboard_node = mat4_identity()}
 	if node >= 0 {
 		match mesh.blocks[node] {
 		Node part_node
@@ -260,6 +264,7 @@ add_shape :: fun(mesh: ^Nif, geometry: Geometry, transform: Mat4, properties: In
 		billboard_mode = properties.billboard_mode,
 		billboard_node = properties.billboard_node,
 		alpha_blend = false,
+		depth_write = true,
 		alpha_test = false,
 		alpha_threshold = 0,
 		two_sided = false,
@@ -345,6 +350,13 @@ apply_properties :: fun(mesh: ^Nif, properties: Inherited, part: ^Model_Part, mo
 		match mesh.blocks[properties.stencil] {
 		Stencil stencil
 			part.two_sided = stencil.draw_mode == 3
+		else
+		}
+	}
+	if properties.z_buffer >= 0 {
+		match mesh.blocks[properties.z_buffer] {
+		Z_Buffer z_buffer
+			part.depth_write = z_buffer.flags & 2 != 0
 		else
 		}
 	}

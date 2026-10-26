@@ -766,6 +766,7 @@ Mesh_Part :: struct {
 	texture_slot: i64      // its texture: its place in the renderer's textures
 	glow_slot: i64         // its glow map's, -1 for none
 	alpha_blend: bool
+	depth_write: bool
 	two_sided: bool
 	alpha_threshold: f32   // pixels less opaque are left out; 0 for none
 	emissive: Vec3
@@ -2275,6 +2276,7 @@ upload_model :: fun(renderer: ^Renderer, built: ^Model, archive: ^Archive, scrat
 			texture_slot = texture_for(renderer, archive, part.texture[:], scratch, part.clamp_mode),
 			glow_slot = glow_map_for(renderer, archive, &part, scratch),
 			alpha_blend = part.alpha_blend,
+			depth_write = part.depth_write,
 			two_sided = part.two_sided,
 			alpha_threshold = threshold,
 			emissive = part.emissive,
@@ -2777,16 +2779,17 @@ draw_land :: fun(renderer: ^Renderer, grounds: ^[]Gpu_Land, planes: ^View_Planes
 	ActiveTexture(TEXTURE0)
 }
 
-// A part's sort key: blended parts after opaque ones, those adding last;
-// within those, the two-sided after the rest; without bindless, then by
-// texture — so each run of one key is one draw call. The part's index in
-// the low bits.
+// A part's sort key: blended parts after opaque ones — those writing depth
+// first, those adding last; within those, the two-sided after the rest;
+// without bindless, then by texture — so each run of one key is one draw
+// call. The part's index in the low bits.
 part_key :: fun(renderer: ^Renderer, part: Mesh_Part, part_index: i64, bindless: bool) -> i64 {
 	group_key : i64 = 0
 	if not bindless do group_key = shown_texture(renderer, part)
 	if part.two_sided do group_key += MAX_TEXTURES
 	if part.alpha_blend do group_key += 2 * MAX_TEXTURES
-	if part.additive do group_key += 4 * MAX_TEXTURES
+	if part.alpha_blend and not part.depth_write do group_key += 4 * MAX_TEXTURES
+	if part.additive do group_key += 8 * MAX_TEXTURES
 	return (group_key << 20) | part_index
 }
 
@@ -2829,9 +2832,10 @@ flip_frame :: fun(flip: ^Gpu_Flip, time: f32) -> i64 {
 
 // Where a billboard part is drawn: its node turned to face the camera —
 // all the way (the node's x to the camera's right, y to its up, z back
-// toward it), or in modes 1, 5 and 9 about the node's own up (y) only, z
-// toward the eye — keeping the node's place and scale. (The part's
-// vertices are in the model's space: taken back through the node first.)
+// toward it); in modes 3 and 4 the same but z toward the eye itself; or in
+// modes 1, 5 and 9 about the node's own up (y) only, z toward the eye —
+// keeping the node's place and scale. (The part's vertices are in the
+// model's space: taken back through the node first.)
 billboard_world :: fun(billboard: ^Gpu_Billboard, placement: Mat4, camera_right: Vec3, camera_up: Vec3, eye: Vec3) -> Mat4 {
 	placed := mat4_mul(placement, billboard.node)
 	origin := Vec3{placed[3][0], placed[3][1], placed[3][2]}
@@ -2844,6 +2848,16 @@ billboard_world :: fun(billboard: ^Gpu_Billboard, placement: Mat4, camera_right:
 		toward := to_eye - upward * dot(to_eye, upward)
 		if vec3_length(toward) < 0.001 do return placement   // the eye right above or below: as placed
 		across = cross(upward, vec3_normalize(toward))
+	elif billboard.mode == 3 or billboard.mode == 4
+		toward := eye - origin
+		if vec3_length(toward) > 0.001 {
+			toward = vec3_normalize(toward)
+			level := camera_up - toward * dot(camera_up, toward)
+			if vec3_length(level) > 0.001 {
+				upward = vec3_normalize(level)
+				across = cross(upward, toward)
+			}
+		}
 	}
 	back := cross(across, upward)
 	turned := mat4_identity()
@@ -2897,6 +2911,16 @@ gather_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]In
 	renderer.commands.len = 0
 	if record_count == 0 do return
 
+	// The instances in view, nearest first: opaque parts are drawn so (what's
+	// hidden fails the depth test early), blended ones the other way round.
+	for k in 0:renderer.visible.len {
+		index := renderer.visible[k]
+		distance := i64(vec3_length(instances[index].center - camera.position))
+		renderer.visible[k] = (distance << 24) | index
+	}
+	sort_keys(&renderer.visible)
+	for k in 0:renderer.visible.len do renderer.visible[k] = renderer.visible[k] & 0xFFFFFF
+
 	// The parts in drawing order; each one's instances' place in the records.
 	sort_keys(&renderer.touched)
 	renderer.commands.len = 0
@@ -2915,13 +2939,17 @@ gather_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]In
 		renderer.part_counts[p] = 0   // counts again as the records fill
 	}
 
-	// The records: each part's instances in their place.
+	// The records: each part's instances in their place — the opaque parts'
+	// nearest first, the blended parts' farthest first.
 	renderer.records.len = record_count
-	for index in renderer.visible {
+	for k in 0:renderer.visible.len * 2 {
+		blended := k >= renderer.visible.len
+		index := if blended do renderer.visible[2 * renderer.visible.len - 1 - k] else renderer.visible[k]
 		instance := &instances[index]
 		placed_model := models[instance.model]
 		for p in placed_model.first_part:placed_model.first_part + placed_model.part_count {
 			part := renderer.parts[p]
+			if part.alpha_blend != blended do continue
 			record := &renderer.records[renderer.part_starts[p] + renderer.part_counts[p]]
 			renderer.part_counts[p] += 1
 			record.world = instance.world
@@ -2956,10 +2984,7 @@ draw_mesh_runs :: fun(renderer: ^Renderer, view_projection: Mat4, lighting: Cell
 	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
 	BindVertexArray(renderer.mesh_vertex_array)
 	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.indirect_buffer)
-	if blended {
-		Enable(BLEND)
-		DepthMask(0)
-	}
+	if blended do Enable(BLEND)
 	Uniform1i(made.adding_at, 0)
 	run_start : i64 = 0
 	for run_start < renderer.commands.len {
@@ -2974,6 +2999,7 @@ draw_mesh_runs :: fun(renderer: ^Renderer, view_projection: Mat4, lighting: Cell
 		}
 		if first_part.two_sided do Disable(CULL_FACE)
 		else do Enable(CULL_FACE)
+		DepthMask(if first_part.depth_write do 1 else 0)
 		if blended {
 			if first_part.additive do BlendFunc(SRC_ALPHA, ONE)
 			else do BlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
@@ -2993,10 +3019,8 @@ draw_mesh_runs :: fun(renderer: ^Renderer, view_projection: Mat4, lighting: Cell
 	}
 	// As it was: what's drawn next (the near pass, after the far's blended
 	// meshes) writes depth, unblended, culled.
-	if blended {
-		DepthMask(1)
-		Disable(BLEND)
-	}
+	DepthMask(1)
+	Disable(BLEND)
 	Enable(CULL_FACE)
 }
 
