@@ -28,6 +28,7 @@ use walking
 use logging
 use mara.string
 use sdl_platform
+use audio
 gl :: use mara.open_gl
 render :: use render
 
@@ -64,6 +65,9 @@ LOG_PATH :: "sooblivion.log"
 // with T held, how much faster again.
 TIME_SCALE :: 30
 HURRIED_TIME_SCALE :: 2000
+// The room the sounds' clips are loaded into.
+SOUND_ROOM :: 64 * MB
+
 // The hour the viewer starts at.
 START_HOUR :: 10
 
@@ -118,6 +122,10 @@ Viewer :: struct {
 	drawn: Frame_Stats
 	told_framebuffer: bool   // the journal has said the frame's framebuffer couldn't be made
 
+	// The sound: the archive of its files, and what plays them.
+	sounds: Archive
+	audio: Audio
+
 	// Since the last summary: frames, refreshes missed, the longest, and
 	// the CPU's and card's time in all, in nanoseconds.
 	last_shown: u64     // when the last frame was shown
@@ -145,7 +153,15 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.journal = journal_open(LOG_PATH)
 	viewer.meshes = open_archive(data_path("Oblivion - Meshes.bsa"), directory_storage)?
 	viewer.textures = open_archive(data_path("Oblivion - Textures - Compressed.bsa"), directory_storage)?
+	viewer.sounds = open_archive(data_path("Oblivion - Sounds.bsa"), directory_storage)?
 	viewer.platform = platform_open("sooblivion", 1280, 720)?
+	audio_init(&viewer.audio, SOUND_ROOM, table_storage)
+	audio_error := audio_open(&viewer.audio)
+	if audio_error {
+		note(&viewer.journal, "no sound: ")
+		note_error(&viewer.journal, audio_error)
+		note_end(&viewer.journal)
+	}
 	set_vsync(&viewer.platform, true)
 	renderer_init(&viewer.renderer, table_storage)?
 	note(&viewer.journal, if viewer.renderer.bindless_available do "the card draws bindless" else "the card can't draw bindless: textures are bound")
@@ -186,7 +202,9 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 }
 
 viewer_close :: fun(viewer: ^Viewer) {
+	audio_close(&viewer.audio)
 	platform_close(&viewer.platform)
+	close_archive(&viewer.sounds)
 	close_archive(&viewer.textures)
 	close_archive(&viewer.meshes)
 	journal_close(&viewer.journal)
@@ -275,6 +293,11 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	leading := leading_door(shown, targeted)
 	usable := leading >= 0 or (targeted != 0 and swings(shown, targeted))
 	if input.pressed[E] and usable {
+		// The door's sound: opening, or (one open) closing — heard on after
+		// going through, where the door was.
+		opening := leading >= 0 or not door_open(shown, targeted)
+		sound, place := door_sound(shown, targeted, opening)
+		if sound >= 0 do play_once(&viewer.audio, &viewer.sounds, &shown.sound_kinds[sound], place, listener_of(camera^))
 		if leading >= 0 {
 			viewer.chosen_door = leading
 			return .door
@@ -348,6 +371,8 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		viewer.told_framebuffer = true
 	}
 	draw_reticle(platform.width, platform.height, usable)
+	hear(&viewer.audio, &viewer.sounds, &shown.sounds, listener_of(camera^), viewer.hour, f64(time_now()) / 1000000000)
+	mix_ahead(&viewer.audio)
 	card_start := time_now()
 	viewer.drawing_time = card_start - drawing_start
 	wait_for_card()
@@ -593,9 +618,15 @@ take_sky :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32) {
 	note_end(journal)
 }
 
+// Where the camera hears from: its place, and its right.
+listener_of :: fun(camera: render.Camera) -> Listener {
+	_, right, _ := camera_axes(camera)
+	return Listener{position = camera.position, right = right}
+}
+
 // Tells the journal what loading couldn't do since it last did: what the
-// scene left out and the textures drawn white, how many, and the first's
-// name and why.
+// scene left out, the textures drawn white and the sounds not played, how
+// many, and the first's name and why.
 note_failures :: fun(viewer: ^Viewer) {
 	shown := &viewer.shown
 	renderer := &viewer.renderer
@@ -619,6 +650,17 @@ note_failures :: fun(viewer: ^Viewer) {
 		note_error(journal, renderer.first_texture_reason)
 		note_end(journal)
 		renderer.texture_failures = 0
+	}
+	sound := &viewer.audio
+	if sound.failures > 0 {
+		note(journal, "  couldn't play ")
+		note(journal, sound.failures)
+		note(journal, " sounds; the first: ")
+		note(journal, sound.first_failure[:])
+		note(journal, ", ")
+		note_error(journal, sound.first_failure_reason)
+		note_end(journal)
+		sound.failures = 0
 	}
 }
 
@@ -688,7 +730,7 @@ leading_door :: fun(shown: ^Scene, reference: u32) -> i64 {
 // `sooblivion view <mesh>`: shows a mesh in the window.
 command_view :: fun(what: []utf8) {
 	directory_storage : [64 * MB]byte
-	table_storage : [1 * MB]byte
+	table_storage : [SOUND_ROOM + 8 * MB]byte
 	viewer : Viewer
 	open_error := viewer_open(&viewer, &directory_storage, &table_storage)
 	if open_error {
@@ -735,7 +777,7 @@ command_view_cell :: fun(name: []utf8) {
 		return
 	}
 	directory_storage : [64 * MB]byte
-	table_storage : [1 * MB]byte
+	table_storage : [SOUND_ROOM + 8 * MB]byte
 	viewer : Viewer
 	open_error := viewer_open(&viewer, &directory_storage, &table_storage)
 	if open_error {
@@ -771,7 +813,7 @@ command_view_world :: fun(name: []utf8, x: i64, y: i64) {
 		return
 	}
 	directory_storage : [64 * MB]byte
-	table_storage : [1 * MB]byte
+	table_storage : [SOUND_ROOM + 8 * MB]byte
 	viewer : Viewer
 	open_error := viewer_open(&viewer, &directory_storage, &table_storage)
 	if open_error {

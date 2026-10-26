@@ -30,6 +30,7 @@ use grass
 use collision
 use animation
 use particles
+use audio
 render :: use render
 use mara.math
 use sdl_platform
@@ -1117,6 +1118,163 @@ command_records :: fun(kind: []utf8) {
 	if kind == "TREE" do check_tree_billboards(&plugin)
 }
 
+// `sooblivion sound <editor id>`: a SOUN record as it's played — how far it's
+// heard, its file's clip (channels, rate, length) — and a second of it
+// mixed (without opening the sound device): how loud at its near distance.
+command_sound :: fun(name: []utf8) {
+	data_storage : [400 * MB]byte
+	index_storage : [96 * MB]byte
+	plugin, load_error := load_oblivion(&data_storage, &index_storage)
+	if load_error {
+		print("couldn't load the plugin: %", load_error)
+		return
+	}
+	directory_storage : [16 * MB]byte
+	sounds, open_error := open_archive(data_path("Oblivion - Sounds.bsa"), &directory_storage)
+	if open_error {
+		print("couldn't open the sounds: %", open_error)
+		return
+	}
+	defer close_archive(&sounds)
+	scratch : [1 * MB]byte
+	form_id, found := find_by_editor_id(&plugin, name, &scratch)
+	if not found {
+		print("no record %", name)
+		return
+	}
+	scratch.len = 0
+	record, record_error := find_record(&plugin, form_id, &scratch)
+	if record_error {
+		print("couldn't read %: %", name, record_error)
+		return
+	}
+	kind, made := sound_kind_of(record)
+	if not made {
+		print("% isn't a sound", name)
+		return
+	}
+	print("%: % (a folder: %), heard full within %, out to %; pitch shifted %, % dB quieter, flags %, hours % to %", name,
+		kind.path, kind.folder, kind.min_distance, kind.max_distance, kind.pitch_shift, kind.attenuation, kind.flags,
+		kind.start_hour, kind.stop_hour)
+
+	room : [32 * MB]byte
+	mixer : Audio
+	audio_init(&mixer, 24 * MB, &room)
+	clip_index, clip_error := clip_for(&mixer, &sounds, &kind)
+	if clip_error {
+		print("its clip couldn't be loaded: %", clip_error)
+		return
+	}
+	clip := mixer.clips[clip_index]
+	print("clip: % channels at % a second, % frames (% s)", clip.channels, clip.rate, clip.frames, f32(clip.frames) / f32(clip.rate))
+	listener := Listener{position = Vec3{0, 0, 0}, right = Vec3{1, 0, 0}}
+	place := Vec3{kind.min_distance, 0, 0}   // at its near distance, to the right
+	gains := side_gains(&kind, place, listener, loudness(&kind, kind.min_distance))
+	_ = start_voice(&mixer, &kind, clip_index, 0, gains, kind.flags & SOUND_LOOP != 0)
+	peak : [2!]f32 = [0, 0]
+	for block in 0:10 {
+		mixer.mix.len = AHEAD * 2
+		for k in 0:mixer.mix.len do mixer.mix[k] = 0
+		for &voice in mixer.voices do mix_voice(&mixer, voice, AHEAD)
+		for k in 0:AHEAD {
+			peak[0] = max(peak[0], abs_f32(mixer.mix[k * 2]))
+			peak[1] = max(peak[1], abs_f32(mixer.mix[k * 2 + 1]))
+		}
+	}
+	print("gains at its near distance, to the right: %; a second mixed peaks at % left, % right", gains, peak[0], peak[1])
+}
+
+// The record whose editor id is name (any letter case): its form id; false
+// when there's none. (Every record is looked at.)
+find_by_editor_id :: fun(plugin: ^Plugin, name: []utf8, scratch: ^[]byte) -> u32, bool {
+	for key, slot in plugin.records.keys {
+		if key == 0 do continue
+		scratch.len = 0
+		record, record_error := record_at(plugin, i64(plugin.records.values[slot]), scratch)
+		if record_error do continue
+		if compare_folded(editor_id(record.data), name) == 0 do return u32(key), true
+	}
+	return 0, false
+}
+
+// `sooblivion sounds`: the game's sounds — how its SOUN records play (their
+// flags, how far they're heard, those naming a folder, files the archive
+// hasn't), and the lights, doors and activators that make them.
+command_sounds :: fun() {
+	data_storage : [400 * MB]byte
+	index_storage : [96 * MB]byte
+	plugin, load_error := load_oblivion(&data_storage, &index_storage)
+	if load_error {
+		print("couldn't load the plugin: %", load_error)
+		return
+	}
+	directory_storage : [16 * MB]byte
+	sounds, open_error := open_archive(data_path("Oblivion - Sounds.bsa"), &directory_storage)
+	if open_error {
+		print("couldn't open the sounds: %", open_error)
+		return
+	}
+	defer close_archive(&sounds)
+
+	scratch : [1 * MB]byte
+	flag_counts : [8!]i64 = all 0
+	kinds : i64 = 0
+	folders : i64 = 0
+	missing : i64 = 0
+	first_missing : str256
+	timed : i64 = 0
+	lights_with_sound : i64 = 0
+	doors_with_sound : i64 = 0
+	activators_with_sound : i64 = 0
+	shortest : f32 = 1000000
+	longest : f32 = 0
+	for key, slot in plugin.records.keys {
+		if key == 0 do continue
+		header : Record_Header = plugin.data[i64(plugin.records.values[slot])]
+		if header.kind != "SOUN" and header.kind != "LIGH" and header.kind != "DOOR" and header.kind != "ACTI" do continue
+		scratch.len = 0
+		record, record_error := record_at(&plugin, i64(plugin.records.values[slot]), &scratch)
+		if record_error do continue
+		if header.kind == "SOUN" {
+			kind, made := sound_kind_of(record)
+			if not made do continue
+			kinds += 1
+			for bit in 0:8 {
+				if kind.flags & (u32(1) << u32(bit)) != 0 do flag_counts[bit] += 1
+			}
+			if kind.start_hour != kind.stop_hour do timed += 1
+			if kind.max_distance > 0 {
+				shortest = min(shortest, kind.max_distance)
+				longest = max(longest, kind.max_distance)
+			}
+			found := false
+			if kind.folder {
+				folders += 1
+				folder_path := kind.path[:]
+				if ends_with(folder_path, "\\") do folder_path = folder_path[0 : folder_path.len - 1]
+				_, found = find_folder(&sounds, folder_path)
+			else
+				_, found = find_file(&sounds, kind.path[:])
+			}
+			if not found {
+				missing += 1
+				if missing == 1 do &first_missing + kind.path[:]
+				if missing <= 25 do print("  missing: %", kind.path)
+			}
+			continue
+		}
+		_, has_sound := form_field(record.data, "SNAM")
+		if header.kind == "LIGH" and has_sound do lights_with_sound += 1
+		if header.kind == "DOOR" and has_sound do doors_with_sound += 1
+		if header.kind == "ACTI" and has_sound do activators_with_sound += 1
+	}
+	print("% sounds: % naming a folder, % played in some hours only, heard out to % to % units", kinds, folders, timed, shortest, longest)
+	print("  flags: % random pitch, % played at random, % environment ignored, % random location, % looping, % menu, % 2D, % all round",
+		flag_counts[0], flag_counts[1], flag_counts[2], flag_counts[3], flag_counts[4], flag_counts[5], flag_counts[6], flag_counts[7])
+	print("  % not in the archive (the first: %)", missing, first_missing)
+	print("% lights, % doors, % activators make sounds", lights_with_sound, doors_with_sound, activators_with_sound)
+}
+
 // Whether each tree's billboard is in the archive: how many are, and the
 // trees whose aren't.
 check_tree_billboards :: fun(plugin: ^Plugin) {
@@ -2014,6 +2172,10 @@ main :: (args: [][]utf8) {
 		command_cell(args[2], args.len > 3 and args[3] == "-all")
 	elif command == "textures"
 		command_textures(if args.len > 2 do args[2] else "Oblivion - Textures - Compressed.bsa")
+	elif command == "sounds"
+		command_sounds()
+	elif command == "sound" and args.len > 2
+		command_sound(args[2])
 	elif command == "nifs"
 		command_nifs(if args.len > 2 do args[2] else "Oblivion - Meshes.bsa")
 	elif command == "bsa" and args.len > 2

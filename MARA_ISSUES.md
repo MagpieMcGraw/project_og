@@ -26,6 +26,16 @@ against Mara at the time written. When one is fixed, move it to Fixed
   broadcast can't start (after `or`). sooblivion renamed its parameter
   (`every_one`, sooblivion.mara command_cell).
 
+- mara.sdl has no audio: only the `Audio` init flag and the device events.
+  sooblivion needs SDL3's audio stream: `SDL_InitSubSystem`,
+  `SDL_OpenAudioDeviceStream` (with `SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK`,
+  an `SDL_AudioSpec`, no callback), `SDL_ResumeAudioStreamDevice`,
+  `SDL_PutAudioStreamData`, `SDL_GetAudioStreamQueued`,
+  `SDL_DestroyAudioStream`, and the `SDL_AUDIO_*` formats (F32 at least).
+  Stopgap: sooblivion's audio.mara has its own foreign block for these
+  (the callback and user data passed as `u64` 0, for C's NULL); it can go
+  when mara.sdl wraps them.
+
 ## Answered (not issues)
 
 - Struct values can't be compared (`part.diffuse != Vec3{1, 1, 1}`): not

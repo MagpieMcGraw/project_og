@@ -457,6 +457,82 @@ light_of :: fun(base: Record, reference: Reference) -> Point_Light, bool {
 		kind = kind, brightness = start, target = start, drift = Vec3{0, 0, 0}, drift_target = Vec3{0, 0, 0}}, true
 }
 
+// ---- sounds -------------------------------------------------------------------
+
+// A sound base object (SOUN): its file's path in the archives (sound\…;
+// a folder's: one of its files is picked each time it plays); where it's
+// heard — full within min_distance, fading out by max_distance (game
+// units); its pitch shifted by a share up or down; its flags (SOUND_*);
+// how many decibels quieter it always plays; and the hours of the day it
+// plays between (start and stop the same: always).
+Sound_Kind :: struct {
+	path: [160]utf8
+	folder: bool
+	min_distance: f32
+	max_distance: f32
+	pitch_shift: f32
+	flags: u32
+	attenuation: f32
+	start_hour: f32
+	stop_hour: f32
+}
+
+SOUND_RANDOM_PITCH        :: 0x1    // its pitch shifted at random each time
+SOUND_PLAY_AT_RANDOM      :: 0x2    // played now and then, not on and on
+SOUND_ENVIRONMENT_IGNORED :: 0x4
+SOUND_RANDOM_LOCATION     :: 0x8    // from somewhere about where it's placed
+SOUND_LOOP                :: 0x10
+SOUND_MENU                :: 0x20
+SOUND_2D                  :: 0x40   // from nowhere in particular: as loud anywhere
+SOUND_360_LFE             :: 0x80   // heard all round
+
+// The sound a SOUN record makes; false when it's not one, or names no file.
+sound_kind_of :: fun(base: Record) -> Sound_Kind, bool {
+	kind := Sound_Kind{path = [], folder = false, min_distance = 0, max_distance = 0, pitch_shift = 0, flags = 0,
+		attenuation = 0, start_hour = 0, stop_hour = 0}
+	if base.header.kind != "SOUN" do return kind, false
+	name_field, named := find_field(base.data, "FNAM")
+	if not named do return kind, false
+	name := field_text(name_field)
+	if name.len == 0 do return kind, false
+	&kind.path + "sound\\"
+	for c in name {
+		if kind.path.len == kind.path.cap do break
+		if c == '/' do &kind.path + '\\'
+		else do &kind.path + lower(c)
+	}
+	kind.folder = not ends_with(kind.path[:], ".wav")
+	data, has_data := find_field(base.data, "SNDX")
+	if not has_data do data, has_data = find_field(base.data, "SNDD")
+	if has_data and data.len >= 8 {
+		near : u8 = data[0]
+		far : u8 = data[1]
+		shift : i8 = data[2]
+		flags : u16 = data[4]
+		kind.min_distance = f32(near) * 5
+		kind.max_distance = f32(far) * 100
+		kind.pitch_shift = f32(shift) / 100
+		kind.flags = u32(flags)
+		if data.len >= 12 {
+			attenuation : u16 = data[8]
+			stop : u8 = data[10]
+			start : u8 = data[11]
+			kind.attenuation = f32(attenuation) / 100
+			kind.start_hour = f32(start) * 24 / 256
+			kind.stop_hour = f32(stop) * 24 / 256
+		}
+	}
+	return kind, true
+}
+
+// A form id field of a record (SNAM, ANAM…), and false when it has none.
+form_field :: fun(data: []byte, kind: []utf8) -> u32, bool {
+	field, found := find_field(data, kind)
+	if not found or field.len < 4 do return 0, false
+	form_id : u32 = field[0]
+	return form_id, true
+}
+
 // Where a door leads (a reference's XTEL): the door at the other end, and
 // where and facing which way one arrives.
 Door_Destination :: struct {

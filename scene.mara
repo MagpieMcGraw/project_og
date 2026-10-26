@@ -25,6 +25,7 @@ use world
 use esm
 use land
 use grass
+use audio
 use collision
 use animation
 
@@ -62,6 +63,15 @@ area_holds :: fun(area: Grid_Area, position: Vec3) -> bool {
 Scene_Door :: struct {
 	reference: u32
 	position: Vec3
+}
+
+// The sounds a door makes opening and closing (in the scene's sound kinds,
+// -1 for none).
+Door_Sounds :: struct {
+	reference: u32
+	position: Vec3
+	opening: i64
+	closing: i64
 }
 
 // A reference waiting for its mesh to be put on the card.
@@ -154,6 +164,14 @@ Scene :: struct {
 	lights_changed: bool         // since the renderer was last given them (set_scene_lights)
 	flicker_seed: u64            // for the flickering lights' chances
 	doors: [1024]Scene_Door
+	// Sounds: the kinds the cells' references make (each SOUN read once,
+	// found by its form id: its index + 1, 0 for none), the sounds placed
+	// (SOUN references, and the lights and activators that make one), and
+	// each door's opening and closing sounds.
+	sound_kinds: [1024]Sound_Kind
+	sound_kind_index: Key_Index
+	sounds: [1024]Placed_Sound
+	door_sounds: [2048]Door_Sounds
 	lighting: Cell_Lighting
 	world: u32                   // the world shown outside, 0 inside
 	center_x: i64                // the cell the exterior was loaded around
@@ -238,6 +256,8 @@ scene_clear :: fun(scene: ^Scene, storage: ^[]byte) {
 	scene.door_kinds.len = 0
 	scene.door_kind_index = key_index(1 << 9, storage)
 	scene.paths = key_index(1 << 13, storage)
+	scene.sound_kinds.len = 0
+	scene.sound_kind_index = key_index(1 << 11, storage)
 	scene.failures = 0
 	scene.grounds.len = 0
 	scene.world = 0
@@ -261,6 +281,8 @@ scene_clear_cell :: fun(scene: ^Scene) {
 	scene.lights.len = 0
 	scene.lights_changed = true
 	scene.doors.len = 0
+	scene.sounds.len = 0
+	scene.door_sounds.len = 0
 	scene.waters.len = 0
 	scene.waters_changed = true
 	scene.lighting = DAYLIGHT
@@ -288,6 +310,65 @@ scene_model :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64 {
 	}
 	_ = index_put(&scene.paths, key, model_index + 1)
 	return model_index
+}
+
+// ---- sounds ----------------------------------------------------------------------
+
+// The kind of sound a SOUN record makes, read the first time: its index in
+// the scene's sound kinds; -1 when it's none (or there's no more room).
+scene_sound_kind :: fun(scene: ^Scene, plugin: ^Plugin, form_id: u32) -> i64 {
+	known, found := index_get(&scene.sound_kind_index, u64(form_id))
+	if found do return known - 1
+	scratch : [256 * KB]byte
+	index : i64 = -1
+	record, record_error := find_record(plugin, form_id, &scratch)
+	if record_error {
+		note_failure(scene, "a sound's record", record_error)
+	else
+		kind, made := sound_kind_of(record)
+		if made and scene.sound_kinds.len < scene.sound_kinds.cap {
+			&scene.sound_kinds + kind
+			index = scene.sound_kinds.len - 1
+		}
+	}
+	// (A full table only means it's read again next time.)
+	_ = index_put(&scene.sound_kind_index, u64(form_id), index + 1)
+	return index
+}
+
+// A sound placed where a reference is: the sound of a SOUN record.
+add_placed_sound :: fun(scene: ^Scene, plugin: ^Plugin, sound: u32, reference: Reference) {
+	kind := scene_sound_kind(scene, plugin, sound)
+	if kind < 0 or scene.sounds.len == scene.sounds.cap do return
+	&scene.sounds + Placed_Sound{kind = scene.sound_kinds[kind], position = reference.position,
+		key = u64(reference.form_id), next_play = 0}
+}
+
+// The sounds a door makes opening (its SNAM) and closing (ANAM), if any.
+add_door_sounds :: fun(scene: ^Scene, plugin: ^Plugin, base: Record, reference: Reference) {
+	opening, opens_loud := form_field(base.data, "SNAM")
+	closing, closes_loud := form_field(base.data, "ANAM")
+	if not opens_loud and not closes_loud or scene.door_sounds.len == scene.door_sounds.cap do return
+	&scene.door_sounds + Door_Sounds{reference = reference.form_id, position = reference.position,
+		opening = if opens_loud do scene_sound_kind(scene, plugin, opening) else -1,
+		closing = if closes_loud do scene_sound_kind(scene, plugin, closing) else -1}
+}
+
+// The sound a door makes opening or closing (in the scene's sound kinds),
+// and where it is; -1 for none.
+door_sound :: fun(scene: ^Scene, reference: u32, opening: bool) -> i64, Vec3 {
+	for &sounds in scene.door_sounds {
+		if sounds.reference == reference do return if opening do sounds.opening else sounds.closing, sounds.position
+	}
+	return -1, Vec3{0, 0, 0}
+}
+
+// Whether a door that opens in place is open now (or opening).
+door_open :: fun(scene: ^Scene, reference: u32) -> bool {
+	for &door in scene.swinging {
+		if door.reference == reference do return if door.moving do door.opening else door.open
+	}
+	return false
 }
 
 // Notes that something couldn't be loaded (and is left out): counted, the
@@ -373,6 +454,14 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, plac
 			&scene.lights + light
 			scene.lights_changed = true
 		}
+		// What it sounds like: a sound placed; a light's or activator's own
+		// sound, where it is; a door's, opening and closing.
+		if base.header.kind == "SOUN" do add_placed_sound(scene, plugin, reference.base, reference)
+		if base.header.kind == "LIGH" or base.header.kind == "ACTI" {
+			sound, makes_sound := form_field(base.data, "SNAM")
+			if makes_sound do add_placed_sound(scene, plugin, sound, reference)
+		}
+		if base.header.kind == "DOOR" do add_door_sounds(scene, plugin, base, reference)
 		in_place := false
 		if base.header.kind == "DOOR" {
 			_, leads := door_destination(plugin, reference.form_id, &scratch)?
@@ -1161,6 +1250,24 @@ drop_outside :: fun(scene: ^Scene, area: Grid_Area) {
 		}
 	}
 	scene.doors.len = kept
+
+	kept = 0
+	for k in 0:scene.sounds.len {
+		if area_holds(area, scene.sounds[k].position) {
+			scene.sounds[kept] = scene.sounds[k]
+			kept += 1
+		}
+	}
+	scene.sounds.len = kept
+
+	kept = 0
+	for k in 0:scene.door_sounds.len {
+		if area_holds(area, scene.door_sounds[k].position) {
+			scene.door_sounds[kept] = scene.door_sounds[k]
+			kept += 1
+		}
+	}
+	scene.door_sounds.len = kept
 
 	kept = 0
 	for k in 0:scene.waters.len {
