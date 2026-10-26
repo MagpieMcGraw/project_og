@@ -1,0 +1,291 @@
+// A NIF turned into what the renderer draws: parts, each a list of
+// triangles in the model's own space with the texture and settings it's
+// drawn with.
+//
+// The NIF's tree is walked from its roots, each object's place combined
+// with its parent's, and the properties on a node passed down to the
+// shapes under it (a shape's own replace them).
+module model
+
+use mara.core
+use mara.math
+use mara.string
+use nif
+
+// One vertex as the renderer draws it: 48 bytes.
+Vertex :: struct {
+	position: Vec3
+	normal: Vec3
+	uv: [2!]f32
+	color: [4!]f32   // red, green, blue, alpha: the mesh's vertex colors, else white
+}
+
+// A part of a model: one shape's triangles, and how they're drawn.
+Model_Part :: struct {
+	vertices: []Vertex
+	indices: []u16          // three for each triangle
+	texture: [160]utf8      // the base texture's path in the archives: textures\…
+	glow_texture: [160]utf8 // the glow map's, or empty
+	alpha_blend: bool       // blended with what's behind it
+	alpha_test: bool        // pixels whose alpha is below the threshold are left out
+	alpha_threshold: f32    // 0 to 1
+	two_sided: bool
+	diffuse: Vec3
+	emissive: Vec3
+	alpha: f32
+}
+
+// A whole model: its parts, and a box around them.
+Model :: struct {
+	parts: []Model_Part
+	bounds_min: Vec3
+	bounds_max: Vec3
+}
+
+// What makes a model fail.
+Model_Error :: error {
+	Too_Many_Parts   // more shapes than the parts' room
+}
+
+// The properties in effect at a place in the tree: block indexes, -1 for none.
+Inherited :: struct {
+	texturing: i64
+	material: i64
+	alpha: i64
+	stencil: i64
+}
+
+// An object's place relative to its parent, as a matrix: translate, turn, scale.
+local_transform :: fun(object: Av_Object) -> Mat4 {
+	m := mat4_identity()
+	for column in 0:3 {
+		for row in 0:3 {
+			m[column][row] = object.rotation[row * 3 + column] * object.scale
+		}
+	}
+	m.w.x = object.translation.x
+	m.w.y = object.translation.y
+	m.w.z = object.translation.z
+	return m
+}
+
+// The properties in effect for an object: its parent's, with its own put over them.
+inherit :: fun(nif: ^Nif, parent: Inherited, properties: Refs) -> Inherited {
+	result := parent
+	for k in 0:properties.count {
+		index := properties.at(k)
+		if index < 0 do continue
+		match nif.blocks[index] {
+		Texturing
+			result.texturing = index
+		Material
+			result.material = index
+		Alpha
+			result.alpha = index
+		Stencil
+			result.stencil = index
+		else
+		}
+	}
+	return result
+}
+
+// Makes a model of a NIF: its parts' vertices and indexes, and the parts
+// themselves, carved from storage.
+build_model :: fun(nif: ^Nif, storage: ^[]byte) -> Model, err {
+	// One part for each shape at most.
+	shape_count : i64 = 0
+	for block in nif.blocks {
+		match block {
+		Shape
+			shape_count += 1
+		else
+		}
+	}
+	model := Model{
+		parts = slice([:shape_count]Model_Part, storage),
+		bounds_min = Vec3{1000000, 1000000, 1000000},
+		bounds_max = Vec3{-1000000, -1000000, -1000000}}
+	none := Inherited{texturing = -1, material = -1, alpha = -1, stencil = -1}
+	for k in 0:nif.roots.count {
+		root := nif.roots.at(k)
+		if root >= 0 do add_object(nif, root, mat4_identity(), none, &model, storage)?
+	}
+	return model
+}
+
+// Adds an object of the tree to the model: a node's children, or a shape.
+add_object :: fun(nif: ^Nif, index: i64, parent: Mat4, inherited: Inherited, model: ^Model, storage: ^[]byte) -> err {
+	match nif.blocks[index] {
+	Node node
+		if node.object.flags & 1 != 0 do return   // hidden
+		if node.object.name == "EditorMarker" do return
+		transform := mat4_mul(parent, local_transform(node.object))
+		properties := inherit(nif, inherited, node.object.properties)
+		for k in 0:node.children.count {
+			child := node.children.at(k)
+			if child >= 0 do add_object(nif, child, transform, properties, model, storage)?
+		}
+	Shape shape
+		if shape.object.flags & 1 != 0 do return
+		if shape.data < 0 do return
+		transform := mat4_mul(parent, local_transform(shape.object))
+		properties := inherit(nif, inherited, shape.object.properties)
+		match nif.blocks[shape.data] {
+		Shape_Data data
+			add_shape(nif, data.geometry, transform, properties, model, storage)?
+		else
+		}
+	else
+	}
+}
+
+// Adds a shape's geometry to the model as a part.
+add_shape :: fun(nif: ^Nif, geometry: Geometry, transform: Mat4, properties: Inherited, model: ^Model, storage: ^[]byte) -> err {
+	count := geometry.vertex_count
+	if count == 0 or geometry.vertices.len == 0 do return
+	if model.parts.len == model.parts.cap do return Too_Many_Parts
+
+	// The vertices, into the model's space. Normals turn with the shape;
+	// its scale is taken out of them by normalizing.
+	vertices := slice([:count]Vertex, storage)
+	for i in 0:count {
+		local_position : Vec3 = geometry.vertices[i * 12]
+		position := mat4_mul_vec4(transform, Vec4{local_position.x, local_position.y, local_position.z, 1})
+		vertex := Vertex{
+			position = Vec3{position.x, position.y, position.z},
+			normal = Vec3{0, 0, 1},
+			uv = [0, 0],
+			color = [1, 1, 1, 1]}
+		if geometry.normals.len != 0 {
+			local_normal : Vec3 = geometry.normals[i * 12]
+			turned := mat4_mul_vec4(transform, Vec4{local_normal.x, local_normal.y, local_normal.z, 0})
+			vertex.normal = vec3_normalize(Vec3{turned.x, turned.y, turned.z})
+		}
+		if geometry.uv_set_count > 0 do vertex.uv = geometry.uvs[i * 8]
+		if geometry.colors.len != 0 do vertex.color = geometry.colors[i * 16]
+		&vertices + vertex
+		grow_bounds(model, vertex.position)
+	}
+
+	// The triangles: as they are, or made from the strips.
+	indices := slice([:geometry.triangle_count * 3]u16, storage)
+	if geometry.triangles.len != 0 {
+		for k in 0:geometry.triangle_count * 3 {
+			index : u16 = geometry.triangles[k * 2]
+			&indices + index
+		}
+	else
+		strip_start : i64 = 0
+		for s in 0:geometry.strip_count {
+			strip_length : u16 = geometry.strip_lengths[s * 2]
+			add_strip(geometry.strips[strip_start * 2 : (strip_start + i64(strip_length)) * 2], &indices)
+			strip_start += i64(strip_length)
+		}
+	}
+
+	// (Field by field: a literal can't give a list field an empty list.)
+	part := next(&model.parts)
+	part.vertices = vertices
+	part.indices = indices
+	part.texture.len = 0
+	part.glow_texture.len = 0
+	part.alpha_blend = false
+	part.alpha_test = false
+	part.alpha_threshold = 0
+	part.two_sided = false
+	part.diffuse = Vec3{1, 1, 1}
+	part.emissive = Vec3{0, 0, 0}
+	part.alpha = 1
+	apply_properties(nif, properties, part)
+}
+
+// Adds a strip's triangles: each vertex after the first two makes one with
+// the two before it, every other one turned around so all face one way.
+// Triangles with a vertex twice (used to join strips) are left out.
+add_strip :: fun(strip: []byte, indices: ^[]u16) {
+	count := strip.len / 2
+	for k in 2:count {
+		a : u16 = strip[(k - 2) * 2]
+		b : u16 = strip[(k - 1) * 2]
+		c : u16 = strip[k * 2]
+		if a == b or b == c or a == c do continue
+		if indices.len + 3 > indices.cap do return
+		if k % 2 == 0 {
+			indices + a
+			indices + b
+			indices + c
+		else
+			indices + a
+			indices + c
+			indices + b
+		}
+	}
+}
+
+// Sets how a part is drawn from the properties in effect for it.
+apply_properties :: fun(nif: ^Nif, properties: Inherited, part: ^Model_Part) {
+	if properties.texturing >= 0 {
+		match nif.blocks[properties.texturing] {
+		Texturing texturing
+			texture_path(nif, texturing.slots[SLOT_BASE], &part.texture)
+			texture_path(nif, texturing.slots[SLOT_GLOW], &part.glow_texture)
+		else
+		}
+	}
+	if properties.material >= 0 {
+		match nif.blocks[properties.material] {
+		Material material
+			part.diffuse = material.diffuse
+			part.emissive = material.emissive
+			part.alpha = material.alpha
+		else
+		}
+	}
+	if properties.alpha >= 0 {
+		match nif.blocks[properties.alpha] {
+		Alpha alpha
+			part.alpha_blend = alpha.flags & 1 != 0
+			part.alpha_test = alpha.flags & 0x200 != 0
+			part.alpha_threshold = f32(alpha.threshold) / 255
+		else
+		}
+	}
+	if properties.stencil >= 0 {
+		match nif.blocks[properties.stencil] {
+		Stencil stencil
+			part.two_sided = stencil.draw_mode == 3
+		else
+		}
+	}
+}
+
+// The archive path of a slot's texture, into path: lower case, '\' between
+// its parts, under textures\ (the files write it with or without that).
+texture_path :: fun(nif: ^Nif, slot: Texture_Slot, path: ^[160]utf8) {
+	path.len = 0
+	if not slot.used or slot.source < 0 do return
+	match nif.blocks[slot.source] {
+	Source_Texture source
+		name := source.file_name
+		clean : [160]utf8
+		for c in name {
+			if clean.len == clean.cap do break
+			if c == '/' do &clean + '\\'
+			else do &clean + lower(c)
+		}
+		start : i64 = 0
+		if starts_with(clean[:], "data\\") do start = 5
+		if not starts_with(clean[start : clean.len], "textures\\") do path + "textures\\"
+		path + clean[start : clean.len]
+	else
+	}
+}
+
+// Widens the model's box to hold a point.
+grow_bounds :: fun(model: ^Model, point: Vec3) {
+	for axis in 0:3 {
+		if point[axis] < model.bounds_min[axis] do model.bounds_min[axis] = point[axis]
+		if point[axis] > model.bounds_max[axis] do model.bounds_max[axis] = point[axis]
+	}
+}

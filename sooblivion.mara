@@ -18,6 +18,8 @@ use bsa
 use nif
 use dds
 use png
+use model
+use mara.math
 use sdl_platform
 use mara.sdl
 use mara.open_gl
@@ -190,6 +192,11 @@ command_nifs :: fun(name: []utf8) {
 	failed : i64 = 0
 	block_total : i64 = 0
 	with_trailing : i64 = 0   // read cleanly, with bytes left after their end
+	model_storage : [64 * MB]byte
+	model_failures : i64 = 0
+	part_total : i64 = 0
+	triangle_total : i64 = 0
+	untextured : i64 = 0
 	start := time_now()
 
 	for file, i in archive.files {
@@ -204,10 +211,21 @@ command_nifs :: fun(name: []utf8) {
 		nif_storage.len = 0
 		failure := Nif_Failure{block = 0, type_name = storage[0:0]}
 		reader = nif_reader(data)
-		model, nif_error := read_nif(&reader, &nif_storage, &failure)
+		mesh, nif_error := read_nif(&reader, &nif_storage, &failure)
 		if not nif_error {
-			block_total += model.blocks.len
-			if model.trailing_bytes > 0 do with_trailing += 1
+			block_total += mesh.blocks.len
+			if mesh.trailing_bytes > 0 do with_trailing += 1
+			model_storage.len = 0
+			built, model_error := build_model(&mesh, &model_storage)
+			if model_error {
+				model_failures += 1
+				continue
+			}
+			for part in built.parts {
+				part_total += 1
+				triangle_total += part.indices.len / 3
+				if part.texture.len == 0 do untextured += 1
+			}
 			continue
 		}
 		failed += 1
@@ -221,6 +239,8 @@ command_nifs :: fun(name: []utf8) {
 	}
 	print("% NIFs read, % blocks, % failed, % with bytes after their end, in % ms",
 		nif_count, block_total, failed, with_trailing, elapsed_ms(start))
+	print("models: % parts, % triangles, % parts without a texture, % failed",
+		part_total, triangle_total, untextured, model_failures)
 	for entry in failures {
 		print("  % files stopped at %: %   (first: %)", entry.files, entry.type_name, entry.reason, entry.example)
 	}
@@ -354,6 +374,53 @@ command_texture :: fun(what: []utf8, name: []utf8) {
 	else do print("wrote % (% x %, %, % mipmaps)", out_name, texture.width, texture.height, texture.format, texture.mips.len)
 }
 
+// `sooblivion model <file> [archive]`: reads a mesh and prints the parts
+// the renderer would draw.
+command_model :: fun(what: []utf8, name: []utf8) {
+	path := data_path(name)
+	directory_storage : [64 * MB]byte
+	archive, open_error := open_archive(path, &directory_storage)
+	if open_error {
+		print("couldn't open %: %", path, open_error)
+		return
+	}
+	defer close_archive(&archive)
+
+	index, found := find_file(&archive, what)
+	if not found {
+		print("no % in %", what, path)
+		return
+	}
+	storage : [64 * MB]byte
+	data, read_error := read_file(&archive, index, &storage)
+	if read_error {
+		print("couldn't read %: %", what, read_error)
+		return
+	}
+	nif_storage : [16 * MB]byte
+	reader := nif_reader(data)
+	failure := Nif_Failure{block = 0, type_name = storage[0:0]}
+	mesh, nif_error := read_nif(&reader, &nif_storage, &failure)
+	if nif_error {
+		print("couldn't read % as a NIF: % at block % (%)", what, nif_error, failure.block, failure.type_name)
+		return
+	}
+	model_storage : [64 * MB]byte
+	built, model_error := build_model(&mesh, &model_storage)
+	if model_error {
+		print("couldn't make a model of %: %", what, model_error)
+		return
+	}
+	print("% blocks, % parts, from % to %", mesh.blocks.len, built.parts.len, built.bounds_min, built.bounds_max)
+	for part in built.parts {
+		print("  % vertices, % triangles, texture % % % %",
+			part.vertices.len, part.indices.len / 3, part.texture,
+			if part.alpha_blend do "blended" else "",
+			if part.alpha_test do "alpha-tested" else "",
+			if part.two_sided do "two-sided" else "")
+	}
+}
+
 usage :: fun() {
 	print("sooblivion esm [plugin]            what a plugin holds, by record type")
 	print("sooblivion bsa <archive>           an archive's folders and files")
@@ -374,6 +441,9 @@ main :: (args: [][]utf8) {
 	elif command == "texture" and args.len > 2
 		if args.len > 3 do command_texture(args[2], args[3])
 		else do command_texture(args[2], "Oblivion - Textures - Compressed.bsa")
+	elif command == "model" and args.len > 2
+		if args.len > 3 do command_model(args[2], args[3])
+		else do command_model(args[2], "Oblivion - Meshes.bsa")
 	elif command == "textures"
 		if args.len > 2 do command_textures(args[2])
 		else do command_textures("Oblivion - Textures - Compressed.bsa")
