@@ -78,8 +78,7 @@ Viewer :: struct {
 	sky_world: u32      // the world they're of, 0 for none yet
 	hour: f32
 	look: Sky_Look
-	water_shallow: Vec3
-	water_deep: Vec3
+	water: Water_Type   // the world's water, as its WATR has it
 
 	// Frames: when the one now drawn began; without vsync, when the next
 	// may begin; how many were drawn in the second counted so far.
@@ -144,9 +143,8 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.sky_world = 0
 	viewer.hour = START_HOUR
 	viewer.look = Sky_Look{state = Sky_State{0}, cloud_lower = 0, cloud_upper = 0, sun = 0,
-		cloud_lower_offset = 0, cloud_upper_offset = 0, water_color = Vec3{0.1, 0.2, 0.25}, outside = false, time = 0}
-	viewer.water_shallow = Vec3{0.05, 0.15, 0.18}
-	viewer.water_deep = Vec3{0.08, 0.14, 0.17}
+		cloud_lower_offset = 0, cloud_upper_offset = 0, outside = false, time = 0, water = DEFAULT_WATER}
+	viewer.water = DEFAULT_WATER
 	viewer.frame_start = time_now()
 	viewer.next_frame = viewer.frame_start
 	viewer.frames_counted = 0
@@ -272,6 +270,10 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 
 	pass_time(viewer, f32(seconds), input.held[T])
 	drawing_start := time_now()
+	if shown.waters_changed {
+		upload_waters(&viewer.renderer, &shown.waters)
+		shown.waters_changed = false
+	}
 	if shown.lights_changed {
 		set_scene_lights(&viewer.renderer, &shown.lights)
 		shown.lights_changed = false
@@ -437,7 +439,7 @@ pass_time :: fun(viewer: ^Viewer, seconds: f32, hurried: bool) {
 		look.state = Sky_State{upper = lighting.ambient, lower = lighting.fog_color, horizon = lighting.fog_color,
 			cloud_lower_color = lighting.ambient, cloud_upper_color = lighting.ambient, sun_color = Vec3{0, 0, 0},
 			sun_direction = Vec3{0, 0, 1}, daylight = 0, lighting = lighting}
-		look.water_color = viewer.water_deep * 0.5 + lighting.ambient * 0.3
+		look.water = lit_water(viewer.water, lighting.ambient * 2)
 		return
 	}
 	most_fog : f32 = CELL_SIZE * (EXTERIOR_RADIUS + 0.5)
@@ -445,8 +447,16 @@ pass_time :: fun(viewer: ^Viewer, seconds: f32, hurried: bool) {
 	look.cloud_lower_offset += seconds * scale / TIME_SCALE * viewer.weather.cloud_speed_lower
 	look.cloud_upper_offset += seconds * scale / TIME_SCALE * viewer.weather.cloud_speed_upper
 	shown.lighting = look.state.lighting
-	light := look.state.lighting.ambient + look.state.lighting.directional * 0.5
-	look.water_color = Vec3{viewer.water_deep.x * light.x, viewer.water_deep.y * light.y, viewer.water_deep.z * light.z} * 1.6
+	look.water = lit_water(viewer.water, look.state.lighting.ambient + look.state.lighting.directional * 0.6)
+}
+
+// Water whose colors are lit by a light: dim at night, its own by day.
+lit_water :: fun(water: Water_Type, light: Vec3) -> Water_Type {
+	lit := water
+	lit.shallow = Vec3{water.shallow.x * light.x, water.shallow.y * light.y, water.shallow.z * light.z}
+	lit.deep = Vec3{water.deep.x * light.x, water.deep.y * light.y, water.deep.z * light.z}
+	lit.reflection = Vec3{water.reflection.x * light.x, water.reflection.y * light.y, water.reflection.z * light.z}
+	return lit
 }
 
 // Reads a world's climate and weather, and puts its sky's textures on the
@@ -457,7 +467,7 @@ take_sky :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32) {
 	scratch : [4 * MB]byte
 	viewer.climate = world_climate(plugin, world_id, &scratch)
 	viewer.weather = read_weather(plugin, viewer.climate.weather, &scratch)
-	viewer.water_shallow, viewer.water_deep = world_water_colors(plugin, world_id, &scratch)
+	viewer.water = world_water(plugin, world_id, &scratch)
 	room := &viewer.room
 	look := &viewer.look
 	look.cloud_lower = texture_for(&viewer.renderer, &viewer.textures, viewer.weather.cloud_lower[:], &room.texture)

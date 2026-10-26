@@ -1,0 +1,346 @@
+// Reading Oblivion's shaders: the compiled Direct3D 9 shaders in its
+// Data\Shaders packages (.sdp), turned back into readable assembly — to
+// see how the game drew things, and do it the same way (or better).
+//
+// A package is a count, then each shader: its name (256 bytes), its size,
+// its bytecode. The bytecode is a stream of 32-bit tokens: a version, then
+// instructions — each an opcode token and its parameters' tokens —, comments
+// (one holds the constant table: the names the shader's uniforms had), and
+// an end token.
+module shader_package
+
+use mara.core
+use mara.string
+
+// A shader in a package: its name and its bytecode (a view of the package).
+Packaged_Shader :: struct {
+	name: []utf8
+	code: []byte
+}
+
+// The shaders in a package, into shaders.
+read_package :: fun(data: []byte, shaders: ^[]Packaged_Shader) {
+	at : i64 = 12
+	for at + 260 <= data.len and shaders.len < shaders.cap {
+		names : []utf8 = data
+		name_end := at
+		for name_end < at + 256 and names[name_end] != utf8(0) do name_end += 1
+		size : u32 = data[at + 256]
+		end := at + 260 + i64(size)
+		if end > data.len do break
+		shaders + Packaged_Shader{name = names[at : name_end], code = data[at + 260 : end]}
+		at = end
+	}
+}
+
+// ---- the constant table ---------------------------------------------------------
+
+// A named constant: which registers it is, and its name.
+Named_Constant :: struct {
+	name: [64]utf8
+	register_set: u16     // 0 bool, 1 int, 2 float, 3 sampler
+	index: u16
+	count: u16
+}
+
+// Reads a CTAB comment's constants (data: after "CTAB") into constants.
+read_constant_table :: fun(data: []byte, constants: ^[]Named_Constant) {
+	if data.len < 28 do return
+	count : u32 = data[12]
+	info_at : u32 = data[16]
+	for k in 0:i64(count) {
+		at := i64(info_at) + k * 20
+		if at + 20 > data.len or constants.len == constants.cap do return
+		name_at : u32 = data[at]
+		constant := next(constants)
+		constant.name.len = 0
+		text : []utf8 = data
+		c := i64(name_at)
+		for c < data.len and text[c] != utf8(0) and constant.name.len < constant.name.cap {
+			&constant.name + text[c]
+			c += 1
+		}
+		constant.register_set = data[at + 4]
+		constant.index = data[at + 6]
+		constant.count = data[at + 8]
+	}
+}
+
+// ---- disassembly ---------------------------------------------------------------
+
+// Opcode names, by number (D3DSIO_*); empty for numbers not used.
+opcode_name :: fun(opcode: i64) -> str64 {
+	if opcode == 0 do return "nop"
+	if opcode == 1 do return "mov"
+	if opcode == 2 do return "add"
+	if opcode == 3 do return "sub"
+	if opcode == 4 do return "mad"
+	if opcode == 5 do return "mul"
+	if opcode == 6 do return "rcp"
+	if opcode == 7 do return "rsq"
+	if opcode == 8 do return "dp3"
+	if opcode == 9 do return "dp4"
+	if opcode == 10 do return "min"
+	if opcode == 11 do return "max"
+	if opcode == 12 do return "slt"
+	if opcode == 13 do return "sge"
+	if opcode == 14 do return "exp"
+	if opcode == 15 do return "log"
+	if opcode == 16 do return "lit"
+	if opcode == 17 do return "dst"
+	if opcode == 18 do return "lrp"
+	if opcode == 19 do return "frc"
+	if opcode == 20 do return "m4x4"
+	if opcode == 21 do return "m4x3"
+	if opcode == 22 do return "m3x4"
+	if opcode == 23 do return "m3x3"
+	if opcode == 24 do return "m3x2"
+	if opcode == 31 do return "dcl"
+	if opcode == 32 do return "pow"
+	if opcode == 33 do return "crs"
+	if opcode == 34 do return "sgn"
+	if opcode == 35 do return "abs"
+	if opcode == 36 do return "nrm"
+	if opcode == 37 do return "sincos"
+	if opcode == 46 do return "mova"
+	if opcode == 64 do return "texcoord"
+	if opcode == 65 do return "texkill"
+	if opcode == 66 do return "texld"
+	if opcode == 78 do return "expp"
+	if opcode == 79 do return "logp"
+	if opcode == 80 do return "cnd"
+	if opcode == 81 do return "def"
+	if opcode == 88 do return "cmp"
+	if opcode == 90 do return "dp2add"
+	if opcode == 91 do return "dsx"
+	if opcode == 92 do return "dsy"
+	if opcode == 95 do return "texldl"
+	return ""
+}
+
+// A register's name: its type's letter and its number (c12, r0, t3, s1, oPos…).
+register_name :: fun(token: u32, pixel: bool, text: ^[]utf8) {
+	number := i64(token & 0x7FF)
+	kind := i64(((token >> 28) & 7) | ((token >> 8) & 0x18))
+	// The registers with names of their own, not a letter and a number.
+	if kind == 4 {
+		if number == 0 do text + "oPos"
+		elif number == 1 do text + "oFog"
+		else do text + "oPts"
+		return
+	elif kind == 9
+		text + "oDepth"
+		return
+	elif kind == 17
+		if number == 0 do text + "vPos"
+		else do text + "vFace"
+		return
+	}
+	if kind == 0 {
+		text + "r"
+	elif kind == 1
+		text + "v"
+	elif kind == 2
+		text + "c"
+	elif kind == 3
+		text + (if pixel do "t" else "a")
+	elif kind == 5
+		text + "oD"
+	elif kind == 6
+		text + (if pixel do "o" else "oT")
+	elif kind == 7
+		text + "i"
+	elif kind == 8
+		text + "oC"
+	elif kind == 10
+		text + "s"
+	elif kind == 14
+		text + "b"
+	elif kind == 19
+		text + "p"
+	else
+		text + "?"
+	}
+	text + int_text(number)[:]
+}
+
+// A number as text, to four places: "-0.5", "2", "0.0011".
+float_text :: fun(value: f32, text: ^[]utf8) {
+	scaled := value
+	if scaled < 0 {
+		text + "-"
+		scaled = -scaled
+	}
+	whole := i64(scaled)
+	text + int_text(whole)[:]
+	fraction := i64((scaled - f32(whole)) * 10000 + 0.5)
+	if fraction >= 10000 do fraction = 9999
+	if fraction == 0 do return
+	text + "."
+	digits := int_text(fraction)
+	for pad in digits.len:4 do text + "0"
+	// (Its zeros at the end left off.)
+	last := digits.len
+	for last > 1 and digits[last - 1] == '0' do last -= 1
+	text + digits[0 : last]
+}
+
+// A destination's write mask: ".xyz", nothing for all four.
+write_mask :: fun(token: u32, text: ^[]utf8) {
+	mask := (token >> 16) & 15
+	if mask == 15 do return
+	text + "."
+	if mask & 1 != 0 do text + "x"
+	if mask & 2 != 0 do text + "y"
+	if mask & 4 != 0 do text + "z"
+	if mask & 8 != 0 do text + "w"
+}
+
+// A source's swizzle: ".zyx", nothing for xyzw; one letter when all four are one.
+swizzle :: fun(token: u32, text: ^[]utf8) {
+	components := (token >> 16) & 0xFF
+	if components == 0xE4 do return
+	letters := "xyzw"
+	text + "."
+	first := components & 3
+	if components == first * 0x55 {
+		text + letters[i64(first)]
+		return
+	}
+	for k in 0:4 do text + letters[i64((components >> u32(k * 2)) & 3)]
+}
+
+// A source parameter: its modifier around its register, and its swizzle.
+source_text :: fun(token: u32, pixel: bool, text: ^[]utf8) {
+	modifier := (token >> 24) & 15
+	if modifier == 1 or modifier == 3 or modifier == 5 or modifier == 8 or modifier == 12 do text + "-"
+	if modifier == 6 do text + "1-"
+	if modifier == 11 or modifier == 12 do text + "abs("
+	register_name(token, pixel, text)
+	if modifier == 2 or modifier == 3 do text + "_bias"
+	if modifier == 4 or modifier == 5 do text + "_bx2"
+	if modifier == 7 or modifier == 8 do text + "_x2"
+	if modifier == 11 or modifier == 12 do text + ")"
+	swizzle(token, text)
+}
+
+// The usage a dcl names: position, texcoord, color…
+usage_name :: fun(usage: i64) -> str64 {
+	if usage == 0 do return "position"
+	if usage == 1 do return "blendweight"
+	if usage == 2 do return "blendindices"
+	if usage == 3 do return "normal"
+	if usage == 4 do return "psize"
+	if usage == 5 do return "texcoord"
+	if usage == 6 do return "tangent"
+	if usage == 7 do return "binormal"
+	if usage == 10 do return "color"
+	if usage == 11 do return "fog"
+	return "usage"
+}
+
+// Disassembles a shader's bytecode, a line at a time, into lines; its
+// constant table's names into constants.
+disassemble :: fun(code: []byte, lines: ^[][256]utf8, constants: ^[]Named_Constant) {
+	if code.len < 4 do return
+	version : u32 = code[0]
+	pixel := version >> 16 == 0xFFFF
+	major := (version >> 8) & 0xFF
+	minor := version & 0xFF
+	line := next(lines)
+	line.len = 0
+	line + (if pixel do "ps_" else "vs_")
+	line + int_text(i64(major))[:]
+	line + "_"
+	line + (if minor == 1 and major == 2 do "x" else int_text(i64(minor))[:])
+
+	tokens := code.len / 4
+	k : i64 = 1
+	for k < tokens and lines.len < lines.cap {
+		token : u32 = code[k * 4]
+		opcode := i64(token & 0xFFFF)
+		if opcode == 0xFFFF do break   // the end
+		if opcode == 0xFFFE {
+			// A comment: its length in tokens; the constant table's is "CTAB".
+			length := i64((token >> 16) & 0x7FFF)
+			if length >= 1 and (k + 1) * 4 + 4 <= code.len {
+				tag : [4!]utf8 = code[(k + 1) * 4]
+				if tag == "CTAB" do read_constant_table(code[(k + 2) * 4 : (k + 1 + length) * 4], constants)
+			}
+			k += 1 + length
+			continue
+		}
+		// The parameters' count: written in the token from shader model 2;
+		// before it, every token after an instruction's with its top bit set.
+		count := i64((token >> 24) & 15)
+		if major < 2 {
+			count = 0
+			if opcode == 81 {
+				count = 5
+			elif opcode == 31
+				count = 2
+			else
+				for k + 1 + count < tokens {
+					next_token : u32 = code[(k + 1 + count) * 4]
+					if next_token & 0x80000000 == 0 do break
+					count += 1
+				}
+			}
+		}
+		line = next(lines)
+		line.len = 0
+		line + "  "
+		name := opcode_name(opcode)
+		if opcode == 31 {
+			// dcl: what's declared, then the register.
+			usage_token : u32 = code[(k + 1) * 4]
+			register_token : u32 = code[(k + 2) * 4]
+			kind := ((register_token >> 28) & 7) | ((register_token >> 8) & 0x18)
+			if kind == 10 {
+				texture_type := (usage_token >> 27) & 15
+				if texture_type == 3 do line + "dcl_cube "
+				elif texture_type == 4 do line + "dcl_volume "
+				else do line + "dcl_2d "
+			elif kind == 1 and not pixel or kind == 6 and not pixel
+				line + "dcl_"
+				line + usage_name(i64(usage_token & 31))[:]
+				index := (usage_token >> 16) & 15
+				if index != 0 do line + int_text(i64(index))[:]
+				line + " "
+			else
+				line + "dcl "
+			}
+			register_name(register_token, pixel, line)
+			write_mask(register_token, line)
+		elif opcode == 81
+			// def: a constant and its four numbers.
+			register_token : u32 = code[(k + 1) * 4]
+			line + "def "
+			register_name(register_token, pixel, line)
+			for n in 0:4 {
+				value : f32 = code[(k + 2 + n) * 4]
+				line + ", "
+				float_text(value, line)
+			}
+		else
+			if name.len == 0 {
+				line + "op"
+				line + int_text(opcode)[:]
+			else
+				line + name[:]
+			}
+			for n in 0:count {
+				parameter : u32 = code[(k + 1 + n) * 4]
+				line + (if n == 0 do " " else ", ")
+				if n == 0 and opcode != 65 {
+					if (parameter >> 20) & 1 != 0 do line + "(sat)"
+					register_name(parameter, pixel, line)
+					write_mask(parameter, line)
+				else
+					source_text(parameter, pixel, line)
+				}
+			}
+		}
+		k += 1 + count
+	}
+}

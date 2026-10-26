@@ -322,24 +322,39 @@ void main() {
 }
 "
 
-// Water: flat at its height, rippled by a few waves moving across it; the
-// sky reflected in it more the flatter it's seen (Fresnel), its own color
-// under that, and the sun glinting off it.
+// Water, after Oblivion's own (its WATER000 pixel shader, ported): a
+// normal from a scrolling ripple texture, flattened with distance; the
+// water's color, deep to shallow by how straight down it's seen; the sky
+// reflected (the game's reflection render, here the sky's color the
+// reflected way), blended toward its reflection color; Fresnel between
+// them; the sun's glint; and its opacity from Fresnel and its depth, so
+// shallow water fades out at the shore.
 WATER_VERTEX_SHADER :: "
 layout(location = 0) in vec3 position;
+layout(location = 1) in float depth;
 uniform mat4 view_projection;
 out vec3 world_position;
+out float water_depth;
 void main() {
 	world_position = position;
+	water_depth = depth;
 	gl_Position = view_projection * vec4(position, 1.0);
 }
 "
 
 WATER_FRAGMENT_SHADER :: "
 in vec3 world_position;
+in float water_depth;
+uniform sampler2D normal_map;
 uniform vec3 camera_position;
 uniform float time;
-uniform vec3 water_color;
+uniform vec2 scroll;
+uniform vec3 shallow_color;
+uniform vec3 deep_color;
+uniform vec3 reflection_color;
+uniform float reflectivity;
+uniform float fresnel_base;
+uniform float sun_power;
 uniform vec3 sun_direction;
 uniform vec3 sun_color;
 uniform float daylight;
@@ -348,34 +363,63 @@ uniform float fog_near;
 uniform float fog_far;
 out vec4 fragment_color;
 
-// A wave's slope at a place: its height a sine moving along its direction.
-vec2 wave_slope(vec2 place, vec2 direction, float length, float speed, float height) {
-	float k = 6.2831853 / length;
-	float phase = dot(place, direction) * k + time * speed;
-	return direction * (cos(phase) * k * height);
-}
+// The least opacity: what the game's VarAmounts.z holds (not known; this looks right).
+const float least_opacity = 0.35;
+// Units of depth to the depth map's 1.
+const float depth_scale = 160.0;
 
 void main() {
-	vec2 place = world_position.xy;
-	vec2 slope = wave_slope(place, normalize(vec2(1.0, 0.3)), 310.0, 1.1, 4.0)
-		+ wave_slope(place, normalize(vec2(-0.4, 1.0)), 170.0, 1.7, 2.0)
-		+ wave_slope(place, normalize(vec2(0.7, -0.8)), 61.0, 2.9, 0.6)
-		+ wave_slope(place, normalize(vec2(-1.0, -0.2)), 23.0, 4.3, 0.15);
-	vec3 normal = normalize(vec3(-slope, 1.0));
-	vec3 to_eye = normalize(camera_position - world_position);
-	float fresnel = 0.02 + 0.98 * pow(1.0 - max(dot(normal, to_eye), 0.0), 5.0);
-	vec3 reflected = reflect(-to_eye, normal);
-	vec3 color = mix(water_color, sky_color(reflected), fresnel);
-	color += sun_color * pow(max(dot(reflected, sun_direction), 0.0), 300.0) * 4.0 * daylight;
-	float opacity = mix(0.65, 1.0, fresnel);
+	// The ripples, as strong as the original's near the eye, gone flat by
+	// 10000 units away; two layers of the texture, against its repeating.
+	float flat_distance = length(camera_position.xy - world_position.xy);
+	float near = clamp(1.0 - flat_distance * 0.0001, 0.0, 1.0);
+	vec2 at = world_position.xy / 900.0;
+	vec3 first = texture(normal_map, at + scroll * time).xyz * 2.0 - 1.0;
+	vec3 second = texture(normal_map, at * 2.37 - scroll.yx * time * 1.4 + 0.5).xyz * 2.0 - 1.0;
+	vec3 normal = first + second;
+	normal.xy *= near * near;
+	normal = normalize(normal);
+
+	vec3 to_eye = camera_position - world_position;
+	float distance = length(to_eye);
+	vec3 eye = to_eye / distance;
+	float facing = clamp(dot(eye, normal), 0.0, 1.0);
+	float fresnel = fresnel_base + (1.0 - fresnel_base) * pow(1.0 - facing, 5.0);
+	vec3 reflected = reflect(-eye, normal);
+
+	vec3 body = mix(deep_color, shallow_color, facing);
+	vec3 reflection = mix(reflection_color, sky_color(reflected), reflectivity);
+	vec3 color = mix(body, reflection, fresnel);
+	color += sun_color * pow(clamp(dot(reflected, sun_direction), 0.0, 1.0), sun_power * 8.0) * daylight;
+
+	// Opacity, as the original: Fresnel's (at least the least), toward a
+	// quarter where it's shallow; faded out from depth 0.55 to 0.2.
+	float depth = clamp(water_depth / depth_scale, 0.0, 1.0);
+	float opaque = max(least_opacity, fresnel);
+	float opacity = mix(0.25, opaque, depth);
+	if (depth < 0.55) {
+		float shore = 1.0 - (depth - 0.2) / 0.35;
+		opacity *= 1.0 - shore * shore * shore;
+	}
+	if (depth < 0.2) opacity = 0.0;
+
 	if (fog_far > fog_near) {
-		float fog = clamp((length(world_position - camera_position) - fog_near) / (fog_far - fog_near), 0.0, 1.0);
+		float fog = clamp((distance - fog_near) / (fog_far - fog_near), 0.0, 1.0);
 		color = mix(color, fog_color, fog);
 		opacity = mix(opacity, 1.0, fog);
 	}
 	fragment_color = vec4(color, opacity);
 }
 "
+
+// The points of a stretch of water along each side: as many as a cell's land.
+WATER_SIDE :: 33
+WATER_VERTICES :: 1089    // 33 x 33
+WATER_INDICES :: 6144     // 32 x 32 x 6
+// Stretches of water on the card at once.
+WATER_SLOTS :: 64
+// The ripple texture's size.
+RIPPLE_SIZE :: 256
 
 // ---- what's on the card -------------------------------------------------------------
 
@@ -425,13 +469,21 @@ Quadrant_Slots :: struct {
 	textures: [QUADRANT_TEXTURES!]i64
 }
 
-// A stretch of water: a rectangle at a height.
-Water_Plane :: struct {
+// A stretch of water: a rectangle at a height, and the water's depth at
+// each of WATER_SIDE x WATER_SIDE points over it, row by row from the south.
+Water_Cell :: struct {
 	low_x: f32
 	low_y: f32
 	high_x: f32
 	high_y: f32
 	height: f32
+	depths: [WATER_VERTICES!]f32
+}
+
+// A point of water as the water program reads it.
+Water_Vertex :: struct {
+	position: Vec3
+	depth: f32
 }
 
 // What the sky and the water look like: the sky's state at the hour, the
@@ -444,9 +496,9 @@ Sky_Look :: struct {
 	sun: i64
 	cloud_lower_offset: f32
 	cloud_upper_offset: f32
-	water_color: Vec3
 	outside: bool        // the sky is drawn only outside
-	time: f32            // seconds, for the water's waves
+	time: f32            // seconds, for the water's ripples
+	water: Water_Type    // its colors lit by the hour's light
 }
 
 // The sky program and where its uniforms are.
@@ -472,7 +524,13 @@ Water_Program :: struct {
 	view_projection_at: i32
 	camera_position_at: i32
 	time_at: i32
-	water_color_at: i32
+	scroll_at: i32
+	shallow_color_at: i32
+	deep_color_at: i32
+	reflection_color_at: i32
+	reflectivity_at: i32
+	fresnel_base_at: i32
+	sun_power_at: i32
 	sky_upper_at: i32
 	sky_lower_at: i32
 	sky_horizon_at: i32
@@ -565,6 +623,10 @@ Renderer :: struct {
 	empty_vertex_array: u32
 	water_vertex_array: u32
 	water_vertex_buffer: u32
+	water_index_buffer: u32
+	water_indirect_buffer: u32
+	water_commands: [WATER_SLOTS]Draw_Command
+	ripple_texture: u32
 
 	// The shared mesh buffers, and how much of them is used.
 	mesh_vertex_array: u32
@@ -756,7 +818,13 @@ make_water_program :: fun(made: ^Water_Program) -> err {
 	made.view_projection_at = GetUniformLocation(program, "view_projection")
 	made.camera_position_at = GetUniformLocation(program, "camera_position")
 	made.time_at = GetUniformLocation(program, "time")
-	made.water_color_at = GetUniformLocation(program, "water_color")
+	made.scroll_at = GetUniformLocation(program, "scroll")
+	made.shallow_color_at = GetUniformLocation(program, "shallow_color")
+	made.deep_color_at = GetUniformLocation(program, "deep_color")
+	made.reflection_color_at = GetUniformLocation(program, "reflection_color")
+	made.reflectivity_at = GetUniformLocation(program, "reflectivity")
+	made.fresnel_base_at = GetUniformLocation(program, "fresnel_base")
+	made.sun_power_at = GetUniformLocation(program, "sun_power")
 	made.sky_upper_at = GetUniformLocation(program, "sky_upper")
 	made.sky_lower_at = GetUniformLocation(program, "sky_lower")
 	made.sky_horizon_at = GetUniformLocation(program, "sky_horizon")
@@ -768,18 +836,124 @@ make_water_program :: fun(made: ^Water_Program) -> err {
 	made.fog_far_at = GetUniformLocation(program, "fog_far")
 }
 
-// The sky's empty vertex array, and the water's buffer: six vertices (two
-// triangles) for each plane, made again each frame.
+// The sky's empty vertex array; the water's buffers — a slot of points
+// for each stretch, the indexes they share — and its ripple texture.
 setup_water_buffers :: fun(renderer: ^Renderer) {
 	GenVertexArrays(1, &renderer.empty_vertex_array)
 	GenVertexArrays(1, &renderer.water_vertex_array)
 	BindVertexArray(renderer.water_vertex_array)
 	GenBuffers(1, &renderer.water_vertex_buffer)
 	BindBuffer(ARRAY_BUFFER, renderer.water_vertex_buffer)
-	BufferData(ARRAY_BUFFER, 1024 * 6 * size_of(Vec3), void, STREAM_DRAW)
+	BufferData(ARRAY_BUFFER, WATER_SLOTS * WATER_VERTICES * size_of(Water_Vertex), void, DYNAMIC_DRAW)
+	stride := i32(size_of(Water_Vertex))
 	EnableVertexAttribArray(0)
-	VertexAttribPointer(0, 3, FLOAT, 0, i32(size_of(Vec3)), 0)
+	VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)    // position
+	EnableVertexAttribArray(1)
+	VertexAttribPointer(1, 1, FLOAT, 0, stride, 12)   // depth
+
+	// Two triangles for each square of the grid, counter-clockwise from above.
+	indices : [WATER_INDICES]u16
+	for row in 0:WATER_SIDE - 1 {
+		for column in 0:WATER_SIDE - 1 {
+			south_west := u16(row * WATER_SIDE + column)
+			south_east := south_west + 1
+			north_west := south_west + u16(WATER_SIDE)
+			north_east := north_west + 1
+			&indices + south_west
+			&indices + south_east
+			&indices + north_east
+			&indices + south_west
+			&indices + north_east
+			&indices + north_west
+		}
+	}
+	GenBuffers(1, &renderer.water_index_buffer)
+	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.water_index_buffer)
+	BufferData(ELEMENT_ARRAY_BUFFER, isize(indices.len * 2), &indices[0], STATIC_DRAW)
 	BindVertexArray(0)
+	GenBuffers(1, &renderer.water_indirect_buffer)
+	make_ripple_texture(renderer)
+}
+
+// The ripples' normals: a texture made of many waves of whole numbers of
+// lengths across it (so it repeats without a seam), each a random way and
+// phase, the shorter ones lower; mipmapped, so far water averages to flat.
+// (The game made its ripples on the card each frame; this stands in.)
+make_ripple_texture :: fun(renderer: ^Renderer) {
+	WAVES :: 48
+	directions_x : [WAVES!]f32
+	directions_y : [WAVES!]f32
+	phases : [WAVES!]f32
+	heights : [WAVES!]f32
+	seed : u64 = 0x2545F4914F6CDD1D
+	for w in 0:WAVES {
+		// A wave of 2 to 14 lengths across, some way; its height the less the shorter.
+		seed = seed *% 6364136223846793005 +% 1442695040888963407
+		x := i64((seed >> 33) % 29) - 14
+		seed = seed *% 6364136223846793005 +% 1442695040888963407
+		y := i64((seed >> 33) % 29) - 14
+		if x * x + y * y < 4 do x = 2 + w % 3
+		seed = seed *% 6364136223846793005 +% 1442695040888963407
+		phases[w] = f32((seed >> 33) % 10000) / 10000 * 6.2831853
+		directions_x[w] = f32(x)
+		directions_y[w] = f32(y)
+		lengths := sqrt_f32(f32(x * x + y * y))
+		heights[w] = 1 / (lengths * sqrt_f32(lengths))
+	}
+	pixels : [RIPPLE_SIZE * RIPPLE_SIZE * 4]u8
+	pixels.len = pixels.cap
+	for py in 0:RIPPLE_SIZE {
+		for px in 0:RIPPLE_SIZE {
+			// The height's slope here: each wave's.
+			slope_x : f32 = 0
+			slope_y : f32 = 0
+			u := f32(px) / RIPPLE_SIZE * 6.2831853
+			v := f32(py) / RIPPLE_SIZE * 6.2831853
+			for w in 0:WAVES {
+				change := cos_f32(directions_x[w] * u + directions_y[w] * v + phases[w]) * heights[w]
+				slope_x += change * directions_x[w]
+				slope_y += change * directions_y[w]
+			}
+			normal := vec3_normalize(Vec3{-slope_x * 0.35, -slope_y * 0.35, 1})
+			at := (py * RIPPLE_SIZE + px) * 4
+			pixels[at] = u8((normal.x * 0.5 + 0.5) * 255)
+			pixels[at + 1] = u8((normal.y * 0.5 + 0.5) * 255)
+			pixels[at + 2] = u8((normal.z * 0.5 + 0.5) * 255)
+			pixels[at + 3] = 255
+		}
+	}
+	GenTextures(1, &renderer.ripple_texture)
+	BindTexture(TEXTURE_2D, renderer.ripple_texture)
+	TexImage2D(TEXTURE_2D, 0, i32(RGBA8), RIPPLE_SIZE, RIPPLE_SIZE, 0, RGBA, UNSIGNED_BYTE, &pixels[0])
+	GenerateMipmap(TEXTURE_2D)
+	TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(LINEAR_MIPMAP_LINEAR))
+	TexParameteri(TEXTURE_2D, TEXTURE_MAG_FILTER, i32(LINEAR))
+	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_S, i32(REPEAT))
+	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_T, i32(REPEAT))
+	if renderer.anisotropy > 1 do TexParameterf(TEXTURE_2D, TEXTURE_MAX_ANISOTROPY, renderer.anisotropy)
+	UseProgram(renderer.water_program.program)
+	Uniform1i(GetUniformLocation(renderer.water_program.program, "normal_map"), 0)
+}
+
+// Puts the stretches of water on the card, each in its slot: their points
+// over their rectangles, at their heights, with their depths.
+upload_waters :: fun(renderer: ^Renderer, waters: ^[]Water_Cell) {
+	BindBuffer(ARRAY_BUFFER, renderer.water_vertex_buffer)
+	points : [WATER_VERTICES]Water_Vertex
+	for k in 0:waters.len {
+		if k == WATER_SLOTS do break
+		water := &waters[k]
+		points.len = 0
+		for row in 0:WATER_SIDE {
+			for column in 0:WATER_SIDE {
+				x := water.low_x + (water.high_x - water.low_x) * f32(column) / (WATER_SIDE - 1)
+				y := water.low_y + (water.high_y - water.low_y) * f32(row) / (WATER_SIDE - 1)
+				&points + Water_Vertex{position = Vec3{x, y, water.height}, depth = water.depths[row * WATER_SIDE + column]}
+			}
+		}
+		BufferSubData(ARRAY_BUFFER, isize(k * WATER_VERTICES * size_of(Water_Vertex)),
+			WATER_VERTICES * size_of(Water_Vertex), &points[0])
+	}
 }
 
 // Where an item of a uniform array is in a program: name[index].
@@ -1199,7 +1373,7 @@ sphere_in_view :: fun(planes: ^View_Planes, center: Vec3, radius: f32) -> bool {
 // then the instances in view — opaque parts, then blended — lit by the
 // lighting and the lights set with set_scene_lights. Tells what it drew.
 draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, grounds: ^[]Gpu_Land,
-	waters: ^[]Water_Plane, look: ^Sky_Look, lighting: Cell_Lighting, camera: Camera, width: i64, height: i64) -> Frame_Stats
+	waters: ^[]Water_Cell, look: ^Sky_Look, lighting: Cell_Lighting, camera: Camera, width: i64, height: i64) -> Frame_Stats
 {
 	stats := Frame_Stats{instances = instances.len, visible = 0, drawn_parts = 0, draw_calls = 0, land_cells = 0}
 	Viewport(0, 0, i32(width), i32(height))
@@ -1222,7 +1396,7 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 	if grounds.len > 0 do draw_land(renderer, grounds, &planes, view_projection, lighting, sun, camera, &stats)
 	gather_meshes(renderer, models, instances, &planes, &stats)
 	draw_mesh_runs(renderer, view_projection, lighting, sun, camera, false, &stats)
-	if waters.len > 0 do draw_water(renderer, waters, look, view_projection, lighting, camera, &stats)
+	if waters.len > 0 do draw_water(renderer, waters, &planes, look, view_projection, lighting, camera, &stats)
 	draw_mesh_runs(renderer, view_projection, lighting, sun, camera, true, &stats)
 
 	DepthMask(1)
@@ -1267,30 +1441,39 @@ draw_sky :: fun(renderer: ^Renderer, look: ^Sky_Look, view_projection: Mat4, lig
 	stats.draw_calls += 1
 }
 
-// Draws the water: its planes, blended over what's below, the depth
-// buffer read but not written.
-draw_water :: fun(renderer: ^Renderer, waters: ^[]Water_Plane, look: ^Sky_Look, view_projection: Mat4,
+// Draws the water in view (put on the card with upload_waters): one call
+// for all of it, blended over what's below, the depth buffer read but not
+// written.
+draw_water :: fun(renderer: ^Renderer, waters: ^[]Water_Cell, planes: ^View_Planes, look: ^Sky_Look, view_projection: Mat4,
 	lighting: Cell_Lighting, camera: Camera, stats: ^Frame_Stats)
 {
-	vertices : [1024 * 6]Vec3
-	for plane in waters {
-		if vertices.len + 6 > vertices.cap do break
-		h := plane.height
-		&vertices + Vec3{plane.low_x, plane.low_y, h}
-		&vertices + Vec3{plane.high_x, plane.low_y, h}
-		&vertices + Vec3{plane.high_x, plane.high_y, h}
-		&vertices + Vec3{plane.low_x, plane.low_y, h}
-		&vertices + Vec3{plane.high_x, plane.high_y, h}
-		&vertices + Vec3{plane.low_x, plane.high_y, h}
+	renderer.water_commands.len = 0
+	for k in 0:waters.len {
+		if k == WATER_SLOTS do break
+		water := &waters[k]
+		middle := Vec3{(water.low_x + water.high_x) / 2, (water.low_y + water.high_y) / 2, water.height}
+		radius := vec3_length(Vec3{water.high_x - water.low_x, water.high_y - water.low_y, 0}) / 2
+		if not sphere_in_view(planes, middle, radius) do continue
+		&renderer.water_commands + Draw_Command{count = WATER_INDICES, instance_count = 1, first_index = 0,
+			base_vertex = i32(k * WATER_VERTICES), base_instance = 0}
 	}
+	if renderer.water_commands.len == 0 do return
+
 	made := &renderer.water_program
 	state := &look.state
+	water := &look.water
 	UseProgram(made.program)
 	matrix := view_projection
 	UniformMatrix4fv(made.view_projection_at, 1, 0, &matrix[0][0])
 	Uniform3f(made.camera_position_at, camera.position.x, camera.position.y, camera.position.z)
 	Uniform1f(made.time_at, look.time)
-	Uniform3f(made.water_color_at, look.water_color.x, look.water_color.y, look.water_color.z)
+	Uniform2f(made.scroll_at, water.scroll[0], water.scroll[1])
+	Uniform3f(made.shallow_color_at, water.shallow.x, water.shallow.y, water.shallow.z)
+	Uniform3f(made.deep_color_at, water.deep.x, water.deep.y, water.deep.z)
+	Uniform3f(made.reflection_color_at, water.reflection.x, water.reflection.y, water.reflection.z)
+	Uniform1f(made.reflectivity_at, water.reflectivity)
+	Uniform1f(made.fresnel_base_at, water.fresnel)
+	Uniform1f(made.sun_power_at, water.sun_power)
 	Uniform3f(made.sky_upper_at, state.upper.x, state.upper.y, state.upper.z)
 	Uniform3f(made.sky_lower_at, state.lower.x, state.lower.y, state.lower.z)
 	Uniform3f(made.sky_horizon_at, state.horizon.x, state.horizon.y, state.horizon.z)
@@ -1300,14 +1483,16 @@ draw_water :: fun(renderer: ^Renderer, waters: ^[]Water_Plane, look: ^Sky_Look, 
 	Uniform3f(made.fog_color_at, lighting.fog_color.x, lighting.fog_color.y, lighting.fog_color.z)
 	Uniform1f(made.fog_near_at, lighting.fog_near)
 	Uniform1f(made.fog_far_at, lighting.fog_far)
+	ActiveTexture(TEXTURE0)
+	BindTexture(TEXTURE_2D, renderer.ripple_texture)
 	BindVertexArray(renderer.water_vertex_array)
-	BindBuffer(ARRAY_BUFFER, renderer.water_vertex_buffer)
-	BufferSubData(ARRAY_BUFFER, 0, isize(vertices.len * size_of(Vec3)), &vertices[0])
+	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.water_indirect_buffer)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.water_commands.len * size_of(Draw_Command)), &renderer.water_commands[0], STREAM_DRAW)
 	Disable(CULL_FACE)   // (seen from under the water too)
 	Enable(BLEND)
 	BlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
 	DepthMask(0)
-	DrawArrays(TRIANGLES, 0, i32(vertices.len))
+	MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, 0, i32(renderer.water_commands.len), 0)
 	DepthMask(1)
 	Disable(BLEND)
 	Enable(CULL_FACE)

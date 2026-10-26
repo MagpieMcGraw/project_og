@@ -496,19 +496,46 @@ cell_water :: fun(plugin: ^Plugin, cell: u32, scratch: ^[]byte) -> f32, bool {
 	return 0, true
 }
 
-// The colors of a world's water (its NAM2's WATR): shallow and deep.
-world_water_colors :: fun(plugin: ^Plugin, world_id: u32, scratch: ^[]byte) -> Vec3, Vec3 {
-	shallow := Vec3{0.05, 0.15, 0.18}
-	deep := Vec3{0.08, 0.14, 0.17}
+// A kind of water (WATR): how it shines and reflects, how its ripples
+// drift, its colors.
+Water_Type :: struct {
+	sun_power: f32        // how tight the sun's glint is: the specular's power
+	reflectivity: f32     // how much of the reflection is the sky's, not reflection_color
+	fresnel: f32          // how much it reflects seen straight down
+	scroll: [2!]f32       // the ripples' drift, in their texture's widths a second
+	shallow: Vec3         // its color seen straight down, and seen at a slant
+	deep: Vec3
+	reflection: Vec3
+}
+
+// Water as the default WATR has it, for a world that names none.
+DEFAULT_WATER :: Water_Type{sun_power = 15, reflectivity = 0.9, fresnel = 0.15, scroll = [0.03, 0.03],
+	shallow = Vec3{0.008, 0.082, 0.118}, deep = Vec3{0.125, 0.18, 0.208}, reflection = Vec3{0.122, 0.267, 0.294}}
+
+// A world's water (its NAM2's WATR). Its DATA: wind velocity and
+// direction, wave amplitude and frequency, sun power, reflectivity,
+// fresnel, scroll speeds, fog near and far (floats), then its shallow,
+// deep and reflection colors (bytes).
+world_water :: fun(plugin: ^Plugin, world_id: u32, scratch: ^[]byte) -> Water_Type {
+	water := DEFAULT_WATER
 	record, record_error := find_record(plugin, world_id, scratch)
-	if record_error do return shallow, deep
+	if record_error do return water
 	water_field, has_water := find_field(record.data, "NAM2")
-	if not has_water or water_field.len < 4 do return shallow, deep
+	if not has_water or water_field.len < 4 do return water
 	water_id : u32 = water_field[0]
-	water, water_error := find_record(plugin, water_id, scratch)
-	if water_error do return shallow, deep
-	data, has_data := find_field(water.data, "DATA")
-	// Its colors after eleven floats: wind, waves, sun, reflection, scrolling, fog.
-	if has_data and data.len >= 56 do return byte_color(data, 44), byte_color(data, 48)
-	return shallow, deep
+	water_record, water_error := find_record(plugin, water_id, scratch)
+	if water_error do return water
+	data, has_data := find_field(water_record.data, "DATA")
+	if not has_data or data.len < 56 do return water
+	water.sun_power = data[16]
+	water.reflectivity = data[20]
+	water.fresnel = data[24]
+	// The scroll speeds: per frame at the game's 30 a second, it seems.
+	scroll_x : f32 = data[28]
+	scroll_y : f32 = data[32]
+	water.scroll = [scroll_x * 30, scroll_y * 30]
+	water.shallow = byte_color(data, 44)
+	water.deep = byte_color(data, 48)
+	water.reflection = byte_color(data, 52)
+	return water
 }

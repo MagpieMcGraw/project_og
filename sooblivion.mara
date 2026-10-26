@@ -23,6 +23,7 @@ use world
 use scene
 use land
 use sky
+use shader_package
 render :: use render
 use mara.math
 use sdl_platform
@@ -852,9 +853,9 @@ command_walk :: fun(name: []utf8, x: i64, y: i64, steps: i64) {
 			// (On the card it'd be in a slot; here it's only remembered.)
 			&walked.grounds + Gpu_Land{x = item.x, y = item.y, slot = free_land_slot(&walked), center = land_mesh.center, radius = land_mesh.radius}
 		}
-		print("step to % %: placing % ms (% instances ready, % waiting); % new meshes % ms; % new textures % ms; % land cells % ms",
+		print("step to % %: placing % ms (% instances ready, % waiting); % new meshes % ms; % new textures % ms; % land cells % ms; % stretches of water",
 			cell_x, y, place_ms, walked.instances.len, walked.waiting.len, mesh_count, mesh_ms,
-			texture_count, i64(texture_ns / 1000000), walked.waiting_land.len, elapsed_ms(land_start))
+			texture_count, i64(texture_ns / 1000000), walked.waiting_land.len, elapsed_ms(land_start), walked.waters.len)
 		walked.waiting.len = 0
 		walked.waiting_land.len = 0
 	}
@@ -947,8 +948,8 @@ command_sky :: fun(name: []utf8) {
 	print("weather %, sunrise % to %, sunset % to %, clouds % and %, sun %", climate.weather,
 		climate.sunrise_begin, climate.sunrise_end, climate.sunset_begin, climate.sunset_end,
 		weather.cloud_lower, weather.cloud_upper, climate.sun_texture)
-	shallow, deep := world_water_colors(&plugin, world_id, &scratch)
-	print("water: shallow %, deep %", shallow, deep)
+	water := world_water(&plugin, world_id, &scratch)
+	print("water: %", water)
 	for hour in [0, 5, 7, 8, 9, 12, 16, 17, 18, 19, 21] {
 		state := sky_at(climate, &weather, f32(hour), 10240)
 		print("  %:00  daylight %  sky % / % / %  sun % toward %  ambient %  sunlight %  fog % % to %", hour, state.daylight,
@@ -956,6 +957,64 @@ command_sky :: fun(name: []utf8) {
 			state.lighting.ambient, state.lighting.directional, state.lighting.fog_color,
 			state.lighting.fog_near, state.lighting.fog_far)
 	}
+}
+
+// `sooblivion shader [name] [package]`: the shaders in one of the game's
+// shader packages (Data\Shaders\shaderpackage019.sdp unless named), or
+// one of them disassembled, its constants' names listed first.
+command_shader :: fun(name: []utf8, package: []utf8) {
+	path : Path
+	&path + DATA_FOLDER
+	&path + "Shaders/"
+	&path + package
+	storage : [4 * MB]byte
+	data, read_error := read_entire_file(path, &storage)
+	if read_error {
+		print("couldn't read %: %", path, read_error)
+		return
+	}
+	shaders : [1024]Packaged_Shader
+	read_package(data, &shaders)
+	if name.len == 0 {
+		line : str1024
+		for shader in shaders {
+			if line.len + shader.name.len + 2 > line.cap {
+				print(line)
+				line.len = 0
+			}
+			&line + shader.name
+			&line + "  "
+		}
+		print(line)
+		print("% shaders", shaders.len)
+		return
+	}
+	for shader in shaders {
+		if compare_folded(shader.name, name) != 0 do continue
+		lines : [2048][256]utf8
+		constants : [256]Named_Constant
+		disassemble(shader.code, &lines, &constants)
+		print("% (% bytes)", shader.name, shader.code.len)
+		for constant in constants {
+			// Its registers: c3, or c3 to c6.
+			registers : str64
+			letter := "c"
+			if constant.register_set == 3 do letter = "s"
+			elif constant.register_set == 1 do letter = "i"
+			elif constant.register_set == 0 do letter = "b"
+			&registers + letter[:]
+			&registers + int_text(i64(constant.index))[:]
+			if constant.count > 1 {
+				&registers + " to "
+				&registers + letter[:]
+				&registers + int_text(i64(constant.index + constant.count - 1))[:]
+			}
+			print("  // %  %", registers, constant.name)
+		}
+		for line in lines do print(line)
+		return
+	}
+	print("no shader % in %", name, path)
 }
 
 usage :: fun() {
@@ -1008,6 +1067,10 @@ main :: (args: [][]utf8) {
 		command_map(if args.len > 2 do args[2] else "Tamriel")
 	elif command == "sky"
 		command_sky(if args.len > 2 do args[2] else "Tamriel")
+	elif command == "shader"
+		name : []utf8 = args[0][0:0]
+		if args.len > 2 do name = args[2]
+		command_shader(name, if args.len > 3 do args[3] else "shaderpackage019.sdp")
 	elif command == "record" and args.len > 2
 		command_record(args[2])
 	elif command == "cell" and args.len > 2

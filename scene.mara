@@ -83,7 +83,8 @@ Scene :: struct {
 	center_x: i64                // the cell the exterior was loaded around
 	center_y: i64
 	grounds: [LAND_SLOTS]Gpu_Land
-	waters: [128]Water_Plane
+	waters: [WATER_SLOTS]Water_Cell
+	waters_changed: bool         // since the renderer was last given them (upload_waters)
 
 	// What's still to load, in order, and how far along that is.
 	waiting: [16384]Waiting_Instance
@@ -128,6 +129,7 @@ scene_clear_cell :: fun(scene: ^Scene) {
 	scene.lights_changed = true
 	scene.doors.len = 0
 	scene.waters.len = 0
+	scene.waters_changed = true
 	scene.lighting = DAYLIGHT
 	scene.waiting.len = 0
 	scene.waiting_next = 0
@@ -314,7 +316,14 @@ show_interior :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, loader: Loader) 
 			if instance.center.x > high.x do high.x = instance.center.x
 			if instance.center.y > high.y do high.y = instance.center.y
 		}
-		&scene.waters + Water_Plane{low_x = low.x - 4096, low_y = low.y - 4096, high_x = high.x + 4096, high_y = high.y + 4096, height = height}
+		water := next(&scene.waters)
+		water.low_x = low.x - 4096
+		water.low_y = low.y - 4096
+		water.high_x = high.x + 4096
+		water.high_y = high.y + 4096
+		water.height = height
+		for k in 0:WATER_VERTICES do water.depths[k] = 1000   // (deep: there's no land under it to know)
+		scene.waters_changed = true
 	}
 }
 
@@ -475,26 +484,50 @@ drop_outside :: fun(scene: ^Scene, area: Grid_Area) {
 
 	kept = 0
 	for k in 0:scene.waters.len {
-		plane := scene.waters[k]
-		middle := Vec3{(plane.low_x + plane.high_x) / 2, (plane.low_y + plane.high_y) / 2, 0}
+		water := &scene.waters[k]
+		middle := Vec3{(water.low_x + water.high_x) / 2, (water.low_y + water.high_y) / 2, 0}
 		if area_holds(area, middle) {
-			scene.waters[kept] = plane
+			if kept != k do scene.waters[kept] = scene.waters[k]
 			kept += 1
 		}
 	}
+	if kept != scene.waters.len do scene.waters_changed = true
 	scene.waters.len = kept
 
 	drop_land(scene, area, false)
 	// What still waits is let go as it comes up, if it's left the area.
 }
 
-// Adds an exterior cell's water, if it has any: a plane over the cell.
+// Adds an exterior cell's water, if it has any and any of it is above the
+// land: over the cell, its depth at each of the land's points.
 add_cell_water :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64) {
-	scratch : [64 * KB]byte
+	scratch : [256 * KB]byte
 	height, has_water := cell_water(plugin, cell, &scratch)
 	if not has_water or scene.waters.len == scene.waters.cap do return
-	&scene.waters + Water_Plane{
-		low_x = f32(x * CELL_SIZE), low_y = f32(y * CELL_SIZE),
-		high_x = f32((x + 1) * CELL_SIZE), high_y = f32((y + 1) * CELL_SIZE),
-		height = height}
+	// Deep where there's no land under it to know.
+	depths : [WATER_VERTICES!]f32
+	for k in 0:WATER_VERTICES do depths[k] = 1000
+	land_at, has_land := find_land(plugin, cell)
+	if has_land {
+		scratch.len = 0
+		record, record_error := record_at(plugin, land_at, &scratch)
+		if record_error do return
+		cell_land : Land
+		read_land(record.data, &cell_land)
+		// All of the land above the water: none to draw.
+		under := false
+		for k in 0:WATER_VERTICES {
+			depths[k] = height - cell_land.heights[k]
+			if depths[k] > 0 do under = true
+		}
+		if not under do return
+	}
+	water := next(&scene.waters)
+	water.low_x = f32(x * CELL_SIZE)
+	water.low_y = f32(y * CELL_SIZE)
+	water.high_x = f32((x + 1) * CELL_SIZE)
+	water.high_y = f32((y + 1) * CELL_SIZE)
+	water.height = height
+	water.depths = depths
+	scene.waters_changed = true
 }
