@@ -150,6 +150,52 @@ Block_Type :: union {
 	bhkMalleableConstraint
 }
 
+// A particle emitter: makes particles in a shape about its emitter object
+// (shape EMITTER_*: a box size.x wide along x, size.y along y, size.z
+// along z; a cylinder of radius size.x, size.y long; a sphere of radius
+// size.x), sends each off along the object's z tipped by the declination
+// and turned round z by the planar angle, at a speed, with a color, radius
+// and life span (in seconds). Each variation is how far either way a
+// particle's may be.
+Emitter :: struct {
+	active: bool
+	shape: i64
+	emitter_object: i64
+	size: Vec3
+	speed: f32
+	speed_variation: f32
+	declination: f32
+	declination_variation: f32
+	planar_angle: f32
+	planar_angle_variation: f32
+	color: [4!]f32
+	radius: f32
+	radius_variation: f32
+	life_span: f32
+	life_span_variation: f32
+}
+
+// A group of keys of a value value_size bytes (a float 4, a color 16, a
+// bool 1): their type (KEY_*), how many, and the keys as the file has
+// them — each its time, its value, then what its type adds (key_bytes).
+Keys :: struct {
+	value_size: i64
+	key_type: i64
+	count: i64
+	data: []byte
+
+	// The k-th key's time.
+	time :: fun(keys: Self, k: i64) -> f32 {
+		seconds : f32 = keys.data[k * key_bytes(keys.key_type, keys.value_size)]
+		return seconds
+	}
+
+	// Where the k-th key's value starts in data.
+	value_at :: fun(keys: Self, k: i64) -> i64 {
+		return k * key_bytes(keys.key_type, keys.value_size) + 4
+	}
+}
+
 // What every object in the scene tree has: a name, its place relative to
 // its parent, and the properties it's drawn with.
 Av_Object :: struct {
@@ -343,11 +389,85 @@ Block :: union {
 		value: f32
 		data: i64
 	}
-	// NiFloatData: keys of a number: their type (KEY_*), count, the keys.
-	Float_Data {
-		key_type: i64
-		key_count: i64
-		keys: []byte
+	// NiBoolInterpolator: on or off, as its keys say over time (or its value).
+	Bool_Interpolator {
+		value: bool
+		data: i64
+	}
+	// NiFloatData, NiColorData, NiBoolData, NiPosData.
+	Key_Data {
+		keys: Keys
+	}
+
+	// Particles. NiParticleSystem: particles, each drawn as a square facing
+	// the camera — its data (room for them), whether they're kept in the
+	// world's space (else its own), and the modifiers that make, move, age
+	// and color them.
+	Particle_System {
+		object: Av_Object
+		data: i64
+		world_space: bool
+		modifiers: Refs
+	}
+	// NiPSysData: how many particles a system has room for.
+	Particle_Data {
+		capacity: i64
+	}
+	// NiPSysBoxEmitter, NiPSysCylinderEmitter, NiPSysSphereEmitter.
+	Particle_Emitter {
+		emitter: Emitter
+	}
+	// NiPSysGrowFadeModifier: particles grow from nothing over their first
+	// grow_time seconds and shrink to nothing over their last fade_time.
+	Grow_Fade_Modifier {
+		active: bool
+		grow_time: f32
+		fade_time: f32
+	}
+	// NiPSysColorModifier: particles' colors over their lives, its data's
+	// keys (times from 0, born, to 1, dying).
+	Color_Modifier {
+		active: bool
+		data: i64
+	}
+	// NiPSysRotationModifier: particles turn (on the screen) at a speed (in
+	// radians a second) from an angle, each a variation either way; the
+	// speed's sign at random if asked.
+	Rotation_Modifier {
+		active: bool
+		speed: f32
+		speed_variation: f32
+		angle: f32
+		angle_variation: f32
+		random_sign: bool
+	}
+	// NiPSysGravityModifier: particles pulled along an axis of its gravity
+	// object (force type 0) or toward it (1), by a strength (units a second,
+	// each second).
+	Gravity_Modifier {
+		active: bool
+		gravity_object: i64
+		axis: Vec3
+		decay: f32
+		strength: f32
+		force_type: u32
+		turbulence: f32
+		turbulence_scale: f32
+	}
+	// NiPSysEmitterCtlr: how fast its system's emitter makes particles (its
+	// birth rate interpolator: particles a second) and when it's on (its
+	// active interpolator, -1 for always) — played as a time controller is:
+	// its time at a frequency from a phase, between a start and a stop
+	// time; flags bits 1 and 2 how it goes on past the stop (CYCLE_*).
+	Emitter_Controller {
+		next: i64
+		flags: u16
+		frequency: f32
+		phase: f32
+		start_time: f32
+		stop_time: f32
+		birth_rate: i64
+		active: i64
 	}
 
 	// Animation. NiControllerSequence: one of an object's animations (a

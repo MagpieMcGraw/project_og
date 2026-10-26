@@ -40,6 +40,7 @@ use bsa
 use world
 use land
 use sky
+use particles
 
 // ---- sizes ---------------------------------------------------------------------
 
@@ -55,6 +56,11 @@ MESH_INDEX_ROOM :: 33554432
 // Mesh parts on the card, textures loaded, instances drawn in a frame.
 MAX_PARTS :: 65536
 MAX_FLIPS :: 1024
+MAX_PARTICLE_KINDS :: 1024
+MAX_PARTICLE_SQUARES :: 16384   // a frame's
+MAX_PARTICLE_RUNS :: 1024
+// How far away particles are drawn, at most (beyond, they'd be a few pixels).
+PARTICLE_REACH :: 6000
 MAX_FLIP_FRAMES :: 16384
 MAX_BILLBOARDS :: 4096
 MAX_TEXTURES :: 8192
@@ -240,6 +246,54 @@ void main() {
 		else color = mix(color, fog_color, fog);
 	}
 	fragment_color = vec4(color, base.a);
+}
+"
+
+// Particles: squares made each frame in the world, each corner's color
+// the light it gives and its opacity; fogged as meshes are.
+PARTICLE_VERTEX_SHADER :: "
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec2 uv;
+layout(location = 2) in vec4 color;
+
+uniform mat4 view_projection;
+
+out vec3 world_position;
+out vec2 texture_uv;
+out vec4 particle_color;
+
+void main() {
+	world_position = position;
+	texture_uv = uv;
+	particle_color = color;
+	gl_Position = view_projection * vec4(position, 1.0);
+}
+"
+
+PARTICLE_FRAGMENT_SHADER :: "
+in vec3 world_position;
+in vec2 texture_uv;
+in vec4 particle_color;
+
+uniform sampler2D particle_texture;
+uniform vec3 camera_position;
+uniform vec3 fog_color;
+uniform float fog_near;
+uniform float fog_far;            // no fog when it isn't past fog_near
+uniform int adding;               // blended by adding: fogged by fading out
+uniform float alpha_threshold;    // pixels less opaque are left out
+
+out vec4 fragment_color;
+
+void main() {
+	vec4 color = texture(particle_texture, texture_uv) * particle_color;
+	if (color.a < alpha_threshold) discard;
+	if (fog_far > fog_near) {
+		float fog = clamp((length(world_position - camera_position) - fog_near) / (fog_far - fog_near), 0.0, 1.0);
+		if (adding != 0) color.a *= 1.0 - fog;
+		else color.rgb = mix(color.rgb, fog_color, fog);
+	}
+	fragment_color = color;
 }
 "
 
@@ -798,13 +852,40 @@ Gpu_Billboard :: struct {
 	node_inverse: Mat4
 }
 
-// A model on the card: its parts (in the renderer's), and a sphere around
-// them in the model's space.
+// A model on the card: its parts and particle systems (in the renderer's),
+// and a sphere around them in the model's space.
 Gpu_Model :: struct {
 	first_part: i64
 	part_count: i64
+	first_particles: i64
+	particles_count: i64
 	center: Vec3
 	radius: f32
+}
+
+// A particle system of a model on the card: how it plays and looks (the
+// model's), its texture's slot, and its flipbook (in the renderer's), -1
+// for none.
+Particle_Kind :: struct {
+	system: Model_Particles
+	texture_slot: i64
+	flip: i64
+}
+
+// A frame's squares of one particle system, drawn together: which kind,
+// and which squares.
+Particle_Run :: struct {
+	kind: i64
+	first_square: i64
+	square_count: i64
+}
+
+// The particle program, and where its uniforms are.
+Particle_Program :: struct {
+	program: u32
+	shared: Shared_Uniforms
+	adding_at: i32
+	alpha_threshold_at: i32
 }
 
 // A model placed in the world, with what drawing it needs worked out once.
@@ -1126,6 +1207,7 @@ Renderer :: struct {
 	grass_programs: [2!]Grass_Program
 	sky_program: Sky_Program
 	water_program: Water_Program
+	particle_program: Particle_Program
 	anisotropy: f32
 
 	// The sky's triangle reads nothing but needs a vertex array; the water's
@@ -1186,6 +1268,15 @@ Renderer :: struct {
 	flip_frames: [MAX_FLIP_FRAMES]i64
 	billboards: [MAX_BILLBOARDS]Gpu_Billboard
 
+	// Particles: the models' systems; a frame's squares (made again each
+	// frame, four corners each), put on the card; the runs they're drawn in.
+	particle_kinds: [MAX_PARTICLE_KINDS]Particle_Kind
+	particle_vertex_array: u32
+	particle_vertex_buffer: u32
+	particle_index_buffer: u32
+	particle_vertices: [MAX_PARTICLE_SQUARES * 4]Particle_Vertex
+	particle_runs: [MAX_PARTICLE_RUNS]Particle_Run
+
 	// The land's buffers, its quadrants' textures, and their handles' buffer.
 	land_vertex_array: u32
 	land_vertex_buffer: u32
@@ -1241,6 +1332,7 @@ renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
 	make_distant_program(&renderer.distant_programs[0], false)?
 	make_tree_program(&renderer.tree_programs[0], false)?
 	make_grass_program(&renderer.grass_programs[0], false)?
+	make_particle_program(&renderer.particle_program)?
 	if renderer.bindless_available {
 		make_tree_program(&renderer.tree_programs[1], true)?
 		make_grass_program(&renderer.grass_programs[1], true)?
@@ -1255,6 +1347,7 @@ renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
 	setup_distant_buffers(renderer)
 	setup_tree_buffers(renderer)
 	setup_grass_buffers(renderer)
+	setup_particle_buffers(renderer)
 
 	renderer.parts.len = 0
 	// Every part's count and start, by its index: all there, all 0.
@@ -1356,6 +1449,13 @@ make_mesh_program :: fun(made: ^Mesh_Program, bindless: bool) -> err {
 		UseProgram(made.program)
 		Uniform1i(GetUniformLocation(made.program, "glow_texture"), 1)
 	}
+}
+
+make_particle_program :: fun(made: ^Particle_Program) -> err {
+	made.program = compile_program(PARTICLE_VERTEX_SHADER, PARTICLE_FRAGMENT_SHADER, false)?
+	made.shared = find_shared_uniforms(made.program)
+	made.adding_at = GetUniformLocation(made.program, "adding")
+	made.alpha_threshold_at = GetUniformLocation(made.program, "alpha_threshold")
 }
 
 make_land_program :: fun(made: ^Land_Program, bindless: bool) -> err {
@@ -1615,6 +1715,38 @@ setup_distant_buffers :: fun(renderer: ^Renderer) {
 	BindBuffer(SHADER_STORAGE_BUFFER, renderer.distant_texture_buffer)
 	BufferData(SHADER_STORAGE_BUFFER, DISTANT_PIECES * 16, [], DYNAMIC_DRAW)
 	clear_distant_land(renderer)
+}
+
+// The particles' buffers: their corners (filled each frame), and the
+// indexes of every square's two triangles (made once).
+setup_particle_buffers :: fun(renderer: ^Renderer) {
+	GenVertexArrays(1, &renderer.particle_vertex_array)
+	BindVertexArray(renderer.particle_vertex_array)
+	GenBuffers(1, &renderer.particle_vertex_buffer)
+	BindBuffer(ARRAY_BUFFER, renderer.particle_vertex_buffer)
+	BufferData(ARRAY_BUFFER, MAX_PARTICLE_SQUARES * 4 * size_of(Particle_Vertex), [], STREAM_DRAW)
+	stride := i32(size_of(Particle_Vertex))
+	EnableVertexAttribArray(0)
+	VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)    // position
+	EnableVertexAttribArray(1)
+	VertexAttribPointer(1, 2, FLOAT, 0, stride, 12)   // uv
+	EnableVertexAttribArray(2)
+	VertexAttribPointer(2, 4, FLOAT, 0, stride, 20)   // color
+
+	indices : [MAX_PARTICLE_SQUARES * 6]u32
+	for square in 0:MAX_PARTICLE_SQUARES {
+		corner := u32(square * 4)
+		&indices + corner
+		&indices + (corner + 1)
+		&indices + (corner + 2)
+		&indices + corner
+		&indices + (corner + 2)
+		&indices + (corner + 3)
+	}
+	GenBuffers(1, &renderer.particle_index_buffer)
+	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.particle_index_buffer)
+	BufferData(ELEMENT_ARRAY_BUFFER, isize(indices.len * 4), indices[:], STATIC_DRAW)
+	BindVertexArray(0)
 }
 
 // No distant land, and no far water. (Their textures stay loaded.)
@@ -2214,6 +2346,7 @@ upload_model :: fun(renderer: ^Renderer, built: ^Model, archive: ^Archive, scrat
 	}
 	if renderer.parts.len + built.parts.len > renderer.parts.cap do return Gpu_Model{0}, No_Room_On_Card
 	if renderer.billboards.len + built.parts.len > renderer.billboards.cap do return Gpu_Model{0}, No_Room_On_Card
+	if renderer.particle_kinds.len + built.particles.len > renderer.particle_kinds.cap do return Gpu_Model{0}, No_Room_On_Card
 	frame_total : i64 = 0
 	for &flip in built.flips do frame_total += flip.frames.len
 	if renderer.flips.len + built.flips.len > renderer.flips.cap or renderer.flip_frames.len + frame_total > renderer.flip_frames.cap {
@@ -2244,10 +2377,22 @@ upload_model :: fun(renderer: ^Renderer, built: ^Model, archive: ^Archive, scrat
 		made.shown = renderer.flip_frames[made.first_frame]
 	}
 
+	// Its particle systems, with their textures.
+	first_particles := renderer.particle_kinds.len
+	for &system in built.particles {
+		kind := next(&renderer.particle_kinds)
+		kind.system = system^
+		kind.texture_slot = texture_for(renderer, archive, system.look.texture[:], scratch, system.look.clamp_mode)
+		kind.flip = -1
+		if system.look.flip >= 0 do kind.flip = first_flip + system.look.flip
+	}
+
 	BindVertexArray(0)   // (binding an index buffer would change a bound vertex array's)
 	gpu := Gpu_Model{
 		first_part = renderer.parts.len,
 		part_count = 0,
+		first_particles = first_particles,
+		particles_count = built.particles.len,
 		center = (built.bounds_min + built.bounds_max) * 0.5,
 		radius = vec3_length(built.bounds_max - built.bounds_min) * 0.5}
 	for part in built.parts {
@@ -2561,6 +2706,7 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 	}
 	if waters.len > 0 do draw_water(renderer, waters, &planes, look, view_projection, lighting, camera, &stats)
 	draw_mesh_runs(renderer, view_projection, lighting, sun, camera, true, &stats)
+	draw_particles(renderer, models, instances, view_projection, lighting, sun, camera, look.time, &stats)
 
 	DepthMask(1)
 	Disable(BLEND)
@@ -3019,6 +3165,65 @@ draw_mesh_runs :: fun(renderer: ^Renderer, view_projection: Mat4, lighting: Cell
 	}
 	// As it was: what's drawn next (the near pass, after the far's blended
 	// meshes) writes depth, unblended, culled.
+	DepthMask(1)
+	Disable(BLEND)
+	Enable(CULL_FACE)
+}
+
+// Draws the particles of the instances in view (gather_meshes' last: the
+// near pass's), farthest first: each system's squares made for the time,
+// blended, after the blended meshes. An instance's particles are seeded by
+// its reference (its index without one), so no two fires are alike.
+draw_particles :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, view_projection: Mat4,
+	lighting: Cell_Lighting, sun: Vec3, camera: Camera, time: f32, stats: ^Frame_Stats)
+{
+	renderer.particle_runs.len = 0
+	renderer.particle_vertices.len = 0
+	_, camera_right, camera_up := camera_axes(camera)
+	for k in 0:renderer.visible.len {
+		index := renderer.visible[renderer.visible.len - 1 - k]
+		instance := &instances[index]
+		placed_model := models[instance.model]
+		if placed_model.particles_count == 0 do continue
+		if vec3_length(instance.center - camera.position) - instance.radius > PARTICLE_REACH do continue
+		seed := instance.reference
+		if seed == 0 do seed = u32(index)
+		for kind_index in placed_model.first_particles:placed_model.first_particles + placed_model.particles_count {
+			if renderer.particle_runs.len == renderer.particle_runs.cap do break
+			first := renderer.particle_vertices.len / 4
+			add_particle_squares(&renderer.particle_kinds[kind_index].system, instance.world, f64(time),
+				seed ~ u32(kind_index * 7919), camera_right, camera_up, lighting.ambient, lighting.directional,
+				&renderer.particle_vertices)
+			count := renderer.particle_vertices.len / 4 - first
+			if count > 0 do &renderer.particle_runs + Particle_Run{kind = kind_index, first_square = first, square_count = count}
+		}
+	}
+	if renderer.particle_runs.len == 0 do return
+
+	BindBuffer(ARRAY_BUFFER, renderer.particle_vertex_buffer)
+	BufferData(ARRAY_BUFFER, MAX_PARTICLE_SQUARES * 4 * size_of(Particle_Vertex), [], STREAM_DRAW)   // (a fresh buffer)
+	BufferSubData(ARRAY_BUFFER, 0, renderer.particle_vertices[:])
+	made := &renderer.particle_program
+	UseProgram(made.program)
+	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
+	BindVertexArray(renderer.particle_vertex_array)
+	Enable(BLEND)
+	Disable(CULL_FACE)
+	ActiveTexture(TEXTURE0)
+	for run in renderer.particle_runs {
+		kind := &renderer.particle_kinds[run.kind]
+		look := &kind.system.look
+		DepthMask(if look.depth_write do 1 else 0)
+		if look.additive do BlendFunc(SRC_ALPHA, ONE)
+		else do BlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
+		Uniform1i(made.adding_at, if look.additive do 1 else 0)
+		Uniform1f(made.alpha_threshold_at, if look.alpha_test do look.alpha_threshold else 0)
+		slot := kind.texture_slot
+		if kind.flip >= 0 do slot = renderer.flips[kind.flip].shown
+		BindTexture(TEXTURE_2D, renderer.textures[slot].id)
+		DrawElements(TRIANGLES, i32(run.square_count * 6), UNSIGNED_INT, usize(run.first_square * 6 * 4))
+		stats.draw_calls += 1
+	}
 	DepthMask(1)
 	Disable(BLEND)
 	Enable(CULL_FACE)

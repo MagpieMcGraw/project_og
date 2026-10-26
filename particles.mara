@@ -1,0 +1,262 @@
+// Particles, played without keeping any: where each of a system's
+// particles is at a time is worked out from that time alone. The emitter
+// makes them at an even pace (its fastest birth rate); each birth is kept
+// by chance at its time's own rate, and only while the emitter is on. A
+// particle's random values (where in the emitter's shape it starts, its
+// speed, size, life, turn) come from a hash of the system's seed and its
+// birth's number — so the same particle is the same each frame, and a
+// placed object needs nothing kept for its fire to burn.
+module particles
+
+use mara.core
+use mara.math
+use model
+use nif
+
+// A corner of a particle's square, as the particle program reads it: where
+// it is in the world, its texture coordinates, its color (the light it
+// gives, and its opacity) — 36 bytes.
+Particle_Vertex :: struct {
+	position: Vec3
+	uv: [2!]f32
+	color: [4!]f32
+}
+
+// The steps a particle pulled toward a point is moved in, at any age (the
+// same number at every age, so it moves smoothly from frame to frame).
+PULLED_STEPS :: 12
+
+// Adds the squares of a system's living particles at a time (seconds) to
+// vertices, each facing the camera (its right and up), placed by world (an
+// instance's matrix) and lit by the scene's ambient light and sun (without
+// a way it faces, a particle takes half the sun). The newest first, as
+// many as the system has room for.
+add_particle_squares :: fun(system: ^Model_Particles, world: Mat4, seconds: f64, seed: u32,
+	camera_right: Vec3, camera_up: Vec3, ambient: Vec3, sun: Vec3, vertices: ^[]Particle_Vertex)
+{
+	longest := system.emitter.life_span + abs(system.emitter.life_span_variation)
+	fastest := fastest_birth_rate(system)
+	if longest <= 0 or fastest <= 0 or system.capacity <= 0 do return
+	spacing := 1 / f64(fastest)
+	newest := i64(floor_f64(seconds / spacing))
+	oldest := i64(floor_f64((seconds - f64(longest)) / spacing))
+	if oldest < 0 do oldest = 0
+	scale := vec3_length(Vec3{world[0][0], world[0][1], world[0][2]})
+	half_sun := sun * 0.5
+
+	shown : i64 = 0
+	birth := newest
+	for birth >= oldest and shown < system.capacity {
+		number := birth
+		birth -= 1
+		born := f64(number) * spacing
+		age := f32(seconds - born)
+		if age < 0 do continue
+		at := controller_time(system, born)
+		if not active_at(system, at) do continue
+		if chance(seed, number, 0) * fastest >= birth_rate_at(system, at) do continue
+		emitter := system.emitter
+		life := emitter.life_span + emitter.life_span_variation * spread(seed, number, 1)
+		if age >= life do continue
+
+		// Where it starts and how it goes, in the model's space: from a
+		// point in the emitter's shape, along the emitter's z tipped by the
+		// declination and turned round by the planar angle.
+		start := emitter_point(emitter, seed, number)
+		placed := mat4_mul_vec4(system.emitter_place, Vec4{start.x, start.y, start.z, 1})
+		declination := emitter.declination + emitter.declination_variation * spread(seed, number, 5)
+		planar := emitter.planar_angle + emitter.planar_angle_variation * spread(seed, number, 6)
+		way := Vec3{sin_f32(declination) * cos_f32(planar), sin_f32(declination) * sin_f32(planar), cos_f32(declination)}
+		turned := mat4_mul_vec4(system.emitter_place, Vec4{way.x, way.y, way.z, 0})
+		direction := Vec3{turned.x, turned.y, turned.z}
+		if vec3_length(direction) > 0 do direction = vec3_normalize(direction)
+		speed := emitter.speed + emitter.speed_variation * spread(seed, number, 7)
+		position := move_particle(system, Vec3{placed.x, placed.y, placed.z}, direction * speed, age)
+
+		// How big, what color, turned how far.
+		radius := (emitter.radius + emitter.radius_variation * spread(seed, number, 8)) * grow_fade(system, age, life) * scale
+		if radius <= 0 do continue
+		color := color_at(system, age / life)
+		opacity := color[3] * system.look.alpha
+		if opacity <= 0 do continue
+		light := particle_light(&system.look, color, ambient, half_sun)
+		angle := system.rotation_angle + system.rotation_angle_variation * spread(seed, number, 9)
+		turning := system.rotation_speed + system.rotation_speed_variation * spread(seed, number, 10)
+		if system.random_sign and chance(seed, number, 11) < 0.5 do turning = -turning
+		angle += turning * age
+
+		center := mat4_mul_vec4(world, Vec4{position.x, position.y, position.z, 1})
+		add_square(vertices, Vec3{center.x, center.y, center.z}, radius, angle, camera_right, camera_up,
+			[light.x, light.y, light.z, opacity])
+		shown += 1
+	}
+}
+
+// A number from 0 up to 1 for a particle — its birth's number, of a
+// system's seed — and which of its random values it is.
+chance :: fun(seed: u32, birth: i64, which: u32) -> f32 {
+	hash := (u64(seed) *% 0x9E3779B97F4A7C15) ~ (u64(birth) *% 0xC2B2AE3D27D4EB4F) ~ (u64(which) *% 0x165667B19E3779F9)
+	hash = (hash ~ (hash >> 33)) *% 0xFF51AFD7ED558CCD
+	hash = (hash ~ (hash >> 33)) *% 0xC4CEB9FE1A85EC53
+	hash = hash ~ (hash >> 33)
+	return f32(hash >> 40) / 16777216
+}
+
+// A number from -1 to 1, as chance: how far a particle's value is off,
+// as a share of its variation.
+spread :: fun(seed: u32, birth: i64, which: u32) -> f32 {
+	return chance(seed, birth, which) * 2 - 1
+}
+
+// A point in an emitter's shape, at random, in the emitter's space: in a
+// box about its middle; in a cylinder along z; in a sphere.
+emitter_point :: fun(emitter: Emitter, seed: u32, birth: i64) -> Vec3 {
+	first := chance(seed, birth, 2)
+	second := chance(seed, birth, 3)
+	third := chance(seed, birth, 4)
+	size := emitter.size
+	if emitter.shape == EMITTER_CYLINDER {
+		turn := first * f32(TAU)
+		out := size.x * sqrt_f32(second)
+		return Vec3{cos_f32(turn) * out, sin_f32(turn) * out, (third - 0.5) * size.y}
+	}
+	if emitter.shape == EMITTER_SPHERE {
+		height := first * 2 - 1
+		turn := second * f32(TAU)
+		ring := sqrt_f32(max(0, 1 - height * height))
+		out := size.x * pow_f32(third, 1.0 / 3)
+		return Vec3{ring * cos_f32(turn) * out, ring * sin_f32(turn) * out, height * out}
+	}
+	return Vec3{(first - 0.5) * size.x, (second - 0.5) * size.y, (third - 0.5) * size.z}
+}
+
+// Where a particle is after an age (seconds), from where it started at a
+// velocity: pulled along its system's gravity, or toward its center.
+move_particle :: fun(system: ^Model_Particles, start: Vec3, velocity: Vec3, age: f32) -> Vec3 {
+	if not system.pulled_in do return start + velocity * age + system.gravity * (0.5 * age * age)
+	strength := vec3_length(system.gravity)
+	step := age / PULLED_STEPS
+	position := start
+	moving := velocity
+	for k in 0:PULLED_STEPS {
+		toward := system.gravity_center - position
+		distance := vec3_length(toward)
+		if distance > 0.001 do moving = moving + toward * (strength * step / distance)
+		position = position + moving * step
+	}
+	return position
+}
+
+// How big a particle is at an age, as a share of its radius: growing from
+// nothing over its system's grow time, shrinking to nothing over its fade.
+grow_fade :: fun(system: ^Model_Particles, age: f32, life: f32) -> f32 {
+	share : f32 = 1
+	if system.grow_time > 0 and age < system.grow_time do share = age / system.grow_time
+	left := life - age
+	if system.fade_time > 0 and left < system.fade_time do share *= left / system.fade_time
+	return share
+}
+
+// A particle's color at a share of its life (0 born, 1 dying): between its
+// system's color keys, or the emitter's color.
+color_at :: fun(system: ^Model_Particles, share: f32) -> [4!]f32 {
+	keys := system.color_times.len
+	if keys == 0 do return system.emitter.color
+	if share <= system.color_times[0] do return system.colors[0]
+	for k in 1:keys {
+		if share < system.color_times[k] {
+			before := system.color_times[k - 1]
+			mix := (share - before) / (system.color_times[k] - before)
+			low := system.colors[k - 1]
+			high := system.colors[k]
+			return [low[0] + (high[0] - low[0]) * mix, low[1] + (high[1] - low[1]) * mix,
+				low[2] + (high[2] - low[2]) * mix, low[3] + (high[3] - low[3]) * mix]
+		}
+	}
+	return system.colors[keys - 1]
+}
+
+// The light a particle gives (its square's color, before its texture), as
+// its look's vertex color and lighting modes have it: lit by its own light
+// only — its color (vertex mode 1) or the material's — or by the scene's
+// too, its color standing for its own light (1) or for what it reflects (2).
+particle_light :: fun(look: ^Model_Part, color: [4!]f32, ambient: Vec3, sun: Vec3) -> Vec3 {
+	own := Vec3{color[0], color[1], color[2]}
+	if look.lighting_mode == 0 {
+		if look.vertex_mode == 1 do return own
+		return look.emissive
+	}
+	lit := ambient + sun
+	if look.vertex_mode == 1 do return lit + own
+	if look.vertex_mode == 2 do return Vec3{own.x * lit.x, own.y * lit.y, own.z * lit.z} + look.emissive
+	return lit + look.emissive
+}
+
+// The emitter controller's time at a time of the scene's (seconds): played
+// at its frequency from its phase, kept between its start and stop time —
+// round again, back and forth, or stopped there.
+controller_time :: fun(system: ^Model_Particles, seconds: f64) -> f32 {
+	start := f64(system.start_time)
+	span := f64(system.stop_time) - start
+	at := seconds * f64(system.frequency) + f64(system.phase)
+	if span <= 0 do return system.start_time
+	if system.cycle == CYCLE_CLAMP {
+		if at < start do return system.start_time
+		if at > start + span do return system.stop_time
+		return f32(at)
+	}
+	laps := floor_f64((at - start) / span)
+	inside := at - start - laps * span
+	if system.cycle == CYCLE_REVERSE and i64(laps) % 2 != 0 do inside = span - inside
+	return f32(start + inside)
+}
+
+// Whether the emitter is on at a controller time: its last key's value by
+// then (the first's before it), or always without keys.
+active_at :: fun(system: ^Model_Particles, at: f32) -> bool {
+	keys := system.active_times.len
+	if keys == 0 do return true
+	on := system.active_values[0]
+	for k in 0:keys {
+		if system.active_times[k] > at do break
+		on = system.active_values[k]
+	}
+	return on
+}
+
+// Particles a second at a controller time: between its keys, or its value.
+birth_rate_at :: fun(system: ^Model_Particles, at: f32) -> f32 {
+	keys := system.birth_times.len
+	if keys == 0 do return system.birth_rate
+	if at <= system.birth_times[0] do return system.birth_rates[0]
+	for k in 1:keys {
+		if at < system.birth_times[k] {
+			before := system.birth_times[k - 1]
+			mix := (at - before) / (system.birth_times[k] - before)
+			return system.birth_rates[k - 1] + (system.birth_rates[k] - system.birth_rates[k - 1]) * mix
+		}
+	}
+	return system.birth_rates[keys - 1]
+}
+
+// The most particles a second a system makes, at any time.
+fastest_birth_rate :: fun(system: ^Model_Particles) -> f32 {
+	if system.birth_times.len == 0 do return system.birth_rate
+	fastest : f32 = 0
+	for rate in system.birth_rates do fastest = max(fastest, rate)
+	return fastest
+}
+
+// Adds a particle's square: about its center, radius out each way, facing
+// the camera (its right and up) and turned by an angle on the screen.
+add_square :: fun(vertices: ^[]Particle_Vertex, center: Vec3, radius: f32, angle: f32, camera_right: Vec3, camera_up: Vec3, color: [4!]f32) {
+	if vertices.len + 4 > vertices.cap do return
+	along := cos_f32(angle)
+	across := sin_f32(angle)
+	right := (camera_right * along + camera_up * across) * radius
+	up := (camera_up * along - camera_right * across) * radius
+	vertices + Particle_Vertex{position = center - right + up, uv = [0, 0], color = color}
+	vertices + Particle_Vertex{position = center - right - up, uv = [0, 1], color = color}
+	vertices + Particle_Vertex{position = center + right - up, uv = [1, 1], color = color}
+	vertices + Particle_Vertex{position = center + right + up, uv = [1, 0], color = color}
+}

@@ -7,7 +7,24 @@ against Mara at the time written. When one is fixed, move it to Fixed
 
 ## Open
 
-None.
+- A parameter (or variable) named `all` is accepted, but then `if x or all {`
+  reads `all {` as the start of a broadcast, and the errors land on the
+  next line, about its tokens:
+
+  ```
+  show :: fun(count: i64, all: bool) {
+  	if count < 25 or all {
+  		print("shown %", count)
+  	}
+  }
+  ```
+
+  gives `[7:8] Parse error: unexpected token Left_Paren "(" (expected
+  statement)` and three more like it, all on the `print` line; nothing
+  names `all`. Expected: either `all` refused as a name where it's
+  declared ("`all` is a keyword"), or `all` read as the variable where a
+  broadcast can't start (after `or`). sooblivion renamed its parameter
+  (`every_one`, sooblivion.mara command_cell).
 
 ## Answered (not issues)
 

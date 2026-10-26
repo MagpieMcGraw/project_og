@@ -40,14 +40,58 @@ Model_Part :: struct {
 	diffuse: Vec3
 	emissive: Vec3
 	alpha: f32
+	vertex_mode: u32        // what its vertex colors stand for: 0 nothing, 1 its own light, 2 its color
+	lighting_mode: u32      // 0 lit by its own light only, 1 by the scene's lights too
 }
 
-// A whole model: its parts, and a box around them.
+// A whole model: its parts, its particle systems, and a box around them.
 Model :: struct {
 	parts: []Model_Part
-	flips: []Model_Flip    // the parts' flipbooks (Model_Part.flip)
+	flips: []Model_Flip    // the parts' flipbooks (Model_Part.flip), and the particles'
+	particles: []Model_Particles
 	bounds_min: Vec3
 	bounds_max: Vec3
+}
+
+// The keys of a particle system's changing values, at most.
+PARTICLE_KEYS :: 16
+
+// A particle system of a model, ready to be played: its emitter (its
+// emitter object's place in the model) and room; how fast it makes
+// particles and when, as its emitter controller says — the controller's
+// time is the scene's at a frequency from a phase, kept between a start and
+// stop time by its cycle (CYCLE_*); how its particles grow, fade, change
+// color, turn and are pulled; and how they're drawn, as a part is (its
+// look's texture, flipbook, blending and material; no vertices).
+Model_Particles :: struct {
+	emitter: Emitter
+	emitter_place: Mat4
+	capacity: i64
+	// Particles a second: its keys' (by the controller's time), or with
+	// none its value. On: its keys' (as many times as values), or always.
+	birth_rate: f32
+	birth_times: [PARTICLE_KEYS]f32
+	birth_rates: [PARTICLE_KEYS]f32
+	active_times: [PARTICLE_KEYS]f32
+	active_values: [PARTICLE_KEYS]bool
+	frequency: f32
+	phase: f32
+	start_time: f32
+	stop_time: f32
+	cycle: i64
+	grow_time: f32                     // seconds; 0 for none
+	fade_time: f32
+	color_times: [PARTICLE_KEYS]f32    // 0 (born) to 1 (dying); none: the emitter's color all along
+	colors: [PARTICLE_KEYS][4!]f32
+	rotation_speed: f32                // radians a second
+	rotation_speed_variation: f32
+	rotation_angle: f32
+	rotation_angle_variation: f32
+	random_sign: bool
+	gravity: Vec3                      // the pull, in the model's space (units a second, each second)
+	pulled_in: bool                    // toward gravity_center, at the pull's strength
+	gravity_center: Vec3
+	look: Model_Part
 }
 
 // The frames a flipbook holds, and the keys saying which shows when, at most.
@@ -80,6 +124,7 @@ Inherited :: struct {
 	alpha: i64
 	stencil: i64
 	z_buffer: i64
+	vertex_color: i64
 	billboard_mode: i64    // the nearest billboard node above: its mode, -1 for none
 	billboard_node: Mat4   // and its place in the model
 }
@@ -115,6 +160,8 @@ inherit :: fun(mesh: ^Nif, parent: Inherited, properties: Refs) -> Inherited {
 			result.stencil = index
 		Z_Buffer
 			result.z_buffer = index
+		Vertex_Color
+			result.vertex_color = index
 		else
 		}
 	}
@@ -140,21 +187,26 @@ build_model_part :: fun(mesh: ^Nif, node: i64, left_out: []i64, storage: ^[]byte
 		else
 		}
 	}
-	// And a flipbook for each flip controller at most.
+	// And a flipbook for each flip controller at most, a particle system
+	// for each one.
 	flip_count : i64 = 0
+	system_count : i64 = 0
 	for block in mesh.blocks {
 		match block {
 		Flip_Controller
 			flip_count += 1
+		Particle_System
+			system_count += 1
 		else
 		}
 	}
 	model := Model{
 		parts = slice([:shape_count]Model_Part, storage),
 		flips = slice([:flip_count]Model_Flip, storage),
+		particles = slice([:system_count]Model_Particles, storage),
 		bounds_min = Vec3{1000000, 1000000, 1000000},
 		bounds_max = Vec3{-1000000, -1000000, -1000000}}
-	none := Inherited{texturing = -1, material = -1, alpha = -1, stencil = -1, z_buffer = -1, billboard_mode = -1, billboard_node = mat4_identity()}
+	none := Inherited{texturing = -1, material = -1, alpha = -1, stencil = -1, z_buffer = -1, vertex_color = -1, billboard_mode = -1, billboard_node = mat4_identity()}
 	if node >= 0 {
 		match mesh.blocks[node] {
 		Node part_node
@@ -204,6 +256,10 @@ add_object :: fun(mesh: ^Nif, index: i64, parent: Mat4, inherited: Inherited, mo
 			add_shape(mesh, data.geometry, transform, properties, model, storage)?
 		else
 		}
+	Particle_System system
+		if system.object.flags & 1 != 0 do return
+		properties := inherit(mesh, inherited, system.object.properties)
+		add_particles(mesh, system.modifiers, system.data, system.object.controller, mat4_mul(parent, local_transform(system.object)), properties, model)
 	else
 	}
 }
@@ -253,25 +309,9 @@ add_shape :: fun(mesh: ^Nif, geometry: Geometry, transform: Mat4, properties: In
 	}
 
 	part := next(&model.parts)
-	part^ = Model_Part{
-		vertices = vertices,
-		indices = indices,
-		texture = [],
-		glow_texture = [],
-		clamp_mode = 3,
-		flip = -1,
-		additive = false,
-		billboard_mode = properties.billboard_mode,
-		billboard_node = properties.billboard_node,
-		alpha_blend = false,
-		depth_write = true,
-		alpha_test = false,
-		alpha_threshold = 0,
-		two_sided = false,
-		diffuse = Vec3{1, 1, 1},
-		emissive = Vec3{0, 0, 0},
-		alpha = 1}
-	apply_properties(mesh, properties, part, model)
+	part^ = part_look(mesh, properties, model)
+	part.vertices = vertices
+	part.indices = indices
 
 	// The material's color, where the mesh has no colors of its own (they
 	// take its place, as Oblivion's meshes mean them to), and its opacity,
@@ -312,6 +352,33 @@ add_strip :: fun(strip: []byte, indices: ^[]u16) {
 			indices + b
 		}
 	}
+}
+
+// How a part with the properties in effect is drawn (no vertices yet):
+// as its properties say, as Gamebryo has it where they say nothing.
+part_look :: fun(mesh: ^Nif, properties: Inherited, model: ^Model) -> Model_Part {
+	part := Model_Part{
+		vertices = [],
+		indices = [],
+		texture = [],
+		glow_texture = [],
+		clamp_mode = 3,
+		flip = -1,
+		additive = false,
+		billboard_mode = properties.billboard_mode,
+		billboard_node = properties.billboard_node,
+		alpha_blend = false,
+		depth_write = true,
+		alpha_test = false,
+		alpha_threshold = 0,
+		two_sided = false,
+		diffuse = Vec3{1, 1, 1},
+		emissive = Vec3{0, 0, 0},
+		alpha = 1,
+		vertex_mode = 2,
+		lighting_mode = 1}
+	apply_properties(mesh, properties, &part, model)
+	return part
 }
 
 // Sets how a part is drawn from the properties in effect for it.
@@ -360,6 +427,237 @@ apply_properties :: fun(mesh: ^Nif, properties: Inherited, part: ^Model_Part, mo
 		else
 		}
 	}
+	if properties.vertex_color >= 0 {
+		match mesh.blocks[properties.vertex_color] {
+		Vertex_Color vertex_color
+			part.vertex_mode = vertex_color.vertex_mode
+			part.lighting_mode = vertex_color.lighting_mode
+		else
+		}
+	}
+}
+
+// Adds a particle system to the model (placed in it at system_place), as
+// its emitter and other modifiers, its data and its emitter controller (in
+// its controllers, from the first) say; none without an emitter. Its
+// emitter's reach goes into the model's bounds.
+add_particles :: fun(mesh: ^Nif, modifiers: Refs, data_block: i64, first_controller: i64, system_place: Mat4,
+	properties: Inherited, model: ^Model)
+{
+	if model.particles.len == model.particles.cap do return
+	for k in 0:modifiers.count {
+		at := modifiers.at(k)
+		if at < 0 or at >= mesh.blocks.len do continue
+		match mesh.blocks[at] {
+		Particle_Emitter made
+			add_system(mesh, made.emitter, modifiers, data_block, first_controller, system_place, properties, model)
+			return
+		else
+		}
+	}
+}
+
+// Adds a particle system with its (first) emitter: add_particles'.
+add_system :: fun(mesh: ^Nif, emitter: Emitter, modifiers: Refs, data_block: i64, first_controller: i64, system_place: Mat4,
+	properties: Inherited, model: ^Model)
+{
+	entry := next(&model.particles)
+	entry.emitter = emitter
+	entry.emitter_place = system_place
+	if emitter.emitter_object >= 0 {
+		place, found := object_place(mesh, emitter.emitter_object)
+		if found do entry.emitter_place = place
+	}
+	entry.capacity = 0
+	if data_block >= 0 and data_block < mesh.blocks.len {
+		match mesh.blocks[data_block] {
+		Particle_Data data
+			entry.capacity = data.capacity
+		else
+		}
+	}
+	entry.look = part_look(mesh, properties, model)
+
+	// Its modifiers.
+	entry.grow_time = 0
+	entry.fade_time = 0
+	entry.color_times.len = 0
+	entry.colors.len = 0
+	entry.rotation_speed = 0
+	entry.rotation_speed_variation = 0
+	entry.rotation_angle = 0
+	entry.rotation_angle_variation = 0
+	entry.random_sign = false
+	entry.gravity = Vec3{0, 0, 0}
+	entry.pulled_in = false
+	entry.gravity_center = Vec3{0, 0, 0}
+	for k in 0:modifiers.count {
+		at := modifiers.at(k)
+		if at < 0 or at >= mesh.blocks.len do continue
+		match mesh.blocks[at] {
+		Grow_Fade_Modifier grow_fade
+			if grow_fade.active {
+				entry.grow_time = grow_fade.grow_time
+				entry.fade_time = grow_fade.fade_time
+			}
+		Color_Modifier color
+			if color.active do add_color_keys(mesh, color.data, entry)
+		Rotation_Modifier rotation
+			if rotation.active {
+				entry.rotation_speed = rotation.speed
+				entry.rotation_speed_variation = rotation.speed_variation
+				entry.rotation_angle = rotation.angle
+				entry.rotation_angle_variation = rotation.angle_variation
+				entry.random_sign = rotation.random_sign
+			}
+		Gravity_Modifier gravity
+			if gravity.active {
+				place := system_place
+				if gravity.gravity_object >= 0 {
+					object, found := object_place(mesh, gravity.gravity_object)
+					if found do place = object
+				}
+				turned := mat4_mul_vec4(place, Vec4{gravity.axis.x, gravity.axis.y, gravity.axis.z, 0})
+				axis := Vec3{turned.x, turned.y, turned.z}
+				if vec3_length(axis) > 0 do axis = vec3_normalize(axis)
+				entry.gravity = axis * gravity.strength
+				entry.pulled_in = gravity.force_type == 1
+				entry.gravity_center = Vec3{place[3][0], place[3][1], place[3][2]}
+			}
+		else
+		}
+	}
+
+	// How fast and when: its emitter controller's, among the system's
+	// controllers; without one, as fast as keeps it full.
+	entry.birth_rate = 0
+	if emitter.life_span > 0 do entry.birth_rate = f32(entry.capacity) / emitter.life_span
+	entry.birth_times.len = 0
+	entry.birth_rates.len = 0
+	entry.active_times.len = 0
+	entry.active_values.len = 0
+	entry.frequency = 1
+	entry.phase = 0
+	entry.start_time = 0
+	entry.stop_time = 0
+	entry.cycle = CYCLE_LOOP
+	at := first_controller
+	for at >= 0 and at < mesh.blocks.len {
+		match mesh.blocks[at] {
+		Emitter_Controller controller
+			entry.frequency = controller.frequency
+			entry.phase = controller.phase
+			entry.start_time = controller.start_time
+			entry.stop_time = controller.stop_time
+			entry.cycle = i64(controller.flags >> 1) & 3
+			add_birth_rate(mesh, controller.birth_rate, entry)
+			add_active_keys(mesh, controller.active, entry)
+			break
+		Flip_Controller flip
+			at = flip.next
+		else
+			break
+		}
+	}
+
+	// What it reaches: the emitter's shape, and as far as a particle goes
+	// in its life.
+	life := emitter.life_span + abs(emitter.life_span_variation)
+	speed := abs(emitter.speed) + abs(emitter.speed_variation)
+	reach := speed * life + 0.5 * vec3_length(entry.gravity) * life * life + abs(emitter.radius) + abs(emitter.radius_variation)
+	scale := vec3_length(Vec3{entry.emitter_place[0][0], entry.emitter_place[0][1], entry.emitter_place[0][2]})
+	extent := max(emitter.size.x, max(emitter.size.y, emitter.size.z)) * scale + reach
+	center := Vec3{entry.emitter_place[3][0], entry.emitter_place[3][1], entry.emitter_place[3][2]}
+	grow_bounds(model, center - Vec3{extent, extent, extent})
+	grow_bounds(model, center + Vec3{extent, extent, extent})
+}
+
+// An object's place in the model, from the roots down; false when it isn't
+// in the tree (or isn't a node or a shape).
+object_place :: fun(mesh: ^Nif, index: i64) -> Mat4, bool {
+	parent, found := parent_transform(mesh, index)
+	if not found do return mat4_identity(), false
+	match mesh.blocks[index] {
+	Node node
+		return mat4_mul(parent, local_transform(node.object)), true
+	Shape shape
+		return mat4_mul(parent, local_transform(shape.object)), true
+	Particle_System system
+		return mat4_mul(parent, local_transform(system.object)), true
+	else
+	}
+	return mat4_identity(), false
+}
+
+// A color modifier's keys (colors over a particle's life), into its system.
+add_color_keys :: fun(mesh: ^Nif, data: i64, entry: ^Model_Particles) {
+	if data < 0 or data >= mesh.blocks.len do return
+	match mesh.blocks[data] {
+	Key_Data key_data
+		keys := key_data.keys
+		if keys.value_size != 16 do return
+		for k in 0:keys.count {
+			if entry.color_times.len == entry.color_times.cap do return
+			at := keys.value_at(k)
+			color : [4!]f32 = [keys.data[at], keys.data[at + 4], keys.data[at + 8], keys.data[at + 12]]
+			&entry.color_times + keys.time(k)
+			&entry.colors + color
+		}
+	else
+	}
+}
+
+// An emitter controller's birth rate (particles a second: its value, or its
+// keys), into its system.
+add_birth_rate :: fun(mesh: ^Nif, interpolator: i64, entry: ^Model_Particles) {
+	if interpolator < 0 or interpolator >= mesh.blocks.len do return
+	match mesh.blocks[interpolator] {
+	Float_Interpolator float_interpolator
+		entry.birth_rate = float_interpolator.value
+		if float_interpolator.data < 0 or float_interpolator.data >= mesh.blocks.len do return
+		match mesh.blocks[float_interpolator.data] {
+		Key_Data key_data
+			keys := key_data.keys
+			if keys.value_size != 4 do return
+			for k in 0:keys.count {
+				if entry.birth_times.len == entry.birth_times.cap do return
+				rate : f32 = keys.data[keys.value_at(k)]
+				&entry.birth_times + keys.time(k)
+				&entry.birth_rates + rate
+			}
+		else
+		}
+	else
+	}
+}
+
+// An emitter controller's on and off (its keys), into its system; with
+// none (or a value of on), always on.
+add_active_keys :: fun(mesh: ^Nif, interpolator: i64, entry: ^Model_Particles) {
+	if interpolator < 0 or interpolator >= mesh.blocks.len do return
+	match mesh.blocks[interpolator] {
+	Bool_Interpolator bool_interpolator
+		if bool_interpolator.data < 0 or bool_interpolator.data >= mesh.blocks.len {
+			if not bool_interpolator.value {
+				&entry.active_times + 0
+				&entry.active_values + false
+			}
+			return
+		}
+		match mesh.blocks[bool_interpolator.data] {
+		Key_Data key_data
+			keys := key_data.keys
+			if keys.value_size != 1 do return
+			for k in 0:keys.count {
+				if entry.active_times.len == entry.active_times.cap do return
+				on : u8 = keys.data[keys.value_at(k)]
+				&entry.active_times + keys.time(k)
+				&entry.active_values + (on != 0)
+			}
+		else
+		}
+	else
+	}
 }
 
 // The flipbook of a texturing's base texture, if its controllers flip it
@@ -405,13 +703,13 @@ add_flip_keys :: fun(mesh: ^Nif, interpolator: i64, entry: ^Model_Flip) {
 	Float_Interpolator float_interpolator
 		if float_interpolator.data < 0 or float_interpolator.data >= mesh.blocks.len do return
 		match mesh.blocks[float_interpolator.data] {
-		Float_Data data
-			size := key_bytes(data.key_type, 4)
-			for k in 0:data.key_count {
+		Key_Data data
+			keys := data.keys
+			if keys.value_size != 4 do return
+			for k in 0:keys.count {
 				if entry.key_times.len == entry.key_times.cap do return
-				time : f32 = data.keys[k * size]
-				value : f32 = data.keys[k * size + 4]
-				&entry.key_times + time
+				value : f32 = keys.data[keys.value_at(k)]
+				&entry.key_times + keys.time(k)
 				&entry.key_values + value
 			}
 		else

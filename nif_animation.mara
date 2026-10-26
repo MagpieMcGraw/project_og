@@ -48,22 +48,18 @@ skip_key_group :: fun(reader: ^Nif_Reader, value_size: i64) {
 	skip_keys(reader, count, key_type, value_size)
 }
 
-// NiFloatData, NiPosData, NiColorData, NiBoolData: one group of keys.
-// A float's (value_size 4) are kept.
+// NiFloatData, NiPosData, NiColorData, NiBoolData: one group of keys,
+// each value value_size bytes.
 read_key_data :: fun(reader: ^Nif_Reader, value_size: i64) -> Block {
-	if value_size != 4 {
-		skip_key_group(reader, value_size)
-		return .Other
-	}
 	count := i64(read_u32(reader))
-	if count == 0 do return Float_Data{key_type = 0, key_count = 0, keys = reader.data[0:0]}
+	if count == 0 do return Key_Data{keys = Keys{value_size = value_size, key_type = 0, count = 0, data = reader.data[0:0]}}
 	key_type := i64(read_u32(reader))
 	if key_type != KEY_LINEAR and key_type != KEY_QUADRATIC and key_type != KEY_TBC and key_type != KEY_CONSTANT {
 		reader.broken = true
 		return .Other
 	}
-	keys := read_view(reader, count * key_bytes(key_type, 4))
-	return Float_Data{key_type = key_type, key_count = count, keys = keys}
+	data := read_view(reader, count * key_bytes(key_type, value_size))
+	return Key_Data{keys = Keys{value_size = value_size, key_type = key_type, count = count, data = data}}
 }
 
 // The size of a key of a type, its value value_size bytes.
@@ -119,12 +115,17 @@ read_keyframe_data :: fun(reader: ^Nif_Reader) -> Block {
 
 // NiFloatInterpolator, NiBoolInterpolator, NiPoint3Interpolator: a value
 // to hold, and keys for it.
-// A float's (value_size 4) is kept.
+// A float's (value_size 4) and a bool's (1) are kept.
 read_value_interpolator :: fun(reader: ^Nif_Reader, value_size: i64) -> Block {
 	if value_size == 4 {
 		value := read_f32(reader)
 		data := read_ref(reader)
 		return Float_Interpolator{value = value, data = data}
+	}
+	if value_size == 1 {
+		on := read_bool(reader)
+		data := read_ref(reader)
+		return Bool_Interpolator{value = on, data = data}
 	}
 	skip(reader, value_size)
 	_ = read_ref(reader)   // data

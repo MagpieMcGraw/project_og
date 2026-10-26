@@ -29,6 +29,7 @@ use distant
 use grass
 use collision
 use animation
+use particles
 render :: use render
 use mara.math
 use sdl_platform
@@ -528,6 +529,46 @@ command_model :: fun(what: []utf8, name: []utf8) {
 			if part.depth_write do "" else "no depth written",
 			if part.alpha_test do "alpha-tested" else "",
 			if part.two_sided do "two-sided" else "")
+	}
+	for &system in built.particles {
+		emitter := system.emitter
+		print("particles: room for %, emitter shape % of size % at %, its z %, its y %", system.capacity, emitter.shape, emitter.size,
+			system.emitter_place[3], system.emitter_place[2], system.emitter_place[1])
+		print("  speed % (± %), declination % (± %), planar angle % (± %)", emitter.speed, emitter.speed_variation,
+			emitter.declination, emitter.declination_variation, emitter.planar_angle, emitter.planar_angle_variation)
+		print("  color %, radius % (± %), life % s (± %)", emitter.color, emitter.radius, emitter.radius_variation,
+			emitter.life_span, emitter.life_span_variation)
+		print("  % a second, keys at % = %; on at % = %", system.birth_rate, system.birth_times, system.birth_rates,
+			system.active_times, system.active_values)
+		print("  played at % times from %, % to % s, cycle %", system.frequency, system.phase, system.start_time, system.stop_time, system.cycle)
+		print("  grows % s, fades % s; colors at % = %", system.grow_time, system.fade_time, system.color_times, system.colors)
+		print("  turns % (± %) from % (± %) %; pulled % (toward %)", system.rotation_speed, system.rotation_speed_variation,
+			system.rotation_angle, system.rotation_angle_variation, if system.random_sign do ", either way" else "",
+			system.gravity, if system.pulled_in do system.gravity_center else Vec3{0, 0, 0})
+		look := &system.look
+		print("  texture % (clamp mode %), flipbook %, % % % %, emissive %, alpha %, vertex mode %, lighting mode %",
+			look.texture, look.clamp_mode, look.flip, if look.alpha_blend do "blended" else "", if look.additive do "(added)" else "",
+			if look.depth_write do "" else "no depth written", if look.alpha_test do "alpha-tested" else "",
+			look.emissive, look.alpha, look.vertex_mode, look.lighting_mode)
+		// Played at 10 seconds, unplaced, seen from the south (as a model
+		// stands in the world: z up).
+		corners : [4096]Particle_Vertex
+		add_particle_squares(system, mat4_identity(), 10, 1, Vec3{1, 0, 0}, Vec3{0, 0, 1}, Vec3{0.1, 0.1, 0.1}, Vec3{0, 0, 0}, &corners)
+		if corners.len == 0 {
+			print("  at 10 s: none")
+			continue
+		}
+		low := Vec3{1000000, 1000000, 1000000}
+		high := Vec3{-1000000, -1000000, -1000000}
+		for c in 0:corners.len / 4 {
+			middle := (corners[c * 4].position + corners[c * 4 + 2].position) * 0.5
+			for axis in 0:3 {
+				low[axis] = min(low[axis], middle[axis])
+				high[axis] = max(high[axis], middle[axis])
+			}
+		}
+		first_size := vec3_length(corners[0].position - corners[2].position) * 0.5
+		print("  at 10 s: % particles, from % to %; the newest % across, color %", corners.len / 4, low, high, first_size, corners[0].color)
 	}
 }
 
