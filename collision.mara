@@ -32,15 +32,37 @@ solid_layer :: fun(layer: u8) -> bool {
 
 // A model's collision: its triangles, three points each, into points.
 add_collision :: fun(mesh: ^Nif, points: ^[]Vec3) {
+	add_collision_part(mesh, -1, [], points)
+}
+
+// Part of a model's collision, as build_model_part makes part of it: what's
+// under a node, in its space (its own body's too); or, for node -1, all
+// but what's under the nodes left out.
+add_collision_part :: fun(mesh: ^Nif, node: i64, left_out: []i64, points: ^[]Vec3) {
+	if node >= 0 {
+		match mesh.blocks[node] {
+		Node part_node
+			add_body(mesh, part_node.object.collision, mat4_identity(), points)
+			for k in 0:part_node.children.count {
+				child := part_node.children.at(k)
+				if child >= 0 do add_object_collision(mesh, child, mat4_identity(), points, left_out)
+			}
+		else
+		}
+		return
+	}
 	for k in 0:mesh.roots.count {
 		root := mesh.roots.at(k)
-		if root >= 0 do add_object_collision(mesh, root, mat4_identity(), points)
+		if root >= 0 do add_object_collision(mesh, root, mat4_identity(), points, left_out)
 	}
 }
 
 // An object's collision and its children's: each placed by its place in
-// the model, under its parent's.
-add_object_collision :: fun(mesh: ^Nif, index: i64, parent: Mat4, points: ^[]Vec3) {
+// the model, under its parent's; nothing under the nodes left out.
+add_object_collision :: fun(mesh: ^Nif, index: i64, parent: Mat4, points: ^[]Vec3, left_out: []i64) {
+	for out in left_out {
+		if out == index do return
+	}
 	match mesh.blocks[index] {
 	Node node
 		if node.object.name == "EditorMarker" do return
@@ -48,7 +70,7 @@ add_object_collision :: fun(mesh: ^Nif, index: i64, parent: Mat4, points: ^[]Vec
 		add_body(mesh, node.object.collision, transform, points)
 		for k in 0:node.children.count {
 			child := node.children.at(k)
-			if child >= 0 do add_object_collision(mesh, child, transform, points)
+			if child >= 0 do add_object_collision(mesh, child, transform, points, left_out)
 		}
 	Shape shape
 		add_body(mesh, shape.object.collision, mat4_mul(parent, local_transform(shape.object)), points)

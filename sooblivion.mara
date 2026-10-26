@@ -28,6 +28,7 @@ use shader_package
 use distant
 use grass
 use collision
+use animation
 render :: use render
 use mara.math
 use sdl_platform
@@ -1232,6 +1233,82 @@ command_doors :: fun() {
 	}
 }
 
+// `sooblivion door <mesh>`: how a door opens in place: its Open and Close
+// sequences' tracks — the nodes they move, their keys, where each node is
+// at the start and the end — and what splitting it there makes: the
+// frame's parts and collision, and each moving node's.
+command_door :: fun(what: []utf8) {
+	path := data_path("Oblivion - Meshes.bsa")
+	directory_storage : [64 * MB]byte
+	archive, open_error := open_archive(path, &directory_storage)
+	if open_error {
+		print("couldn't open %: %", path, open_error)
+		return
+	}
+	defer close_archive(&archive)
+	index, found := find_file(&archive, what)
+	if not found {
+		print("no % in %", what, path)
+		return
+	}
+	storage : [16 * MB]byte
+	data, read_error := read_file(&archive, index, &storage)
+	if read_error do return
+	nif_storage : [16 * MB]byte
+	failure := Nif_Failure{block = 0, type_name = storage[0:0]}
+	mesh, nif_error := read_nif(data, &nif_storage, &failure)
+	if nif_error {
+		print("couldn't read it: %", nif_error)
+		return
+	}
+	moving : [8]i64
+	for name in ["Open", "Close"] {
+		sequence := find_sequence(&mesh, name)
+		if sequence < 0 {
+			print("no % sequence", name)
+			continue
+		}
+		start, stop := sequence_span(&mesh, sequence)
+		tracks : [8]Track
+		read_tracks(&mesh, sequence, &tracks)
+		print("%: from % to % s, % tracks", name, start, stop, tracks.len)
+		for &track in tracks {
+			node := find_node(&mesh, track.node_name[:])
+			if node >= 0 {
+				match mesh.blocks[node] {
+				Node moved
+					track.rest = local_transform(moved.object)
+				else
+				}
+				known := false
+				for m in moving {
+					if m == node do known = true
+				}
+				if not known and moving.len < moving.cap do &moving + node
+			}
+			at_start := track_pose(track, start)
+			at_stop := track_pose(track, stop)
+			print("  % (block %): % rotation keys, % translation keys; x axis % to %, at % to %", track.node_name, node,
+				track.rotations.len, track.translations.len,
+				Vec3{at_start[0][0], at_start[0][1], at_start[0][2]}, Vec3{at_stop[0][0], at_stop[0][1], at_stop[0][2]},
+				Vec3{at_start.w.x, at_start.w.y, at_start.w.z}, Vec3{at_stop.w.x, at_stop.w.y, at_stop.w.z})
+		}
+	}
+	model_storage : [16 * MB]byte
+	points : [200000]Vec3
+	frame, frame_error := build_model_part(&mesh, -1, moving[:], &model_storage)
+	add_collision_part(&mesh, -1, moving[:], &points)
+	if not frame_error do print("the frame: % parts, % collision triangles", frame.parts.len, points.len / 3)
+	for node in moving {
+		points.len = 0
+		piece, piece_error := build_model_part(&mesh, node, [], &model_storage)
+		add_collision_part(&mesh, node, [], &points)
+		parent, in_tree := parent_transform(&mesh, node)
+		if not piece_error do print("block %: % parts, % collision triangles; its parent at % (found %)", node, piece.parts.len,
+			points.len / 3, Vec3{parent.w.x, parent.w.y, parent.w.z}, in_tree)
+	}
+}
+
 // A base record and how many references place it.
 Base_Count :: struct {
 	base: u32
@@ -1775,6 +1852,8 @@ main :: (args: [][]utf8) {
 		command_sky(if args.len > 2 do args[2] else "Tamriel")
 	elif command == "doors"
 		command_doors()
+	elif command == "door" and args.len > 2
+		command_door(args[2])
 	elif command == "collision" and args.len > 2
 		command_collision(args[2])
 	elif command == "grass" and args.len > 4

@@ -95,6 +95,13 @@ inherit :: fun(mesh: ^Nif, parent: Inherited, properties: Refs) -> Inherited {
 // Makes a model of a NIF: its parts' vertices and indexes, and the parts
 // themselves, carved from storage.
 build_model :: fun(mesh: ^Nif, storage: ^[]byte) -> Model, err {
+	return build_model_part(mesh, -1, [], storage)
+}
+
+// Makes a model of part of a NIF: the objects under a node, in the node's
+// own space (as if it were the model's origin, unturned); or, for node -1,
+// the whole tree but for what's under the nodes left out.
+build_model_part :: fun(mesh: ^Nif, node: i64, left_out: []i64, storage: ^[]byte) -> Model, err {
 	// One part for each shape at most.
 	shape_count : i64 = 0
 	for block in mesh.blocks {
@@ -109,15 +116,31 @@ build_model :: fun(mesh: ^Nif, storage: ^[]byte) -> Model, err {
 		bounds_min = Vec3{1000000, 1000000, 1000000},
 		bounds_max = Vec3{-1000000, -1000000, -1000000}}
 	none := Inherited{texturing = -1, material = -1, alpha = -1, stencil = -1}
+	if node >= 0 {
+		match mesh.blocks[node] {
+		Node part_node
+			properties := inherit(mesh, none, part_node.object.properties)
+			for k in 0:part_node.children.count {
+				child := part_node.children.at(k)
+				if child >= 0 do add_object(mesh, child, mat4_identity(), properties, &model, storage, left_out)?
+			}
+		else
+		}
+		return model
+	}
 	for k in 0:mesh.roots.count {
 		root := mesh.roots.at(k)
-		if root >= 0 do add_object(mesh, root, mat4_identity(), none, &model, storage)?
+		if root >= 0 do add_object(mesh, root, mat4_identity(), none, &model, storage, left_out)?
 	}
 	return model
 }
 
-// Adds an object of the tree to the model: a node's children, or a shape.
-add_object :: fun(mesh: ^Nif, index: i64, parent: Mat4, inherited: Inherited, model: ^Model, storage: ^[]byte) -> err {
+// Adds an object of the tree to the model: a node's children, or a shape;
+// nothing under the nodes left out.
+add_object :: fun(mesh: ^Nif, index: i64, parent: Mat4, inherited: Inherited, model: ^Model, storage: ^[]byte, left_out: []i64) -> err {
+	for out in left_out {
+		if out == index do return
+	}
 	match mesh.blocks[index] {
 	Node node
 		if node.object.flags & 1 != 0 do return   // hidden
@@ -126,7 +149,7 @@ add_object :: fun(mesh: ^Nif, index: i64, parent: Mat4, inherited: Inherited, mo
 		properties := inherit(mesh, inherited, node.object.properties)
 		for k in 0:node.children.count {
 			child := node.children.at(k)
-			if child >= 0 do add_object(mesh, child, transform, properties, model, storage)?
+			if child >= 0 do add_object(mesh, child, transform, properties, model, storage, left_out)?
 		}
 	Shape shape
 		if shape.object.flags & 1 != 0 do return
@@ -292,4 +315,46 @@ grow_bounds :: fun(model: ^Model, point: Vec3) {
 		if point[axis] < model.bounds_min[axis] do model.bounds_min[axis] = point[axis]
 		if point[axis] > model.bounds_max[axis] do model.bounds_max[axis] = point[axis]
 	}
+}
+
+// A node of a NIF by its name: its block's index, -1 when there's none.
+find_node :: fun(mesh: ^Nif, name: []utf8) -> i64 {
+	for &block, index in mesh.blocks {
+		match block^ {
+		Node node
+			if node.object.name == name do return index
+		else
+		}
+	}
+	return -1
+}
+
+// Where a node's parent is in the model (its place, from the roots down),
+// unmoved; false when the node isn't in the tree.
+parent_transform :: fun(mesh: ^Nif, node: i64) -> Mat4, bool {
+	for k in 0:mesh.roots.count {
+		root := mesh.roots.at(k)
+		if root < 0 do continue
+		found, place := find_parent_transform(mesh, root, node, mat4_identity())
+		if found do return place, true
+	}
+	return mat4_identity(), false
+}
+
+// Below an object (placed under parent): whether the node is, and its
+// parent's place.
+find_parent_transform :: fun(mesh: ^Nif, index: i64, node: i64, parent: Mat4) -> bool, Mat4 {
+	if index == node do return true, parent
+	match mesh.blocks[index] {
+	Node branch
+		transform := mat4_mul(parent, local_transform(branch.object))
+		for k in 0:branch.children.count {
+			child := branch.children.at(k)
+			if child < 0 do continue
+			found, place := find_parent_transform(mesh, child, node, transform)
+			if found do return true, place
+		}
+	else
+	}
+	return false, parent
 }

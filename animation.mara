@@ -1,0 +1,304 @@
+// Animation: a NIF's nodes moved over time — where each is, how it's
+// turned — as its sequences (NiControllerSequence) say: for each node a
+// track of keys, and its pose at a time between them.
+//
+// Keys are read as the file has them; between two, the pose goes in a
+// straight line (rotations by the shorter way), whatever the keys' type
+// asks for: doors and the like move evenly enough for that.
+module animation
+
+use mara.core
+use mara.math
+use mara.string
+use nif
+
+// The keys a track holds of each kind, at most.
+TRACK_KEYS :: 32
+
+// A node's movement in one sequence: its keys (times in seconds), and its
+// pose where they say nothing: the interpolator's, else the node's own.
+Track :: struct {
+	node_name: [64]utf8
+	rotation_times: [TRACK_KEYS]f32
+	rotations: [TRACK_KEYS][4!]f32    // quaternions: w, x, y, z
+	// Or rotations as three angles (radians) about x, y and z, each with
+	// its own keys: turned about x, then y, then z.
+	angle_times: [3!][TRACK_KEYS]f32
+	angles: [3!][TRACK_KEYS]f32
+	translation_times: [TRACK_KEYS]f32
+	translations: [TRACK_KEYS]Vec3
+	rest: Mat4                         // the node's place in its parent, unmoved
+}
+
+// A sequence of a NIF by its name ("Open"): the index of its block; -1
+// when there's none.
+find_sequence :: fun(mesh: ^Nif, name: []utf8) -> i64 {
+	for &block, index in mesh.blocks {
+		match block^ {
+		Sequence sequence
+			if compare_folded(sequence.name, name) == 0 do return index
+		else
+		}
+	}
+	return -1
+}
+
+// A sequence's span of time: its start and its stop, in seconds.
+sequence_span :: fun(mesh: ^Nif, sequence_index: i64) -> f32, f32 {
+	match mesh.blocks[sequence_index] {
+	Sequence sequence
+		return sequence.start_time, sequence.stop_time
+	else
+	}
+	return 0, 0
+}
+
+// The tracks of a sequence: each node it moves by a transform
+// interpolator, its keys copied out of the file. Into tracks.
+read_tracks :: fun(mesh: ^Nif, sequence_index: i64, tracks: ^[]Track) {
+	match mesh.blocks[sequence_index] {
+	Sequence sequence
+		for b in 0:sequence.block_count {
+			if sequence.blocks.len < (b + 1) * CONTROLLED_BLOCK_SIZE or tracks.len == tracks.cap do return
+			at := b * CONTROLLED_BLOCK_SIZE
+			interpolator : i32 = sequence.blocks[at]
+			palette : i32 = sequence.blocks[at + 9]
+			name_offset : u32 = sequence.blocks[at + 13]
+			if interpolator < 0 or palette < 0 do continue
+			track := next(tracks)
+			track.node_name.len = 0
+			track.rotation_times.len = 0
+			track.rotations.len = 0
+			for axis in 0:3 {
+				track.angle_times[axis].len = 0
+				track.angles[axis].len = 0
+			}
+			track.translation_times.len = 0
+			track.translations.len = 0
+			track.rest = mat4_identity()
+			palette_name(mesh, i64(palette), i64(name_offset), &track.node_name)
+			read_track_keys(mesh, i64(interpolator), track)
+			// A node it doesn't move (one held still, as a root is): not a track.
+			if not track_moves(track) do tracks.len -= 1
+		}
+	else
+	}
+}
+
+// A name in a string palette, at an offset: up to its 0, into name.
+palette_name :: fun(mesh: ^Nif, palette_index: i64, offset: i64, name: ^[64]utf8) {
+	if palette_index >= mesh.blocks.len do return
+	match mesh.blocks[palette_index] {
+	String_Palette palette
+		at := offset
+		for at < palette.text.len {
+			c : u8 = palette.text[at]
+			if c == 0 or name.len == name.cap do return
+			name + utf8(c)
+			at += 1
+		}
+	else
+	}
+}
+
+// A transform interpolator's keys into a track: its data's, and where it
+// has none of a kind, its own pose as the one key of that kind.
+read_track_keys :: fun(mesh: ^Nif, interpolator_index: i64, track: ^Track) {
+	if interpolator_index >= mesh.blocks.len do return
+	match mesh.blocks[interpolator_index] {
+	Transform_Interpolator interpolator
+		if interpolator.data >= 0 and interpolator.data < mesh.blocks.len {
+			match mesh.blocks[interpolator.data] {
+			Transform_Data data
+				rotation_size := rotation_key_bytes(data.rotation_type)
+				for k in 0:data.rotation_count {
+					if track.rotations.len == track.rotations.cap do break
+					time : f32 = data.rotations[k * rotation_size]
+					rotation : [4!]f32 = data.rotations[k * rotation_size + 4]
+					&track.rotation_times + time
+					&track.rotations + rotation
+				}
+				read_angle_keys(data.angles, track)
+				translation_size := key_bytes(data.translation_type, 12)
+				for k in 0:data.translation_count {
+					if track.translations.len == track.translations.cap do break
+					time : f32 = data.translations[k * translation_size]
+					translation : Vec3 = data.translations[k * translation_size + 4]
+					&track.translation_times + time
+					&track.translations + translation
+				}
+			else
+			}
+		}
+		if track.rotations.len == 0 and track.angles[0].len + track.angles[1].len + track.angles[2].len == 0 and abs_f32(interpolator.rotation[0]) < UNSET_BEYOND {
+			&track.rotation_times + 0
+			&track.rotations + interpolator.rotation
+		}
+		if track.translations.len == 0 and abs_f32(interpolator.translation.x) < UNSET_BEYOND {
+			&track.translation_times + 0
+			&track.translations + interpolator.translation
+		}
+	else
+	}
+}
+
+// The three angles' tracks of a rotation (KEY_XYZ), as the file has
+// them: for each axis, a count, a type if there are keys, the keys
+// (time, angle, and what the type adds).
+read_angle_keys :: fun(angles: []byte, track: ^Track) {
+	at : i64 = 0
+	for axis in 0:3 {
+		if at + 4 > angles.len do return
+		count : u32 = angles[at]
+		at += 4
+		if count == 0 do continue
+		key_type : u32 = angles[at]
+		at += 4
+		size := key_bytes(i64(key_type), 4)
+		for k in 0:i64(count) {
+			if at + size > angles.len do return
+			time : f32 = angles[at]
+			angle : f32 = angles[at + 4]
+			if track.angles[axis].len < track.angles[axis].cap {
+				&track.angle_times[axis] + time
+				&track.angles[axis] + angle
+			}
+			at += size
+		}
+	}
+}
+
+// Whether a track moves its node: whether any kind of its keys has two
+// that differ.
+track_moves :: fun(track: ^Track) -> bool {
+	for k in 1:track.rotations.len {
+		for i in 0:4 {
+			if abs_f32(track.rotations[k][i] - track.rotations[0][i]) > 0.0001 do return true
+		}
+	}
+	for k in 1:track.translations.len {
+		if vec3_length(track.translations[k] - track.translations[0]) > 0.01 do return true
+	}
+	for axis in 0:3 {
+		for k in 1:track.angles[axis].len {
+			if abs_f32(track.angles[axis][k] - track.angles[axis][0]) > 0.0001 do return true
+		}
+	}
+	return false
+}
+
+// A track's node's place in its parent at a time: its rest, turned and
+// moved as its keys say there.
+track_pose :: fun(track: ^Track, time: f32) -> Mat4 {
+	pose := track.rest
+	turned := mat4_identity()
+	turns := false
+	if track.rotations.len > 0 {
+		turned = wxyz_matrix(rotation_at(track, time))
+		turns = true
+	elif track.angles[0].len + track.angles[1].len + track.angles[2].len > 0
+		// About x, then y, then z.
+		x := angle_at(&track.angle_times[0], &track.angles[0], time)
+		y := angle_at(&track.angle_times[1], &track.angles[1], time)
+		z := angle_at(&track.angle_times[2], &track.angles[2], time)
+		turned = mat4_mul(axis_turn(z, 2), mat4_mul(axis_turn(y, 1), axis_turn(x, 0)))
+		turns = true
+	}
+	if turns {
+		for column in 0:3 {
+			for row in 0:3 do pose[column][row] = turned[column][row]
+		}
+	}
+	if track.translations.len > 0 {
+		place := translation_at(track, time)
+		pose.w.x = place.x
+		pose.w.y = place.y
+		pose.w.z = place.z
+	}
+	return pose
+}
+
+// Where a time falls among keys' times: the key before it and how far
+// toward the next (0 to 1); the first or last key past either end.
+key_between :: fun(times: ^[]f32, time: f32) -> i64, f32 {
+	if times.len == 1 or time <= times[0] do return 0, 0
+	last := times.len - 1
+	if time >= times[last] do return last, 0
+	k : i64 = 0
+	for k + 1 < last and times[k + 1] <= time do k += 1
+	span := times[k + 1] - times[k]
+	if span <= 0 do return k, 0
+	return k, (time - times[k]) / span
+}
+
+// The rotation at a time: between its keys, the shorter way.
+rotation_at :: fun(track: ^Track, time: f32) -> [4!]f32 {
+	k, part := key_between(&track.rotation_times, time)
+	from := track.rotations[k]
+	if part == 0 do return from
+	to := track.rotations[k + 1]
+	// (q and -q are one rotation: the nearer of the two.)
+	if from[0] * to[0] + from[1] * to[1] + from[2] * to[2] + from[3] * to[3] < 0 {
+		for i in 0:4 do to[i] = -to[i]
+	}
+	mixed : [4!]f32
+	size : f32 = 0
+	for i in 0:4 {
+		mixed[i] = from[i] + (to[i] - from[i]) * part
+		size += mixed[i] * mixed[i]
+	}
+	size = sqrt_f32(size)
+	if size > 0 {
+		for i in 0:4 do mixed[i] = mixed[i] / size
+	}
+	return mixed
+}
+
+// An angle at a time, between its keys; 0 where there are none.
+angle_at :: fun(times: ^[]f32, angles: ^[]f32, time: f32) -> f32 {
+	if angles.len == 0 do return 0
+	k, part := key_between(times, time)
+	if part == 0 do return angles[k]
+	return angles[k] + (angles[k + 1] - angles[k]) * part
+}
+
+// A turn by an angle (radians, counter-clockwise looking down the axis)
+// about an axis: 0 x, 1 y, 2 z.
+axis_turn :: fun(angle: f32, axis: i64) -> Mat4 {
+	c := cos_f32(angle)
+	s := sin_f32(angle)
+	m := mat4_identity()
+	first := (axis + 1) % 3
+	second := (axis + 2) % 3
+	m[first][first] = c
+	m[first][second] = s
+	m[second][first] = -s
+	m[second][second] = c
+	return m
+}
+
+// The translation at a time: between its keys, in a straight line.
+translation_at :: fun(track: ^Track, time: f32) -> Vec3 {
+	k, part := key_between(&track.translation_times, time)
+	if part == 0 do return track.translations[k]
+	return track.translations[k] + (track.translations[k + 1] - track.translations[k]) * part
+}
+
+// A turn as a matrix, from a quaternion as NIFs write it: w, x, y, z.
+wxyz_matrix :: fun(q: [4!]f32) -> Mat4 {
+	w := q[0]
+	x := q[1]
+	y := q[2]
+	z := q[3]
+	m := mat4_identity()
+	m[0][0] = 1 - 2 * (y * y + z * z)
+	m[0][1] = 2 * (x * y + z * w)
+	m[0][2] = 2 * (x * z - y * w)
+	m[1][0] = 2 * (x * y - z * w)
+	m[1][1] = 1 - 2 * (x * x + z * z)
+	m[1][2] = 2 * (y * z + x * w)
+	m[2][0] = 2 * (x * z + y * w)
+	m[2][1] = 2 * (y * z - x * w)
+	m[2][2] = 1 - 2 * (x * x + y * y)
+	return m
+}

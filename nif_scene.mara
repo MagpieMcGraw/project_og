@@ -464,9 +464,9 @@ read_furniture_marker :: fun(reader: ^Nif_Reader) -> Block {
 // NiStringPalette: names an animation's blocks point into.
 read_string_palette :: fun(reader: ^Nif_Reader) -> Block {
 	size := i64(read_u32(reader))
-	skip(reader, size)
+	text := read_view(reader, size)
 	skip(reader, 4)   // the size again
-	return .Other
+	return String_Palette{text = text}
 }
 
 // NiDefaultAVObjectPalette: an animated mesh's objects by name.

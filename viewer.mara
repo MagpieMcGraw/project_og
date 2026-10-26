@@ -267,11 +267,17 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		note_end(&viewer.journal)
 		update_title(viewer)
 	}
-	// What the reticle is on: E uses it (a door, for now).
-	targeted := targeted_door(shown, camera^)
-	if input.pressed[E] and targeted >= 0 {
-		viewer.chosen_door = targeted
-		return .door
+	// What the reticle is on: E uses it — a door that leads somewhere is
+	// gone through, one that opens in place opens or closes.
+	targeted := targeted_reference(shown, camera^)
+	leading := leading_door(shown, targeted)
+	usable := leading >= 0 or (targeted != 0 and swings(shown, targeted))
+	if input.pressed[E] and usable {
+		if leading >= 0 {
+			viewer.chosen_door = leading
+			return .door
+		}
+		_ = use_door(shown, targeted)
 	}
 
 	seconds, now := time_since(viewer.frame_start)
@@ -317,6 +323,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	}
 
 	pass_time(viewer, f32(seconds), input.held[T])
+	swing_doors(shown, f32(seconds))
 	drawing_start := time_now()
 	if shown.waters_changed {
 		upload_waters(&viewer.renderer, &shown.waters)
@@ -328,7 +335,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	}
 	viewer.drawn = draw_frame(&viewer.renderer, &shown.models, &shown.instances, &shown.distant_instances, &shown.grounds, &shown.waters,
 		&shown.tree_cells, &shown.grass_cells, &viewer.look, shown.lighting, camera^, platform.width, platform.height)
-	draw_reticle(platform.width, platform.height, targeted >= 0)
+	draw_reticle(platform.width, platform.height, usable)
 	card_start := time_now()
 	viewer.drawing_time = card_start - drawing_start
 	wait_for_card()
@@ -608,14 +615,19 @@ load_some :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	}
 }
 
-// The door the reticle is on, within reach: its index in the scene's
-// doors, or -1 — the first thing the eyes meet, if it's a door that leads
-// somewhere (a wall between hides it).
-targeted_door :: fun(shown: ^Scene, camera: render.Camera) -> i64 {
+// What the reticle is on, within reach: the first thing the eyes meet
+// (a wall between hides what's behind it), its reference; 0 for none.
+targeted_reference :: fun(shown: ^Scene, camera: render.Camera) -> u32 {
 	forward, _, _ := camera_axes(camera)
 	picked, _, hit := pick(shown, camera.position, forward, DOOR_REACH)
-	if not hit do return -1
-	reference := shown.instances[picked].reference
+	if not hit do return 0
+	return shown.instances[picked].reference
+}
+
+// A reference's door that leads somewhere: its index in the scene's
+// doors, -1 when it isn't one.
+leading_door :: fun(shown: ^Scene, reference: u32) -> i64 {
+	if reference == 0 do return -1
 	for candidate, i in shown.doors {
 		if candidate.reference == reference do return i
 	}

@@ -323,6 +323,40 @@ Block :: union {
 		vertex_count: i64
 		vertices: []byte     // a Vec3 each
 	}
+
+	// Animation. NiControllerSequence: one of an object's animations (a
+	// door's Open, its Close): the blocks it moves, each by an
+	// interpolator; its span of time.
+	Sequence {
+		name: []utf8
+		block_count: i64
+		blocks: []byte       // as Oblivion's files have them: CONTROLLED_BLOCK_SIZE bytes each
+		start_time: f32
+		stop_time: f32
+	}
+	// NiStringPalette: names, each ended by a 0, that sequences point into.
+	String_Palette {
+		text: []byte
+	}
+	// NiTransformInterpolator: an object's pose where its keys say nothing
+	// (beyond UNSET_BEYOND where it gives none either), and its keys.
+	Transform_Interpolator {
+		translation: Vec3
+		rotation: [4!]f32    // a quaternion: w, x, y, z
+		scale: f32
+		data: i64
+	}
+	// NiTransformData, NiKeyframeData: keys over time. Each group: its
+	// type (KEY_*), its count, the keys as the file has them.
+	Transform_Data {
+		rotation_type: i64
+		rotation_count: i64
+		rotations: []byte    // time, w x y z, and what the type adds
+		angles: []byte       // rotations as three angles' tracks (KEY_XYZ): x's, y's, z's, each a group of f32 keys
+		translation_type: i64
+		translation_count: i64
+		translations: []byte // time, x y z, and what the type adds
+	}
 }
 
 // A whole NIF: its header, its blocks, and the blocks at the top of its tree.

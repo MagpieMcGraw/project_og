@@ -26,6 +26,7 @@ use esm
 use land
 use grass
 use collision
+use animation
 
 // Room for the models' collision: points, three a triangle. (Tamriel's
 // meshes have 1.8 million triangles in all; a scene's models, a few hundred
@@ -68,6 +69,49 @@ Waiting_Instance :: struct {
 	path: [256]utf8
 	world: Mat4
 	reference: u32
+	door: bool         // a door that doesn't lead anywhere: it may open in place
+}
+
+// Doors that open in place: kinds of them loaded, the moving pieces a
+// kind can have, the doors placed at once.
+DOOR_KINDS :: 64
+DOOR_PIECES :: 4
+SWINGING_DOORS :: 512
+
+// A moving piece of a door that opens in place: its model (what's under
+// its node, in the node's space), where its node's parent is in the
+// door's model, and its node's tracks in the door's Open and Close.
+Door_Piece :: struct {
+	model: i64
+	parent: Mat4
+	opening: Track
+	closing: Track
+}
+
+// A kind of door that opens in place (its mesh has Open and Close
+// sequences that move something): its frame's model (what doesn't move;
+// -1 when everything does), its moving pieces, and the spans of time its
+// opening and closing take.
+Door_Kind :: struct {
+	frame: i64
+	pieces: [DOOR_PIECES]Door_Piece
+	open_start: f32
+	open_stop: f32
+	close_start: f32
+	close_stop: f32
+}
+
+// A door placed that opens in place: its reference, its kind, where it's
+// placed, whether it's open; while it moves, which way and how long it's
+// been moving.
+Swinging_Door :: struct {
+	reference: u32
+	kind: i64
+	placement: Mat4
+	open: bool
+	moving: bool
+	opening: bool
+	time: f32
 }
 
 // A model's collision: its points in the scene's collision, three a triangle.
@@ -104,6 +148,12 @@ Scene :: struct {
 	center_y: i64
 	grounds: [LAND_SLOTS]Gpu_Land
 	land_heights: [LAND_SLOTS!][1089!]f32   // each land slot's heights, for standing on
+
+	// Doors that open in place: the kinds loaded (by their mesh's path:
+	// the kind's index + 1; 0 for a mesh that isn't one), the doors placed.
+	door_kinds: [DOOR_KINDS]Door_Kind
+	door_kind_index: Key_Index
+	swinging: [SWINGING_DOORS]Swinging_Door
 
 	// What's seen from afar outside: the world's references seen from afar
 	// (but its trees, billboards: tree_cells), each with its far mesh;
@@ -173,6 +223,8 @@ scene_clear :: fun(scene: ^Scene, storage: ^[]byte) {
 	scene.models.len = 0
 	scene.model_collision.len = 0
 	scene.collision_points.len = 0
+	scene.door_kinds.len = 0
+	scene.door_kind_index = key_index(1 << 9, storage)
 	scene.paths = key_index(1 << 13, storage)
 	scene.failed_paths = 0
 	scene.grounds.len = 0
@@ -206,6 +258,7 @@ scene_clear_cell :: fun(scene: ^Scene) {
 	scene.waiting_land_next = 0
 	scene.waiting_trees.len = 0
 	scene.waiting_trees_next = 0
+	scene.swinging.len = 0
 }
 
 // ---- models ---------------------------------------------------------------------
@@ -300,21 +353,41 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, plac
 			&scene.lights + light
 			scene.lights_changed = true
 		}
-		if base.header.kind == "DOOR" and scene.doors.len < scene.doors.cap {
+		in_place := false
+		if base.header.kind == "DOOR" {
 			_, leads := door_destination(plugin, reference.form_id, &scratch)
-			if leads do &scene.doors + Scene_Door{reference = reference.form_id, position = reference.position}
+			if leads and scene.doors.len < scene.doors.cap do &scene.doors + Scene_Door{reference = reference.form_id, position = reference.position}
+			in_place = not leads
 		}
 
 		// (Trees are drawn as billboards, each cell's at once: load_trees.)
 		if base.header.kind == "TREE" do continue
 		path := model_path(base)
 		if path.len == 0 or is_marker(path[:]) do continue
+		// A door that opens in place, of a kind loaded: its pieces.
+		if in_place {
+			kind_index, kind_known := index_get(&scene.door_kind_index, text_hash(path[:]))
+			if kind_known and kind_index > 0 {
+				place_door(scene, kind_index - 1, reference_transform(reference), reference.form_id)
+				continue
+			}
+			if not kind_known and scene.waiting.len < scene.waiting.cap {
+				waiting := next(&scene.waiting)
+				waiting.reference = reference.form_id
+				waiting.door = true
+				waiting.path.len = 0
+				&waiting.path + path[:]
+				waiting.world = reference_transform(reference)
+				continue
+			}
+		}
 		model_index, known := known_model(scene, path[:])
 		if known {
 			if model_index >= 0 do add_instance(scene, model_index, reference_transform(reference), reference.form_id)
 		elif scene.waiting.len < scene.waiting.cap
 			waiting := next(&scene.waiting)
 			waiting.reference = reference.form_id
+			waiting.door = false
 			waiting.path.len = 0
 			&waiting.path + path[:]
 			waiting.world = reference_transform(reference)
@@ -341,6 +414,13 @@ load_waiting :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, budget: u64)
 		// (Outside, the camera may have moved on since it was queued.)
 		place := Vec3{item.world[3][0], item.world[3][1], item.world[3][2]}
 		if scene.world != 0 and not area_holds(shown_area(scene), place) do continue
+		if item.door {
+			kind_index := door_kind(scene, loader, item.path[:])
+			if kind_index >= 0 {
+				place_door(scene, kind_index, item.world, item.reference)
+				continue
+			}
+		}
 		model_index := scene_model(scene, loader, item.path[:])
 		if model_index >= 0 do add_instance(scene, model_index, item.world, item.reference)
 	}
@@ -618,6 +698,185 @@ load_land :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64, load
 	&scene.grounds + upload_land(loader.renderer, &mesh, x, y, slot, loader.textures, &room.texture)
 	scene.land_heights[slot] = cell_land.heights
 	load_grass(scene, plugin, cell, x, y, &cell_land, slot, loader)
+}
+
+// ---- doors that open in place -------------------------------------------------------
+
+// The kind of door a mesh is, if it opens in place: its index in the
+// scene's door kinds, loaded the first time; -1 when it doesn't.
+door_kind :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64 {
+	key := text_hash(path)
+	known, found := index_get(&scene.door_kind_index, key)
+	if found do return known - 1
+	kind_index := load_door_kind(scene, loader, path)
+	_ = index_put(&scene.door_kind_index, key, kind_index + 1)
+	return kind_index
+}
+
+// Reads a door's mesh: if its Open and Close sequences move nodes, its
+// frame and those nodes' pieces are each put on the card as a model (with
+// its collision), and the tracks kept. -1 when they move nothing.
+load_door_kind :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64 {
+	if scene.door_kinds.len == scene.door_kinds.cap do return -1
+	room := loader.room
+	index, found := find_file(loader.meshes, path)
+	if not found do return -1
+	room.file.len = 0
+	data, read_error := read_file(loader.meshes, index, &room.file)
+	if read_error do return -1
+	room.blocks.len = 0
+	failure := Nif_Failure{block = 0, type_name = room.file[0:0]}
+	mesh, nif_error := read_nif(data, &room.blocks, &failure)
+	if nif_error do return -1
+	open := find_sequence(&mesh, "Open")
+	close := find_sequence(&mesh, "Close")
+	if open < 0 or close < 0 do return -1
+	opening : [DOOR_PIECES]Track
+	closing : [DOOR_PIECES]Track
+	read_tracks(&mesh, open, &opening)
+	read_tracks(&mesh, close, &closing)
+	// The nodes they move, each found, its rest taken.
+	moving : [DOOR_PIECES]i64
+	for &track in opening {
+		node := find_node(&mesh, track.node_name[:])
+		if node < 0 do return -1
+		match mesh.blocks[node] {
+		Node moved
+			track.rest = local_transform(moved.object)
+		else
+		}
+		&moving + node
+	}
+	if moving.len == 0 do return -1
+	for &track in closing {
+		node := find_node(&mesh, track.node_name[:])
+		if node < 0 do continue
+		match mesh.blocks[node] {
+		Node moved
+			track.rest = local_transform(moved.object)
+		else
+		}
+	}
+
+	kind := next(&scene.door_kinds)
+	kind.open_start, kind.open_stop = sequence_span(&mesh, open)
+	kind.close_start, kind.close_stop = sequence_span(&mesh, close)
+	kind.frame = add_door_model(scene, loader, &mesh, -1, moving[:])
+	kind.pieces.len = 0
+	for k in 0:moving.len {
+		// (A moving node under another is its own piece, not part of that one's.)
+		others : [DOOR_PIECES]i64
+		for other in moving {
+			if other != moving[k] do &others + other
+		}
+		piece := next(&kind.pieces)
+		piece.model = add_door_model(scene, loader, &mesh, moving[k], others[:])
+		piece.parent, _ = parent_transform(&mesh, moving[k])
+		piece.opening = opening[k]
+		// Its Close track: the one for its node; else its Open one, run back.
+		piece.closing = opening[k]
+		for &track in closing {
+			if track.node_name[:] == opening[k].node_name[:] do piece.closing = track^
+		}
+		if piece.model < 0 {
+			scene.door_kinds.len -= 1
+			return -1
+		}
+	}
+	return scene.door_kinds.len - 1
+}
+
+// Puts part of a door's mesh on the card as a model, with its collision:
+// what's under a node, in its space (node -1: all but what's under the
+// nodes left out). Its index in the scene's models; -1 when it has no
+// parts or there's no room.
+add_door_model :: fun(scene: ^Scene, loader: Loader, mesh: ^Nif, node: i64, left_out: []i64) -> i64 {
+	if scene.models.len == scene.models.cap do return -1
+	room := loader.room
+	room.model.len = 0
+	built, model_error := build_model_part(mesh, node, left_out, &room.model)
+	if model_error or built.parts.len == 0 do return -1
+	gpu, upload_error := upload_model(loader.renderer, built, loader.textures, &room.texture)
+	if upload_error do return -1
+	collision_start := scene.collision_points.len
+	add_collision_part(mesh, node, left_out, &scene.collision_points)
+	&scene.model_collision + Collision_Range{first = collision_start, count = scene.collision_points.len - collision_start}
+	&scene.models + gpu
+	return scene.models.len - 1
+}
+
+// Where a door's piece is with its node posed by a track at a moment (seconds).
+piece_world :: fun(placement: Mat4, piece: ^Door_Piece, track: ^Track, moment: f32) -> Mat4 {
+	return mat4_mul(placement, mat4_mul(piece.parent, track_pose(track, moment)))
+}
+
+// Places a door that opens in place, closed: its frame and its pieces
+// (each where its Close leaves it), all of them its reference's.
+place_door :: fun(scene: ^Scene, kind_index: i64, placement: Mat4, reference: u32) {
+	kind := &scene.door_kinds[kind_index]
+	if kind.frame >= 0 do add_instance(scene, kind.frame, placement, reference)
+	for &piece in kind.pieces do add_instance(scene, piece.model, piece_world(placement, piece, &piece.closing, kind.close_stop), reference)
+	door := Swinging_Door{reference = reference, kind = kind_index, placement = placement, open = false, moving = false, opening = false, time = 0}
+	for &placed in scene.swinging {
+		if placed.reference == reference {
+			placed^ = door
+			return
+		}
+	}
+	if scene.swinging.len < scene.swinging.cap do &scene.swinging + door
+}
+
+// Opens or closes a door that opens in place, if a reference is one (and
+// it isn't moving already): true when it is.
+use_door :: fun(scene: ^Scene, reference: u32) -> bool {
+	for &door in scene.swinging {
+		if door.reference != reference do continue
+		if not door.moving {
+			door.opening = not door.open
+			door.moving = true
+			door.time = 0
+		}
+		return true
+	}
+	return false
+}
+
+// Whether a reference is a door that opens in place.
+swings :: fun(scene: ^Scene, reference: u32) -> bool {
+	for &door in scene.swinging {
+		if door.reference == reference do return true
+	}
+	return false
+}
+
+// Moves the doors that are opening or closing on by a frame: their
+// pieces' instances posed as their tracks say, until they're done.
+swing_doors :: fun(scene: ^Scene, seconds: f32) {
+	for &door in scene.swinging {
+		if not door.moving do continue
+		kind := &scene.door_kinds[door.kind]
+		door.time += seconds
+		start := if door.opening do kind.open_start else kind.close_start
+		stop := if door.opening do kind.open_stop else kind.close_stop
+		at := start + door.time
+		if at >= stop {
+			at = stop
+			door.moving = false
+			door.open = door.opening
+		}
+		for &piece in kind.pieces {
+			track := if door.opening do &piece.opening else &piece.closing
+			posed := piece_world(door.placement, piece, track, at)
+			for &instance in scene.instances {
+				if instance.reference != door.reference or instance.model != piece.model do continue
+				// (Moved, its lights kept.)
+				moved := place_instance(scene.models[instance.model], instance.model, posed, instance.reference)
+				instance.world = moved.world
+				instance.center = moved.center
+				instance.radius = moved.radius
+			}
+		}
+	}
 }
 
 // ---- seen from afar ---------------------------------------------------------------
