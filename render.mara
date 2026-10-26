@@ -1,5 +1,16 @@
-// Drawing models with OpenGL: their parts uploaded to the graphics card
-// with their textures, and drawn from a camera.
+// Drawing the world with OpenGL, in few calls.
+//
+// Meshes: every model's vertices and indexes go into one shared pair of
+// buffers on the card, each part a range of them. A model placed in the
+// world (an Instance) has what drawing it needs worked out once: its
+// matrix, a sphere around it, the lights that reach it. Each frame, the
+// instances outside the camera's view are left out, the rest gathered by
+// mesh part, and each part drawn once for all its instances (instancing),
+// the parts that share a texture in one call (MultiDrawElementsIndirect).
+//
+// Land: every cell's land is laid out alike, so all of it shares one list
+// of indexes, and all its textures sit in one texture array: the cells in
+// view are drawn in one call, each pixel blending its quadrant's layers.
 //
 // Oblivion's world has z up, x east and y north; a unit is about 1.4 cm, a
 // cell 4096 units across.
@@ -7,56 +18,94 @@ module render
 
 use mara.core
 use mara.math
+use mara.string
 use mara.open_gl
 use model
 use dds
 use bsa
 use world
-use mara.string
+use land
 
-// The most lights that light one object.
-MAX_LIGHTS :: 8
+// ---- sizes ---------------------------------------------------------------------
 
-VERTEX_SHADER_SOURCE :: "#version 450 core
+// The lights the shader knows at once (a scene's first ones), and how many
+// light one object.
+SCENE_LIGHTS :: 256
+LIGHTS_PER_OBJECT :: 8
+NO_LIGHT :: 0xFFFF
+
+// Room in the shared mesh buffers: vertices (48 bytes each) and indexes.
+MESH_VERTEX_ROOM :: 4194304
+MESH_INDEX_ROOM :: 33554432
+// Mesh parts on the card, textures loaded, instances drawn in a frame.
+MAX_PARTS :: 65536
+MAX_TEXTURES :: 8192
+MAX_DRAWN :: 65536
+
+// The land texture array: each texture's size in it, and its layers.
+LAND_TEXTURE_SIZE :: 512
+LAND_TEXTURE_LEVELS :: 10     // 512 down to 1
+LAND_LAYERS :: 192
+// Cells of land on the card at once.
+LAND_SLOTS :: 64
+
+// ---- shaders ---------------------------------------------------------------------
+
+MESH_VERTEX_SHADER :: "#version 450 core
 layout(location = 0) in vec3 position;
 layout(location = 1) in vec3 normal;
 layout(location = 2) in vec2 uv;
 layout(location = 3) in vec4 color;
+// Each instance's: its matrix's columns, its lights, its part's material.
+layout(location = 4) in vec4 world_x;
+layout(location = 5) in vec4 world_y;
+layout(location = 6) in vec4 world_z;
+layout(location = 7) in vec4 world_w;
+layout(location = 8) in uvec4 lights_first;
+layout(location = 9) in uvec4 lights_second;
+layout(location = 10) in vec4 material;    // alpha threshold, emissive color
 
-uniform mat4 world_view_projection;
-uniform mat4 world;
+uniform mat4 view_projection;
 
 out vec3 world_position;
 out vec3 world_normal;
 out vec2 texture_uv;
 out vec4 vertex_color;
+flat out uvec4 light_set_first;
+flat out uvec4 light_set_second;
+flat out vec4 part_material;
 
 void main() {
-	gl_Position = world_view_projection * vec4(position, 1.0);
-	world_position = (world * vec4(position, 1.0)).xyz;
+	mat4 world = mat4(world_x, world_y, world_z, world_w);
+	vec4 placed = world * vec4(position, 1.0);
+	gl_Position = view_projection * placed;
+	world_position = placed.xyz;
 	world_normal = mat3(world) * normal;
 	texture_uv = uv;
 	vertex_color = color;
+	light_set_first = lights_first;
+	light_set_second = lights_second;
+	part_material = material;
 }
 "
 
-FRAGMENT_SHADER_SOURCE :: "#version 450 core
-#define MAX_LIGHTS 8
+MESH_FRAGMENT_SHADER :: "#version 450 core
+#define SCENE_LIGHTS 256
 in vec3 world_position;
 in vec3 world_normal;
 in vec2 texture_uv;
 in vec4 vertex_color;
+flat in uvec4 light_set_first;
+flat in uvec4 light_set_second;
+flat in vec4 part_material;
 
 uniform sampler2D base_texture;
-uniform float alpha_threshold;    // pixels below it are left out; 0 for none
 uniform vec3 sun_direction;       // where the light comes from
 uniform vec3 sun_color;
 uniform vec3 ambient_color;
-uniform vec3 emissive_color;
-uniform int light_count;
-uniform vec3 light_position[MAX_LIGHTS];
-uniform vec3 light_color[MAX_LIGHTS];
-uniform float light_radius[MAX_LIGHTS];
+uniform vec3 light_positions[SCENE_LIGHTS];
+uniform vec3 light_colors[SCENE_LIGHTS];
+uniform float light_reaches[SCENE_LIGHTS];
 uniform vec3 camera_position;
 uniform vec3 fog_color;
 uniform float fog_near;
@@ -64,18 +113,27 @@ uniform float fog_far;            // no fog when it isn't past fog_near
 
 out vec4 fragment_color;
 
+vec3 point_light(uint index, vec3 normal) {
+	vec3 to_light = light_positions[index] - world_position;
+	float distance = length(to_light);
+	float reach = clamp(1.0 - distance / light_reaches[index], 0.0, 1.0);
+	float facing = max(dot(normal, to_light / max(distance, 0.001)), 0.0);
+	return light_colors[index] * facing * reach * reach;
+}
+
 void main() {
 	vec4 base = texture(base_texture, texture_uv) * vertex_color;
-	if (base.a < alpha_threshold) discard;
+	if (base.a < part_material.x) discard;
 	vec3 normal = normalize(world_normal);
 	if (!gl_FrontFacing) normal = -normal;   // a two-sided part's back
-	vec3 light = ambient_color + emissive_color + sun_color * max(dot(normal, sun_direction), 0.0);
-	for (int i = 0; i < light_count; i++) {
-		vec3 to_light = light_position[i] - world_position;
-		float distance = length(to_light);
-		float reach = clamp(1.0 - distance / light_radius[i], 0.0, 1.0);
-		float facing = max(dot(normal, to_light / max(distance, 0.001)), 0.0);
-		light += light_color[i] * facing * reach * reach;
+	vec3 light = ambient_color + part_material.yzw + sun_color * max(dot(normal, sun_direction), 0.0);
+	for (int i = 0; i < 4; i++) {
+		if (light_set_first[i] == 65535u) break;
+		light += point_light(light_set_first[i], normal);
+	}
+	for (int i = 0; i < 4; i++) {
+		if (light_set_second[i] == 65535u) break;
+		light += point_light(light_set_second[i], normal);
 	}
 	vec3 color = base.rgb * light;
 	if (fog_far > fog_near) {
@@ -86,32 +144,130 @@ void main() {
 }
 "
 
-// A model's part on the graphics card.
-Gpu_Part :: struct {
-	vertex_array: u32
-	vertex_buffer: u32
-	index_buffer: u32
-	index_count: i32
-	texture: u32
+LAND_VERTEX_SHADER :: "#version 450 core
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec3 normal;
+layout(location = 2) in vec2 uv;
+layout(location = 3) in vec3 color;
+layout(location = 4) in uvec4 layers_first;    // the base, then layers 1 to 3
+layout(location = 5) in uvec4 layers_second;   // layers 4 to 7
+layout(location = 6) in uvec4 layers_last;     // layer 8
+layout(location = 7) in vec4 weights_first;    // layers 1 to 4
+layout(location = 8) in vec4 weights_second;   // layers 5 to 8
+
+uniform mat4 view_projection;
+
+out vec3 world_position;
+out vec3 world_normal;
+out vec2 texture_uv;
+out vec3 vertex_color;
+flat out uvec4 layer_set_first;
+flat out uvec4 layer_set_second;
+flat out uint layer_last;
+out vec4 layer_weights_first;
+out vec4 layer_weights_second;
+
+void main() {
+	gl_Position = view_projection * vec4(position, 1.0);
+	world_position = position;
+	world_normal = normal;
+	texture_uv = uv;
+	vertex_color = color;
+	layer_set_first = layers_first;
+	layer_set_second = layers_second;
+	layer_last = layers_last.x;
+	layer_weights_first = weights_first;
+	layer_weights_second = weights_second;
+}
+"
+
+LAND_FRAGMENT_SHADER :: "#version 450 core
+in vec3 world_position;
+in vec3 world_normal;
+in vec2 texture_uv;
+in vec3 vertex_color;
+flat in uvec4 layer_set_first;
+flat in uvec4 layer_set_second;
+flat in uint layer_last;
+in vec4 layer_weights_first;
+in vec4 layer_weights_second;
+
+uniform sampler2DArray land_textures;
+uniform vec3 sun_direction;
+uniform vec3 sun_color;
+uniform vec3 ambient_color;
+uniform vec3 camera_position;
+uniform vec3 fog_color;
+uniform float fog_near;
+uniform float fog_far;
+
+out vec4 fragment_color;
+
+vec3 layer_color(uint layer) {
+	return texture(land_textures, vec3(texture_uv, float(layer))).rgb;
+}
+
+void main() {
+	uint layers[8] = uint[8](layer_set_first.y, layer_set_first.z, layer_set_first.w,
+		layer_set_second.x, layer_set_second.y, layer_set_second.z, layer_set_second.w, layer_last);
+	float weights[8] = float[8](layer_weights_first.x, layer_weights_first.y, layer_weights_first.z, layer_weights_first.w,
+		layer_weights_second.x, layer_weights_second.y, layer_weights_second.z, layer_weights_second.w);
+	vec3 color = layer_color(layer_set_first.x);
+	for (int i = 0; i < 8; i++) {
+		if (weights[i] > 0.0) color = mix(color, layer_color(layers[i]), weights[i]);
+	}
+	color *= vertex_color;
+	vec3 normal = normalize(world_normal);
+	color *= ambient_color + sun_color * max(dot(normal, sun_direction), 0.0);
+	if (fog_far > fog_near) {
+		float fog = clamp((length(world_position - camera_position) - fog_near) / (fog_far - fog_near), 0.0, 1.0);
+		color = mix(color, fog_color, fog);
+	}
+	fragment_color = vec4(color, 1.0);
+}
+"
+
+// ---- what's on the card -------------------------------------------------------------
+
+// A mesh part on the card: its range of the shared buffers, and how it's drawn.
+Mesh_Part :: struct {
+	first_index: u32
+	index_count: u32
+	base_vertex: i32
+	texture: u32           // its OpenGL texture
+	texture_slot: i64      // its place in the renderer's textures: parts are drawn grouped by it
 	alpha_blend: bool
-	alpha_test: bool
-	alpha_threshold: f32
 	two_sided: bool
+	alpha_threshold: f32   // pixels less opaque are left out; 0 for none
 	emissive: Vec3
 }
 
-// A model on the graphics card: its parts, and a sphere around them in
-// the model's space (for choosing the lights that reach it).
+// A model on the card: its parts (in the renderer's), and a sphere around
+// them in the model's space.
 Gpu_Model :: struct {
-	parts: [64]Gpu_Part
+	first_part: i64
+	part_count: i64
 	center: Vec3
 	radius: f32
 }
 
-// A model placed in the world.
+// A model placed in the world, with what drawing it needs worked out once.
 Instance :: struct {
-	model: i64     // in the models drawn
+	model: i64             // in the models drawn
 	world: Mat4
+	center: Vec3           // a sphere around it, in the world
+	radius: f32
+	lights: [LIGHTS_PER_OBJECT!]u16   // the scene's lights that reach it, nearest first; NO_LIGHT after
+}
+
+// A cell's land on the card: where on the grid, its slot in the land
+// buffer, and a sphere around it.
+Gpu_Land :: struct {
+	x: i64
+	y: i64
+	slot: i64
+	center: Vec3
+	radius: f32
 }
 
 // A texture loaded once, by its path.
@@ -120,26 +276,93 @@ Cached_Texture :: struct {
 	id: u32
 }
 
-// The renderer: its shader, its textures, and where they're read from.
+// What an instance of a mesh part is drawn with: its matrix, its lights,
+// the part's material — 96 bytes, as the mesh shader reads them.
+Drawn_Instance :: struct {
+	world: Mat4
+	lights: [LIGHTS_PER_OBJECT!]u16
+	material: [4!]f32      // alpha threshold, emissive red, green, blue
+}
+
+// One draw of MultiDrawElementsIndirect, as OpenGL reads it: 20 bytes.
+Draw_Command :: struct {
+	count: u32             // indexes
+	instance_count: u32
+	first_index: u32
+	base_vertex: i32
+	base_instance: u32     // the first of its instances in the instance buffer
+}
+
+// What a frame drew.
+Frame_Stats :: struct {
+	instances: i64         // placed
+	visible: i64           // in view, drawn
+	drawn_parts: i64       // part instances
+	draw_calls: i64
+	land_cells: i64        // in view, drawn
+}
+
+// The renderer: its programs, its buffers, its textures, and room for a
+// frame's work.
 Renderer :: struct {
-	program: u32
-	world_view_projection_at: i32   // the shader's uniforms' places
-	world_at: i32
-	alpha_threshold_at: i32
-	sun_direction_at: i32
-	sun_color_at: i32
-	ambient_color_at: i32
-	emissive_color_at: i32
-	light_count_at: i32
-	light_position_at: [MAX_LIGHTS!]i32
-	light_color_at: [MAX_LIGHTS!]i32
-	light_radius_at: [MAX_LIGHTS!]i32
-	camera_position_at: i32
-	fog_color_at: i32
-	fog_near_at: i32
-	fog_far_at: i32
-	textures: [4096]Cached_Texture
-	white_texture: u32              // for parts with none
+	// The mesh program and its uniforms' places.
+	mesh_program: u32
+	mesh_view_projection_at: i32
+	mesh_sun_direction_at: i32
+	mesh_sun_color_at: i32
+	mesh_ambient_color_at: i32
+	mesh_camera_position_at: i32
+	mesh_fog_color_at: i32
+	mesh_fog_near_at: i32
+	mesh_fog_far_at: i32
+	light_position_at: [SCENE_LIGHTS!]i32
+	light_color_at: [SCENE_LIGHTS!]i32
+	light_reach_at: [SCENE_LIGHTS!]i32
+
+	// The land program and its uniforms' places.
+	land_program: u32
+	land_view_projection_at: i32
+	land_sun_direction_at: i32
+	land_sun_color_at: i32
+	land_ambient_color_at: i32
+	land_camera_position_at: i32
+	land_fog_color_at: i32
+	land_fog_near_at: i32
+	land_fog_far_at: i32
+
+	// The shared mesh buffers, and how much of them is used.
+	mesh_vertex_array: u32
+	mesh_vertex_buffer: u32
+	mesh_index_buffer: u32
+	instance_buffer: u32
+	vertices_used: i64
+	indices_used: i64
+	parts: [MAX_PARTS]Mesh_Part
+
+	// Indirect buffers: one for each draw call a frame makes.
+	indirect_buffers: [4096]u32
+
+	// The land's buffers, its slots, and its texture array.
+	land_vertex_array: u32
+	land_vertex_buffer: u32
+	land_index_buffer: u32
+	land_indirect_buffer: u32
+	land_texture_array: u32                      // 0 until there's land: it's big
+	land_texture_paths: [LAND_LAYERS][160]utf8   // each layer's texture
+
+	// Textures, found by their paths' hashes.
+	textures: [MAX_TEXTURES]Cached_Texture
+	texture_index: Key_Index
+	white_texture: u32
+
+	// A frame's work.
+	visible: [MAX_DRAWN]i64        // instances in view
+	part_counts: [MAX_PARTS]i64    // instances of each part this frame
+	part_starts: [MAX_PARTS]i64    // where each part's instances start in records
+	touched: [MAX_PARTS]i64        // the parts drawn, each as its sort key
+	records: [MAX_DRAWN]Drawn_Instance
+	commands: [MAX_DRAWN]Draw_Command
+	land_commands: [LAND_SLOTS]Draw_Command
 }
 
 // What setting up the renderer can fail with.
@@ -147,42 +370,77 @@ Render_Error :: error {
 	Shader_Failed
 }
 
-// Compiles the shader and makes the white texture.
-renderer_init :: fun(renderer: ^Renderer) -> err {
-	vertex_shader := gl_compile_shader(VERTEX_SHADER, VERTEX_SHADER_SOURCE)
-	fragment_shader := gl_compile_shader(FRAGMENT_SHADER, FRAGMENT_SHADER_SOURCE)
-	if vertex_shader == 0 or fragment_shader == 0 do return Shader_Failed
-	renderer.program = gl_link_program(vertex_shader, fragment_shader)
-	if renderer.program == 0 do return Shader_Failed
-	program := renderer.program
-	renderer.world_view_projection_at = GetUniformLocation(program, "world_view_projection")
-	renderer.world_at = GetUniformLocation(program, "world")
-	renderer.alpha_threshold_at = GetUniformLocation(program, "alpha_threshold")
-	renderer.sun_direction_at = GetUniformLocation(program, "sun_direction")
-	renderer.sun_color_at = GetUniformLocation(program, "sun_color")
-	renderer.ambient_color_at = GetUniformLocation(program, "ambient_color")
-	renderer.emissive_color_at = GetUniformLocation(program, "emissive_color")
-	renderer.light_count_at = GetUniformLocation(program, "light_count")
-	renderer.camera_position_at = GetUniformLocation(program, "camera_position")
-	renderer.fog_color_at = GetUniformLocation(program, "fog_color")
-	renderer.fog_near_at = GetUniformLocation(program, "fog_near")
-	renderer.fog_far_at = GetUniformLocation(program, "fog_far")
-	for i in 0:MAX_LIGHTS {
-		renderer.light_position_at[i] = array_uniform(program, "light_position[", i)
-		renderer.light_color_at[i] = array_uniform(program, "light_color[", i)
-		renderer.light_radius_at[i] = array_uniform(program, "light_radius[", i)
+// ---- setting up ------------------------------------------------------------------
+
+// Compiles the programs, makes the buffers, the land texture array and the
+// white texture. The texture index is carved from storage.
+renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
+	renderer.mesh_program = compile_program(MESH_VERTEX_SHADER, MESH_FRAGMENT_SHADER)?
+	program := renderer.mesh_program
+	renderer.mesh_view_projection_at = GetUniformLocation(program, "view_projection")
+	renderer.mesh_sun_direction_at = GetUniformLocation(program, "sun_direction")
+	renderer.mesh_sun_color_at = GetUniformLocation(program, "sun_color")
+	renderer.mesh_ambient_color_at = GetUniformLocation(program, "ambient_color")
+	renderer.mesh_camera_position_at = GetUniformLocation(program, "camera_position")
+	renderer.mesh_fog_color_at = GetUniformLocation(program, "fog_color")
+	renderer.mesh_fog_near_at = GetUniformLocation(program, "fog_near")
+	renderer.mesh_fog_far_at = GetUniformLocation(program, "fog_far")
+	for i in 0:SCENE_LIGHTS {
+		renderer.light_position_at[i] = array_uniform(program, "light_positions[", i)
+		renderer.light_color_at[i] = array_uniform(program, "light_colors[", i)
+		renderer.light_reach_at[i] = array_uniform(program, "light_reaches[", i)
+	}
+
+	renderer.land_program = compile_program(LAND_VERTEX_SHADER, LAND_FRAGMENT_SHADER)?
+	program = renderer.land_program
+	renderer.land_view_projection_at = GetUniformLocation(program, "view_projection")
+	renderer.land_sun_direction_at = GetUniformLocation(program, "sun_direction")
+	renderer.land_sun_color_at = GetUniformLocation(program, "sun_color")
+	renderer.land_ambient_color_at = GetUniformLocation(program, "ambient_color")
+	renderer.land_camera_position_at = GetUniformLocation(program, "camera_position")
+	renderer.land_fog_color_at = GetUniformLocation(program, "fog_color")
+	renderer.land_fog_near_at = GetUniformLocation(program, "fog_near")
+	renderer.land_fog_far_at = GetUniformLocation(program, "fog_far")
+
+	setup_mesh_buffers(renderer)
+	setup_land_buffers(renderer)
+
+	renderer.parts.len = 0
+	// Every part's count and start, by its index: all there, all 0.
+	renderer.part_counts.len = MAX_PARTS
+	renderer.part_starts.len = MAX_PARTS
+	for p in 0:MAX_PARTS {
+		renderer.part_counts[p] = 0
+		renderer.part_starts[p] = 0
 	}
 	renderer.textures.len = 0
+	renderer.texture_index = key_index(1 << 14, storage)
+	renderer.indirect_buffers.len = 0
+	renderer.land_texture_paths.len = 0
 
+	// The white texture: slot 0, for parts with none.
 	white : [4!]u8 = [255, 255, 255, 255]
 	GenTextures(1, &renderer.white_texture)
 	BindTexture(TEXTURE_2D, renderer.white_texture)
 	TexImage2D(TEXTURE_2D, 0, i32(RGBA8), 1, 1, 0, RGBA, UNSIGNED_BYTE, &white[0])
 	TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(LINEAR))
 	TexParameteri(TEXTURE_2D, TEXTURE_MAG_FILTER, i32(LINEAR))
+	entry := next(&renderer.textures)
+	entry.path.len = 0
+	entry.id = renderer.white_texture
 }
 
-// Where an item of a uniform array is in the shader: name[index].
+// A program of a vertex and a fragment shader.
+compile_program :: fun(vertex_source: []utf8, fragment_source: []utf8) -> u32, err {
+	vertex_shader := gl_compile_shader(VERTEX_SHADER, cstring(vertex_source))
+	fragment_shader := gl_compile_shader(FRAGMENT_SHADER, cstring(fragment_source))
+	if vertex_shader == 0 or fragment_shader == 0 do return 0, Shader_Failed
+	program := gl_link_program(vertex_shader, fragment_shader)
+	if program == 0 do return 0, Shader_Failed
+	return program
+}
+
+// Where an item of a uniform array is in a program: name[index].
 array_uniform :: fun(program: u32, name_start: []utf8, index: i64) -> i32 {
 	name : str64
 	&name + name_start
@@ -191,35 +449,146 @@ array_uniform :: fun(program: u32, name_start: []utf8, index: i64) -> i32 {
 	return GetUniformLocation(program, cstring(name))
 }
 
-// The texture at path in the archive, loaded onto the card the first time
-// it's asked for; the white texture when it can't be read. scratch is room
-// for reading and decoding it.
-texture_for :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratch: ^[]byte) -> u32 {
-	if path.len == 0 do return renderer.white_texture
-	for cached in renderer.textures {
-		if cached.path[:] == path do return cached.id
+// The shared mesh buffers and the instance buffer, and how the mesh
+// program reads them.
+setup_mesh_buffers :: fun(renderer: ^Renderer) {
+	GenVertexArrays(1, &renderer.mesh_vertex_array)
+	BindVertexArray(renderer.mesh_vertex_array)
+
+	GenBuffers(1, &renderer.mesh_vertex_buffer)
+	BindBuffer(ARRAY_BUFFER, renderer.mesh_vertex_buffer)
+	BufferData(ARRAY_BUFFER, MESH_VERTEX_ROOM * size_of(Vertex), void, STATIC_DRAW)
+	stride := i32(size_of(Vertex))
+	EnableVertexAttribArray(0)
+	VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)    // position
+	EnableVertexAttribArray(1)
+	VertexAttribPointer(1, 3, FLOAT, 0, stride, 12)   // normal
+	EnableVertexAttribArray(2)
+	VertexAttribPointer(2, 2, FLOAT, 0, stride, 24)   // uv
+	EnableVertexAttribArray(3)
+	VertexAttribPointer(3, 4, FLOAT, 0, stride, 32)   // color
+
+	GenBuffers(1, &renderer.mesh_index_buffer)
+	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.mesh_index_buffer)
+	BufferData(ELEMENT_ARRAY_BUFFER, MESH_INDEX_ROOM * 2, void, STATIC_DRAW)
+
+	// The instances: one Drawn_Instance each, read once for each instance.
+	GenBuffers(1, &renderer.instance_buffer)
+	BindBuffer(ARRAY_BUFFER, renderer.instance_buffer)
+	BufferData(ARRAY_BUFFER, MAX_DRAWN * size_of(Drawn_Instance), void, STREAM_DRAW)
+	instance_stride := i32(size_of(Drawn_Instance))
+	for column in 0:4 {
+		location := u32(4 + column)
+		EnableVertexAttribArray(location)
+		VertexAttribPointer(location, 4, FLOAT, 0, instance_stride, usize(column * 16))
+		VertexAttribDivisor(location, 1)
 	}
+	EnableVertexAttribArray(8)
+	VertexAttribIPointer(8, 4, UNSIGNED_SHORT, instance_stride, 64)    // lights 1 to 4
+	VertexAttribDivisor(8, 1)
+	EnableVertexAttribArray(9)
+	VertexAttribIPointer(9, 4, UNSIGNED_SHORT, instance_stride, 72)    // lights 5 to 8
+	VertexAttribDivisor(9, 1)
+	EnableVertexAttribArray(10)
+	VertexAttribPointer(10, 4, FLOAT, 0, instance_stride, 80)          // material
+	VertexAttribDivisor(10, 1)
+	BindVertexArray(0)
+}
+
+// The land's buffers — its slots of vertices, the indexes they share — its
+// texture array, and how the land program reads them.
+setup_land_buffers :: fun(renderer: ^Renderer) {
+	GenVertexArrays(1, &renderer.land_vertex_array)
+	BindVertexArray(renderer.land_vertex_array)
+
+	GenBuffers(1, &renderer.land_vertex_buffer)
+	BindBuffer(ARRAY_BUFFER, renderer.land_vertex_buffer)
+	BufferData(ARRAY_BUFFER, LAND_SLOTS * LAND_MESH_VERTICES * size_of(Land_Vertex), void, STATIC_DRAW)
+	stride := i32(size_of(Land_Vertex))
+	EnableVertexAttribArray(0)
+	VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)         // position
+	EnableVertexAttribArray(1)
+	VertexAttribPointer(1, 3, FLOAT, 0, stride, 12)        // normal
+	EnableVertexAttribArray(2)
+	VertexAttribPointer(2, 2, FLOAT, 0, stride, 24)        // uv
+	EnableVertexAttribArray(3)
+	VertexAttribPointer(3, 3, FLOAT, 0, stride, 32)        // color
+	EnableVertexAttribArray(4)
+	VertexAttribIPointer(4, 4, UNSIGNED_BYTE, stride, 44)  // the base and layers 1 to 3
+	EnableVertexAttribArray(5)
+	VertexAttribIPointer(5, 4, UNSIGNED_BYTE, stride, 48)  // layers 4 to 7
+	EnableVertexAttribArray(6)
+	VertexAttribIPointer(6, 4, UNSIGNED_BYTE, stride, 52)  // layer 8
+	EnableVertexAttribArray(7)
+	VertexAttribPointer(7, 4, UNSIGNED_BYTE, 1, stride, 56)   // weights 1 to 4, 0 to 1
+	EnableVertexAttribArray(8)
+	VertexAttribPointer(8, 4, UNSIGNED_BYTE, 1, stride, 60)   // weights 5 to 8
+
+	indices : [LAND_MESH_INDICES]u16
+	land_indices(&indices)
+	GenBuffers(1, &renderer.land_index_buffer)
+	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.land_index_buffer)
+	BufferData(ELEMENT_ARRAY_BUFFER, isize(indices.len * 2), &indices[0], STATIC_DRAW)
+	BindVertexArray(0)
+	GenBuffers(1, &renderer.land_indirect_buffer)
+	renderer.land_texture_array = 0
+}
+
+// Makes the land texture array: room for LAND_LAYERS textures at every
+// level, about 270 MB on the card.
+make_land_texture_array :: fun(renderer: ^Renderer) {
+	GenTextures(1, &renderer.land_texture_array)
+	BindTexture(TEXTURE_2D_ARRAY, renderer.land_texture_array)
+	for level in 0:LAND_TEXTURE_LEVELS {
+		size := i32(LAND_TEXTURE_SIZE >> level)
+		TexImage3D(TEXTURE_2D_ARRAY, i32(level), i32(RGBA8), size, size, LAND_LAYERS, 0, RGBA, UNSIGNED_BYTE, void)
+	}
+	TexParameteri(TEXTURE_2D_ARRAY, TEXTURE_MIN_FILTER, i32(LINEAR_MIPMAP_LINEAR))
+	TexParameteri(TEXTURE_2D_ARRAY, TEXTURE_MAG_FILTER, i32(LINEAR))
+	TexParameteri(TEXTURE_2D_ARRAY, TEXTURE_WRAP_S, i32(REPEAT))
+	TexParameteri(TEXTURE_2D_ARRAY, TEXTURE_WRAP_T, i32(REPEAT))
+}
+
+// ---- textures --------------------------------------------------------------------
+
+// The slot of the texture at path in the archive (an index into the
+// renderer's textures), loaded onto the card the first time it's asked
+// for; the white texture's (0) when it can't be read. scratch is room for
+// reading and decoding it.
+texture_for :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratch: ^[]byte) -> i64 {
+	if path.len == 0 do return 0
+	key := text_hash(path)
+	known, found := index_get(&renderer.texture_index, key)
+	if found do return known
+	if renderer.textures.len == renderer.textures.cap do return 0
 	id := load_texture(archive, path, scratch)
-	if id == 0 do id = renderer.white_texture
-	if renderer.textures.len < renderer.textures.cap {
+	slot : i64 = 0
+	if id != 0 {
+		slot = renderer.textures.len
 		entry := next(&renderer.textures)
 		entry.path.len = 0
 		&entry.path + path
 		entry.id = id
 	}
-	return id
+	_ = index_put(&renderer.texture_index, key, slot)
+	return slot
+}
+
+// A 64-bit FNV-1a hash of a text, never 0: a path's key in a table.
+text_hash :: fun(text: []utf8) -> u64 {
+	hash : u64 = 0xCBF29CE484222325
+	for c in text {
+		hash = (hash ~ u64(c)) *% 0x100000001B3
+	}
+	if hash == 0 do hash = 1
+	return hash
 }
 
 // Reads a texture from the archive onto the card: block compressed ones as
 // they are, the rest decoded to plain pixels. 0 when it can't be read.
 load_texture :: fun(archive: ^Archive, path: []utf8, scratch: ^[]byte) -> u32 {
-	index, found := find_file(archive, path)
-	if not found do return 0
-	scratch.len = 0
-	data, read_error := read_file(archive, index, scratch)
+	texture, read_error := read_archive_texture(archive, path, scratch)
 	if read_error do return 0
-	texture, texture_error := read_texture(data)
-	if texture_error do return 0
 
 	id : u32 = 0
 	GenTextures(1, &id)
@@ -252,56 +621,257 @@ load_texture :: fun(archive: ^Archive, path: []utf8, scratch: ^[]byte) -> u32 {
 	return id
 }
 
-// Takes a model's parts off the card (its textures stay, cached).
-free_model :: fun(gpu: ^Gpu_Model) {
-	for &part in gpu.parts {
-		DeleteBuffers(1, &part.vertex_buffer)
-		DeleteBuffers(1, &part.index_buffer)
-		DeleteVertexArrays(1, &part.vertex_array)
-	}
-	gpu.parts.len = 0
+// A texture from the archive, its header read: into scratch (len set to 0).
+read_archive_texture :: fun(archive: ^Archive, path: []utf8, scratch: ^[]byte) -> Texture, err {
+	scratch.len = 0
+	index, found := find_file(archive, path)
+	if not found do return Texture(), Not_Found
+	data := read_file(archive, index, scratch)?
+	return read_texture(data)
 }
 
-// Puts a model's parts on the card, their textures read from the archive.
-upload_model :: fun(renderer: ^Renderer, built: Model, archive: ^Archive, scratch: ^[]byte, gpu: ^Gpu_Model) {
-	gpu.parts.len = 0
-	gpu.center = (built.bounds_min + built.bounds_max) * 0.5
-	gpu.radius = vec3_length(built.bounds_max - built.bounds_min) * 0.5
+// ---- meshes --------------------------------------------------------------------------
+
+// What putting a model on the card can fail with.
+Upload_Error :: error {
+	No_Room_On_Card   // the shared buffers or the parts table are full
+}
+
+// Puts a model's parts into the shared buffers, their textures read from
+// the archive: the model on the card.
+upload_model :: fun(renderer: ^Renderer, built: Model, archive: ^Archive, scratch: ^[]byte) -> Gpu_Model, err {
+	vertex_total : i64 = 0
+	index_total : i64 = 0
 	for part in built.parts {
-		if gpu.parts.len == gpu.parts.cap do break
-		if part.indices.len == 0 do continue
-		gpu_part := next(&gpu.parts)
-		GenVertexArrays(1, &gpu_part.vertex_array)
-		BindVertexArray(gpu_part.vertex_array)
-
-		GenBuffers(1, &gpu_part.vertex_buffer)
-		BindBuffer(ARRAY_BUFFER, gpu_part.vertex_buffer)
-		BufferData(ARRAY_BUFFER, isize(part.vertices.len * size_of(Vertex)), &part.vertices[0], STATIC_DRAW)
-		GenBuffers(1, &gpu_part.index_buffer)
-		BindBuffer(ELEMENT_ARRAY_BUFFER, gpu_part.index_buffer)
-		BufferData(ELEMENT_ARRAY_BUFFER, isize(part.indices.len * 2), &part.indices[0], STATIC_DRAW)
-
-		// position, normal, uv, color: as Vertex lays them out.
-		stride := i32(size_of(Vertex))
-		EnableVertexAttribArray(0)
-		VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)
-		EnableVertexAttribArray(1)
-		VertexAttribPointer(1, 3, FLOAT, 0, stride, 12)
-		EnableVertexAttribArray(2)
-		VertexAttribPointer(2, 2, FLOAT, 0, stride, 24)
-		EnableVertexAttribArray(3)
-		VertexAttribPointer(3, 4, FLOAT, 0, stride, 32)
-
-		gpu_part.index_count = i32(part.indices.len)
-		gpu_part.texture = texture_for(renderer, archive, part.texture[:], scratch)
-		gpu_part.alpha_blend = part.alpha_blend
-		gpu_part.alpha_test = part.alpha_test
-		gpu_part.alpha_threshold = part.alpha_threshold
-		gpu_part.two_sided = part.two_sided
-		gpu_part.emissive = part.emissive
+		vertex_total += part.vertices.len
+		index_total += part.indices.len
 	}
-	BindVertexArray(0)
+	if renderer.vertices_used + vertex_total > MESH_VERTEX_ROOM or renderer.indices_used + index_total > MESH_INDEX_ROOM {
+		return Gpu_Model{0}, No_Room_On_Card
+	}
+	if renderer.parts.len + built.parts.len > renderer.parts.cap do return Gpu_Model{0}, No_Room_On_Card
+
+	BindVertexArray(0)   // (binding an index buffer would change a bound vertex array's)
+	gpu := Gpu_Model{
+		first_part = renderer.parts.len,
+		part_count = 0,
+		center = (built.bounds_min + built.bounds_max) * 0.5,
+		radius = vec3_length(built.bounds_max - built.bounds_min) * 0.5}
+	for part in built.parts {
+		if part.indices.len == 0 or part.vertices.len == 0 do continue
+		BindBuffer(ARRAY_BUFFER, renderer.mesh_vertex_buffer)
+		BufferSubData(ARRAY_BUFFER, isize(renderer.vertices_used * size_of(Vertex)),
+			isize(part.vertices.len * size_of(Vertex)), &part.vertices[0])
+		BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.mesh_index_buffer)
+		BufferSubData(ELEMENT_ARRAY_BUFFER, isize(renderer.indices_used * 2), isize(part.indices.len * 2), &part.indices[0])
+
+		slot := texture_for(renderer, archive, part.texture[:], scratch)
+		threshold : f32 = 0
+		if part.alpha_test do threshold = part.alpha_threshold
+		next(&renderer.parts)^ = Mesh_Part{
+			first_index = u32(renderer.indices_used),
+			index_count = u32(part.indices.len),
+			base_vertex = i32(renderer.vertices_used),
+			texture = renderer.textures[slot].id,
+			texture_slot = slot,
+			alpha_blend = part.alpha_blend,
+			two_sided = part.two_sided,
+			alpha_threshold = threshold,
+			emissive = part.emissive}
+		renderer.vertices_used += part.vertices.len
+		renderer.indices_used += part.indices.len
+		gpu.part_count += 1
+	}
+	return gpu
 }
+
+// An instance of a model placed in the world: its sphere worked out, no
+// lights yet (choose_lights).
+place_instance :: fun(gpu: Gpu_Model, model_index: i64, placement: Mat4) -> Instance {
+	placed := mat4_mul_vec4(placement, Vec4{gpu.center.x, gpu.center.y, gpu.center.z, 1})
+	// The scale: how long the matrix's x axis is.
+	scale := vec3_length(Vec3{placement[0][0], placement[0][1], placement[0][2]})
+	instance := Instance{
+		model = model_index,
+		world = placement,
+		center = Vec3{placed.x, placed.y, placed.z},
+		radius = gpu.radius * scale,
+		lights = []}
+	for k in 0:LIGHTS_PER_OBJECT do instance.lights[k] = NO_LIGHT
+	return instance
+}
+
+// Chooses the lights that light an instance: those of the scene's first
+// SCENE_LIGHTS whose reach meets its sphere, the nearest first.
+choose_lights :: fun(instance: ^Instance, lights: ^[]Point_Light) {
+	distances : [LIGHTS_PER_OBJECT!]f32
+	count : i64 = 0
+	for k in 0:instance.lights.len do instance.lights[k] = NO_LIGHT
+	last := lights.len
+	if last > SCENE_LIGHTS do last = SCENE_LIGHTS
+	for index in 0:last {
+		light := lights[index]
+		distance := vec3_length(light.position - instance.center)
+		if distance > light.radius + instance.radius do continue
+		if count == LIGHTS_PER_OBJECT and distance >= distances[LIGHTS_PER_OBJECT - 1] do continue
+		at := count
+		if count < LIGHTS_PER_OBJECT do count += 1
+		else do at = LIGHTS_PER_OBJECT - 1
+		for at > 0 and distances[at - 1] > distance {
+			instance.lights[at] = instance.lights[at - 1]
+			distances[at] = distances[at - 1]
+			at -= 1
+		}
+		instance.lights[at] = u16(index)
+		distances[at] = distance
+	}
+}
+
+// Gives the mesh program the scene's lights: its first SCENE_LIGHTS.
+set_scene_lights :: fun(renderer: ^Renderer, lights: ^[]Point_Light) {
+	UseProgram(renderer.mesh_program)
+	last := lights.len
+	if last > SCENE_LIGHTS do last = SCENE_LIGHTS
+	for i in 0:last {
+		light := lights[i]
+		Uniform3f(renderer.light_position_at[i], light.position.x, light.position.y, light.position.z)
+		Uniform3f(renderer.light_color_at[i], light.color.x, light.color.y, light.color.z)
+		Uniform1f(renderer.light_reach_at[i], light.radius)
+	}
+}
+
+// ---- land ---------------------------------------------------------------------------------
+
+// Puts the land of the cell at x, y on the card: its textures into the
+// land array (each one the first time), its vertices into a slot (0 to
+// LAND_SLOTS - 1, one no other land is in).
+upload_land :: fun(renderer: ^Renderer, mesh: ^Land_Mesh, x: i64, y: i64, slot: i64, archive: ^Archive, scratch: ^[]byte) -> Gpu_Land {
+	// Each quadrant's textures' layers in the array, into its vertices.
+	for q in 0:4 {
+		textures := &mesh.textures[q]
+		layers : [QUADRANT_TEXTURES!]u8
+		for k in 0:textures.count do layers[k] = u8(land_layer_for(renderer, archive, textures.paths[k][:], scratch))
+		for k in textures.count:QUADRANT_TEXTURES do layers[k] = layers[0]
+		first := q * QUADRANT_SIDE * QUADRANT_SIDE
+		for v in first:first + QUADRANT_SIDE * QUADRANT_SIDE {
+			for k in 0:QUADRANT_TEXTURES do mesh.vertices[v].layers[k] = layers[k]
+		}
+	}
+	BindBuffer(ARRAY_BUFFER, renderer.land_vertex_buffer)
+	BufferSubData(ARRAY_BUFFER, isize(slot * LAND_MESH_VERTICES * size_of(Land_Vertex)),
+		LAND_MESH_VERTICES * size_of(Land_Vertex), &mesh.vertices[0])
+	return Gpu_Land{x = x, y = y, slot = slot, center = mesh.center, radius = mesh.radius}
+}
+
+// The layer of the land texture array holding the texture at path, put
+// there the first time it's asked for. Layer 0 (the first loaded) when it
+// can't be read, or the array is full.
+land_layer_for :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratch: ^[]byte) -> i64 {
+	for known, layer in renderer.land_texture_paths {
+		if known[:] == path do return layer
+	}
+	if renderer.land_texture_paths.len == renderer.land_texture_paths.cap do return 0
+	if renderer.land_texture_array == 0 do make_land_texture_array(renderer)
+	texture, read_error := read_archive_texture(archive, path, scratch)
+	if read_error do return 0
+	layer := renderer.land_texture_paths.len
+	if not fill_land_layer(renderer, texture, layer, scratch) do return 0
+	entry := next(&renderer.land_texture_paths)
+	entry.len = 0
+	entry + path
+	return layer
+}
+
+// Puts a texture into a layer of the land array, at every level: from its
+// own mipmaps where it has the size, else its largest made to fit.
+fill_land_layer :: fun(renderer: ^Renderer, texture: Texture, layer: i64, scratch: ^[]byte) -> bool {
+	BindTexture(TEXTURE_2D_ARRAY, renderer.land_texture_array)
+	// The level of the texture to start from: the first no bigger than the layer.
+	start : i64 = 0
+	for mip, k in texture.mips {
+		start = k
+		if mip.width <= LAND_TEXTURE_SIZE do break
+	}
+	pixels_at := scratch.len
+	previous := scratch[0:0]
+	previous_size : i64 = 0
+	for level in 0:LAND_TEXTURE_LEVELS {
+		size := LAND_TEXTURE_SIZE >> level
+		mip_index := start + level
+		level_pixels := scratch[0:0]
+		if mip_index < texture.mips.len and texture.mips[mip_index].width == size and texture.mips[mip_index].height == size {
+			decoded, decode_error := decode_rgba(texture, mip_index, scratch)
+			if decode_error do return false
+			level_pixels = decoded
+		elif level == 0
+			// Smaller than a layer: its largest, stretched to fit.
+			decoded, decode_error := decode_rgba(texture, 0, scratch)
+			if decode_error do return false
+			stretched, fits := stretch(decoded, texture.mips[0].width, texture.mips[0].height, size, scratch)
+			if not fits do return false
+			level_pixels = stretched
+		else
+			// Past its mipmaps: the level above, halved.
+			halved, fits := halve(previous, previous_size, scratch)
+			if not fits do return false
+			level_pixels = halved
+		}
+		TexSubImage3D(TEXTURE_2D_ARRAY, i32(level), 0, 0, i32(layer), i32(size), i32(size), 1, RGBA, UNSIGNED_BYTE, &level_pixels[0])
+		previous = level_pixels
+		previous_size = size
+	}
+	scratch.len = pixels_at
+	return true
+}
+
+// Pixels stretched (or shrunk) to a square of size, nearest pixel: into
+// scratch, after what it holds.
+stretch :: fun(pixels: []byte, width: i64, height: i64, size: i64, scratch: ^[]byte) -> []byte, bool {
+	start := scratch.len
+	if start + size * size * 4 > scratch.cap do return scratch[0:0], false
+	out := scratch[start : start + size * size * 4]
+	for y in 0:size {
+		from_y := y * height / size
+		for x in 0:size {
+			from_x := x * width / size
+			for c in 0:4 do out[(y * size + x) * 4 + c] = pixels[(from_y * width + from_x) * 4 + c]
+		}
+	}
+	scratch.len = start + size * size * 4
+	return out, true
+}
+
+// A square of pixels halved: each 2 by 2 averaged. Into scratch, after
+// what it holds.
+halve :: fun(pixels: []byte, size: i64, scratch: ^[]byte) -> []byte, bool {
+	half := size / 2
+	if half < 1 do half = 1
+	start := scratch.len
+	if start + half * half * 4 > scratch.cap do return scratch[0:0], false
+	out := scratch[start : start + half * half * 4]
+	for y in 0:half {
+		for x in 0:half {
+			for c in 0:4 {
+				sum : i64 = 0
+				for dy in 0:2 {
+					for dx in 0:2 {
+						from_x := x * 2 + dx
+						from_y := y * 2 + dy
+						if from_x >= size do from_x = size - 1
+						if from_y >= size do from_y = size - 1
+						value : u8 = pixels[(from_y * size + from_x) * 4 + c]
+						sum += i64(value)
+					}
+				}
+				out[(y * half + x) * 4 + c] = u8(sum / 4)
+			}
+		}
+	}
+	scratch.len = start + half * half * 4
+	return out, true
+}
+
+// ---- the camera ----------------------------------------------------------------------
 
 // Where the camera is and which way it looks.
 Camera :: struct {
@@ -341,100 +911,244 @@ view_matrix :: fun(camera: Camera) -> Mat4 {
 	return view
 }
 
-// Draws the instances of models from the camera, into a frame width by
-// height pixels, lit by the cell's lighting and its lights: opaque parts
-// first, then the blended ones over them.
-draw_instances :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, lights: ^[]Point_Light,
-	lighting: Cell_Lighting, camera: Camera, width: i64, height: i64)
+// The six planes bounding what a view and projection see, each as its
+// normal (pointing in) and distance: a point p is inside a plane when
+// dot(normal, p) + distance >= 0.
+View_Planes :: struct {
+	planes: [6!][4!]f32
+}
+
+view_planes :: fun(view_projection: Mat4) -> View_Planes {
+	m := view_projection
+	result := View_Planes{0}
+	// Each plane: the matrix's last row, plus or minus one of its first
+	// three (row i: the columns' i-th items) — left, right, bottom, top,
+	// near, far.
+	for p in 0:6 {
+		row := p / 2
+		sign : f32 = 1
+		if p % 2 == 1 do sign = -1
+		plane : [4!]f32
+		for k in 0:4 do plane[k] = m[k][3] + sign * m[k][row]
+		scale := sqrt_f32(plane[0] * plane[0] + plane[1] * plane[1] + plane[2] * plane[2])
+		if scale > 0 {
+			for k in 0:4 do plane[k] = plane[k] / scale
+		}
+		result.planes[p] = plane
+	}
+	return result
+}
+
+// Whether any of a sphere is in view.
+sphere_in_view :: fun(planes: ^View_Planes, center: Vec3, radius: f32) -> bool {
+	for p in 0:6 {
+		plane := planes.planes[p]
+		if plane[0] * center.x + plane[1] * center.y + plane[2] * center.z + plane[3] < -radius do return false
+	}
+	return true
+}
+
+// ---- drawing a frame -----------------------------------------------------------------
+
+// Draws a frame width by height pixels from the camera: the land in view,
+// then the instances in view — opaque parts, then blended — lit by the
+// lighting and the lights set with set_scene_lights. Tells what it drew.
+draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, grounds: ^[]Gpu_Land,
+	lighting: Cell_Lighting, camera: Camera, width: i64, height: i64) -> Frame_Stats
 {
+	stats := Frame_Stats{instances = instances.len, visible = 0, drawn_parts = 0, draw_calls = 0, land_cells = 0}
 	Viewport(0, 0, i32(width), i32(height))
 	fog := lighting.fog_color
 	ClearColor(fog.x, fog.y, fog.z, 1.0)
 	Clear(COLOR_BUFFER_BIT | DEPTH_BUFFER_BIT)
 	Enable(DEPTH_TEST)
 	DepthFunc(LEQUAL)
-	UseProgram(renderer.program)
+	Enable(CULL_FACE)
+	Disable(BLEND)
+	DepthMask(1)
 	ActiveTexture(TEXTURE0)
 
 	projection := mat4_perspective(camera.field_of_view, f32(width) / f32(height), camera.near, camera.far)
 	view_projection := mat4_mul(projection, view_matrix(camera))
+	planes := view_planes(view_projection)
 	sun := vec3_normalize(lighting.direction)
-	Uniform3f(renderer.sun_direction_at, sun.x, sun.y, sun.z)
-	Uniform3f(renderer.sun_color_at, lighting.directional.x, lighting.directional.y, lighting.directional.z)
-	Uniform3f(renderer.ambient_color_at, lighting.ambient.x, lighting.ambient.y, lighting.ambient.z)
-	Uniform3f(renderer.camera_position_at, camera.position.x, camera.position.y, camera.position.z)
-	Uniform3f(renderer.fog_color_at, fog.x, fog.y, fog.z)
-	Uniform1f(renderer.fog_near_at, lighting.fog_near)
-	Uniform1f(renderer.fog_far_at, lighting.fog_far)
 
-	for pass in 0:2 {
-		blended_pass := pass == 1
-		if blended_pass {
-			Enable(BLEND)
-			BlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
-			DepthMask(0)
-		else
-			Disable(BLEND)
-			DepthMask(1)
-		}
-		for &instance in instances {
-			gpu_model := &models[instance.model]
-			world_view_projection := mat4_mul(view_projection, instance.world)
-			UniformMatrix4fv(renderer.world_view_projection_at, 1, 0, &world_view_projection[0][0])
-			UniformMatrix4fv(renderer.world_at, 1, 0, &instance.world[0][0])
-			set_lights(renderer, gpu_model, instance, lights)
-			for part in gpu_model.parts {
-				if part.alpha_blend != blended_pass do continue
-				if part.two_sided do Disable(CULL_FACE)
-				else do Enable(CULL_FACE)
-				threshold : f32 = 0
-				if part.alpha_test do threshold = part.alpha_threshold
-				Uniform1f(renderer.alpha_threshold_at, threshold)
-				Uniform3f(renderer.emissive_color_at, part.emissive.x, part.emissive.y, part.emissive.z)
-				BindTexture(TEXTURE_2D, part.texture)
-				BindVertexArray(part.vertex_array)
-				DrawElements(TRIANGLES, part.index_count, UNSIGNED_SHORT, void)
-			}
-		}
-	}
+	if grounds.len > 0 do draw_land(renderer, grounds, &planes, view_projection, lighting, sun, camera, &stats)
+	draw_meshes(renderer, models, instances, &planes, view_projection, lighting, sun, camera, &stats)
+
 	DepthMask(1)
 	Disable(BLEND)
 	BindVertexArray(0)
+	return stats
 }
 
-// Gives the shader the lights that reach an instance: those whose reach
-// meets the sphere around it, the nearest MAX_LIGHTS of them.
-set_lights :: fun(renderer: ^Renderer, gpu_model: ^Gpu_Model, instance: ^Instance, lights: ^[]Point_Light) {
-	placed := mat4_mul_vec4(instance.world, Vec4{gpu_model.center.x, gpu_model.center.y, gpu_model.center.z, 1})
-	center := Vec3{placed.x, placed.y, placed.z}
-	// The instance's scale: how long its x axis is in the world.
-	scale := vec3_length(Vec3{instance.world[0][0], instance.world[0][1], instance.world[0][2]})
-	radius := gpu_model.radius * scale
-
-	// The nearest, kept sorted by distance.
-	chosen : [MAX_LIGHTS!]i64
-	distances : [MAX_LIGHTS!]f32
-	count : i64 = 0
-	for light, index in lights {
-		distance := vec3_length(light.position - center)
-		if distance > light.radius + radius do continue
-		if count == MAX_LIGHTS and distance >= distances[MAX_LIGHTS - 1] do continue
-		at := count
-		if count < MAX_LIGHTS do count += 1
-		else do at = MAX_LIGHTS - 1
-		for at > 0 and distances[at - 1] > distance {
-			chosen[at] = chosen[at - 1]
-			distances[at] = distances[at - 1]
-			at -= 1
-		}
-		chosen[at] = index
-		distances[at] = distance
+// Draws the land in view: one call for all of it.
+draw_land :: fun(renderer: ^Renderer, grounds: ^[]Gpu_Land, planes: ^View_Planes, view_projection: Mat4,
+	lighting: Cell_Lighting, sun: Vec3, camera: Camera, stats: ^Frame_Stats)
+{
+	renderer.land_commands.len = 0
+	for ground in grounds {
+		if not sphere_in_view(planes, ground.center, ground.radius) do continue
+		&renderer.land_commands + Draw_Command{
+			count = LAND_MESH_INDICES,
+			instance_count = 1,
+			first_index = 0,
+			base_vertex = i32(ground.slot * LAND_MESH_VERTICES),
+			base_instance = 0}
 	}
-	Uniform1i(renderer.light_count_at, i32(count))
-	for i in 0:count {
-		light := lights[chosen[i]]
-		Uniform3f(renderer.light_position_at[i], light.position.x, light.position.y, light.position.z)
-		Uniform3f(renderer.light_color_at[i], light.color.x, light.color.y, light.color.z)
-		Uniform1f(renderer.light_radius_at[i], light.radius)
+	stats.land_cells = renderer.land_commands.len
+	if renderer.land_commands.len == 0 do return
+
+	UseProgram(renderer.land_program)
+	matrix := view_projection
+	UniformMatrix4fv(renderer.land_view_projection_at, 1, 0, &matrix[0][0])
+	Uniform3f(renderer.land_sun_direction_at, sun.x, sun.y, sun.z)
+	Uniform3f(renderer.land_sun_color_at, lighting.directional.x, lighting.directional.y, lighting.directional.z)
+	Uniform3f(renderer.land_ambient_color_at, lighting.ambient.x, lighting.ambient.y, lighting.ambient.z)
+	Uniform3f(renderer.land_camera_position_at, camera.position.x, camera.position.y, camera.position.z)
+	Uniform3f(renderer.land_fog_color_at, lighting.fog_color.x, lighting.fog_color.y, lighting.fog_color.z)
+	Uniform1f(renderer.land_fog_near_at, lighting.fog_near)
+	Uniform1f(renderer.land_fog_far_at, lighting.fog_far)
+	BindTexture(TEXTURE_2D_ARRAY, renderer.land_texture_array)
+	BindVertexArray(renderer.land_vertex_array)
+	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.land_indirect_buffer)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.land_commands.len * size_of(Draw_Command)), &renderer.land_commands[0], STREAM_DRAW)
+	MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, void, i32(renderer.land_commands.len), 0)
+	stats.draw_calls += 1
+}
+
+// A part's sort key: blended parts after opaque ones; within those, the
+// two-sided after the rest; then by texture — so each run of one key is
+// one draw call. The part's index in the low bits.
+part_key :: fun(part: Mesh_Part, part_index: i64) -> i64 {
+	group_key := part.texture_slot
+	if part.two_sided do group_key += MAX_TEXTURES
+	if part.alpha_blend do group_key += 2 * MAX_TEXTURES
+	return (group_key << 20) | part_index
+}
+
+// Draws the instances in view: their parts gathered — each part's
+// instances together, the parts of one texture and state together — and
+// each gathering drawn with one call.
+draw_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, planes: ^View_Planes,
+	view_projection: Mat4, lighting: Cell_Lighting, sun: Vec3, camera: Camera, stats: ^Frame_Stats)
+{
+	// The instances in view, and how many of each part they draw.
+	renderer.visible.len = 0
+	renderer.touched.len = 0
+	record_count : i64 = 0
+	for &instance, index in instances {
+		if not sphere_in_view(planes, instance.center, instance.radius) do continue
+		placed_model := models[instance.model]
+		if record_count + placed_model.part_count > MAX_DRAWN do break
+		&renderer.visible + index
+		for p in placed_model.first_part:placed_model.first_part + placed_model.part_count {
+			if renderer.part_counts[p] == 0 do &renderer.touched + part_key(renderer.parts[p], p)
+			renderer.part_counts[p] += 1
+		}
+		record_count += placed_model.part_count
+	}
+	stats.visible = renderer.visible.len
+	stats.drawn_parts = record_count
+	if record_count == 0 do return
+
+	// The parts in drawing order; each one's instances' place in the records.
+	sort_keys(&renderer.touched)
+	renderer.commands.len = 0
+	start : i64 = 0
+	for key in renderer.touched {
+		p := key & 0xFFFFF
+		part := renderer.parts[p]
+		&renderer.commands + Draw_Command{
+			count = part.index_count,
+			instance_count = u32(renderer.part_counts[p]),
+			first_index = part.first_index,
+			base_vertex = part.base_vertex,
+			base_instance = u32(start)}
+		renderer.part_starts[p] = start
+		start += renderer.part_counts[p]
+		renderer.part_counts[p] = 0   // counts again as the records fill
+	}
+
+	// The records: each part's instances in their place.
+	renderer.records.len = record_count
+	for index in renderer.visible {
+		instance := &instances[index]
+		placed_model := models[instance.model]
+		for p in placed_model.first_part:placed_model.first_part + placed_model.part_count {
+			part := renderer.parts[p]
+			record := &renderer.records[renderer.part_starts[p] + renderer.part_counts[p]]
+			renderer.part_counts[p] += 1
+			record.world = instance.world
+			record.lights = instance.lights
+			record.material = [part.alpha_threshold, part.emissive.x, part.emissive.y, part.emissive.z]
+		}
+	}
+	for key in renderer.touched do renderer.part_counts[key & 0xFFFFF] = 0
+
+	UseProgram(renderer.mesh_program)
+	matrix := view_projection
+	UniformMatrix4fv(renderer.mesh_view_projection_at, 1, 0, &matrix[0][0])
+	Uniform3f(renderer.mesh_sun_direction_at, sun.x, sun.y, sun.z)
+	Uniform3f(renderer.mesh_sun_color_at, lighting.directional.x, lighting.directional.y, lighting.directional.z)
+	Uniform3f(renderer.mesh_ambient_color_at, lighting.ambient.x, lighting.ambient.y, lighting.ambient.z)
+	Uniform3f(renderer.mesh_camera_position_at, camera.position.x, camera.position.y, camera.position.z)
+	Uniform3f(renderer.mesh_fog_color_at, lighting.fog_color.x, lighting.fog_color.y, lighting.fog_color.z)
+	Uniform1f(renderer.mesh_fog_near_at, lighting.fog_near)
+	Uniform1f(renderer.mesh_fog_far_at, lighting.fog_far)
+	BindVertexArray(renderer.mesh_vertex_array)
+	BindBuffer(ARRAY_BUFFER, renderer.instance_buffer)
+	BufferData(ARRAY_BUFFER, MAX_DRAWN * size_of(Drawn_Instance), void, STREAM_DRAW)   // (a fresh buffer: no waiting on last frame's)
+	BufferSubData(ARRAY_BUFFER, 0, isize(record_count * size_of(Drawn_Instance)), &renderer.records[0])
+
+	// A call for each run of commands of one key: one texture and state.
+	run_start : i64 = 0
+	call : i64 = 0
+	blending := false
+	for run_start < renderer.commands.len {
+		group_key := renderer.touched[run_start] >> 20
+		run_end := run_start + 1
+		for run_end < renderer.commands.len and renderer.touched[run_end] >> 20 == group_key do run_end += 1
+
+		first_part := renderer.parts[renderer.touched[run_start] & 0xFFFFF]
+		if first_part.alpha_blend and not blending {
+			blending = true
+			Enable(BLEND)
+			BlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
+			DepthMask(0)
+		}
+		if first_part.two_sided do Disable(CULL_FACE)
+		else do Enable(CULL_FACE)
+		BindTexture(TEXTURE_2D, first_part.texture)
+
+		// Each call's commands in a buffer of its own, from its start:
+		// mara.open_gl's MultiDrawElementsIndirect takes no offset.
+		if call == renderer.indirect_buffers.len {
+			if renderer.indirect_buffers.len == renderer.indirect_buffers.cap do break
+			GenBuffers(1, next(&renderer.indirect_buffers))
+		}
+		BindBuffer(DRAW_INDIRECT_BUFFER, renderer.indirect_buffers[call])
+		BufferData(DRAW_INDIRECT_BUFFER, isize((run_end - run_start) * size_of(Draw_Command)), &renderer.commands[run_start], STREAM_DRAW)
+		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, void, i32(run_end - run_start), 0)
+		call += 1
+		run_start = run_end
+	}
+	stats.draw_calls += call
+}
+
+// Sorts keys, smallest first (Shell's sort: a few thousand at most).
+sort_keys :: fun(keys: ^[]i64) {
+	gap := keys.len / 2
+	for gap > 0 {
+		for i in gap:keys.len {
+			value := keys[i]
+			k := i
+			for k >= gap and keys[k - gap] > value {
+				keys[k] = keys[k - gap]
+				k -= gap
+			}
+			keys[k] = value
+		}
+		gap /= 2
 	}
 }

@@ -23,6 +23,7 @@ use scene
 use logging
 use mara.string
 use sdl_platform
+gl :: use mara.open_gl
 render :: use render
 
 // How high above the floor the camera is when arriving: a person's eyes,
@@ -35,6 +36,9 @@ DOOR_REACH :: 300
 MOST_FRAMES_A_SECOND :: 60
 // How long a frame may spend loading what's waiting, in nanoseconds.
 LOAD_BUDGET :: 6000000
+// A frame longer than this (in nanoseconds) goes in the journal, with
+// where its time went.
+SLOW_FRAME :: 18000000
 // Where the viewer's journal goes, in the folder it's run from.
 LOG_PATH :: "sooblivion.log"
 
@@ -65,6 +69,15 @@ Viewer :: struct {
 	// Loading after walking into another cell: when it began, over how many frames.
 	loading_since: u64
 	loading_frames: i64
+
+	// Where the last frame's time went, in nanoseconds, and what it drew:
+	// for the journal when it was slow, and the title.
+	drawing_time: u64
+	showing_time: u64
+	loading_time: u64
+	crossing_time: u64
+	drawn: Frame_Stats
+	gl_errors_seen: [16]u32
 }
 
 // What happened in a frame that the command has to answer.
@@ -84,7 +97,7 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.textures = open_archive(data_path("Oblivion - Textures - Compressed.bsa"), directory_storage)?
 	viewer.platform = platform_open("sooblivion", 1280, 720)?
 	set_vsync(&viewer.platform, true)
-	renderer_init(&viewer.renderer)?
+	renderer_init(&viewer.renderer, table_storage)?
 	scene_clear(&viewer.shown, table_storage)
 	viewer.camera = render.Camera(){position = Vec3{0, 0, 0}, yaw = 0, pitch = 0}
 	viewer.speed = 400
@@ -97,6 +110,12 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.frames_a_second = 0
 	viewer.loading_since = 0
 	viewer.loading_frames = 0
+	viewer.drawing_time = 0
+	viewer.showing_time = 0
+	viewer.loading_time = 0
+	viewer.crossing_time = 0
+	viewer.drawn = Frame_Stats{instances = 0, visible = 0, drawn_parts = 0, draw_calls = 0, land_cells = 0}
+	viewer.gl_errors_seen.len = 0
 }
 
 viewer_close :: fun(viewer: ^Viewer) {
@@ -121,8 +140,9 @@ viewer_loader :: fun(viewer: ^Viewer) -> Loader {
 	return Loader{renderer = &viewer.renderer, meshes = &viewer.meshes, textures = &viewer.textures, room = &viewer.room}
 }
 
-// Shows what's shown, how many frames a second, and whether vsync is on
-// in the window's title: "Inn of Ill Omen — 60 fps, vsync on".
+// Shows what's shown, how many frames a second, whether vsync is on, and
+// what the last frame drew in the window's title: "Inn of Ill Omen — 60
+// fps, vsync on — 140 of 210 in view, 52 draw calls".
 update_title :: fun(viewer: ^Viewer) {
 	title : str256
 	&title + viewer.place[:]
@@ -130,6 +150,13 @@ update_title :: fun(viewer: ^Viewer) {
 	&title + int_text(viewer.frames_a_second)[:]
 	&title + " fps, vsync "
 	&title + (if viewer.platform.vsync do "on" else "off")
+	&title + " — "
+	&title + int_text(viewer.drawn.visible)[:]
+	&title + " of "
+	&title + int_text(viewer.drawn.instances)[:]
+	&title + " in view, "
+	&title + int_text(viewer.drawn.draw_calls)[:]
+	&title + " draw calls"
 	_ = SetWindowTitle(viewer.platform.window, cstring(title))
 }
 
@@ -166,6 +193,9 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 
 	seconds, now := time_since(viewer.frame_start)
 	viewer.frame_start = now
+	if u64(seconds * 1000000000) > SLOW_FRAME do note_slow_frame(viewer, seconds)
+	viewer.loading_time = 0
+	viewer.crossing_time = 0
 	if platform.mouse_look {
 		camera.yaw += input.mouse_moved_x * 0.003
 		camera.pitch -= input.mouse_moved_y * 0.003
@@ -180,9 +210,18 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	if input.held[D] do camera.position = camera.position + right * step
 	if input.held[A] do camera.position = camera.position - right * step
 
-	draw_instances(&viewer.renderer, &shown.models, &shown.instances, &shown.lights, shown.lighting,
+	drawing_start := time_now()
+	if shown.lights_changed {
+		set_scene_lights(&viewer.renderer, &shown.lights)
+		shown.lights_changed = false
+	}
+	viewer.drawn = draw_frame(&viewer.renderer, &shown.models, &shown.instances, &shown.grounds, shown.lighting,
 		camera^, platform.width, platform.height)
+	showing_start := time_now()
+	viewer.drawing_time = showing_start - drawing_start
 	present(platform)
+	viewer.showing_time = time_now() - showing_start
+	note_gl_errors(viewer)
 	if not platform.vsync do wait_for_next_frame(viewer)
 	count_frame(viewer)
 
@@ -211,6 +250,52 @@ wait_for_next_frame :: fun(viewer: ^Viewer) {
 	for time_now() < viewer.next_frame {}
 }
 
+// Notes a frame that took too long, and where its time went: drawing
+// (the CPU's part of it), showing (the swap and waiting for the card:
+// the card's part, and vsync's wait), loading, and placing a cell walked
+// into.
+note_slow_frame :: fun(viewer: ^Viewer, seconds: f64) {
+	journal := &viewer.journal
+	drawn := viewer.drawn
+	note(journal, "slow frame: ")
+	note(journal, i64(seconds * 1000))
+	note(journal, " ms (drawing ")
+	note(journal, i64(viewer.drawing_time / 1000000))
+	note(journal, ", showing ")
+	note(journal, i64(viewer.showing_time / 1000000))
+	note(journal, ", loading ")
+	note(journal, i64(viewer.loading_time / 1000000))
+	note(journal, ", placing ")
+	note(journal, i64(viewer.crossing_time / 1000000))
+	note(journal, "); ")
+	note(journal, drawn.visible)
+	note(journal, " of ")
+	note(journal, drawn.instances)
+	note(journal, " in view, ")
+	note(journal, drawn.drawn_parts)
+	note(journal, " parts, ")
+	note(journal, drawn.draw_calls)
+	note(journal, " draw calls, ")
+	note(journal, drawn.land_cells)
+	note(journal, " land cells")
+	note_end(journal)
+}
+
+// Notes what OpenGL says went wrong, if anything: each kind of error the
+// first time only, so a frame's mistake isn't noted sixty times a second.
+note_gl_errors :: fun(viewer: ^Viewer) {
+	for true {
+		code := gl.GetError()
+		if code == 0 do return
+		if code in viewer.gl_errors_seen do continue
+		if viewer.gl_errors_seen.len < viewer.gl_errors_seen.cap do &viewer.gl_errors_seen + code
+		note(&viewer.journal, "OpenGL error ")
+		note(&viewer.journal, i64(code))
+		note(&viewer.journal, " (1280 bad enum, 1281 bad value, 1282 bad operation, 1285 out of memory)")
+		note_end(&viewer.journal)
+	}
+}
+
 // Counts a frame drawn; each second, the count goes in the title.
 count_frame :: fun(viewer: ^Viewer) {
 	viewer.frames_counted += 1
@@ -229,14 +314,17 @@ load_some :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	shown := &viewer.shown
 	if not anything_waiting(shown) do return
 	viewer.loading_frames += 1
-	if load_waiting(shown, plugin, viewer_loader(viewer), LOAD_BUDGET) {
+	loading_start := time_now()
+	done := load_waiting(shown, plugin, viewer_loader(viewer), LOAD_BUDGET)
+	viewer.loading_time = time_now() - loading_start
+	if done {
 		journal := &viewer.journal
 		note(journal, "  caught up in ")
 		note(journal, i64((time_now() - viewer.loading_since) / 1000000))
 		note(journal, " ms over ")
 		note(journal, viewer.loading_frames)
 		note(journal, " frames: ")
-		note(journal, shown.models.len - shown.free_models.len)
+		note(journal, shown.models.len)
 		note(journal, " models loaded (")
 		note(journal, shown.failed_paths)
 		note(journal, " meshes failed)")
@@ -396,6 +484,7 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 			note_end(journal)
 			viewer.loading_since = start
 			viewer.loading_frames = 0
+			viewer.crossing_time = time_now() - start
 		door
 			scratch.len = 0
 			there, leads := door_destination(plugin, viewer.shown.doors[viewer.chosen_door].reference, &scratch)
@@ -471,7 +560,7 @@ go_outside :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32, place: Vec3) 
 	note(journal, " lights, ")
 	note(journal, shown.doors.len)
 	note(journal, " doors, ")
-	note(journal, shown.terrain.len)
+	note(journal, shown.grounds.len)
 	note(journal, " land cells; ")
 	note(journal, shown.models.len)
 	note(journal, " models loaded (")
@@ -524,8 +613,8 @@ ground_height :: fun(plugin: ^Plugin, world_id: u32, place: Vec3, scratch: ^[]by
 	x, y := grid_of(place)
 	cell := exterior_cell(plugin, world_id, x, y)
 	if cell == 0 do return 0
-	land_at, has_land := find_land(plugin, cell)
-	if not has_land do return 0
+	land_at, found := find_land(plugin, cell)
+	if not found do return 0
 	scratch.len = 0
 	record, record_error := record_at(plugin, land_at, scratch)
 	if record_error do return 0

@@ -652,36 +652,38 @@ command_area :: fun(name: []utf8, x: i64, y: i64) {
 
 	area := area_around(x, y)
 	cell_land : Land
-	model_room : [16 * MB]byte
+	land_mesh : Land_Mesh
 	references : [16384]Reference
 	land_cells : i64 = 0
-	parts : i64 = 0
+	parts : i64 = 0     // the quadrants' textures: base and layers
 	missing_textures : i64 = 0
 	for cell_y in area.low_y..area.high_y {
 		for cell_x in area.low_x..area.high_x {
 			cell := exterior_cell(&plugin, world_id, cell_x, cell_y)
 			if cell == 0 do continue
 			_ = cell_references(&plugin, cell, &references)
-			land_at, has_land := find_land(&plugin, cell)
-			if not has_land do continue
+			land_at, found := find_land(&plugin, cell)
+			if not found do continue
 			scratch.len = 0
 			record, record_error := record_at(&plugin, land_at, &scratch)
 			if record_error do continue
 			read_land(record.data, &cell_land)
-			model_room.len = 0
-			built := build_land_model(&plugin, &cell_land, cell_x, cell_y, &model_room)
+			build_land_mesh(&plugin, &cell_land, cell_x, cell_y, &land_mesh)
 			land_cells += 1
-			for part in built.parts {
-				parts += 1
-				_, found := find_file(&textures, part.texture[:])
-				if not found {
-					missing_textures += 1
-					if missing_textures <= 5 do print("  no texture %", part.texture)
+			for q in 0:4 {
+				quadrant := &land_mesh.textures[q]
+				for k in 0:quadrant.count {
+					parts += 1
+					_, texture_found := find_file(&textures, quadrant.paths[k][:])
+					if not texture_found {
+						missing_textures += 1
+						if missing_textures <= 5 do print("  no texture %", quadrant.paths[k])
+					}
 				}
 			}
 		}
 	}
-	print("% land cells, % land parts (% textures missing), % references in the cells", land_cells, parts, missing_textures, references.len)
+	print("% land cells, % land textures (% missing), % references in the cells", land_cells, parts, missing_textures, references.len)
 	persistent := persistent_cell(&plugin, world_id)
 	references.len = 0
 	_ = cell_references(&plugin, persistent, &references)
@@ -732,18 +734,6 @@ command_walk :: fun(name: []utf8, x: i64, y: i64, steps: i64) {
 
 	for step in 0..steps {
 		cell_x := x + step
-		// The land left behind, forgotten (as drop_terrain would, without a card).
-		area := area_around(cell_x, y)
-		k : i64 = 0
-		for k < walked.terrain.len {
-			ground := walked.terrain[k]
-			if ground.x < area.low_x or ground.x > area.high_x {
-				walked.terrain[k] = walked.terrain[walked.terrain.len - 1]
-				walked.terrain.len -= 1
-			else
-				k += 1
-			}
-		}
 		place_start := time_now()
 		_ = show_exterior(&walked, &plugin, world_id, cell_x, y)
 		place_ms := elapsed_ms(place_start)
@@ -791,16 +781,17 @@ command_walk :: fun(name: []utf8, x: i64, y: i64, steps: i64) {
 
 		land_start := time_now()
 		cell_land : Land
+		land_mesh : Land_Mesh
 		for item in walked.waiting_land {
-			land_at, has_land := find_land(&plugin, item.cell)
-			if not has_land do continue
+			land_at, found := find_land(&plugin, item.cell)
+			if not found do continue
 			file_room.len = 0
 			record, record_error := record_at(&plugin, land_at, &file_room)
 			if record_error do continue
 			read_land(record.data, &cell_land)
-			model_room.len = 0
-			_ = build_land_model(&plugin, &cell_land, item.x, item.y, &model_room)
-			&walked.terrain + Terrain_Cell{x = item.x, y = item.y, model = 0}
+			build_land_mesh(&plugin, &cell_land, item.x, item.y, &land_mesh)
+			// (On the card it'd be in a slot; here it's only remembered.)
+			&walked.grounds + Gpu_Land{x = item.x, y = item.y, slot = free_land_slot(&walked), center = land_mesh.center, radius = land_mesh.radius}
 		}
 		print("step to % %: placing % ms (% instances ready, % waiting); % new meshes % ms; % new textures % ms; % land cells % ms",
 			cell_x, y, place_ms, walked.instances.len, walked.waiting.len, mesh_count, mesh_ms,
