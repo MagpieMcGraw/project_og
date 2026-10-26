@@ -149,3 +149,178 @@ read_texture :: fun(data: []byte) -> Texture, err {
 	if texture.mips.len == 0 do return texture, Truncated
 	return texture
 }
+
+// ---- decoding to plain pixels ---------------------------------------------
+
+// What decoding can fail with, beyond reading.
+Decode_Error :: error {
+	No_Room   // the output can't hold the image
+}
+
+// One of a texture's images as plain pixels: 8 bits each of red, green,
+// blue and alpha, row by row from the top. Into out, after what it holds
+// (its len moved past them); a view of them.
+decode_rgba :: fun(texture: Texture, mip_index: i64, out: ^[]byte) -> []byte, err {
+	mip := texture.mips[mip_index]
+	start := out.len
+	size := mip.width * mip.height * 4
+	if start + size > out.cap do return out[start : start], No_Room
+	pixels := out[start : start + size]
+	source := texture.pixels[mip.at : mip.at + mip.size]
+
+	match texture.format {
+	dxt1
+		decode_blocks(source, &pixels, mip.width, mip.height, .dxt1)
+	dxt3
+		decode_blocks(source, &pixels, mip.width, mip.height, .dxt3)
+	dxt5
+		decode_blocks(source, &pixels, mip.width, mip.height, .dxt5)
+	bgra8
+		for i in 0:mip.width * mip.height {
+			pixels[i * 4] = source[i * 4 + 2]
+			pixels[i * 4 + 1] = source[i * 4 + 1]
+			pixels[i * 4 + 2] = source[i * 4]
+			pixels[i * 4 + 3] = source[i * 4 + 3]
+		}
+	bgr8
+		for i in 0:mip.width * mip.height {
+			pixels[i * 4] = source[i * 3 + 2]
+			pixels[i * 4 + 1] = source[i * 3 + 1]
+			pixels[i * 4 + 2] = source[i * 3]
+			pixels[i * 4 + 3] = u8(255)
+		}
+	luminance8
+		for i in 0:mip.width * mip.height {
+			gray : u8 = source[i]
+			pixels[i * 4] = gray
+			pixels[i * 4 + 1] = gray
+			pixels[i * 4 + 2] = gray
+			pixels[i * 4 + 3] = u8(255)
+		}
+	bgra4
+		for i in 0:mip.width * mip.height {
+			packed : u16 = source[i * 2]
+			pixels[i * 4] = u8(((packed >> 8) & 15) * 17)
+			pixels[i * 4 + 1] = u8(((packed >> 4) & 15) * 17)
+			pixels[i * 4 + 2] = u8((packed & 15) * 17)
+			pixels[i * 4 + 3] = u8(((packed >> 12) & 15) * 17)
+		}
+	unknown
+		for i in 0:size do pixels[i] = u8(255)
+	}
+	out.len = start + size
+	return pixels
+}
+
+// Decodes block compressed pixels: each 4x4 block into its place, the
+// blocks at the right and bottom edges cut to the image.
+decode_blocks :: fun(source: []byte, pixels: ^[]byte, width: i64, height: i64, format: Pixel_Format) {
+	block_size : i64 = 16
+	if format == .dxt1 do block_size = 8
+	blocks_wide := (width + 3) / 4
+	blocks_high := (height + 3) / 4
+	block : [64!]u8   // the block's 16 pixels, 4 bytes each
+	for block_y in 0:blocks_high {
+		for block_x in 0:blocks_wide {
+			at := (block_y * blocks_wide + block_x) * block_size
+			if format == .dxt1 {
+				decode_color_block(source, at, false, &block)
+			elif format == .dxt3
+				decode_color_block(source, at + 8, true, &block)
+				decode_explicit_alpha(source, at, &block)
+			else
+				decode_color_block(source, at + 8, true, &block)
+				decode_interpolated_alpha(source, at, &block)
+			}
+			for row in 0:4 {
+				y := block_y * 4 + row
+				if y >= height do break
+				for column in 0:4 {
+					x := block_x * 4 + column
+					if x >= width do break
+					to := (y * width + x) * 4
+					from := (row * 4 + column) * 4
+					for c in 0:4 do pixels[to + c] = block[from + c]
+				}
+			}
+		}
+	}
+}
+
+// A 5-6-5 color as 8 bits each of red, green and blue.
+expand_565 :: fun(color: u16) -> i64, i64, i64 {
+	red := i64((color >> 11) & 31)
+	green := i64((color >> 5) & 63)
+	blue := i64(color & 31)
+	return (red << 3) | (red >> 2), (green << 2) | (green >> 4), (blue << 3) | (blue >> 2)
+}
+
+// A DXT color block: two colors, two more between them, and 2 bits a pixel
+// choosing among the four. In DXT1, when the first color isn't the larger,
+// there's one color between and the fourth choice is transparent.
+decode_color_block :: fun(source: []byte, at: i64, always_four: bool, block: ^[64!]u8) {
+	first : u16 = source[at]
+	second : u16 = source[at + 2]
+	choices : u32 = source[at + 4]
+
+	palette : [16!]i64
+	palette[0], palette[1], palette[2] = expand_565(first)
+	palette[4], palette[5], palette[6] = expand_565(second)
+	palette[3] = 255
+	palette[7] = 255
+	if always_four or first > second {
+		for c in 0:3 {
+			palette[8 + c] = (2 * palette[c] + palette[4 + c]) / 3
+			palette[12 + c] = (palette[c] + 2 * palette[4 + c]) / 3
+		}
+		palette[11] = 255
+		palette[15] = 255
+	else
+		for c in 0:3 {
+			palette[8 + c] = (palette[c] + palette[4 + c]) / 2
+			palette[12 + c] = 0
+		}
+		palette[11] = 255
+		palette[15] = 0
+	}
+	for i in 0:16 {
+		choice := i64((choices >> u32(i * 2)) & 3)
+		for c in 0:4 do block[i * 4 + c] = u8(palette[choice * 4 + c])
+	}
+}
+
+// DXT3's alpha: 4 bits a pixel, as they are.
+decode_explicit_alpha :: fun(source: []byte, at: i64, block: ^[64!]u8) {
+	alphas : u64 = source[at]
+	for i in 0:16 {
+		alpha := i64((alphas >> u64(i * 4)) & 15)
+		block[i * 4 + 3] = u8(alpha * 17)
+	}
+}
+
+// DXT5's alpha: two values, six or four between them (and then 0 and
+// 255), and 3 bits a pixel choosing among the eight.
+decode_interpolated_alpha :: fun(source: []byte, at: i64, block: ^[64!]u8) {
+	first_byte : u8 = source[at]
+	second_byte : u8 = source[at + 1]
+	first := i64(first_byte)
+	second := i64(second_byte)
+	values : [8!]i64
+	values[0] = first
+	values[1] = second
+	if first > second {
+		for i in 1..6 do values[i + 1] = ((7 - i) * first + i * second) / 7
+	else
+		for i in 1..4 do values[i + 1] = ((5 - i) * first + i * second) / 5
+		values[6] = 0
+		values[7] = 255
+	}
+	// The 48 bits of choices, in the 6 bytes after the two values.
+	low : u32 = source[at + 2]
+	high : u16 = source[at + 6]
+	choices := u64(low) | (u64(high) << 32)
+	for i in 0:16 {
+		choice := i64((choices >> u64(i * 3)) & 7)
+		block[i * 4 + 3] = u8(values[choice])
+	}
+}

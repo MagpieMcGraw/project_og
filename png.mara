@@ -1,0 +1,120 @@
+// Writing PNG images: for looking at textures and frames without a window.
+//
+// The pixels are stored, not packed: zlib's stored blocks hold them as they
+// are. That makes big files, but no compressor is needed and any viewer
+// opens them.
+module png
+
+use mara.core
+use inflate   // adler32
+
+// The CRC-32 a PNG's chunks end with, from its table (crc_table).
+crc32 :: fun(table: ^[256!]u32, data: []byte, start: u32 = 0xFFFFFFFF) -> u32 {
+	crc := start
+	for k in 0:data.len {
+		value : u8 = data[k]
+		crc = table[i64((crc ~ u32(value)) & 255)] ~ (crc >> 8)
+	}
+	return crc
+}
+
+// The table crc32 works from: each byte's remainder.
+crc_table :: fun() -> [256!]u32 {
+	table : [256!]u32
+	for n in 0:256 {
+		c := u32(n)
+		for k in 0:8 {
+			if c & 1 != 0 do c = 0xEDB88320 ~ (c >> 1)
+			else do c = c >> 1
+		}
+		table[n] = c
+	}
+	return table
+}
+
+// Appends a u32, most significant byte first, as PNG writes numbers.
+add_u32_big :: fun(out: ^[]byte, value: u32) {
+	out + u8((value >> 24) & 255)
+	out + u8((value >> 16) & 255)
+	out + u8((value >> 8) & 255)
+	out + u8(value & 255)
+}
+
+// Appends a chunk: its length, its type, its data, and the CRC of the type
+// and data.
+add_chunk :: fun(out: ^[]byte, table: ^[256!]u32, kind: []utf8, data: []byte) {
+	add_u32_big(out, u32(data.len))
+	start := out.len
+	out + kind
+	out + data
+	crc := crc32(table, out[start : out.len]) ~ 0xFFFFFFFF
+	add_u32_big(out, crc)
+}
+
+// The bytes of a PNG image of 8-bit red, green, blue, alpha pixels, row by
+// row from the top, into out: what it holds replaced. scratch holds the rows
+// as PNG lays them out, a filter byte before each.
+encode_png :: fun(pixels: []byte, width: i64, height: i64, out: ^[]byte, scratch: ^[]byte) {
+	table := crc_table()
+	out.len = 0
+	signature : [8!]u8 = [137, 80, 78, 71, 13, 10, 26, 10]
+	for b in signature do out + b
+
+	header : [13!]byte
+	header[0] = u8((width >> 24) & 255)
+	header[1] = u8((width >> 16) & 255)
+	header[2] = u8((width >> 8) & 255)
+	header[3] = u8(width & 255)
+	header[4] = u8((height >> 24) & 255)
+	header[5] = u8((height >> 16) & 255)
+	header[6] = u8((height >> 8) & 255)
+	header[7] = u8(height & 255)
+	header[8] = u8(8)    // bits a channel
+	header[9] = u8(6)    // red, green, blue, alpha
+	header[10] = u8(0)   // deflate
+	header[11] = u8(0)   // filtering by rows
+	header[12] = u8(0)   // not interlaced
+	add_chunk(out, &table, "IHDR", header[:])
+
+	// The rows, each after a 0: no filter.
+	scratch.len = 0
+	row_size := width * 4
+	for y in 0:height {
+		scratch + u8(0)
+		scratch + pixels[y * row_size : (y + 1) * row_size]
+	}
+	rows := scratch[0 : scratch.len]
+
+	// A zlib stream of stored blocks, each up to 65535 bytes, written
+	// straight into out after the chunk's length and type.
+	length_at := out.len
+	add_u32_big(out, 0)   // the length, written once known
+	type_at := out.len
+	out + "IDAT"
+	out + u8(0x78)
+	out + u8(0x01)
+	at : i64 = 0
+	for at < rows.len or at == 0 {
+		size := rows.len - at
+		if size > 65535 do size = 65535
+		last := at + size == rows.len
+		out + u8(if last do 1 else 0)
+		out + u8(size & 255)
+		out + u8((size >> 8) & 255)
+		out + u8((65535 - size) & 255)
+		out + u8(((65535 - size) >> 8) & 255)
+		out + rows[at : at + size]
+		at += size
+		if last do break
+	}
+	add_u32_big(out, adler32(rows))
+	data_length := out.len - type_at - 4
+	out[length_at] = u8((data_length >> 24) & 255)
+	out[length_at + 1] = u8((data_length >> 16) & 255)
+	out[length_at + 2] = u8((data_length >> 8) & 255)
+	out[length_at + 3] = u8(data_length & 255)
+	crc := crc32(&table, out[type_at : out.len]) ~ 0xFFFFFFFF
+	add_u32_big(out, crc)
+
+	add_chunk(out, &table, "IEND", out[0:0])
+}

@@ -17,6 +17,7 @@ use esm
 use bsa
 use nif
 use dds
+use png
 use sdl_platform
 use mara.sdl
 use mara.open_gl
@@ -307,6 +308,52 @@ command_view :: fun() {
 	}
 }
 
+// `sooblivion texture <file> [archive]`: decodes a texture's largest image
+// and writes it out as a PNG in the current folder, for looking at.
+command_texture :: fun(what: []utf8, name: []utf8) {
+	path := data_path(name)
+	directory_storage : [64 * MB]byte
+	archive, open_error := open_archive(path, &directory_storage)
+	if open_error {
+		print("couldn't open %: %", path, open_error)
+		return
+	}
+	defer close_archive(&archive)
+
+	index, found := find_file(&archive, what)
+	if not found {
+		print("no % in %", what, path)
+		return
+	}
+	storage : [64 * MB]byte
+	data, read_error := read_file(&archive, index, &storage)
+	if read_error {
+		print("couldn't read %: %", what, read_error)
+		return
+	}
+	texture, texture_error := read_texture(data)
+	if texture_error {
+		print("% isn't a texture this reads: %", what, texture_error)
+		return
+	}
+	pixel_storage : [64 * MB]byte
+	pixels, decode_error := decode_rgba(texture, 0, &pixel_storage)
+	if decode_error {
+		print("couldn't decode %: %", what, decode_error)
+		return
+	}
+	png_storage : [80 * MB]byte
+	row_storage : [80 * MB]byte
+	encode_png(pixels, texture.mips[0].width, texture.mips[0].height, &png_storage, &row_storage)
+
+	out_name : Path
+	&out_name + get_file(what)
+	&out_name + ".png"
+	write_error := write_entire_file(out_name, png_storage[:])
+	if write_error do print("couldn't write %: %", out_name, write_error)
+	else do print("wrote % (% x %, %, % mipmaps)", out_name, texture.width, texture.height, texture.format, texture.mips.len)
+}
+
 usage :: fun() {
 	print("sooblivion esm [plugin]            what a plugin holds, by record type")
 	print("sooblivion bsa <archive>           an archive's folders and files")
@@ -324,6 +371,9 @@ main :: (args: [][]utf8) {
 		else do command_esm("Oblivion.esm")
 	elif command == "view"
 		command_view()
+	elif command == "texture" and args.len > 2
+		if args.len > 3 do command_texture(args[2], args[3])
+		else do command_texture(args[2], "Oblivion - Textures - Compressed.bsa")
 	elif command == "textures"
 		if args.len > 2 do command_textures(args[2])
 		else do command_textures("Oblivion - Textures - Compressed.bsa")
