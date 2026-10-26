@@ -19,6 +19,7 @@ use nif
 use dds
 use png
 use model
+render :: use render
 use mara.math
 use sdl_platform
 use mara.sdl
@@ -307,8 +308,51 @@ command_textures :: fun(name: []utf8) {
 	}
 }
 
-// `sooblivion view`: opens the game's window.
-command_view :: fun() {
+// `sooblivion view <mesh>`: shows a mesh in the game's window. W, A, S, D
+// move, the right mouse button turns mouse look on and off, Escape quits.
+command_view :: fun(what: []utf8) {
+	meshes_path := data_path("Oblivion - Meshes.bsa")
+	textures_path := data_path("Oblivion - Textures - Compressed.bsa")
+	directory_storage : [64 * MB]byte
+	meshes, meshes_error := open_archive(meshes_path, &directory_storage)
+	if meshes_error {
+		print("couldn't open %: %", meshes_path, meshes_error)
+		return
+	}
+	defer close_archive(&meshes)
+	textures, textures_error := open_archive(textures_path, &directory_storage)
+	if textures_error {
+		print("couldn't open %: %", textures_path, textures_error)
+		return
+	}
+	defer close_archive(&textures)
+
+	index, found := find_file(&meshes, what)
+	if not found {
+		print("no % in %", what, meshes_path)
+		return
+	}
+	storage : [64 * MB]byte
+	data, read_error := read_file(&meshes, index, &storage)
+	if read_error {
+		print("couldn't read %: %", what, read_error)
+		return
+	}
+	nif_storage : [16 * MB]byte
+	reader := nif_reader(data)
+	failure := Nif_Failure{block = 0, type_name = storage[0:0]}
+	mesh, nif_error := read_nif(&reader, &nif_storage, &failure)
+	if nif_error {
+		print("couldn't read % as a NIF: % at block % (%)", what, nif_error, failure.block, failure.type_name)
+		return
+	}
+	model_storage : [64 * MB]byte
+	built, model_error := build_model(&mesh, &model_storage)
+	if model_error {
+		print("couldn't make a model of %: %", what, model_error)
+		return
+	}
+
 	platform : Platform
 	open_error := platform_open(&platform, "sooblivion", 1280, 720)
 	if open_error {
@@ -317,13 +361,44 @@ command_view :: fun() {
 	}
 	defer platform_close(&platform)
 
+	renderer : render.Renderer
+	init_error := renderer_init(&renderer)
+	if init_error {
+		print("couldn't set up drawing: %", init_error)
+		return
+	}
+	scratch : [64 * MB]byte
+	models : [1]Gpu_Model
+	upload_model(&renderer, built, &textures, &scratch, next(&models))
+
+	// Start back from the model's middle, far enough to see all of it.
+	center := (built.bounds_min + built.bounds_max) * 0.5
+	size := vec3_length(built.bounds_max - built.bounds_min)
+	camera := Camera(){position = center - Vec3{0, size, 0}, yaw = 0, pitch = 0}
+
 	input : Input
+	frame_start := time_now()
 	for true {
 		read_input(&platform, &input)
 		if input.quit or input.pressed[Escape] do break
-		Viewport(0, 0, i32(platform.width), i32(platform.height))
-		ClearColor(0.45, 0.6, 0.8, 1.0)
-		Clear(COLOR_BUFFER_BIT | DEPTH_BUFFER_BIT)
+		if input.mouse_pressed[3] do set_mouse_look(&platform, not platform.mouse_look)
+
+		seconds, now := time_since(frame_start)
+		frame_start = now
+		if platform.mouse_look {
+			camera.yaw += input.mouse_moved_x * 0.003
+			camera.pitch -= input.mouse_moved_y * 0.003
+			if camera.pitch > 1.5 do camera.pitch = 1.5
+			if camera.pitch < -1.5 do camera.pitch = -1.5
+		}
+		forward, right, up := camera_axes(camera)
+		speed := f32(seconds) * size * 0.5
+		if input.held[W] do camera.position = camera.position + forward * speed
+		if input.held[S] do camera.position = camera.position - forward * speed
+		if input.held[D] do camera.position = camera.position + right * speed
+		if input.held[A] do camera.position = camera.position - right * speed
+
+		draw_models(&renderer, &models, camera, platform.width, platform.height)
 		present(&platform)
 	}
 }
@@ -436,8 +511,8 @@ main :: (args: [][]utf8) {
 	if command == "esm" {
 		if args.len > 2 do command_esm(args[2])
 		else do command_esm("Oblivion.esm")
-	elif command == "view"
-		command_view()
+	elif command == "view" and args.len > 2
+		command_view(args[2])
 	elif command == "texture" and args.len > 2
 		if args.len > 3 do command_texture(args[2], args[3])
 		else do command_texture(args[2], "Oblivion - Textures - Compressed.bsa")

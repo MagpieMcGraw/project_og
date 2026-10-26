@@ -1,0 +1,317 @@
+// Drawing models with OpenGL: their parts uploaded to the graphics card
+// with their textures, and drawn from a camera.
+//
+// Oblivion's world has z up, x east and y north; a unit is about 1.4 cm, a
+// cell 4096 units across.
+module render
+
+use mara.core
+use mara.math
+use mara.open_gl
+use model
+use dds
+use bsa
+
+VERTEX_SHADER_SOURCE :: "#version 450 core
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec3 normal;
+layout(location = 2) in vec2 uv;
+layout(location = 3) in vec4 color;
+
+uniform mat4 world_view_projection;
+uniform mat4 world;
+
+out vec3 world_normal;
+out vec2 texture_uv;
+out vec4 vertex_color;
+
+void main() {
+	gl_Position = world_view_projection * vec4(position, 1.0);
+	world_normal = mat3(world) * normal;
+	texture_uv = uv;
+	vertex_color = color;
+}
+"
+
+FRAGMENT_SHADER_SOURCE :: "#version 450 core
+in vec3 world_normal;
+in vec2 texture_uv;
+in vec4 vertex_color;
+
+uniform sampler2D base_texture;
+uniform float alpha_threshold;    // pixels below it are left out; 0 for none
+uniform vec3 sun_direction;       // where the light comes from
+uniform vec3 sun_color;
+uniform vec3 ambient_color;
+uniform vec3 emissive_color;
+
+out vec4 fragment_color;
+
+void main() {
+	vec4 base = texture(base_texture, texture_uv) * vertex_color;
+	if (base.a < alpha_threshold) discard;
+	float facing = max(dot(normalize(world_normal), sun_direction), 0.0);
+	vec3 light = ambient_color + sun_color * facing + emissive_color;
+	fragment_color = vec4(base.rgb * light, base.a);
+}
+"
+
+// A model's part on the graphics card.
+Gpu_Part :: struct {
+	vertex_array: u32
+	vertex_buffer: u32
+	index_buffer: u32
+	index_count: i32
+	texture: u32
+	alpha_blend: bool
+	alpha_test: bool
+	alpha_threshold: f32
+	two_sided: bool
+	emissive: Vec3
+}
+
+// A model on the graphics card: its parts, and where it is.
+Gpu_Model :: struct {
+	parts: [64]Gpu_Part
+	world: Mat4
+}
+
+// A texture loaded once, by its path.
+Cached_Texture :: struct {
+	path: [160]utf8
+	id: u32
+}
+
+// The renderer: its shader, its textures, and where they're read from.
+Renderer :: struct {
+	program: u32
+	world_view_projection_at: i32   // the shader's uniforms' places
+	world_at: i32
+	alpha_threshold_at: i32
+	sun_direction_at: i32
+	sun_color_at: i32
+	ambient_color_at: i32
+	emissive_color_at: i32
+	textures: [4096]Cached_Texture
+	white_texture: u32              // for parts with none
+}
+
+// What setting up the renderer can fail with.
+Render_Error :: error {
+	Shader_Failed
+}
+
+// Compiles the shader and makes the white texture.
+renderer_init :: fun(renderer: ^Renderer) -> err {
+	vertex_shader := gl_compile_shader(VERTEX_SHADER, VERTEX_SHADER_SOURCE)
+	fragment_shader := gl_compile_shader(FRAGMENT_SHADER, FRAGMENT_SHADER_SOURCE)
+	if vertex_shader == 0 or fragment_shader == 0 do return Shader_Failed
+	renderer.program = gl_link_program(vertex_shader, fragment_shader)
+	if renderer.program == 0 do return Shader_Failed
+	program := renderer.program
+	renderer.world_view_projection_at = GetUniformLocation(program, "world_view_projection")
+	renderer.world_at = GetUniformLocation(program, "world")
+	renderer.alpha_threshold_at = GetUniformLocation(program, "alpha_threshold")
+	renderer.sun_direction_at = GetUniformLocation(program, "sun_direction")
+	renderer.sun_color_at = GetUniformLocation(program, "sun_color")
+	renderer.ambient_color_at = GetUniformLocation(program, "ambient_color")
+	renderer.emissive_color_at = GetUniformLocation(program, "emissive_color")
+	renderer.textures.len = 0
+
+	white : [4!]u8 = [255, 255, 255, 255]
+	GenTextures(1, &renderer.white_texture)
+	BindTexture(TEXTURE_2D, renderer.white_texture)
+	TexImage2D(TEXTURE_2D, 0, i32(RGBA8), 1, 1, 0, RGBA, UNSIGNED_BYTE, &white[0])
+	TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(LINEAR))
+	TexParameteri(TEXTURE_2D, TEXTURE_MAG_FILTER, i32(LINEAR))
+}
+
+// The texture at path in the archive, loaded onto the card the first time
+// it's asked for; the white texture when it can't be read. scratch is room
+// for reading and decoding it.
+texture_for :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratch: ^[]byte) -> u32 {
+	if path.len == 0 do return renderer.white_texture
+	for cached in renderer.textures {
+		if cached.path[:] == path do return cached.id
+	}
+	id := load_texture(archive, path, scratch)
+	if id == 0 do id = renderer.white_texture
+	if renderer.textures.len < renderer.textures.cap {
+		entry := next(&renderer.textures)
+		entry.path.len = 0
+		&entry.path + path
+		entry.id = id
+	}
+	return id
+}
+
+// Reads a texture from the archive onto the card: block compressed ones as
+// they are, the rest decoded to plain pixels. 0 when it can't be read.
+load_texture :: fun(archive: ^Archive, path: []utf8, scratch: ^[]byte) -> u32 {
+	index, found := find_file(archive, path)
+	if not found do return 0
+	scratch.len = 0
+	data, read_error := read_file(archive, index, scratch)
+	if read_error do return 0
+	texture, texture_error := read_texture(data)
+	if texture_error do return 0
+
+	id : u32 = 0
+	GenTextures(1, &id)
+	BindTexture(TEXTURE_2D, id)
+	for mip, level in texture.mips {
+		width := i32(mip.width)
+		height := i32(mip.height)
+		pixels := texture.pixels[mip.at : mip.at + mip.size]
+		match texture.format {
+		dxt1
+			CompressedTexImage2D(TEXTURE_2D, i32(level), RGBA_S3TC_DXT1, width, height, 0, i32(mip.size), &pixels[0])
+		dxt3
+			CompressedTexImage2D(TEXTURE_2D, i32(level), RGBA_S3TC_DXT3, width, height, 0, i32(mip.size), &pixels[0])
+		dxt5
+			CompressedTexImage2D(TEXTURE_2D, i32(level), RGBA_S3TC_DXT5, width, height, 0, i32(mip.size), &pixels[0])
+		else
+			decoded, decode_error := decode_rgba(texture, level, scratch)
+			if decode_error do break
+			TexImage2D(TEXTURE_2D, i32(level), i32(RGBA8), width, height, 0, RGBA, UNSIGNED_BYTE, &decoded[0])
+		}
+	}
+	// A texture without all its mipmaps can't use them (it would draw black).
+	last := texture.mips[texture.mips.len - 1]
+	full_chain := last.width == 1 and last.height == 1
+	if full_chain do TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(LINEAR_MIPMAP_LINEAR))
+	else do TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(LINEAR))
+	TexParameteri(TEXTURE_2D, TEXTURE_MAG_FILTER, i32(LINEAR))
+	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_S, i32(REPEAT))
+	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_T, i32(REPEAT))
+	return id
+}
+
+// Puts a model's parts on the card, their textures read from the archive.
+upload_model :: fun(renderer: ^Renderer, built: Model, archive: ^Archive, scratch: ^[]byte, gpu: ^Gpu_Model) {
+	gpu.parts.len = 0
+	gpu.world = mat4_identity()
+	for part in built.parts {
+		if gpu.parts.len == gpu.parts.cap do break
+		if part.indices.len == 0 do continue
+		gpu_part := next(&gpu.parts)
+		GenVertexArrays(1, &gpu_part.vertex_array)
+		BindVertexArray(gpu_part.vertex_array)
+
+		GenBuffers(1, &gpu_part.vertex_buffer)
+		BindBuffer(ARRAY_BUFFER, gpu_part.vertex_buffer)
+		BufferData(ARRAY_BUFFER, isize(part.vertices.len * size_of(Vertex)), &part.vertices[0], STATIC_DRAW)
+		GenBuffers(1, &gpu_part.index_buffer)
+		BindBuffer(ELEMENT_ARRAY_BUFFER, gpu_part.index_buffer)
+		BufferData(ELEMENT_ARRAY_BUFFER, isize(part.indices.len * 2), &part.indices[0], STATIC_DRAW)
+
+		// position, normal, uv, color: as Vertex lays them out.
+		stride := i32(size_of(Vertex))
+		EnableVertexAttribArray(0)
+		VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)
+		EnableVertexAttribArray(1)
+		VertexAttribPointer(1, 3, FLOAT, 0, stride, 12)
+		EnableVertexAttribArray(2)
+		VertexAttribPointer(2, 2, FLOAT, 0, stride, 24)
+		EnableVertexAttribArray(3)
+		VertexAttribPointer(3, 4, FLOAT, 0, stride, 32)
+
+		gpu_part.index_count = i32(part.indices.len)
+		gpu_part.texture = texture_for(renderer, archive, part.texture[:], scratch)
+		gpu_part.alpha_blend = part.alpha_blend
+		gpu_part.alpha_test = part.alpha_test
+		gpu_part.alpha_threshold = part.alpha_threshold
+		gpu_part.two_sided = part.two_sided
+		gpu_part.emissive = part.emissive
+	}
+	BindVertexArray(0)
+}
+
+// Where the camera is and which way it looks.
+Camera :: struct {
+	position: Vec3
+	yaw: f32      // turned from looking north (+y), clockwise seen from above
+	pitch: f32    // up from level
+	field_of_view: f32 = 1.2   // vertical, in radians
+	near: f32 = 5
+	far: f32 = 60000
+}
+
+// The way the camera looks, and its right and up.
+camera_axes :: fun(camera: Camera) -> Vec3, Vec3, Vec3 {
+	forward := Vec3{sin_f32(camera.yaw) * cos_f32(camera.pitch), cos_f32(camera.yaw) * cos_f32(camera.pitch), sin_f32(camera.pitch)}
+	right := Vec3{cos_f32(camera.yaw), -sin_f32(camera.yaw), 0}
+	up := cross(right, forward)
+	return forward, right, up
+}
+
+// The matrix taking the world to the camera's view: the camera looking
+// down its -z, as OpenGL has it.
+view_matrix :: fun(camera: Camera) -> Mat4 {
+	forward, right, up := camera_axes(camera)
+	view := mat4_identity()
+	view[0][0] = right.x
+	view[1][0] = right.y
+	view[2][0] = right.z
+	view[0][1] = up.x
+	view[1][1] = up.y
+	view[2][1] = up.z
+	view[0][2] = -forward.x
+	view[1][2] = -forward.y
+	view[2][2] = -forward.z
+	view[3][0] = -dot(right, camera.position)
+	view[3][1] = -dot(up, camera.position)
+	view[3][2] = dot(forward, camera.position)
+	return view
+}
+
+// Draws models from the camera, into a frame width by height pixels:
+// opaque parts first, then the blended ones over them.
+draw_models :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, camera: Camera, width: i64, height: i64) {
+	Viewport(0, 0, i32(width), i32(height))
+	ClearColor(0.45, 0.6, 0.8, 1.0)
+	Clear(COLOR_BUFFER_BIT | DEPTH_BUFFER_BIT)
+	Enable(DEPTH_TEST)
+	DepthFunc(LEQUAL)
+	UseProgram(renderer.program)
+	ActiveTexture(TEXTURE0)
+
+	projection := mat4_perspective(camera.field_of_view, f32(width) / f32(height), camera.near, camera.far)
+	view_projection := mat4_mul(projection, view_matrix(camera))
+	sun := vec3_normalize(Vec3{0.3, -0.4, 0.85})
+	Uniform3f(renderer.sun_direction_at, sun.x, sun.y, sun.z)
+	Uniform3f(renderer.sun_color_at, 0.75, 0.72, 0.65)
+	Uniform3f(renderer.ambient_color_at, 0.4, 0.42, 0.45)
+
+	for pass in 0:2 {
+		blended_pass := pass == 1
+		if blended_pass {
+			Enable(BLEND)
+			BlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
+			DepthMask(0)
+		else
+			Disable(BLEND)
+			DepthMask(1)
+		}
+		for &gpu_model in models {
+			world_view_projection := mat4_mul(view_projection, gpu_model.world)
+			UniformMatrix4fv(renderer.world_view_projection_at, 1, 0, &world_view_projection[0][0])
+			UniformMatrix4fv(renderer.world_at, 1, 0, &gpu_model.world[0][0])
+			for part in gpu_model.parts {
+				if part.alpha_blend != blended_pass do continue
+				if part.two_sided do Disable(CULL_FACE)
+				else do Enable(CULL_FACE)
+				threshold : f32 = 0
+				if part.alpha_test do threshold = part.alpha_threshold
+				Uniform1f(renderer.alpha_threshold_at, threshold)
+				Uniform3f(renderer.emissive_color_at, part.emissive.x, part.emissive.y, part.emissive.z)
+				BindTexture(TEXTURE_2D, part.texture)
+				BindVertexArray(part.vertex_array)
+				DrawElements(TRIANGLES, part.index_count, UNSIGNED_SHORT, void)
+			}
+		}
+	}
+	DepthMask(1)
+	Disable(BLEND)
+	BindVertexArray(0)
+}
