@@ -53,9 +53,7 @@ platform_open :: fun(title: []utf8, width: i64, height: i64) -> Platform, err {
 	_ = sdl.GL_SetAttribute(ContextMinorVersion, 5)
 	_ = sdl.GL_SetAttribute(DepthSize, 24)
 
-	title_text : str256
-	&title_text + title
-	window := sdl.CreateWindow(cstring(title_text), i32(width), i32(height), OpenGL | Resizable)
+	window := sdl.CreateWindow(title, i32(width), i32(height), OpenGL | Resizable)
 	if window == void do return Platform{0}, Window_Failed
 	context := sdl.GL_CreateContext(window)
 	if context == void do return Platform{0}, Context_Failed

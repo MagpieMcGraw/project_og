@@ -1008,7 +1008,7 @@ one_pixel_texture :: fun(renderer: ^Renderer, pixel: [4!]u8) -> i64 {
 	id : u32 = 0
 	GenTextures(1, &id)
 	BindTexture(TEXTURE_2D, id)
-	TexImage2D(TEXTURE_2D, 0, i32(RGBA8), 1, 1, 0, RGBA, UNSIGNED_BYTE, &color[0])
+	TexImage2D(TEXTURE_2D, 0, i32(RGBA8), 1, 1, 0, RGBA, UNSIGNED_BYTE, color[:])
 	TexParameteri(TEXTURE_2D, TEXTURE_MAX_LEVEL, 0)
 	TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(LINEAR))
 	TexParameteri(TEXTURE_2D, TEXTURE_MAG_FILTER, i32(LINEAR))
@@ -1049,9 +1049,9 @@ shader_source :: fun(shared: []utf8, body: []utf8, bindless: bool, source: ^[]ut
 compile_program :: fun(vertex_body: []utf8, fragment_body: []utf8, bindless: bool, shared: []utf8 = "") -> u32, err {
 	source : [16 * KB]utf8
 	shader_source("", vertex_body, bindless, &source)
-	vertex_shader := gl_compile_shader(VERTEX_SHADER, cstring(source))
+	vertex_shader := gl_compile_shader(VERTEX_SHADER, source[:])
 	shader_source(shared, fragment_body, bindless, &source)
-	fragment_shader := gl_compile_shader(FRAGMENT_SHADER, cstring(source))
+	fragment_shader := gl_compile_shader(FRAGMENT_SHADER, source[:])
 	if vertex_shader == 0 or fragment_shader == 0 do return 0, Shader_Failed
 	program := gl_link_program(vertex_shader, fragment_shader)
 	if program == 0 do return 0, Shader_Failed
@@ -1166,7 +1166,7 @@ setup_water_buffers :: fun(renderer: ^Renderer) {
 	BindVertexArray(renderer.water_vertex_array)
 	GenBuffers(1, &renderer.water_vertex_buffer)
 	BindBuffer(ARRAY_BUFFER, renderer.water_vertex_buffer)
-	BufferData(ARRAY_BUFFER, (WATER_SLOTS + 1) * WATER_VERTICES * size_of(Water_Vertex), void, DYNAMIC_DRAW)
+	BufferData(ARRAY_BUFFER, (WATER_SLOTS + 1) * WATER_VERTICES * size_of(Water_Vertex), [], DYNAMIC_DRAW)
 	stride := i32(size_of(Water_Vertex))
 	EnableVertexAttribArray(0)
 	VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)    // position
@@ -1191,7 +1191,7 @@ setup_water_buffers :: fun(renderer: ^Renderer) {
 	}
 	GenBuffers(1, &renderer.water_index_buffer)
 	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.water_index_buffer)
-	BufferData(ELEMENT_ARRAY_BUFFER, isize(indices.len * 2), &indices[0], STATIC_DRAW)
+	BufferData(ELEMENT_ARRAY_BUFFER, isize(indices.len * 2), indices[:], STATIC_DRAW)
 	BindVertexArray(0)
 	GenBuffers(1, &renderer.water_indirect_buffer)
 	make_ripple_texture(renderer)
@@ -1246,7 +1246,7 @@ make_ripple_texture :: fun(renderer: ^Renderer) {
 	}
 	GenTextures(1, &renderer.ripple_texture)
 	BindTexture(TEXTURE_2D, renderer.ripple_texture)
-	TexImage2D(TEXTURE_2D, 0, i32(RGBA8), RIPPLE_SIZE, RIPPLE_SIZE, 0, RGBA, UNSIGNED_BYTE, &pixels[0])
+	TexImage2D(TEXTURE_2D, 0, i32(RGBA8), RIPPLE_SIZE, RIPPLE_SIZE, 0, RGBA, UNSIGNED_BYTE, pixels[:])
 	GenerateMipmap(TEXTURE_2D)
 	TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(LINEAR_MIPMAP_LINEAR))
 	TexParameteri(TEXTURE_2D, TEXTURE_MAG_FILTER, i32(LINEAR))
@@ -1277,8 +1277,7 @@ upload_water :: fun(renderer: ^Renderer, water: ^Water_Cell, slot: i64) {
 		}
 	}
 	BindBuffer(ARRAY_BUFFER, renderer.water_vertex_buffer)
-	BufferSubData(ARRAY_BUFFER, isize(slot * WATER_VERTICES * size_of(Water_Vertex)),
-		WATER_VERTICES * size_of(Water_Vertex), &points[0])
+	BufferSubData(ARRAY_BUFFER, isize(slot * WATER_VERTICES * size_of(Water_Vertex)), points[:])
 }
 
 // The far water: a stretch over a rectangle at a height, deep all over.
@@ -1303,7 +1302,7 @@ setup_distant_buffers :: fun(renderer: ^Renderer) {
 	BindVertexArray(renderer.distant_vertex_array)
 	GenBuffers(1, &renderer.distant_vertex_buffer)
 	BindBuffer(ARRAY_BUFFER, renderer.distant_vertex_buffer)
-	BufferData(ARRAY_BUFFER, DISTANT_VERTEX_ROOM * size_of(Distant_Vertex), void, STATIC_DRAW)
+	BufferData(ARRAY_BUFFER, DISTANT_VERTEX_ROOM * size_of(Distant_Vertex), [], STATIC_DRAW)
 	stride := i32(size_of(Distant_Vertex))
 	EnableVertexAttribArray(0)
 	VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)    // position
@@ -1314,19 +1313,19 @@ setup_distant_buffers :: fun(renderer: ^Renderer) {
 	for k in 0:DISTANT_PIECES do &numbers + u32(k)
 	GenBuffers(1, &renderer.distant_piece_buffer)
 	BindBuffer(ARRAY_BUFFER, renderer.distant_piece_buffer)
-	BufferData(ARRAY_BUFFER, DISTANT_PIECES * 4, &numbers[0], STATIC_DRAW)
+	BufferData(ARRAY_BUFFER, DISTANT_PIECES * 4, numbers[:], STATIC_DRAW)
 	EnableVertexAttribArray(2)
 	VertexAttribIPointer(2, 1, UNSIGNED_INT, 4, 0)    // the piece
 	VertexAttribDivisor(2, 1)
 
 	GenBuffers(1, &renderer.distant_index_buffer)
 	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.distant_index_buffer)
-	BufferData(ELEMENT_ARRAY_BUFFER, DISTANT_INDEX_ROOM * 2, void, STATIC_DRAW)
+	BufferData(ELEMENT_ARRAY_BUFFER, DISTANT_INDEX_ROOM * 2, [], STATIC_DRAW)
 	BindVertexArray(0)
 	GenBuffers(1, &renderer.distant_indirect_buffer)
 	GenBuffers(1, &renderer.distant_texture_buffer)
 	BindBuffer(SHADER_STORAGE_BUFFER, renderer.distant_texture_buffer)
-	BufferData(SHADER_STORAGE_BUFFER, DISTANT_PIECES * 16, void, DYNAMIC_DRAW)
+	BufferData(SHADER_STORAGE_BUFFER, DISTANT_PIECES * 16, [], DYNAMIC_DRAW)
 	clear_distant_land(renderer)
 }
 
@@ -1362,16 +1361,15 @@ upload_distant_piece :: fun(renderer: ^Renderer, part: ^Model_Part, color_textur
 	}
 	BindVertexArray(0)   // (binding an index buffer would change a bound vertex array's)
 	BindBuffer(ARRAY_BUFFER, renderer.distant_vertex_buffer)
-	BufferSubData(ARRAY_BUFFER, isize(renderer.distant_vertices_used * size_of(Distant_Vertex)),
-		isize(points.len * size_of(Distant_Vertex)), &points[0])
+	BufferSubData(ARRAY_BUFFER, isize(renderer.distant_vertices_used * size_of(Distant_Vertex)), points[:])
 	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.distant_index_buffer)
-	BufferSubData(ELEMENT_ARRAY_BUFFER, isize(renderer.distant_indices_used * 2), isize(index_count * 2), &part.indices[0])
+	BufferSubData(ELEMENT_ARRAY_BUFFER, isize(renderer.distant_indices_used * 2), part.indices)
 
 	piece_number := renderer.distant_pieces.len
 	if renderer.bindless_available {
 		handles : [2!]u64 = [renderer.textures[color_texture].handle, renderer.textures[normal_texture].handle]
 		BindBuffer(SHADER_STORAGE_BUFFER, renderer.distant_texture_buffer)
-		BufferSubData(SHADER_STORAGE_BUFFER, isize(piece_number * 16), 16, &handles[0])
+		BufferSubData(SHADER_STORAGE_BUFFER, isize(piece_number * 16), handles[:])
 	}
 	&renderer.distant_pieces + Distant_Piece{
 		first_index = u32(renderer.distant_indices_used),
@@ -1395,7 +1393,7 @@ setup_tree_buffers :: fun(renderer: ^Renderer) {
 	BindVertexArray(renderer.tree_vertex_array)
 	GenBuffers(1, &renderer.tree_instance_buffer)
 	BindBuffer(ARRAY_BUFFER, renderer.tree_instance_buffer)
-	BufferData(ARRAY_BUFFER, TREE_CELLS * TREES_PER_CELL * size_of(Tree_Instance), void, STATIC_DRAW)
+	BufferData(ARRAY_BUFFER, TREE_CELLS * TREES_PER_CELL * size_of(Tree_Instance), [], STATIC_DRAW)
 	stride := i32(size_of(Tree_Instance))
 	EnableVertexAttribArray(0)
 	VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)            // position
@@ -1409,7 +1407,7 @@ setup_tree_buffers :: fun(renderer: ^Renderer) {
 	corners : [6!]u16 = [0, 1, 2, 0, 2, 3]
 	GenBuffers(1, &renderer.tree_index_buffer)
 	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.tree_index_buffer)
-	BufferData(ELEMENT_ARRAY_BUFFER, 12, &corners[0], STATIC_DRAW)
+	BufferData(ELEMENT_ARRAY_BUFFER, 12, corners[:], STATIC_DRAW)
 	BindVertexArray(0)
 	GenBuffers(1, &renderer.tree_indirect_buffer)
 }
@@ -1456,8 +1454,7 @@ upload_trees :: fun(renderer: ^Renderer, trees: ^[]Placed_Tree, x: i64, y: i64, 
 	placed.radius = vec3_length(high - low) * 0.5 + widest * 0.5
 	if instances.len > 0 {
 		BindBuffer(ARRAY_BUFFER, renderer.tree_instance_buffer)
-		BufferSubData(ARRAY_BUFFER, isize(slot * TREES_PER_CELL * size_of(Tree_Instance)),
-			isize(instances.len * size_of(Tree_Instance)), &instances[0])
+		BufferSubData(ARRAY_BUFFER, isize(slot * TREES_PER_CELL * size_of(Tree_Instance)), instances[:])
 	}
 	return placed
 }
@@ -1487,7 +1484,7 @@ draw_trees :: fun(renderer: ^Renderer, tree_cells: ^[]Gpu_Trees, hidden: ^Hidden
 	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
 	BindVertexArray(renderer.tree_vertex_array)
 	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.tree_indirect_buffer)
-	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.tree_commands.len * size_of(Draw_Command)), &renderer.tree_commands[0], STREAM_DRAW)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.tree_commands.len * size_of(Draw_Command)), renderer.tree_commands[:], STREAM_DRAW)
 	Disable(CULL_FACE)
 	if bindless {
 		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, 0, i32(renderer.tree_commands.len), 0)
@@ -1554,7 +1551,7 @@ array_uniform :: fun(program: u32, name_start: []utf8, index: i64) -> i32 {
 	&name + name_start
 	&name + int_text(index)[:]
 	&name + "]"
-	return GetUniformLocation(program, cstring(name))
+	return GetUniformLocation(program, name[:])
 }
 
 // Gives a program its shared uniforms for a frame.
@@ -1578,7 +1575,7 @@ setup_mesh_buffers :: fun(renderer: ^Renderer) {
 
 	GenBuffers(1, &renderer.mesh_vertex_buffer)
 	BindBuffer(ARRAY_BUFFER, renderer.mesh_vertex_buffer)
-	BufferData(ARRAY_BUFFER, MESH_VERTEX_ROOM * size_of(Vertex), void, STATIC_DRAW)
+	BufferData(ARRAY_BUFFER, MESH_VERTEX_ROOM * size_of(Vertex), [], STATIC_DRAW)
 	stride := i32(size_of(Vertex))
 	EnableVertexAttribArray(0)
 	VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)    // position
@@ -1591,12 +1588,12 @@ setup_mesh_buffers :: fun(renderer: ^Renderer) {
 
 	GenBuffers(1, &renderer.mesh_index_buffer)
 	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.mesh_index_buffer)
-	BufferData(ELEMENT_ARRAY_BUFFER, MESH_INDEX_ROOM * 2, void, STATIC_DRAW)
+	BufferData(ELEMENT_ARRAY_BUFFER, MESH_INDEX_ROOM * 2, [], STATIC_DRAW)
 
 	// The instances: one Drawn_Instance each, read once for each instance.
 	GenBuffers(1, &renderer.instance_buffer)
 	BindBuffer(ARRAY_BUFFER, renderer.instance_buffer)
-	BufferData(ARRAY_BUFFER, MAX_DRAWN * size_of(Drawn_Instance), void, STREAM_DRAW)
+	BufferData(ARRAY_BUFFER, MAX_DRAWN * size_of(Drawn_Instance), [], STREAM_DRAW)
 	instance_stride := i32(size_of(Drawn_Instance))
 	for column in 0:4 {
 		location := u32(4 + column)
@@ -1629,7 +1626,7 @@ setup_land_buffers :: fun(renderer: ^Renderer) {
 
 	GenBuffers(1, &renderer.land_vertex_buffer)
 	BindBuffer(ARRAY_BUFFER, renderer.land_vertex_buffer)
-	BufferData(ARRAY_BUFFER, LAND_SLOTS * LAND_MESH_VERTICES * size_of(Land_Vertex), void, STATIC_DRAW)
+	BufferData(ARRAY_BUFFER, LAND_SLOTS * LAND_MESH_VERTICES * size_of(Land_Vertex), [], STATIC_DRAW)
 	stride := i32(size_of(Land_Vertex))
 	EnableVertexAttribArray(0)
 	VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)            // position
@@ -1648,13 +1645,13 @@ setup_land_buffers :: fun(renderer: ^Renderer) {
 	land_indices(&indices)
 	GenBuffers(1, &renderer.land_index_buffer)
 	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.land_index_buffer)
-	BufferData(ELEMENT_ARRAY_BUFFER, isize(indices.len * 2), &indices[0], STATIC_DRAW)
+	BufferData(ELEMENT_ARRAY_BUFFER, isize(indices.len * 2), indices[:], STATIC_DRAW)
 	BindVertexArray(0)
 	GenBuffers(1, &renderer.land_indirect_buffer)
 
 	GenBuffers(1, &renderer.land_texture_buffer)
 	BindBuffer(SHADER_STORAGE_BUFFER, renderer.land_texture_buffer)
-	BufferData(SHADER_STORAGE_BUFFER, LAND_QUADRANTS * QUADRANT_TEXTURES * 8, void, DYNAMIC_DRAW)
+	BufferData(SHADER_STORAGE_BUFFER, LAND_QUADRANTS * QUADRANT_TEXTURES * 8, [], DYNAMIC_DRAW)
 }
 
 // ---- textures --------------------------------------------------------------------
@@ -1710,15 +1707,15 @@ load_texture :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratc
 		pixels := texture.pixels[mip.at : mip.at + mip.size]
 		match texture.format {
 		dxt1
-			CompressedTexImage2D(TEXTURE_2D, i32(level), RGBA_S3TC_DXT1, width, height, 0, i32(mip.size), &pixels[0])
+			CompressedTexImage2D(TEXTURE_2D, i32(level), RGBA_S3TC_DXT1, width, height, 0, pixels)
 		dxt3
-			CompressedTexImage2D(TEXTURE_2D, i32(level), RGBA_S3TC_DXT3, width, height, 0, i32(mip.size), &pixels[0])
+			CompressedTexImage2D(TEXTURE_2D, i32(level), RGBA_S3TC_DXT3, width, height, 0, pixels)
 		dxt5
-			CompressedTexImage2D(TEXTURE_2D, i32(level), RGBA_S3TC_DXT5, width, height, 0, i32(mip.size), &pixels[0])
+			CompressedTexImage2D(TEXTURE_2D, i32(level), RGBA_S3TC_DXT5, width, height, 0, pixels)
 		else
 			decoded, decode_error := decode_rgba(texture, level, scratch)
 			if decode_error do break
-			TexImage2D(TEXTURE_2D, i32(level), i32(RGBA8), width, height, 0, RGBA, UNSIGNED_BYTE, &decoded[0])
+			TexImage2D(TEXTURE_2D, i32(level), i32(RGBA8), width, height, 0, RGBA, UNSIGNED_BYTE, decoded)
 		}
 		levels += 1
 	}
@@ -1772,10 +1769,9 @@ upload_model :: fun(renderer: ^Renderer, built: Model, archive: ^Archive, scratc
 	for part in built.parts {
 		if part.indices.len == 0 or part.vertices.len == 0 do continue
 		BindBuffer(ARRAY_BUFFER, renderer.mesh_vertex_buffer)
-		BufferSubData(ARRAY_BUFFER, isize(renderer.vertices_used * size_of(Vertex)),
-			isize(part.vertices.len * size_of(Vertex)), &part.vertices[0])
+		BufferSubData(ARRAY_BUFFER, isize(renderer.vertices_used * size_of(Vertex)), part.vertices)
 		BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.mesh_index_buffer)
-		BufferSubData(ELEMENT_ARRAY_BUFFER, isize(renderer.indices_used * 2), isize(part.indices.len * 2), &part.indices[0])
+		BufferSubData(ELEMENT_ARRAY_BUFFER, isize(renderer.indices_used * 2), part.indices)
 
 		threshold : f32 = 0
 		if part.alpha_test do threshold = part.alpha_threshold
@@ -1873,12 +1869,11 @@ upload_land :: fun(renderer: ^Renderer, mesh: ^Land_Mesh, x: i64, y: i64, slot: 
 		}
 		if renderer.bindless_available {
 			BindBuffer(SHADER_STORAGE_BUFFER, renderer.land_texture_buffer)
-			BufferSubData(SHADER_STORAGE_BUFFER, isize((slot * 4 + q) * QUADRANT_TEXTURES * 8), QUADRANT_TEXTURES * 8, &handles[0])
+			BufferSubData(SHADER_STORAGE_BUFFER, isize((slot * 4 + q) * QUADRANT_TEXTURES * 8), handles[:])
 		}
 	}
 	BindBuffer(ARRAY_BUFFER, renderer.land_vertex_buffer)
-	BufferSubData(ARRAY_BUFFER, isize(slot * LAND_MESH_VERTICES * size_of(Land_Vertex)),
-		LAND_MESH_VERTICES * size_of(Land_Vertex), &mesh.vertices[0])
+	BufferSubData(ARRAY_BUFFER, isize(slot * LAND_MESH_VERTICES * size_of(Land_Vertex)), mesh.vertices[:])
 	return Gpu_Land{x = x, y = y, slot = slot, center = mesh.center, radius = mesh.radius}
 }
 
@@ -2072,7 +2067,7 @@ draw_distant_land :: fun(renderer: ^Renderer, grounds: ^[]Gpu_Land, planes: ^Vie
 	set_hidden_cells(&made.hidden, &hidden)
 	BindVertexArray(renderer.distant_vertex_array)
 	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.distant_indirect_buffer)
-	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.distant_commands.len * size_of(Draw_Command)), &renderer.distant_commands[0], STREAM_DRAW)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.distant_commands.len * size_of(Draw_Command)), renderer.distant_commands[:], STREAM_DRAW)
 	if renderer.use_bindless {
 		BindBufferBase(SHADER_STORAGE_BUFFER, 2, renderer.distant_texture_buffer)
 		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, 0, i32(renderer.distant_commands.len), 0)
@@ -2161,7 +2156,7 @@ draw_water_commands :: fun(renderer: ^Renderer, look: ^Sky_Look, view_projection
 	BindTexture(TEXTURE_2D, renderer.ripple_texture)
 	BindVertexArray(renderer.water_vertex_array)
 	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.water_indirect_buffer)
-	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.water_commands.len * size_of(Draw_Command)), &renderer.water_commands[0], STREAM_DRAW)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.water_commands.len * size_of(Draw_Command)), renderer.water_commands[:], STREAM_DRAW)
 	Disable(CULL_FACE)   // (seen from under the water too)
 	Enable(BLEND)
 	BlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
@@ -2204,7 +2199,7 @@ draw_land :: fun(renderer: ^Renderer, grounds: ^[]Gpu_Land, planes: ^View_Planes
 	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
 	BindVertexArray(renderer.land_vertex_array)
 	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.land_indirect_buffer)
-	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.land_commands.len * size_of(Draw_Command)), &renderer.land_commands[0], STREAM_DRAW)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.land_commands.len * size_of(Draw_Command)), renderer.land_commands[:], STREAM_DRAW)
 	if bindless {
 		BindBufferBase(SHADER_STORAGE_BUFFER, 1, renderer.land_texture_buffer)
 		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, 0, i32(renderer.land_commands.len), 0)
@@ -2299,10 +2294,10 @@ gather_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]In
 	for key in renderer.touched do renderer.part_counts[key & 0xFFFFF] = 0
 
 	BindBuffer(ARRAY_BUFFER, renderer.instance_buffer)
-	BufferData(ARRAY_BUFFER, MAX_DRAWN * size_of(Drawn_Instance), void, STREAM_DRAW)   // (a fresh buffer: no waiting on last frame's)
-	BufferSubData(ARRAY_BUFFER, 0, isize(record_count * size_of(Drawn_Instance)), &renderer.records[0])
+	BufferData(ARRAY_BUFFER, MAX_DRAWN * size_of(Drawn_Instance), [], STREAM_DRAW)   // (a fresh buffer: no waiting on last frame's)
+	BufferSubData(ARRAY_BUFFER, 0, renderer.records[0 : record_count])
 	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.indirect_buffer)
-	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.commands.len * size_of(Draw_Command)), &renderer.commands[0], STREAM_DRAW)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.commands.len * size_of(Draw_Command)), renderer.commands[:], STREAM_DRAW)
 }
 
 // Draws the gathered meshes' opaque runs, or their blended ones (after the

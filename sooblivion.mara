@@ -15,6 +15,7 @@ use mara.memory
 use mara.time
 use esm
 use bsa
+use inflate
 use nif
 use dds
 use png
@@ -128,6 +129,39 @@ command_bsa :: fun(name: []utf8, what: []utf8) {
 		}
 		print("% files read, % failed, % MB unpacked, in % ms",
 			archive.files.len, failed, total / MB, elapsed_ms(start))
+		return
+	}
+	if what == "-cut" {
+		// Every packed file's stream cut short — at a quarter, a half and
+		// three quarters of it — unpacked into exactly its size's room: each
+		// should fail with Input_Ended.
+		start := time_now()
+		cuts : i64 = 0
+		ended : i64 = 0
+		others : i64 = 0
+		for file, i in archive.files {
+			if not file.packed or file.size <= 8 do continue
+			storage.len = 0
+			packed := storage[storage.cap - file.size : storage.cap]
+			_ = file_seek(archive.file, file.offset, SEEK_SET)
+			read_error := read_exactly(archive.file, packed)
+			if read_error do continue
+			unpacked_size : u32 = packed[0]
+			stream := packed[4 : packed.len]
+			for quarter in 1..3 {
+				output := storage[0 : i64(unpacked_size)]
+				output.len = 0
+				cut_error := unzip(stream[0 : stream.len * quarter / 4], &output)
+				cuts += 1
+				if cut_error == Input_Ended {
+					ended += 1
+				else
+					others += 1
+					if others <= 10 do print("  % cut at %/4: %", file_name(&archive, file), quarter, cut_error)
+				}
+			}
+		}
+		print("% cuts: % Input_Ended, % otherwise, in % ms", cuts, ended, others, elapsed_ms(start))
 		return
 	}
 
@@ -1170,11 +1204,9 @@ command_lod :: fun(name: []utf8, x: i64, y: i64) {
 	cell_land : Land
 	read_land(record.data, &cell_land)
 	piece_size := f32(LOD_CELLS * CELL_SIZE)
-	columns : [5!]i64 = [4, 16, 28, 8, 20]
-	rows : [5!]i64 = [4, 16, 8, 28, 30]
-	for k in 0:5 {
-		column := columns[k]
-		row := rows[k]
+	for point in [[4, 4], [16, 16], [28, 8], [8, 28], [20, 30]] {
+		column := point[0]
+		row := point[1]
 		// Where the point is on the piece's textures: u east, v north.
 		u := (f32((x - corner_x) * CELL_SIZE) + f32(column) * LAND_SPACING) / piece_size
 		v := (f32((y - corner_y) * CELL_SIZE) + f32(row) * LAND_SPACING) / piece_size
