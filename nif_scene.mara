@@ -52,7 +52,7 @@ read_node :: fun(reader: ^Nif_Reader) -> Block {
 	object := read_av_object(reader)
 	children := read_refs(reader)
 	skip_refs(reader)   // effects: lights and the like it casts on its children
-	return Node{object = object, children = children, billboard = false}
+	return Node{object = object, children = children, billboard = false, billboard_mode = 0}
 }
 
 // NiBillboardNode: a node that turns to face the camera.
@@ -60,8 +60,9 @@ read_billboard_node :: fun(reader: ^Nif_Reader) -> Block {
 	object := read_av_object(reader)
 	children := read_refs(reader)
 	skip_refs(reader)   // effects
-	if reader.version >= VERSION_10_1_0_0 do skip(reader, 2)   // billboard mode
-	return Node{object = object, children = children, billboard = true}
+	mode : u16 = 0
+	if reader.version >= VERSION_10_1_0_0 do mode = read_u16(reader)
+	return Node{object = object, children = children, billboard = true, billboard_mode = mode}
 }
 
 // NiTriShape, NiTriStrips (NiGeometry): a mesh in the tree.
@@ -348,7 +349,7 @@ read_texture_slot :: fun(reader: ^Nif_Reader) -> Texture_Slot {
 
 // NiTexturingProperty: the textures a shape is drawn with, each in its slot.
 read_texturing_property :: fun(reader: ^Nif_Reader) -> Block {
-	_ = read_object_net(reader)
+	net := read_object_net(reader)
 	if reader.version <= VERSION_10_0_1_2 do skip(reader, 2)   // flags
 	apply_mode := read_u32(reader)
 	count := i64(read_u32(reader))
@@ -365,7 +366,7 @@ read_texturing_property :: fun(reader: ^Nif_Reader) -> Block {
 		slot := read_texture_slot(reader)
 		if slot.used do skip(reader, 4)   // map id
 	}
-	return Texturing{apply_mode = apply_mode, slots = slots}
+	return Texturing{apply_mode = apply_mode, slots = slots, controller = net.controller}
 }
 
 // NiVertexColorProperty: what a mesh's vertex colors are used for.

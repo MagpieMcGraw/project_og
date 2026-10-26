@@ -322,7 +322,7 @@ load_model :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64, err {
 	mesh := read_nif(data, &room.blocks, &failure)?
 	room.model.len = 0
 	built := build_model(&mesh, &room.model)?
-	gpu := upload_model(loader.renderer, built, loader.textures, &room.texture)?
+	gpu := upload_model(loader.renderer, &built, loader.textures, &room.texture)?
 	// What it collides as (from its blocks, still in their room).
 	collision_start := scene.collision_points.len
 	add_collision(&mesh, &scene.collision_points)
@@ -872,7 +872,7 @@ add_door_model :: fun(scene: ^Scene, loader: Loader, mesh: ^Nif, node: i64, left
 	room.model.len = 0
 	built := build_model_part(mesh, node, left_out, &room.model)?
 	if built.parts.len == 0 do return -1, No_Parts
-	gpu := upload_model(loader.renderer, built, loader.textures, &room.texture)?
+	gpu := upload_model(loader.renderer, &built, loader.textures, &room.texture)?
 	collision_start := scene.collision_points.len
 	add_collision_part(mesh, node, left_out, &scene.collision_points)
 	&scene.model_collision + Collision_Range{first = collision_start, count = scene.collision_points.len - collision_start}

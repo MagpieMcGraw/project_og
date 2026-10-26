@@ -28,6 +28,10 @@ Model_Part :: struct {
 	glow_texture: [160]utf8 // the glow map's, or empty
 	clamp_mode: u32         // how the base texture's edges go: 0 clamped both ways, 1 clamped across
 	                        // and repeating up, 2 repeating across and clamped up, 3 repeating both
+	flip: i64               // its texture's flipbook (in the model's flips), -1 for none
+	additive: bool          // blended by adding its light to what's behind (fire)
+	billboard_mode: i64     // under a billboard node: its mode (Node's billboard_mode); -1 for none
+	billboard_node: Mat4    // that node's place in the model
 	alpha_blend: bool       // blended with what's behind it
 	alpha_test: bool        // pixels whose alpha is below the threshold are left out
 	alpha_threshold: f32    // 0 to 1
@@ -40,8 +44,27 @@ Model_Part :: struct {
 // A whole model: its parts, and a box around them.
 Model :: struct {
 	parts: []Model_Part
+	flips: []Model_Flip    // the parts' flipbooks (Model_Part.flip)
 	bounds_min: Vec3
 	bounds_max: Vec3
+}
+
+// The frames a flipbook holds, and the keys saying which shows when, at most.
+FLIP_FRAMES :: 48
+FLIP_KEYS :: 32
+
+// A part's texture flipped through frames (a flame's, say): the frames'
+// archive paths; its span of time, played at a frequency from a phase;
+// and its keys — at each time, which frame (as a number) — or, with none,
+// the frames in turn across the span.
+Model_Flip :: struct {
+	frames: [FLIP_FRAMES][160]utf8
+	start_time: f32
+	stop_time: f32
+	frequency: f32
+	phase: f32
+	key_times: [FLIP_KEYS]f32
+	key_values: [FLIP_KEYS]f32
 }
 
 // What makes a model fail.
@@ -55,6 +78,8 @@ Inherited :: struct {
 	material: i64
 	alpha: i64
 	stencil: i64
+	billboard_mode: i64    // the nearest billboard node above: its mode, -1 for none
+	billboard_node: Mat4   // and its place in the model
 }
 
 // An object's place relative to its parent, as a matrix: translate, turn, scale.
@@ -111,11 +136,21 @@ build_model_part :: fun(mesh: ^Nif, node: i64, left_out: []i64, storage: ^[]byte
 		else
 		}
 	}
+	// And a flipbook for each flip controller at most.
+	flip_count : i64 = 0
+	for block in mesh.blocks {
+		match block {
+		Flip_Controller
+			flip_count += 1
+		else
+		}
+	}
 	model := Model{
 		parts = slice([:shape_count]Model_Part, storage),
+		flips = slice([:flip_count]Model_Flip, storage),
 		bounds_min = Vec3{1000000, 1000000, 1000000},
 		bounds_max = Vec3{-1000000, -1000000, -1000000}}
-	none := Inherited{texturing = -1, material = -1, alpha = -1, stencil = -1}
+	none := Inherited{texturing = -1, material = -1, alpha = -1, stencil = -1, billboard_mode = -1, billboard_node = mat4_identity()}
 	if node >= 0 {
 		match mesh.blocks[node] {
 		Node part_node
@@ -147,6 +182,10 @@ add_object :: fun(mesh: ^Nif, index: i64, parent: Mat4, inherited: Inherited, mo
 		if node.object.name == "EditorMarker" do return
 		transform := mat4_mul(parent, local_transform(node.object))
 		properties := inherit(mesh, inherited, node.object.properties)
+		if node.billboard {
+			properties.billboard_mode = i64(node.billboard_mode)
+			properties.billboard_node = transform
+		}
 		for k in 0:node.children.count {
 			child := node.children.at(k)
 			if child >= 0 do add_object(mesh, child, transform, properties, model, storage, left_out)?
@@ -216,6 +255,10 @@ add_shape :: fun(mesh: ^Nif, geometry: Geometry, transform: Mat4, properties: In
 		texture = [],
 		glow_texture = [],
 		clamp_mode = 3,
+		flip = -1,
+		additive = false,
+		billboard_mode = properties.billboard_mode,
+		billboard_node = properties.billboard_node,
 		alpha_blend = false,
 		alpha_test = false,
 		alpha_threshold = 0,
@@ -223,7 +266,7 @@ add_shape :: fun(mesh: ^Nif, geometry: Geometry, transform: Mat4, properties: In
 		diffuse = Vec3{1, 1, 1},
 		emissive = Vec3{0, 0, 0},
 		alpha = 1}
-	apply_properties(mesh, properties, part)
+	apply_properties(mesh, properties, part, model)
 
 	// The material's color, where the mesh has no colors of its own (they
 	// take its place, as Oblivion's meshes mean them to), and its opacity,
@@ -267,11 +310,12 @@ add_strip :: fun(strip: []byte, indices: ^[]u16) {
 }
 
 // Sets how a part is drawn from the properties in effect for it.
-apply_properties :: fun(mesh: ^Nif, properties: Inherited, part: ^Model_Part) {
+apply_properties :: fun(mesh: ^Nif, properties: Inherited, part: ^Model_Part, model: ^Model) {
 	if properties.texturing >= 0 {
 		match mesh.blocks[properties.texturing] {
 		Texturing texturing
 			texture_path(mesh, texturing.slots[SLOT_BASE], &part.texture)
+			part.flip = add_flip(mesh, texturing.controller, model)
 			if texturing.slots[SLOT_BASE].used do part.clamp_mode = texturing.slots[SLOT_BASE].clamp_mode
 			texture_path(mesh, texturing.slots[SLOT_GLOW], &part.glow_texture)
 		else
@@ -290,6 +334,8 @@ apply_properties :: fun(mesh: ^Nif, properties: Inherited, part: ^Model_Part) {
 		match mesh.blocks[properties.alpha] {
 		Alpha alpha
 			part.alpha_blend = alpha.flags & 1 != 0
+			// Its blending's factor for what's behind (bits 5 to 8): 0 is one, adding.
+			part.additive = part.alpha_blend and (alpha.flags >> 5) & 15 == 0
 			part.alpha_test = alpha.flags & 0x200 != 0
 			part.alpha_threshold = f32(alpha.threshold) / 255
 		else
@@ -301,6 +347,64 @@ apply_properties :: fun(mesh: ^Nif, properties: Inherited, part: ^Model_Part) {
 			part.two_sided = stencil.draw_mode == 3
 		else
 		}
+	}
+}
+
+// The flipbook of a texturing's base texture, if its controllers flip it
+// (through one frame at least): its index in the model's flips; -1 for
+// none. (Followed down the chain of flip controllers only: the first on a
+// texturing, in Oblivion's meshes.)
+add_flip :: fun(mesh: ^Nif, controller: i64, model: ^Model) -> i64 {
+	at := controller
+	for at >= 0 and at < mesh.blocks.len {
+		match mesh.blocks[at] {
+		Flip_Controller flip
+			if flip.slot != SLOT_BASE {
+				at = flip.next
+				continue
+			}
+			if model.flips.len == model.flips.cap or flip.sources.count == 0 do return -1
+			entry := next(&model.flips)
+			entry.frames.len = 0
+			for k in 0:flip.sources.count {
+				if entry.frames.len == entry.frames.cap do break
+				frame := next(&entry.frames)
+				texture_path(mesh, Texture_Slot{used = true, source = flip.sources.at(k), clamp_mode = 0, filter_mode = 0, uv_set = 0}, frame)
+			}
+			entry.start_time = flip.start_time
+			entry.stop_time = flip.stop_time
+			entry.frequency = flip.frequency
+			entry.phase = flip.phase
+			entry.key_times.len = 0
+			entry.key_values.len = 0
+			add_flip_keys(mesh, flip.interpolator, entry)
+			return model.flips.len - 1
+		else
+			return -1
+		}
+	}
+	return -1
+}
+
+// A flip's interpolator's keys (which frame at which time), into its flipbook.
+add_flip_keys :: fun(mesh: ^Nif, interpolator: i64, entry: ^Model_Flip) {
+	if interpolator < 0 or interpolator >= mesh.blocks.len do return
+	match mesh.blocks[interpolator] {
+	Float_Interpolator float_interpolator
+		if float_interpolator.data < 0 or float_interpolator.data >= mesh.blocks.len do return
+		match mesh.blocks[float_interpolator.data] {
+		Float_Data data
+			size := key_bytes(data.key_type, 4)
+			for k in 0:data.key_count {
+				if entry.key_times.len == entry.key_times.cap do return
+				time : f32 = data.keys[k * size]
+				value : f32 = data.keys[k * size + 4]
+				&entry.key_times + time
+				&entry.key_values + value
+			}
+		else
+		}
+	else
 	}
 }
 

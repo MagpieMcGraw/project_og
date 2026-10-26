@@ -209,6 +209,7 @@ Block :: union {
 		object: Av_Object
 		children: Refs
 		billboard: bool
+		billboard_mode: u16  // a billboard's: 0 faces the camera; 1 (and 5) turns about its up; …
 	}
 	// NiTriShape, NiTriStrips: a mesh in the tree, its geometry in another block.
 	Shape {
@@ -222,6 +223,7 @@ Block :: union {
 	Texturing {
 		apply_mode: u32
 		slots: [SLOT_COUNT!]Texture_Slot
+		controller: i64      // its first controller (a flip controller, say), -1 for none
 	}
 	Source_Texture {
 		file_name: []utf8   // a path under textures\, as the file spells it
@@ -322,6 +324,30 @@ Block :: union {
 		triangles: []byte    // 3 u16 vertex indexes, welding (u16), a normal: 20 bytes each
 		vertex_count: i64
 		vertices: []byte     // a Vec3 each
+	}
+
+	// NiFlipController: flips one of a texturing's textures through
+	// sources over time — which shows when, its interpolator's keys say.
+	Flip_Controller {
+		next: i64            // the next controller on the same object
+		frequency: f32
+		phase: f32
+		start_time: f32
+		stop_time: f32
+		interpolator: i64
+		slot: u32            // which of the texturing's textures (SLOT_BASE…)
+		sources: Refs        // NiSourceTextures
+	}
+	// NiFloatInterpolator: a number, as its keys say over time (or its value).
+	Float_Interpolator {
+		value: f32
+		data: i64
+	}
+	// NiFloatData: keys of a number: their type (KEY_*), count, the keys.
+	Float_Data {
+		key_type: i64
+		key_count: i64
+		keys: []byte
 	}
 
 	// Animation. NiControllerSequence: one of an object's animations (a

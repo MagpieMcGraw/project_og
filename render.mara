@@ -54,6 +54,9 @@ MESH_VERTEX_ROOM :: 4194304
 MESH_INDEX_ROOM :: 33554432
 // Mesh parts on the card, textures loaded, instances drawn in a frame.
 MAX_PARTS :: 65536
+MAX_FLIPS :: 1024
+MAX_FLIP_FRAMES :: 16384
+MAX_BILLBOARDS :: 4096
 MAX_TEXTURES :: 8192
 MAX_DRAWN :: 65536
 
@@ -197,6 +200,7 @@ uniform vec3 camera_position;
 uniform vec3 fog_color;
 uniform float fog_near;
 uniform float fog_far;            // no fog when it isn't past fog_near
+uniform int adding;               // blended by adding (fire): fogged by fading out
 
 out vec4 fragment_color;
 
@@ -232,7 +236,8 @@ void main() {
 	vec3 color = base.rgb * light;
 	if (fog_far > fog_near) {
 		float fog = clamp((length(world_position - camera_position) - fog_near) / (fog_far - fog_near), 0.0, 1.0);
-		color = mix(color, fog_color, fog);
+		if (adding != 0) base.a *= 1.0 - fog;
+		else color = mix(color, fog_color, fog);
 	}
 	fragment_color = vec4(color, base.a);
 }
@@ -764,6 +769,32 @@ Mesh_Part :: struct {
 	two_sided: bool
 	alpha_threshold: f32   // pixels less opaque are left out; 0 for none
 	emissive: Vec3
+	additive: bool         // blended by adding its light to what's behind (fire)
+	flip: i64              // its texture's flipbook (in the renderer's flips), -1 for none
+	billboard: i64         // turned to face the camera: its billboard (in the renderer's), -1 for none
+}
+
+// A flipbook on the card: its frames' textures (in the renderer's
+// flip_frames), its timing and keys (as Model_Flip's), and the texture it
+// shows this frame.
+Gpu_Flip :: struct {
+	first_frame: i64
+	frame_count: i64
+	start_time: f32
+	stop_time: f32
+	frequency: f32
+	phase: f32
+	key_times: [FLIP_KEYS]f32
+	key_values: [FLIP_KEYS]f32
+	shown: i64             // a texture slot
+}
+
+// A billboard node of a model on the card: its mode (Node's billboard_mode),
+// its place in the model, and the way back.
+Gpu_Billboard :: struct {
+	mode: i64
+	node: Mat4
+	node_inverse: Mat4
 }
 
 // A model on the card: its parts (in the renderer's), and a sphere around
@@ -1069,6 +1100,7 @@ Shared_Uniforms :: struct {
 Mesh_Program :: struct {
 	program: u32
 	shared: Shared_Uniforms
+	adding_at: i32
 }
 
 // A land program, and where its uniforms are.
@@ -1147,6 +1179,11 @@ Renderer :: struct {
 	vertices_used: i64
 	indices_used: i64
 	parts: [MAX_PARTS]Mesh_Part
+	// The parts' flipbooks (a flame's frames) and their frames' texture
+	// slots; the billboard nodes parts are under.
+	flips: [MAX_FLIPS]Gpu_Flip
+	flip_frames: [MAX_FLIP_FRAMES]i64
+	billboards: [MAX_BILLBOARDS]Gpu_Billboard
 
 	// The land's buffers, its quadrants' textures, and their handles' buffer.
 	land_vertex_array: u32
@@ -1313,6 +1350,7 @@ find_shared_uniforms :: fun(program: u32) -> Shared_Uniforms {
 make_mesh_program :: fun(made: ^Mesh_Program, bindless: bool) -> err {
 	made.program = compile_program(MESH_VERTEX_SHADER, MESH_FRAGMENT_SHADER, bindless)?
 	made.shared = find_shared_uniforms(made.program)
+	made.adding_at = GetUniformLocation(made.program, "adding")
 	if not bindless {
 		UseProgram(made.program)
 		Uniform1i(GetUniformLocation(made.program, "glow_texture"), 1)
@@ -2163,7 +2201,7 @@ Upload_Error :: error {
 
 // Puts a model's parts into the shared buffers, their textures read from
 // the archive: the model on the card.
-upload_model :: fun(renderer: ^Renderer, built: Model, archive: ^Archive, scratch: ^[]byte) -> Gpu_Model, err {
+upload_model :: fun(renderer: ^Renderer, built: ^Model, archive: ^Archive, scratch: ^[]byte) -> Gpu_Model, err {
 	vertex_total : i64 = 0
 	index_total : i64 = 0
 	for part in built.parts {
@@ -2174,6 +2212,36 @@ upload_model :: fun(renderer: ^Renderer, built: Model, archive: ^Archive, scratc
 		return Gpu_Model{0}, No_Room_On_Card
 	}
 	if renderer.parts.len + built.parts.len > renderer.parts.cap do return Gpu_Model{0}, No_Room_On_Card
+	if renderer.billboards.len + built.parts.len > renderer.billboards.cap do return Gpu_Model{0}, No_Room_On_Card
+	frame_total : i64 = 0
+	for &flip in built.flips do frame_total += flip.frames.len
+	if renderer.flips.len + built.flips.len > renderer.flips.cap or renderer.flip_frames.len + frame_total > renderer.flip_frames.cap {
+		return Gpu_Model{0}, No_Room_On_Card
+	}
+
+	// Its flipbooks: each frame's texture, its edges as the first part
+	// flipping it has them.
+	first_flip := renderer.flips.len
+	for &flip, flip_index in built.flips {
+		clamp_mode : u32 = REPEAT_BOTH
+		for part in built.parts {
+			if part.flip == flip_index {
+				clamp_mode = part.clamp_mode
+				break
+			}
+		}
+		made := next(&renderer.flips)
+		made.first_frame = renderer.flip_frames.len
+		made.frame_count = flip.frames.len
+		for frame in flip.frames do &renderer.flip_frames + texture_for(renderer, archive, frame[:], scratch, clamp_mode)
+		made.start_time = flip.start_time
+		made.stop_time = flip.stop_time
+		made.frequency = flip.frequency
+		made.phase = flip.phase
+		made.key_times = flip.key_times
+		made.key_values = flip.key_values
+		made.shown = renderer.flip_frames[made.first_frame]
+	}
 
 	BindVertexArray(0)   // (binding an index buffer would change a bound vertex array's)
 	gpu := Gpu_Model{
@@ -2190,6 +2258,16 @@ upload_model :: fun(renderer: ^Renderer, built: Model, archive: ^Archive, scratc
 
 		threshold : f32 = 0
 		if part.alpha_test do threshold = part.alpha_threshold
+		flip : i64 = -1
+		if part.flip >= 0 do flip = first_flip + part.flip
+		billboard : i64 = -1
+		if part.billboard_mode >= 0 {
+			billboard = renderer.billboards.len
+			&renderer.billboards + Gpu_Billboard{
+				mode = part.billboard_mode,
+				node = part.billboard_node,
+				node_inverse = mat4_inverse(part.billboard_node)}
+		}
 		next(&renderer.parts)^ = Mesh_Part{
 			first_index = u32(renderer.indices_used),
 			index_count = u32(part.indices.len),
@@ -2199,7 +2277,10 @@ upload_model :: fun(renderer: ^Renderer, built: Model, archive: ^Archive, scratc
 			alpha_blend = part.alpha_blend,
 			two_sided = part.two_sided,
 			alpha_threshold = threshold,
-			emissive = part.emissive}
+			emissive = part.emissive,
+			additive = part.additive,
+			flip = flip,
+			billboard = billboard}
 		renderer.vertices_used += part.vertices.len
 		renderer.indices_used += part.indices.len
 		gpu.part_count += 1
@@ -2459,7 +2540,7 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 		// What's seen from afar, but in the cells drawn in full (there, its
 		// own references are).
 		if distant_instances.len > 0 {
-			gather_meshes(renderer, models, distant_instances, &far_planes, &near_cells, &stats)
+			gather_meshes(renderer, models, distant_instances, &far_planes, &near_cells, camera, look.time, &stats)
 			draw_mesh_runs(renderer, far_view_projection, lighting, sun, camera, false, &stats)
 		}
 		if tree_cells.len > 0 do draw_trees(renderer, tree_cells, &near_cells, false, &far_planes, far_view_projection, lighting, sun, camera, &stats)
@@ -2470,7 +2551,7 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 	}
 	if grounds.len > 0 do draw_land(renderer, grounds, &planes, view_projection, lighting, sun, camera, &stats)
 	nothing_left_out := hidden_around(camera.position)
-	gather_meshes(renderer, models, instances, &planes, &nothing_left_out, &stats)
+	gather_meshes(renderer, models, instances, &planes, &nothing_left_out, camera, look.time, &stats)
 	draw_mesh_runs(renderer, view_projection, lighting, sun, camera, false, &stats)
 	if look.outside and tree_cells.len > 0 do draw_trees(renderer, tree_cells, &near_cells, true, &planes, view_projection, lighting, sun, camera, &stats)
 	if look.outside and grass_cells.len > 0 {
@@ -2696,25 +2777,102 @@ draw_land :: fun(renderer: ^Renderer, grounds: ^[]Gpu_Land, planes: ^View_Planes
 	ActiveTexture(TEXTURE0)
 }
 
-// A part's sort key: blended parts after opaque ones; within those, the
-// two-sided after the rest; without bindless, then by texture — so each
-// run of one key is one draw call. The part's index in the low bits.
-part_key :: fun(part: Mesh_Part, part_index: i64, bindless: bool) -> i64 {
+// A part's sort key: blended parts after opaque ones, those adding last;
+// within those, the two-sided after the rest; without bindless, then by
+// texture — so each run of one key is one draw call. The part's index in
+// the low bits.
+part_key :: fun(renderer: ^Renderer, part: Mesh_Part, part_index: i64, bindless: bool) -> i64 {
 	group_key : i64 = 0
-	if not bindless do group_key = part.texture_slot
+	if not bindless do group_key = shown_texture(renderer, part)
 	if part.two_sided do group_key += MAX_TEXTURES
 	if part.alpha_blend do group_key += 2 * MAX_TEXTURES
+	if part.additive do group_key += 4 * MAX_TEXTURES
 	return (group_key << 20) | part_index
+}
+
+// The texture a part shows this frame (its slot): its flipbook's frame now,
+// else its own.
+shown_texture :: fun(renderer: ^Renderer, part: Mesh_Part) -> i64 {
+	if part.flip >= 0 do return renderer.flips[part.flip].shown
+	return part.texture_slot
+}
+
+// Which of its frames a flipbook shows at a time (seconds): the time
+// played at its frequency from its phase, round and round its span; then
+// its keys' value there (between two, in a line) is the frame's number —
+// or, with no keys, the frames in turn across the span.
+flip_frame :: fun(flip: ^Gpu_Flip, time: f32) -> i64 {
+	span := flip.stop_time - flip.start_time
+	at := time * flip.frequency + flip.phase
+	if span > 0 do at -= floor_f32((at - flip.start_time) / span) * span
+	value : f32 = 0
+	if flip.key_times.len == 0 {
+		if span > 0 do value = (at - flip.start_time) / span * f32(flip.frame_count)
+	elif at <= flip.key_times[0]
+		value = flip.key_values[0]
+	else
+		value = flip.key_values[flip.key_times.len - 1]
+		for k in 1:flip.key_times.len {
+			if at < flip.key_times[k] {
+				before := flip.key_times[k - 1]
+				share := (at - before) / (flip.key_times[k] - before)
+				value = flip.key_values[k - 1] + (flip.key_values[k] - flip.key_values[k - 1]) * share
+				break
+			}
+		}
+	}
+	frame := i64(value)
+	if frame >= flip.frame_count do frame = flip.frame_count - 1
+	if frame < 0 do frame = 0
+	return frame
+}
+
+// Where a billboard part is drawn: its node turned to face the camera —
+// all the way (the node's x to the camera's right, y to its up, z back
+// toward it), or in modes 1, 5 and 9 about the node's own up (y) only, z
+// toward the eye — keeping the node's place and scale. (The part's
+// vertices are in the model's space: taken back through the node first.)
+billboard_world :: fun(billboard: ^Gpu_Billboard, placement: Mat4, camera_right: Vec3, camera_up: Vec3, eye: Vec3) -> Mat4 {
+	placed := mat4_mul(placement, billboard.node)
+	origin := Vec3{placed[3][0], placed[3][1], placed[3][2]}
+	scale := vec3_length(Vec3{placed[0][0], placed[0][1], placed[0][2]})
+	across := camera_right
+	upward := camera_up
+	if billboard.mode == 1 or billboard.mode == 5 or billboard.mode == 9 {
+		upward = vec3_normalize(Vec3{placed[1][0], placed[1][1], placed[1][2]})
+		to_eye := eye - origin
+		toward := to_eye - upward * dot(to_eye, upward)
+		if vec3_length(toward) < 0.001 do return placement   // the eye right above or below: as placed
+		across = cross(upward, vec3_normalize(toward))
+	}
+	back := cross(across, upward)
+	turned := mat4_identity()
+	turned[0][0] = across.x * scale
+	turned[0][1] = across.y * scale
+	turned[0][2] = across.z * scale
+	turned[1][0] = upward.x * scale
+	turned[1][1] = upward.y * scale
+	turned[1][2] = upward.z * scale
+	turned[2][0] = back.x * scale
+	turned[2][1] = back.y * scale
+	turned[2][2] = back.z * scale
+	turned[3][0] = origin.x
+	turned[3][1] = origin.y
+	turned[3][2] = origin.z
+	return mat4_mul(turned, billboard.node_inverse)
 }
 
 // Gathers the instances in view for drawing: their parts — each part's
 // instances together, the parts of one state (and, without bindless, one
 // texture) together — into the records and the commands, both put on the
-// card. draw_mesh_runs draws them, a call for each gathering.
+// card. draw_mesh_runs draws them, a call for each gathering. The camera
+// turns billboards; the time (seconds) is the flipbooks'.
 gather_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, planes: ^View_Planes,
-	left_out: ^Hidden_Cells, stats: ^Frame_Stats)
+	left_out: ^Hidden_Cells, camera: Camera, time: f32, stats: ^Frame_Stats)
 {
 	bindless := renderer.use_bindless
+	for &flip in renderer.flips do flip.shown = renderer.flip_frames[flip.first_frame + flip_frame(flip, time)]
+	_, camera_right, camera_up := camera_axes(camera)
 
 	// The instances in view (but in the cells left out), and how many of
 	// each part they draw.
@@ -2729,7 +2887,7 @@ gather_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]In
 		if record_count + placed_model.part_count > MAX_DRAWN do break
 		&renderer.visible + index
 		for p in placed_model.first_part:placed_model.first_part + placed_model.part_count {
-			if renderer.part_counts[p] == 0 do &renderer.touched + part_key(renderer.parts[p], p, bindless)
+			if renderer.part_counts[p] == 0 do &renderer.touched + part_key(renderer, renderer.parts[p], p, bindless)
 			renderer.part_counts[p] += 1
 		}
 		record_count += placed_model.part_count
@@ -2767,9 +2925,12 @@ gather_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]In
 			record := &renderer.records[renderer.part_starts[p] + renderer.part_counts[p]]
 			renderer.part_counts[p] += 1
 			record.world = instance.world
+			if part.billboard >= 0 {
+				record.world = billboard_world(&renderer.billboards[part.billboard], instance.world, camera_right, camera_up, camera.position)
+			}
 			record.lights = instance.lights
 			record.material = [part.alpha_threshold, part.emissive.x, part.emissive.y, part.emissive.z]
-			record.texture = renderer.textures[part.texture_slot].handle
+			record.texture = renderer.textures[shown_texture(renderer, part)].handle
 			record.glow = 0
 			if part.glow_slot >= 0 do record.glow = if bindless do renderer.textures[part.glow_slot].handle else 1
 		}
@@ -2797,9 +2958,9 @@ draw_mesh_runs :: fun(renderer: ^Renderer, view_projection: Mat4, lighting: Cell
 	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.indirect_buffer)
 	if blended {
 		Enable(BLEND)
-		BlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
 		DepthMask(0)
 	}
+	Uniform1i(made.adding_at, 0)
 	run_start : i64 = 0
 	for run_start < renderer.commands.len {
 		group_key := renderer.touched[run_start] >> 20
@@ -2813,8 +2974,13 @@ draw_mesh_runs :: fun(renderer: ^Renderer, view_projection: Mat4, lighting: Cell
 		}
 		if first_part.two_sided do Disable(CULL_FACE)
 		else do Enable(CULL_FACE)
+		if blended {
+			if first_part.additive do BlendFunc(SRC_ALPHA, ONE)
+			else do BlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
+			Uniform1i(made.adding_at, if first_part.additive do 1 else 0)
+		}
 		if not bindless {
-			BindTexture(TEXTURE_2D, renderer.textures[first_part.texture_slot].id)
+			BindTexture(TEXTURE_2D, renderer.textures[shown_texture(renderer, first_part)].id)
 			if first_part.glow_slot >= 0 {
 				ActiveTexture(TEXTURE1)
 				BindTexture(TEXTURE_2D, renderer.textures[first_part.glow_slot].id)

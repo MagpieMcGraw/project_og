@@ -508,6 +508,13 @@ command_model :: fun(what: []utf8, name: []utf8) {
 		}
 		if part.vertices.len > 0 do print("  texture coordinates from % to %; first vertex %", low_uv, high_uv, part.vertices[0])
 		print("  material: diffuse %, emissive %, alpha %; glow map %", part.diffuse, part.emissive, part.alpha, part.glow_texture)
+		if part.billboard_mode >= 0 do print("  under a billboard node, mode %, at %", part.billboard_mode, part.billboard_node[3])
+		if part.flip >= 0 {
+			flip := &built.flips[part.flip]
+			print("  flipbook: % frames (the first %), % to % s at % times from %; keys at % = %",
+				flip.frames.len, if flip.frames.len > 0 do flip.frames[0][:] else "", flip.start_time, flip.stop_time,
+				flip.frequency, flip.phase, flip.key_times, flip.key_values)
+		}
 		if part.indices.len >= 3 {
 			// Which way its first triangle faces, by its winding (counter-clockwise seen from the front).
 			a := part.vertices[i64(part.indices[0])].position
@@ -515,9 +522,9 @@ command_model :: fun(what: []utf8, name: []utf8) {
 			c := part.vertices[i64(part.indices[2])].position
 			print("  its first triangle faces %", vec3_normalize(cross(b - a, c - a)))
 		}
-		print("  % vertices, % triangles, texture % (clamp mode %) % % %",
+		print("  % vertices, % triangles, texture % (clamp mode %) % % % %",
 			part.vertices.len, part.indices.len / 3, part.texture, part.clamp_mode,
-			if part.alpha_blend do "blended" else "",
+			if part.alpha_blend do "blended" else "", if part.additive do "(added)" else "",
 			if part.alpha_test do "alpha-tested" else "",
 			if part.two_sided do "two-sided" else "")
 	}

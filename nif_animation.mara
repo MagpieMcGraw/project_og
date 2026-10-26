@@ -49,9 +49,21 @@ skip_key_group :: fun(reader: ^Nif_Reader, value_size: i64) {
 }
 
 // NiFloatData, NiPosData, NiColorData, NiBoolData: one group of keys.
+// A float's (value_size 4) are kept.
 read_key_data :: fun(reader: ^Nif_Reader, value_size: i64) -> Block {
-	skip_key_group(reader, value_size)
-	return .Other
+	if value_size != 4 {
+		skip_key_group(reader, value_size)
+		return .Other
+	}
+	count := i64(read_u32(reader))
+	if count == 0 do return Float_Data{key_type = 0, key_count = 0, keys = reader.data[0:0]}
+	key_type := i64(read_u32(reader))
+	if key_type != KEY_LINEAR and key_type != KEY_QUADRATIC and key_type != KEY_TBC and key_type != KEY_CONSTANT {
+		reader.broken = true
+		return .Other
+	}
+	keys := read_view(reader, count * key_bytes(key_type, 4))
+	return Float_Data{key_type = key_type, key_count = count, keys = keys}
 }
 
 // The size of a key of a type, its value value_size bytes.
@@ -107,7 +119,13 @@ read_keyframe_data :: fun(reader: ^Nif_Reader) -> Block {
 
 // NiFloatInterpolator, NiBoolInterpolator, NiPoint3Interpolator: a value
 // to hold, and keys for it.
+// A float's (value_size 4) is kept.
 read_value_interpolator :: fun(reader: ^Nif_Reader, value_size: i64) -> Block {
+	if value_size == 4 {
+		value := read_f32(reader)
+		data := read_ref(reader)
+		return Float_Interpolator{value = value, data = data}
+	}
 	skip(reader, value_size)
 	_ = read_ref(reader)   // data
 	return .Other
@@ -327,11 +345,22 @@ read_material_color_controller :: fun(reader: ^Nif_Reader) -> Block {
 
 // NiFlipController: steps a texture slot through a list of textures.
 read_flip_controller :: fun(reader: ^Nif_Reader) -> Block {
-	skip_single_interp_controller(reader)
-	skip(reader, 4)   // texture slot
+	// Its time controller's fields, then its interpolator's.
+	next_controller := read_ref(reader)
+	skip(reader, 2)        // flags
+	frequency := read_f32(reader)
+	phase := read_f32(reader)
+	start_time := read_f32(reader)
+	stop_time := read_f32(reader)
+	_ = read_ref(reader)   // target
+	if reader.version >= VERSION_10_1_0_104 and reader.version <= VERSION_10_1_0_108 do skip(reader, 1)
+	interpolator : i64 = -1
+	if reader.version >= VERSION_10_1_0_104 do interpolator = read_ref(reader)
+	slot := read_u32(reader)
 	if reader.version <= VERSION_10_1_0_103 do skip(reader, 8)   // start time, time between
-	skip_refs(reader) // the textures
-	return .Other
+	sources := read_refs(reader)
+	return Flip_Controller{next = next_controller, frequency = frequency, phase = phase, start_time = start_time, stop_time = stop_time,
+		interpolator = interpolator, slot = slot, sources = sources}
 }
 
 // NiTextureTransformController: slides or turns a texture.
