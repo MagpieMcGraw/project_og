@@ -133,6 +133,11 @@ read_input :: fun(platform: ^Platform, input: ^Input) {
 	}
 }
 
+// Waits for the card to finish what it's been asked to draw.
+wait_for_card :: fun() {
+	Finish()
+}
+
 // Shows what was drawn this frame, then waits for the card to finish it,
 // so no frames queue up behind it: the next frame starts from input read
 // after this one is up.

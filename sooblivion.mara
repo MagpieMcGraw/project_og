@@ -684,6 +684,44 @@ command_area :: fun(name: []utf8, x: i64, y: i64) {
 		}
 	}
 	print("% land cells, % land textures (% missing), % references in the cells", land_cells, parts, missing_textures, references.len)
+
+	// What the cells' references are: by their base's record type, and
+	// whether their meshes are in the archive.
+	Kind_Tally :: struct {
+		kind: [4!]utf8
+		count: i64
+		with_mesh: i64      // a .nif in the archive
+		speed_trees: i64    // a .spt: SpeedTree, not drawn yet
+		disabled: i64
+	}
+	tallies : [64]Kind_Tally
+	directory_storage2 : [64 * MB]byte
+	meshes, meshes_error := open_archive(data_path("Oblivion - Meshes.bsa"), &directory_storage2)
+	if meshes_error do return
+	defer close_archive(&meshes)
+	for reference in references {
+		scratch.len = 0
+		base, base_error := find_record(&plugin, reference.base, &scratch)
+		if base_error do continue
+		at : i64 = -1
+		for known, k in tallies {
+			if known.kind == base.header.kind do at = k
+		}
+		if at < 0 {
+			at = tallies.len
+			&tallies + Kind_Tally{kind = base.header.kind, count = 0, with_mesh = 0, speed_trees = 0, disabled = 0}
+		}
+		tally := &tallies[at]
+		tally.count += 1
+		if reference.flags & RECORD_DISABLED != 0 do tally.disabled += 1
+		path := model_path(base)
+		if ends_with(path[:], ".spt") do tally.speed_trees += 1
+		_, found := find_file(&meshes, path[:])
+		if found do tally.with_mesh += 1
+	}
+	for tally in tallies {
+		print("  %: %, % with a mesh, % SpeedTrees, % disabled", tally.kind, tally.count, tally.with_mesh, tally.speed_trees, tally.disabled)
+	}
 	persistent := persistent_cell(&plugin, world_id)
 	references.len = 0
 	_ = cell_references(&plugin, persistent, &references)

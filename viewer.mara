@@ -36,9 +36,13 @@ DOOR_REACH :: 300
 MOST_FRAMES_A_SECOND :: 60
 // How long a frame may spend loading what's waiting, in nanoseconds.
 LOAD_BUDGET :: 6000000
-// A frame longer than this (in nanoseconds) goes in the journal, with
-// where its time went.
-SLOW_FRAME :: 18000000
+// A frame longer than this (in nanoseconds) missed a refresh at 60 a
+// second (the next one is 33 ms on), and goes in the journal with where its
+// time went. (With vsync, frames come 15 to 18 ms apart as the system
+// shows them: that's not slow.)
+SLOW_FRAME :: 25000000
+// How often the journal gets a summary of the frames since the last.
+SUMMARY_EVERY :: 10000000000
 // Where the viewer's journal goes, in the folder it's run from.
 LOG_PATH :: "sooblivion.log"
 
@@ -72,11 +76,21 @@ Viewer :: struct {
 
 	// Where the last frame's time went, in nanoseconds, and what it drew:
 	// for the journal when it was slow, and the title.
-	drawing_time: u64
-	showing_time: u64
+	drawing_time: u64    // the CPU's: what draw_frame took
+	card_time: u64       // the card's: waiting for it to finish drawing
+	waiting_time: u64    // showing it: the swap, and vsync's wait for the refresh
 	loading_time: u64
 	crossing_time: u64
 	drawn: Frame_Stats
+
+	// Since the last summary: frames, refreshes missed, the longest, and
+	// the CPU's and card's time in all, in nanoseconds.
+	summary_since: u64
+	summary_frames: i64
+	summary_missed: i64
+	summary_longest: u64
+	summary_drawing: u64
+	summary_card: u64
 	gl_errors_seen: [16]u32
 }
 
@@ -111,9 +125,11 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.loading_since = 0
 	viewer.loading_frames = 0
 	viewer.drawing_time = 0
-	viewer.showing_time = 0
+	viewer.card_time = 0
+	viewer.waiting_time = 0
 	viewer.loading_time = 0
 	viewer.crossing_time = 0
+	start_summary(viewer)
 	viewer.drawn = Frame_Stats{instances = 0, visible = 0, drawn_parts = 0, draw_calls = 0, land_cells = 0}
 	viewer.gl_errors_seen.len = 0
 }
@@ -193,7 +209,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 
 	seconds, now := time_since(viewer.frame_start)
 	viewer.frame_start = now
-	if u64(seconds * 1000000000) > SLOW_FRAME do note_slow_frame(viewer, seconds)
+	add_to_summary(viewer, u64(seconds * 1000000000))
 	viewer.loading_time = 0
 	viewer.crossing_time = 0
 	if platform.mouse_look {
@@ -217,10 +233,13 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	}
 	viewer.drawn = draw_frame(&viewer.renderer, &shown.models, &shown.instances, &shown.grounds, shown.lighting,
 		camera^, platform.width, platform.height)
-	showing_start := time_now()
-	viewer.drawing_time = showing_start - drawing_start
+	card_start := time_now()
+	viewer.drawing_time = card_start - drawing_start
+	wait_for_card()
+	waiting_start := time_now()
+	viewer.card_time = waiting_start - card_start
 	present(platform)
-	viewer.showing_time = time_now() - showing_start
+	viewer.waiting_time = time_now() - waiting_start
 	note_gl_errors(viewer)
 	if not platform.vsync do wait_for_next_frame(viewer)
 	count_frame(viewer)
@@ -250,19 +269,71 @@ wait_for_next_frame :: fun(viewer: ^Viewer) {
 	for time_now() < viewer.next_frame {}
 }
 
-// Notes a frame that took too long, and where its time went: drawing
-// (the CPU's part of it), showing (the swap and waiting for the card:
-// the card's part, and vsync's wait), loading, and placing a cell walked
-// into.
-note_slow_frame :: fun(viewer: ^Viewer, seconds: f64) {
+// Starts counting frames for the next summary.
+start_summary :: fun(viewer: ^Viewer) {
+	viewer.summary_since = time_now()
+	viewer.summary_frames = 0
+	viewer.summary_missed = 0
+	viewer.summary_longest = 0
+	viewer.summary_drawing = 0
+	viewer.summary_card = 0
+}
+
+// Counts the frame just past, which took frame_length nanoseconds from its
+// start to the next's: noted when it missed a refresh; every
+// SUMMARY_EVERY, a summary.
+add_to_summary :: fun(viewer: ^Viewer, frame_length: u64) {
+	viewer.summary_frames += 1
+	viewer.summary_drawing += viewer.drawing_time
+	viewer.summary_card += viewer.card_time
+	if frame_length > viewer.summary_longest do viewer.summary_longest = frame_length
+	if frame_length > SLOW_FRAME {
+		viewer.summary_missed += 1
+		note_slow_frame(viewer, frame_length)
+	}
+	if time_now() - viewer.summary_since < SUMMARY_EVERY do return
+
+	journal := &viewer.journal
+	frames := viewer.summary_frames
+	note(journal, "frames: ")
+	note(journal, frames)
+	note(journal, " in ")
+	note(journal, i64((time_now() - viewer.summary_since) / 1000000000))
+	note(journal, " s, ")
+	note(journal, viewer.summary_missed)
+	note(journal, " missed a refresh, the longest ")
+	note(journal, i64(viewer.summary_longest / 1000000))
+	note(journal, " ms; each took the CPU ")
+	note_milliseconds(journal, viewer.summary_drawing / u64(frames))
+	note(journal, " ms and the card ")
+	note_milliseconds(journal, viewer.summary_card / u64(frames))
+	note(journal, " ms, of 16.7")
+	note_end(journal)
+	start_summary(viewer)
+}
+
+// Notes nanoseconds as milliseconds to a tenth: "2.4".
+note_milliseconds :: fun(journal: ^Journal, nanoseconds: u64) {
+	tenths := i64(nanoseconds / 100000)
+	note(journal, tenths / 10)
+	note(journal, ".")
+	note(journal, tenths % 10)
+}
+
+// Notes a frame that missed a refresh, and where its time went: drawing
+// (the CPU's), the card's, waiting to show it (the swap and vsync),
+// loading, and placing a cell walked into.
+note_slow_frame :: fun(viewer: ^Viewer, frame_length: u64) {
 	journal := &viewer.journal
 	drawn := viewer.drawn
-	note(journal, "slow frame: ")
-	note(journal, i64(seconds * 1000))
+	note(journal, "missed a refresh: ")
+	note(journal, i64(frame_length / 1000000))
 	note(journal, " ms (drawing ")
 	note(journal, i64(viewer.drawing_time / 1000000))
+	note(journal, ", the card ")
+	note(journal, i64(viewer.card_time / 1000000))
 	note(journal, ", showing ")
-	note(journal, i64(viewer.showing_time / 1000000))
+	note(journal, i64(viewer.waiting_time / 1000000))
 	note(journal, ", loading ")
 	note(journal, i64(viewer.loading_time / 1000000))
 	note(journal, ", placing ")
