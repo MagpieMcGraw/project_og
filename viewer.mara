@@ -5,7 +5,8 @@
 // W, A, S, D fly, Left Shift faster; the right mouse button turns mouse
 // look on and off; E goes through the door nearest the camera; V turns
 // vsync on and off; B switches between drawing bindless and binding
-// textures (where the card can do both); Escape quits. The window's title says where, how many
+// textures (where the card can do both); T, held, hurries the day along;
+// Escape quits. The window's title says where, how many
 // frames a second, and whether vsync is on; sooblivion.log, in the folder
 // it's run from, keeps what happened.
 module sooblivion
@@ -21,6 +22,7 @@ use model
 use world
 use land
 use scene
+use sky
 use logging
 use mara.string
 use sdl_platform
@@ -46,6 +48,12 @@ SLOW_FRAME :: 25000000
 SUMMARY_EVERY :: 10000000000
 // Where the viewer's journal goes, in the folder it's run from.
 LOG_PATH :: "sooblivion.log"
+// How much faster than ours the game's day goes (Oblivion's own), and,
+// with T held, how much faster again.
+TIME_SCALE :: 30
+HURRIED_TIME_SCALE :: 2000
+// The hour the viewer starts at.
+START_HOUR :: 10
 
 // What the viewer commands share: the archives, the window, drawing, what's
 // drawn, the keyboard and mouse, and the journal.
@@ -62,6 +70,16 @@ Viewer :: struct {
 	journal: Journal
 	place: str256       // what's shown, for the window's title
 	chosen_door: i64    // the door view_frame stopped for
+
+	// The sky outside: the world's climate and weather, the hour of the
+	// game's day, and what the sky and water look like now.
+	climate: Climate
+	weather: Weather
+	sky_world: u32      // the world they're of, 0 for none yet
+	hour: f32
+	look: Sky_Look
+	water_shallow: Vec3
+	water_deep: Vec3
 
 	// Frames: when the one now drawn began; without vsync, when the next
 	// may begin; how many were drawn in the second counted so far.
@@ -123,6 +141,12 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.speed = 400
 	viewer.place.len = 0
 	viewer.chosen_door = -1
+	viewer.sky_world = 0
+	viewer.hour = START_HOUR
+	viewer.look = Sky_Look{state = Sky_State{0}, cloud_lower = 0, cloud_upper = 0, sun = 0,
+		cloud_lower_offset = 0, cloud_upper_offset = 0, water_color = Vec3{0.1, 0.2, 0.25}, outside = false, time = 0}
+	viewer.water_shallow = Vec3{0.05, 0.15, 0.18}
+	viewer.water_deep = Vec3{0.08, 0.14, 0.17}
 	viewer.frame_start = time_now()
 	viewer.next_frame = viewer.frame_start
 	viewer.frames_counted = 0
@@ -174,6 +198,14 @@ update_title :: fun(viewer: ^Viewer) {
 	&title + " fps, vsync "
 	&title + (if viewer.platform.vsync do "on" else "off")
 	&title + (if viewer.renderer.use_bindless do ", bindless" else ", bound textures")
+	&title + " — "
+	whole_hours := i64(viewer.hour)
+	minutes := i64((viewer.hour - f32(whole_hours)) * 60)
+	if whole_hours < 10 do &title + "0"
+	&title + int_text(whole_hours)[:]
+	&title + ":"
+	if minutes < 10 do &title + "0"
+	&title + int_text(minutes)[:]
 	&title + " — "
 	&title + int_text(viewer.drawn.visible)[:]
 	&title + " of "
@@ -238,13 +270,14 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	if input.held[D] do camera.position = camera.position + right * step
 	if input.held[A] do camera.position = camera.position - right * step
 
+	pass_time(viewer, f32(seconds), input.held[T])
 	drawing_start := time_now()
 	if shown.lights_changed {
 		set_scene_lights(&viewer.renderer, &shown.lights)
 		shown.lights_changed = false
 	}
-	viewer.drawn = draw_frame(&viewer.renderer, &shown.models, &shown.instances, &shown.grounds, shown.lighting,
-		camera^, platform.width, platform.height)
+	viewer.drawn = draw_frame(&viewer.renderer, &shown.models, &shown.instances, &shown.grounds, &shown.waters,
+		&viewer.look, shown.lighting, camera^, platform.width, platform.height)
 	card_start := time_now()
 	viewer.drawing_time = card_start - drawing_start
 	wait_for_card()
@@ -385,6 +418,72 @@ note_gl_errors :: fun(viewer: ^Viewer) {
 		note(&viewer.journal, " (1280 bad enum, 1281 bad value, 1282 bad operation, 1285 out of memory)")
 		note_end(&viewer.journal)
 	}
+}
+
+// Moves the game's day on by a frame's seconds (much faster when hurried),
+// and outside, the sky with it: its colors, the clouds' drift, the light
+// everything's drawn with.
+pass_time :: fun(viewer: ^Viewer, seconds: f32, hurried: bool) {
+	scale : f32 = if hurried do HURRIED_TIME_SCALE else TIME_SCALE
+	viewer.hour += seconds * scale / 3600
+	if viewer.hour >= 24 do viewer.hour -= 24
+	look := &viewer.look
+	look.time += seconds
+	shown := &viewer.shown
+	look.outside = shown.world != 0
+	if not look.outside {
+		// Inside, what water there is reflects the cell's fog and ambient.
+		lighting := shown.lighting
+		look.state = Sky_State{upper = lighting.ambient, lower = lighting.fog_color, horizon = lighting.fog_color,
+			cloud_lower_color = lighting.ambient, cloud_upper_color = lighting.ambient, sun_color = Vec3{0, 0, 0},
+			sun_direction = Vec3{0, 0, 1}, daylight = 0, lighting = lighting}
+		look.water_color = viewer.water_deep * 0.5 + lighting.ambient * 0.3
+		return
+	}
+	most_fog : f32 = CELL_SIZE * (EXTERIOR_RADIUS + 0.5)
+	look.state = sky_at(viewer.climate, &viewer.weather, viewer.hour, most_fog)
+	look.cloud_lower_offset += seconds * scale / TIME_SCALE * viewer.weather.cloud_speed_lower
+	look.cloud_upper_offset += seconds * scale / TIME_SCALE * viewer.weather.cloud_speed_upper
+	shown.lighting = look.state.lighting
+	light := look.state.lighting.ambient + look.state.lighting.directional * 0.5
+	look.water_color = Vec3{viewer.water_deep.x * light.x, viewer.water_deep.y * light.y, viewer.water_deep.z * light.z} * 1.6
+}
+
+// Reads a world's climate and weather, and puts its sky's textures on the
+// card: the first time the viewer goes out into it.
+take_sky :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32) {
+	if viewer.sky_world == world_id do return
+	viewer.sky_world = world_id
+	scratch : [4 * MB]byte
+	viewer.climate = world_climate(plugin, world_id, &scratch)
+	viewer.weather = read_weather(plugin, viewer.climate.weather, &scratch)
+	viewer.water_shallow, viewer.water_deep = world_water_colors(plugin, world_id, &scratch)
+	room := &viewer.room
+	look := &viewer.look
+	look.cloud_lower = texture_for(&viewer.renderer, &viewer.textures, viewer.weather.cloud_lower[:], &room.texture)
+	look.cloud_upper = texture_for(&viewer.renderer, &viewer.textures, viewer.weather.cloud_upper[:], &room.texture)
+	look.sun = texture_for(&viewer.renderer, &viewer.textures, viewer.climate.sun_texture[:], &room.texture)
+	journal := &viewer.journal
+	note(journal, "the sky: ")
+	note(journal, editor_id_of(plugin, viewer.climate.weather))
+	note(journal, " weather; sunrise ")
+	note(journal, i64(viewer.climate.sunrise_begin))
+	note(journal, " to ")
+	note(journal, i64(viewer.climate.sunrise_end))
+	note(journal, ", sunset ")
+	note(journal, i64(viewer.climate.sunset_begin))
+	note(journal, " to ")
+	note(journal, i64(viewer.climate.sunset_end))
+	note_end(journal)
+}
+
+// A record's editor id, as text kept by value.
+editor_id_of :: fun(plugin: ^Plugin, form_id: u32) -> str256 {
+	scratch : [1 * MB]byte
+	name : str256
+	record, record_error := find_record(plugin, form_id, &scratch)
+	if not record_error do &name + editor_id(record.data)
+	return name
 }
 
 // Counts a frame drawn; each second, the count goes in the title.
@@ -634,6 +733,7 @@ go_inside :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
 go_outside :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32, place: Vec3) {
 	shown := &viewer.shown
 	start := time_now()
+	take_sky(viewer, plugin, world_id)
 	x, y := grid_of(place)
 	show_error := show_exterior(shown, plugin, world_id, x, y)
 	_ = load_waiting(shown, plugin, viewer_loader(viewer), 0xFFFFFFFFFFFFFFFF)

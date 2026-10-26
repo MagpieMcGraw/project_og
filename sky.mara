@@ -1,0 +1,261 @@
+// The sky outside: a world's climate and its weather, and from them, for an
+// hour of the day, the sky's colors, the sun, the clouds, and the light
+// and fog everything outside is drawn with.
+//
+// A weather (WTHR) gives ten colors — sky, fog, clouds, ambient, sunlight,
+// sun, stars, horizon — at four times of day: sunrise, day, sunset, night.
+// A climate (CLMT) says which weathers come, and when the sun rises and
+// sets; between its times, the colors blend.
+module sky
+
+use mara.core
+use mara.math
+use mara.string
+use world
+use esm
+
+// The weather's colors, as NAM0 lists them.
+SKY_UPPER    :: 0
+FOG          :: 1
+CLOUDS_LOWER :: 2
+AMBIENT      :: 3
+SUNLIGHT     :: 4
+SUN          :: 5
+STARS        :: 6
+SKY_LOWER    :: 7
+HORIZON      :: 8
+CLOUDS_UPPER :: 9
+WEATHER_COLORS :: 10
+
+// The times of day a weather gives its colors for.
+SUNRISE :: 0
+DAY     :: 1
+SUNSET  :: 2
+NIGHT   :: 3
+
+// A weather: its colors at each time of day, its fog, its clouds.
+Weather :: struct {
+	colors: [WEATHER_COLORS!][4!]Vec3
+	fog_day_near: f32
+	fog_day_far: f32
+	fog_night_near: f32
+	fog_night_far: f32
+	cloud_lower: [160]utf8     // the clouds' textures' archive paths
+	cloud_upper: [160]utf8
+	cloud_speed_lower: f32     // how fast each layer drifts, in its texture's widths a second
+	cloud_speed_upper: f32
+}
+
+// A climate: the weather it brings (its likeliest), and the sun's hours.
+Climate :: struct {
+	weather: u32
+	sunrise_begin: f32         // hours, 0 to 24
+	sunrise_end: f32
+	sunset_begin: f32
+	sunset_end: f32
+	sun_texture: [160]utf8
+}
+
+// The sky at an hour: what the sky and water are drawn with, and the
+// lighting everything outside is.
+Sky_State :: struct {
+	upper: Vec3
+	lower: Vec3
+	horizon: Vec3
+	cloud_lower_color: Vec3
+	cloud_upper_color: Vec3
+	sun_color: Vec3            // the sun's disc
+	sun_direction: Vec3        // toward the sun (below the horizon at night)
+	daylight: f32              // 0 at night, 1 by day
+	lighting: Cell_Lighting
+}
+
+// The climate of a world: its CNAM's, or TamrielClimate, or DefaultClimate.
+world_climate :: fun(plugin: ^Plugin, world_id: u32, scratch: ^[]byte) -> Climate {
+	climate := Climate{weather = 0, sunrise_begin = 6, sunrise_end = 10, sunset_begin = 16, sunset_end = 20, sun_texture = []}
+	climate_id : u32 = 0
+	record, record_error := find_record(plugin, world_id, scratch)
+	if not record_error {
+		field, found := find_field(record.data, "CNAM")
+		if found and field.len >= 4 do climate_id = field[0]
+	}
+	if climate_id == 0 do climate_id = find_by_editor_id(plugin, "CLMT", "TamrielClimate", scratch)
+	if climate_id == 0 do climate_id = find_by_editor_id(plugin, "CLMT", "DefaultClimate", scratch)
+	if climate_id == 0 do return climate
+
+	climate_record, climate_error := find_record(plugin, climate_id, scratch)
+	if climate_error do return climate
+	// The likeliest weather: WLST is (weather, chance) pairs.
+	weathers, has_weathers := find_field(climate_record.data, "WLST")
+	if has_weathers {
+		best : i32 = -1
+		for k in 0:weathers.len / 8 {
+			weather : u32 = weathers[k * 8]
+			chance : i32 = weathers[k * 8 + 4]
+			if chance > best {
+				best = chance
+				climate.weather = weather
+			}
+		}
+	}
+	// TNAM: sunrise's and sunset's beginnings and ends, in tens of minutes.
+	timing, has_timing := find_field(climate_record.data, "TNAM")
+	if has_timing and timing.len >= 4 {
+		hours : [4!]f32
+		for k in 0:4 {
+			tens : u8 = timing[k]
+			hours[k] = f32(tens) / 6
+		}
+		climate.sunrise_begin = hours[0]
+		climate.sunrise_end = hours[1]
+		climate.sunset_begin = hours[2]
+		climate.sunset_end = hours[3]
+	}
+	sun, has_sun := find_field(climate_record.data, "FNAM")
+	if has_sun do texture_path_of(field_text(sun), &climate.sun_texture)
+	return climate
+}
+
+// The form id of the record of a kind with an editor id; 0 when there's none.
+find_by_editor_id :: fun(plugin: ^Plugin, kind: []utf8, name: []utf8, scratch: ^[]byte) -> u32 {
+	for key, slot in plugin.records.keys {
+		if key == 0 do continue
+		header : Record_Header = plugin.data[i64(plugin.records.values[slot])]
+		if header.kind != kind do continue
+		scratch.len = 0
+		record, record_error := record_at(plugin, i64(plugin.records.values[slot]), scratch)
+		if record_error do continue
+		if compare_folded(editor_id(record.data), name) == 0 do return u32(key)
+	}
+	return 0
+}
+
+// A texture's archive path from a record's: textures\…, lower case.
+texture_path_of :: fun(name: []utf8, path: ^[160]utf8) {
+	path.len = 0
+	if name.len == 0 do return
+	path + "textures\\"
+	for c in name {
+		if path.len == path.cap do break
+		if c == '/' do path + '\\'
+		else do path + lower(c)
+	}
+}
+
+// Reads a weather record. Its colors, as NAM0 has them: for each color, at
+// each time of day, red, green, blue and a byte unused.
+read_weather :: fun(plugin: ^Plugin, weather_id: u32, scratch: ^[]byte) -> Weather {
+	weather := Weather{colors = [], fog_day_near = 4096, fog_day_far = 40000, fog_night_near = 2048, fog_night_far = 20000,
+		cloud_lower = [], cloud_upper = [], cloud_speed_lower = 0, cloud_speed_upper = 0}
+	for c in 0:WEATHER_COLORS {
+		for t in 0:4 do weather.colors[c][t] = Vec3{0.5, 0.6, 0.8}
+	}
+	record, record_error := find_record(plugin, weather_id, scratch)
+	if record_error do return weather
+	colors, has_colors := find_field(record.data, "NAM0")
+	if has_colors and colors.len >= WEATHER_COLORS * 16 {
+		for c in 0:WEATHER_COLORS {
+			for t in 0:4 do weather.colors[c][t] = byte_color(colors, (c * 4 + t) * 4)
+		}
+	}
+	fog, has_fog := find_field(record.data, "FNAM")
+	if has_fog and fog.len >= 16 {
+		weather.fog_day_near = fog[0]
+		weather.fog_day_far = fog[4]
+		weather.fog_night_near = fog[8]
+		weather.fog_night_far = fog[12]
+	}
+	lower_clouds, has_lower := find_field(record.data, "CNAM")
+	if has_lower do texture_path_of(field_text(lower_clouds), &weather.cloud_lower)
+	upper_clouds, has_upper := find_field(record.data, "DNAM")
+	if has_upper do texture_path_of(field_text(upper_clouds), &weather.cloud_upper)
+	data, has_data := find_field(record.data, "DATA")
+	if has_data and data.len >= 3 {
+		lower_speed : u8 = data[1]
+		upper_speed : u8 = data[2]
+		weather.cloud_speed_lower = f32(lower_speed) * 0.00004
+		weather.cloud_speed_upper = f32(upper_speed) * 0.00004
+	}
+	return weather
+}
+
+// How a weather's four times of day mix at an hour: a weight for each.
+// Night until sunrise begins; to sunrise's colors by its middle, to day's
+// by its end; day until sunset begins; to sunset's by its middle, to
+// night's by its end.
+time_weights :: fun(climate: Climate, hour: f32) -> [4!]f32 {
+	weights : [4!]f32 = [0, 0, 0, 0]
+	sunrise_middle := (climate.sunrise_begin + climate.sunrise_end) / 2
+	sunset_middle := (climate.sunset_begin + climate.sunset_end) / 2
+	if hour < climate.sunrise_begin or hour >= climate.sunset_end {
+		weights[NIGHT] = 1
+	elif hour < sunrise_middle
+		t := (hour - climate.sunrise_begin) / (sunrise_middle - climate.sunrise_begin)
+		weights[NIGHT] = 1 - t
+		weights[SUNRISE] = t
+	elif hour < climate.sunrise_end
+		t := (hour - sunrise_middle) / (climate.sunrise_end - sunrise_middle)
+		weights[SUNRISE] = 1 - t
+		weights[DAY] = t
+	elif hour < climate.sunset_begin
+		weights[DAY] = 1
+	elif hour < sunset_middle
+		t := (hour - climate.sunset_begin) / (sunset_middle - climate.sunset_begin)
+		weights[DAY] = 1 - t
+		weights[SUNSET] = t
+	else
+		t := (hour - sunset_middle) / (climate.sunset_end - sunset_middle)
+		weights[SUNSET] = 1 - t
+		weights[NIGHT] = t
+	}
+	return weights
+}
+
+// A weather's color at the mix of times of day.
+mixed_color :: fun(weather: ^Weather, color: i64, weights: [4!]f32) -> Vec3 {
+	mixed := Vec3{0, 0, 0}
+	for t in 0:4 do mixed = mixed + weather.colors[color][t] * weights[t]
+	return mixed
+}
+
+// The sky at an hour of the day (0 to 24), with the fog no farther than
+// most_fog: the world shown ends there.
+sky_at :: fun(climate: Climate, weather: ^Weather, hour: f32, most_fog: f32) -> Sky_State {
+	weights := time_weights(climate, hour)
+	daylight := weights[DAY] + (weights[SUNRISE] + weights[SUNSET]) * 0.5
+
+	// The sun: up in the east at sunrise's beginning, down in the west at
+	// sunset's end, highest between; at night, the moon's light from the
+	// other side of the sky.
+	day_length := climate.sunset_end - climate.sunrise_begin
+	progress := (hour - climate.sunrise_begin) / day_length
+	angle := progress * 3.14159265
+	sun_direction := vec3_normalize(Vec3{cos_f32(angle), -0.3, sin_f32(angle)})
+	light_direction := sun_direction
+	if sun_direction.z < 0.05 {
+		// The moon's light, from high in the sky opposite.
+		light_direction = vec3_normalize(Vec3{-sun_direction.x, 0.3, 0.6})
+	}
+
+	fog_near := weather.fog_day_near * daylight + weather.fog_night_near * (1 - daylight)
+	fog_far := weather.fog_day_far * daylight + weather.fog_night_far * (1 - daylight)
+	if fog_far > most_fog do fog_far = most_fog
+	if fog_near > fog_far * 0.5 do fog_near = fog_far * 0.5
+
+	return Sky_State{
+		upper = mixed_color(weather, SKY_UPPER, weights),
+		lower = mixed_color(weather, SKY_LOWER, weights),
+		horizon = mixed_color(weather, HORIZON, weights),
+		cloud_lower_color = mixed_color(weather, CLOUDS_LOWER, weights),
+		cloud_upper_color = mixed_color(weather, CLOUDS_UPPER, weights),
+		sun_color = mixed_color(weather, SUN, weights),
+		sun_direction = sun_direction,
+		daylight = daylight,
+		lighting = Cell_Lighting{
+			ambient = mixed_color(weather, AMBIENT, weights),
+			directional = mixed_color(weather, SUNLIGHT, weights),
+			direction = light_direction,
+			fog_color = mixed_color(weather, FOG, weights),
+			fog_near = fog_near,
+			fog_far = fog_far}}
+}

@@ -22,6 +22,7 @@ use model
 use world
 use scene
 use land
+use sky
 render :: use render
 use mara.math
 use sdl_platform
@@ -685,6 +686,24 @@ command_area :: fun(name: []utf8, x: i64, y: i64) {
 	}
 	print("% land cells, % land textures (% missing), % references in the cells", land_cells, parts, missing_textures, references.len)
 
+	// The cells' water: whether their flags say they have it, and its height.
+	for cell_y in area.low_y..area.high_y {
+		for cell_x in area.low_x..area.high_x {
+			cell := exterior_cell(&plugin, world_id, cell_x, cell_y)
+			if cell == 0 do continue
+			scratch.len = 0
+			record, record_error := find_record(&plugin, cell, &scratch)
+			if record_error do continue
+			flags_field, has_flags := find_field(record.data, "DATA")
+			height_field, has_height := find_field(record.data, "XCLW")
+			flags : u8 = 0
+			if has_flags and flags_field.len >= 1 do flags = flags_field[0]
+			height : f32 = -999999
+			if has_height and height_field.len >= 4 do height = height_field[0]
+			print("  cell % %: flags %, water height %", cell_x, cell_y, flags, height)
+		}
+	}
+
 	// What the cells' references are: by their base's record type, and
 	// whether their meshes are in the archive.
 	Kind_Tally :: struct {
@@ -841,6 +860,104 @@ command_walk :: fun(name: []utf8, x: i64, y: i64, steps: i64) {
 	}
 }
 
+// `sooblivion record <editor id or form id>`: a record's fields, each read three ways
+// — as text, as u32s, as f32s — for working out what's in them.
+command_record :: fun(name: []utf8) {
+	data_storage : [400 * MB]byte
+	index_storage : [96 * MB]byte
+	plugin, load_error := load_oblivion(&data_storage, &index_storage)
+	if load_error {
+		print("couldn't load the plugin: %", load_error)
+		return
+	}
+	scratch : [16 * MB]byte
+	// A number names a record by its form id.
+	wanted, named_by_id := parse_number(name)
+	form_id := u32(wanted)
+	for key, slot in plugin.records.keys {
+		if key == 0 do continue
+		scratch.len = 0
+		record, record_error := record_at(&plugin, i64(plugin.records.values[slot]), &scratch)
+		if record_error do continue
+		if compare_folded(editor_id(record.data), name) != 0 and (not named_by_id or u32(key) != form_id) do continue
+		print("% % (form id %), % bytes", record.header.kind, name, record.header.form_id, record.data.len)
+		fields := Fields{data = record.data, at = 0, broken = false}
+		for field in next_field(&fields) {
+			line : str1024
+			&line + "  "
+			&line + field.kind[:]
+			&line + " "
+			&line + int_text(field.data.len)[:]
+			&line + ": "
+			// As text, where it reads as text.
+			printable := field.data.len > 0
+			for b in 0:field.data.len {
+				c : u8 = field.data[b]
+				if (c < 32 or c > 126) and not (c == 0 and b == field.data.len - 1) do printable = false
+			}
+			if printable {
+				&line + field_text(field.data)
+			else
+				shown := field.data.len / 4
+				if shown > 40 do shown = 40
+				for k in 0:shown {
+					value : u32 = field.data[k * 4]
+					number : f32 = field.data[k * 4]
+					&line + int_text(i64(value))[:]
+					if value > 0x30000000 and value < 0x50000000 or value > 0xB0000000 and value < 0xD0000000 {
+						&line + "/"
+						&line + int_text(i64(number * 1000))[:]
+						&line + "m"
+					}
+					&line + " "
+				}
+				if field.data.len % 4 != 0 {
+					&line + "| bytes:"
+					for b in 0:field.data.len {
+						if b >= 64 do break
+						c : u8 = field.data[b]
+						&line + " "
+						&line + int_text(i64(c))[:]
+					}
+				}
+			}
+			print(line)
+		}
+	}
+}
+
+// `sooblivion sky [world]`: the sky outside at hours through a day — its
+// colors, the sun, the light and fog — as the viewer would draw it.
+command_sky :: fun(name: []utf8) {
+	data_storage : [400 * MB]byte
+	index_storage : [96 * MB]byte
+	plugin, load_error := load_oblivion(&data_storage, &index_storage)
+	if load_error {
+		print("couldn't load the plugin: %", load_error)
+		return
+	}
+	scratch : [16 * MB]byte
+	world_id := find_world(&plugin, name, &scratch)
+	if world_id == 0 {
+		print("no world %", name)
+		return
+	}
+	climate := world_climate(&plugin, world_id, &scratch)
+	weather := read_weather(&plugin, climate.weather, &scratch)
+	print("weather %, sunrise % to %, sunset % to %, clouds % and %, sun %", climate.weather,
+		climate.sunrise_begin, climate.sunrise_end, climate.sunset_begin, climate.sunset_end,
+		weather.cloud_lower, weather.cloud_upper, climate.sun_texture)
+	shallow, deep := world_water_colors(&plugin, world_id, &scratch)
+	print("water: shallow %, deep %", shallow, deep)
+	for hour in [0, 5, 7, 8, 9, 12, 16, 17, 18, 19, 21] {
+		state := sky_at(climate, &weather, f32(hour), 10240)
+		print("  %:00  daylight %  sky % / % / %  sun % toward %  ambient %  sunlight %  fog % % to %", hour, state.daylight,
+			state.upper, state.horizon, state.lower, state.sun_color, state.sun_direction,
+			state.lighting.ambient, state.lighting.directional, state.lighting.fog_color,
+			state.lighting.fog_near, state.lighting.fog_far)
+	}
+}
+
 usage :: fun() {
 	print("sooblivion esm [plugin]            what a plugin holds, by record type")
 	print("sooblivion bsa <archive>           an archive's folders and files")
@@ -889,6 +1006,10 @@ main :: (args: [][]utf8) {
 		}
 	elif command == "map"
 		command_map(if args.len > 2 do args[2] else "Tamriel")
+	elif command == "sky"
+		command_sky(if args.len > 2 do args[2] else "Tamriel")
+	elif command == "record" and args.len > 2
+		command_record(args[2])
 	elif command == "cell" and args.len > 2
 		command_cell(args[2])
 	elif command == "textures"

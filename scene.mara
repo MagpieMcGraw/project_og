@@ -83,6 +83,7 @@ Scene :: struct {
 	center_x: i64                // the cell the exterior was loaded around
 	center_y: i64
 	grounds: [LAND_SLOTS]Gpu_Land
+	waters: [128]Water_Plane
 
 	// What's still to load, in order, and how far along that is.
 	waiting: [16384]Waiting_Instance
@@ -126,6 +127,7 @@ scene_clear_cell :: fun(scene: ^Scene) {
 	scene.lights.len = 0
 	scene.lights_changed = true
 	scene.doors.len = 0
+	scene.waters.len = 0
 	scene.lighting = DAYLIGHT
 	scene.waiting.len = 0
 	scene.waiting_next = 0
@@ -300,6 +302,20 @@ show_interior :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, loader: Loader) 
 	add_cell(scene, plugin, cell, EVERYWHERE, NOWHERE)?
 	_ = load_waiting(scene, plugin, loader, 0xFFFFFFFFFFFFFFFF)
 	choose_all_lights(scene)
+
+	// Water inside (sewers, caves): a plane under all that's placed.
+	height, has_water := cell_water(plugin, cell, &scratch)
+	if has_water and scene.instances.len > 0 {
+		low := Vec3{1000000, 1000000, 0}
+		high := Vec3{-1000000, -1000000, 0}
+		for instance in scene.instances {
+			if instance.center.x < low.x do low.x = instance.center.x
+			if instance.center.y < low.y do low.y = instance.center.y
+			if instance.center.x > high.x do high.x = instance.center.x
+			if instance.center.y > high.y do high.y = instance.center.y
+		}
+		&scene.waters + Water_Plane{low_x = low.x - 4096, low_y = low.y - 4096, high_x = high.x + 4096, high_y = high.y + 4096, height = height}
+	}
 }
 
 // ---- outside ------------------------------------------------------------------------
@@ -414,6 +430,7 @@ show_exterior :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, x: i64, y: i
 				if not land_loaded(scene, cell_x, cell_y) and scene.waiting_land.len < scene.waiting_land.cap {
 					&scene.waiting_land + Waiting_Land{cell = cell, x = cell_x, y = cell_y}
 				}
+				add_cell_water(scene, plugin, cell, cell_x, cell_y)
 				add_cell(scene, plugin, cell, EVERYWHERE, NOWHERE)?
 			}
 		}
@@ -456,6 +473,28 @@ drop_outside :: fun(scene: ^Scene, area: Grid_Area) {
 	}
 	scene.doors.len = kept
 
+	kept = 0
+	for k in 0:scene.waters.len {
+		plane := scene.waters[k]
+		middle := Vec3{(plane.low_x + plane.high_x) / 2, (plane.low_y + plane.high_y) / 2, 0}
+		if area_holds(area, middle) {
+			scene.waters[kept] = plane
+			kept += 1
+		}
+	}
+	scene.waters.len = kept
+
 	drop_land(scene, area, false)
 	// What still waits is let go as it comes up, if it's left the area.
+}
+
+// Adds an exterior cell's water, if it has any: a plane over the cell.
+add_cell_water :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64) {
+	scratch : [64 * KB]byte
+	height, has_water := cell_water(plugin, cell, &scratch)
+	if not has_water or scene.waters.len == scene.waters.cap do return
+	&scene.waters + Water_Plane{
+		low_x = f32(x * CELL_SIZE), low_y = f32(y * CELL_SIZE),
+		high_x = f32((x + 1) * CELL_SIZE), high_y = f32((y + 1) * CELL_SIZE),
+		height = height}
 }

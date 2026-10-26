@@ -32,6 +32,7 @@ use dds
 use bsa
 use world
 use land
+use sky
 
 // ---- sizes ---------------------------------------------------------------------
 
@@ -250,6 +251,132 @@ void main() {
 }
 "
 
+// The sky's color seen looking a way: up from the horizon to the top of
+// the sky, down from it to the sky's lower color. Shared by the sky and
+// the water (which shows it reflected).
+SKY_COLOR_FUNCTION :: "
+uniform vec3 sky_upper;
+uniform vec3 sky_lower;
+uniform vec3 sky_horizon;
+vec3 sky_color(vec3 direction) {
+	if (direction.z >= 0.0) return mix(sky_horizon, sky_upper, pow(min(direction.z * 1.5, 1.0), 0.6));
+	return mix(sky_horizon, sky_lower, min(-direction.z * 4.0, 1.0));
+}
+"
+
+// The sky: one triangle over the whole screen, each pixel the sky the way
+// it looks — its colors, two layers of clouds on a plane far above, the sun.
+SKY_VERTEX_SHADER :: "
+out vec2 screen;
+void main() {
+	screen = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2) * 2.0 - 1.0;
+	gl_Position = vec4(screen, 1.0, 1.0);
+}
+"
+
+SKY_FRAGMENT_SHADER :: "
+in vec2 screen;
+uniform mat4 inverse_view_projection;
+uniform vec3 camera_position;
+uniform vec3 fog_color;
+uniform vec3 sun_direction;
+uniform vec3 sun_color;
+uniform vec3 cloud_lower_color;
+uniform vec3 cloud_upper_color;
+uniform vec2 cloud_lower_offset;
+uniform vec2 cloud_upper_offset;
+uniform sampler2D cloud_lower_texture;
+uniform sampler2D cloud_upper_texture;
+uniform sampler2D sun_texture;
+out vec4 fragment_color;
+
+void main() {
+	vec4 far = inverse_view_projection * vec4(screen, 1.0, 1.0);
+	vec3 direction = normalize(far.xyz / far.w - camera_position);
+	vec3 color = sky_color(direction);
+
+	// The sun: its texture on a patch of sky around its direction.
+	vec3 side = normalize(cross(sun_direction, vec3(0.0, 0.0, 1.0)));
+	vec3 up = cross(side, sun_direction);
+	if (dot(direction, sun_direction) > 0.0) {
+		vec2 at = vec2(dot(direction, side), dot(direction, up)) / 0.12 + 0.5;
+		if (all(greaterThan(at, vec2(0.0))) && all(lessThan(at, vec2(1.0)))) {
+			vec4 sun = texture(sun_texture, at);
+			color += sun_color * sun.rgb * sun.a;
+		}
+	}
+
+	// The clouds: two layers on a plane above, faded toward the horizon.
+	if (direction.z > 0.0) {
+		vec2 on_plane = direction.xy / direction.z;
+		float fade = smoothstep(0.03, 0.3, direction.z);
+		vec4 upper = texture(cloud_upper_texture, on_plane * 0.3 + cloud_upper_offset);
+		color = mix(color, cloud_upper_color * upper.rgb, upper.a * fade);
+		vec4 lower = texture(cloud_lower_texture, on_plane * 0.45 + cloud_lower_offset);
+		color = mix(color, cloud_lower_color * lower.rgb, lower.a * fade);
+	}
+
+	// Low in the sky, it fades into the fog, as the land at its edge does.
+	color = mix(color, fog_color, 1.0 - smoothstep(-0.02, 0.12, direction.z));
+	fragment_color = vec4(color, 1.0);
+}
+"
+
+// Water: flat at its height, rippled by a few waves moving across it; the
+// sky reflected in it more the flatter it's seen (Fresnel), its own color
+// under that, and the sun glinting off it.
+WATER_VERTEX_SHADER :: "
+layout(location = 0) in vec3 position;
+uniform mat4 view_projection;
+out vec3 world_position;
+void main() {
+	world_position = position;
+	gl_Position = view_projection * vec4(position, 1.0);
+}
+"
+
+WATER_FRAGMENT_SHADER :: "
+in vec3 world_position;
+uniform vec3 camera_position;
+uniform float time;
+uniform vec3 water_color;
+uniform vec3 sun_direction;
+uniform vec3 sun_color;
+uniform float daylight;
+uniform vec3 fog_color;
+uniform float fog_near;
+uniform float fog_far;
+out vec4 fragment_color;
+
+// A wave's slope at a place: its height a sine moving along its direction.
+vec2 wave_slope(vec2 place, vec2 direction, float length, float speed, float height) {
+	float k = 6.2831853 / length;
+	float phase = dot(place, direction) * k + time * speed;
+	return direction * (cos(phase) * k * height);
+}
+
+void main() {
+	vec2 place = world_position.xy;
+	vec2 slope = wave_slope(place, normalize(vec2(1.0, 0.3)), 310.0, 1.1, 4.0)
+		+ wave_slope(place, normalize(vec2(-0.4, 1.0)), 170.0, 1.7, 2.0)
+		+ wave_slope(place, normalize(vec2(0.7, -0.8)), 61.0, 2.9, 0.6)
+		+ wave_slope(place, normalize(vec2(-1.0, -0.2)), 23.0, 4.3, 0.15);
+	vec3 normal = normalize(vec3(-slope, 1.0));
+	vec3 to_eye = normalize(camera_position - world_position);
+	float fresnel = 0.02 + 0.98 * pow(1.0 - max(dot(normal, to_eye), 0.0), 5.0);
+	vec3 reflected = reflect(-to_eye, normal);
+	vec3 color = mix(water_color, sky_color(reflected), fresnel);
+	color += sun_color * pow(max(dot(reflected, sun_direction), 0.0), 300.0) * 4.0 * daylight;
+	float opacity = mix(0.65, 1.0, fresnel);
+	if (fog_far > fog_near) {
+		float fog = clamp((length(world_position - camera_position) - fog_near) / (fog_far - fog_near), 0.0, 1.0);
+		color = mix(color, fog_color, fog);
+		opacity = mix(opacity, 1.0, fog);
+	}
+	fragment_color = vec4(color, opacity);
+}
+"
+
 // ---- what's on the card -------------------------------------------------------------
 
 // A mesh part on the card: its range of the shared buffers, and how it's drawn.
@@ -296,6 +423,65 @@ Gpu_Land :: struct {
 // renderer's textures (the base's again where it has fewer layers).
 Quadrant_Slots :: struct {
 	textures: [QUADRANT_TEXTURES!]i64
+}
+
+// A stretch of water: a rectangle at a height.
+Water_Plane :: struct {
+	low_x: f32
+	low_y: f32
+	high_x: f32
+	high_y: f32
+	height: f32
+}
+
+// What the sky and the water look like: the sky's state at the hour, the
+// textures of its clouds and sun (slots in the renderer's textures), how
+// far the clouds have drifted, and the water's color.
+Sky_Look :: struct {
+	state: Sky_State
+	cloud_lower: i64
+	cloud_upper: i64
+	sun: i64
+	cloud_lower_offset: f32
+	cloud_upper_offset: f32
+	water_color: Vec3
+	outside: bool        // the sky is drawn only outside
+	time: f32            // seconds, for the water's waves
+}
+
+// The sky program and where its uniforms are.
+Sky_Program :: struct {
+	program: u32
+	inverse_view_projection_at: i32
+	camera_position_at: i32
+	fog_color_at: i32
+	sky_upper_at: i32
+	sky_lower_at: i32
+	sky_horizon_at: i32
+	sun_direction_at: i32
+	sun_color_at: i32
+	cloud_lower_color_at: i32
+	cloud_upper_color_at: i32
+	cloud_lower_offset_at: i32
+	cloud_upper_offset_at: i32
+}
+
+// The water program and where its uniforms are.
+Water_Program :: struct {
+	program: u32
+	view_projection_at: i32
+	camera_position_at: i32
+	time_at: i32
+	water_color_at: i32
+	sky_upper_at: i32
+	sky_lower_at: i32
+	sky_horizon_at: i32
+	sun_direction_at: i32
+	sun_color_at: i32
+	daylight_at: i32
+	fog_color_at: i32
+	fog_near_at: i32
+	fog_far_at: i32
 }
 
 // A texture on the card, loaded once, by its path.
@@ -370,7 +556,15 @@ Renderer :: struct {
 	use_bindless: bool
 	mesh_programs: [2!]Mesh_Program
 	land_programs: [2!]Land_Program
+	sky_program: Sky_Program
+	water_program: Water_Program
 	anisotropy: f32
+
+	// The sky's triangle reads nothing but needs a vertex array; the water's
+	// rectangles are made again each frame.
+	empty_vertex_array: u32
+	water_vertex_array: u32
+	water_vertex_buffer: u32
 
 	// The shared mesh buffers, and how much of them is used.
 	mesh_vertex_array: u32
@@ -423,6 +617,8 @@ renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
 
 	make_mesh_program(&renderer.mesh_programs[0], false)?
 	make_land_program(&renderer.land_programs[0], false)?
+	make_sky_program(&renderer.sky_program)?
+	make_water_program(&renderer.water_program)?
 	if renderer.bindless_available {
 		make_mesh_program(&renderer.mesh_programs[1], true)?
 		make_land_program(&renderer.land_programs[1], true)?
@@ -430,6 +626,7 @@ renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
 
 	setup_mesh_buffers(renderer)
 	setup_land_buffers(renderer)
+	setup_water_buffers(renderer)
 
 	renderer.parts.len = 0
 	// Every part's count and start, by its index: all there, all 0.
@@ -475,20 +672,23 @@ which_program :: fun(renderer: ^Renderer) -> i64 {
 }
 
 // A shader's source: the version, then — bindless — the extension and the
-// BINDLESS define, then its body. Into source.
-shader_source :: fun(body: []utf8, bindless: bool, source: ^[]utf8) {
+// BINDLESS define, then shared (functions it uses), then its body. Into
+// source.
+shader_source :: fun(shared: []utf8, body: []utf8, bindless: bool, source: ^[]utf8) {
 	source.len = 0
 	source + "#version 450 core\n"
 	if bindless do source + "#extension GL_ARB_bindless_texture : require\n#define BINDLESS 1\n"
+	source + shared
 	source + body
 }
 
-// A program of a vertex and a fragment shader, compiled one way or the other.
-compile_program :: fun(vertex_body: []utf8, fragment_body: []utf8, bindless: bool) -> u32, err {
+// A program of a vertex and a fragment shader, compiled one way or the
+// other; shared goes before the fragment shader's body.
+compile_program :: fun(vertex_body: []utf8, fragment_body: []utf8, bindless: bool, shared: []utf8 = "") -> u32, err {
 	source : [16 * KB]utf8
-	shader_source(vertex_body, bindless, &source)
+	shader_source("", vertex_body, bindless, &source)
 	vertex_shader := gl_compile_shader(VERTEX_SHADER, cstring(source))
-	shader_source(fragment_body, bindless, &source)
+	shader_source(shared, fragment_body, bindless, &source)
 	fragment_shader := gl_compile_shader(FRAGMENT_SHADER, cstring(source))
 	if vertex_shader == 0 or fragment_shader == 0 do return 0, Shader_Failed
 	program := gl_link_program(vertex_shader, fragment_shader)
@@ -527,6 +727,59 @@ make_land_program :: fun(made: ^Land_Program, bindless: bool) -> err {
 		made.layer_texture_at[k] = array_uniform(made.program, "layer_textures[", k)
 		if not bindless do Uniform1i(made.layer_texture_at[k], i32(k))
 	}
+}
+
+make_sky_program :: fun(made: ^Sky_Program) -> err {
+	made.program = compile_program(SKY_VERTEX_SHADER, SKY_FRAGMENT_SHADER, false, SKY_COLOR_FUNCTION)?
+	program := made.program
+	made.inverse_view_projection_at = GetUniformLocation(program, "inverse_view_projection")
+	made.camera_position_at = GetUniformLocation(program, "camera_position")
+	made.fog_color_at = GetUniformLocation(program, "fog_color")
+	made.sky_upper_at = GetUniformLocation(program, "sky_upper")
+	made.sky_lower_at = GetUniformLocation(program, "sky_lower")
+	made.sky_horizon_at = GetUniformLocation(program, "sky_horizon")
+	made.sun_direction_at = GetUniformLocation(program, "sun_direction")
+	made.sun_color_at = GetUniformLocation(program, "sun_color")
+	made.cloud_lower_color_at = GetUniformLocation(program, "cloud_lower_color")
+	made.cloud_upper_color_at = GetUniformLocation(program, "cloud_upper_color")
+	made.cloud_lower_offset_at = GetUniformLocation(program, "cloud_lower_offset")
+	made.cloud_upper_offset_at = GetUniformLocation(program, "cloud_upper_offset")
+	UseProgram(program)
+	Uniform1i(GetUniformLocation(program, "cloud_lower_texture"), 0)
+	Uniform1i(GetUniformLocation(program, "cloud_upper_texture"), 1)
+	Uniform1i(GetUniformLocation(program, "sun_texture"), 2)
+}
+
+make_water_program :: fun(made: ^Water_Program) -> err {
+	made.program = compile_program(WATER_VERTEX_SHADER, WATER_FRAGMENT_SHADER, false, SKY_COLOR_FUNCTION)?
+	program := made.program
+	made.view_projection_at = GetUniformLocation(program, "view_projection")
+	made.camera_position_at = GetUniformLocation(program, "camera_position")
+	made.time_at = GetUniformLocation(program, "time")
+	made.water_color_at = GetUniformLocation(program, "water_color")
+	made.sky_upper_at = GetUniformLocation(program, "sky_upper")
+	made.sky_lower_at = GetUniformLocation(program, "sky_lower")
+	made.sky_horizon_at = GetUniformLocation(program, "sky_horizon")
+	made.sun_direction_at = GetUniformLocation(program, "sun_direction")
+	made.sun_color_at = GetUniformLocation(program, "sun_color")
+	made.daylight_at = GetUniformLocation(program, "daylight")
+	made.fog_color_at = GetUniformLocation(program, "fog_color")
+	made.fog_near_at = GetUniformLocation(program, "fog_near")
+	made.fog_far_at = GetUniformLocation(program, "fog_far")
+}
+
+// The sky's empty vertex array, and the water's buffer: six vertices (two
+// triangles) for each plane, made again each frame.
+setup_water_buffers :: fun(renderer: ^Renderer) {
+	GenVertexArrays(1, &renderer.empty_vertex_array)
+	GenVertexArrays(1, &renderer.water_vertex_array)
+	BindVertexArray(renderer.water_vertex_array)
+	GenBuffers(1, &renderer.water_vertex_buffer)
+	BindBuffer(ARRAY_BUFFER, renderer.water_vertex_buffer)
+	BufferData(ARRAY_BUFFER, 1024 * 6 * size_of(Vec3), void, STREAM_DRAW)
+	EnableVertexAttribArray(0)
+	VertexAttribPointer(0, 3, FLOAT, 0, i32(size_of(Vec3)), 0)
+	BindVertexArray(0)
 }
 
 // Where an item of a uniform array is in a program: name[index].
@@ -946,7 +1199,7 @@ sphere_in_view :: fun(planes: ^View_Planes, center: Vec3, radius: f32) -> bool {
 // then the instances in view — opaque parts, then blended — lit by the
 // lighting and the lights set with set_scene_lights. Tells what it drew.
 draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, grounds: ^[]Gpu_Land,
-	lighting: Cell_Lighting, camera: Camera, width: i64, height: i64) -> Frame_Stats
+	waters: ^[]Water_Plane, look: ^Sky_Look, lighting: Cell_Lighting, camera: Camera, width: i64, height: i64) -> Frame_Stats
 {
 	stats := Frame_Stats{instances = instances.len, visible = 0, drawn_parts = 0, draw_calls = 0, land_cells = 0}
 	Viewport(0, 0, i32(width), i32(height))
@@ -965,14 +1218,100 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 	planes := view_planes(view_projection)
 	sun := vec3_normalize(lighting.direction)
 
+	if look.outside do draw_sky(renderer, look, view_projection, lighting, camera, &stats)
 	if grounds.len > 0 do draw_land(renderer, grounds, &planes, view_projection, lighting, sun, camera, &stats)
-	draw_meshes(renderer, models, instances, &planes, view_projection, lighting, sun, camera, &stats)
+	gather_meshes(renderer, models, instances, &planes, &stats)
+	draw_mesh_runs(renderer, view_projection, lighting, sun, camera, false, &stats)
+	if waters.len > 0 do draw_water(renderer, waters, look, view_projection, lighting, camera, &stats)
+	draw_mesh_runs(renderer, view_projection, lighting, sun, camera, true, &stats)
 
 	DepthMask(1)
 	Disable(BLEND)
 	ActiveTexture(TEXTURE0)
 	BindVertexArray(0)
 	return stats
+}
+
+// Draws the sky behind everything: its triangle over the screen, the
+// depth buffer neither read nor written.
+draw_sky :: fun(renderer: ^Renderer, look: ^Sky_Look, view_projection: Mat4, lighting: Cell_Lighting, camera: Camera, stats: ^Frame_Stats) {
+	made := &renderer.sky_program
+	state := &look.state
+	UseProgram(made.program)
+	inverse := mat4_inverse(view_projection)
+	UniformMatrix4fv(made.inverse_view_projection_at, 1, 0, &inverse[0][0])
+	Uniform3f(made.camera_position_at, camera.position.x, camera.position.y, camera.position.z)
+	Uniform3f(made.fog_color_at, lighting.fog_color.x, lighting.fog_color.y, lighting.fog_color.z)
+	Uniform3f(made.sky_upper_at, state.upper.x, state.upper.y, state.upper.z)
+	Uniform3f(made.sky_lower_at, state.lower.x, state.lower.y, state.lower.z)
+	Uniform3f(made.sky_horizon_at, state.horizon.x, state.horizon.y, state.horizon.z)
+	Uniform3f(made.sun_direction_at, state.sun_direction.x, state.sun_direction.y, state.sun_direction.z)
+	Uniform3f(made.sun_color_at, state.sun_color.x, state.sun_color.y, state.sun_color.z)
+	Uniform3f(made.cloud_lower_color_at, state.cloud_lower_color.x, state.cloud_lower_color.y, state.cloud_lower_color.z)
+	Uniform3f(made.cloud_upper_color_at, state.cloud_upper_color.x, state.cloud_upper_color.y, state.cloud_upper_color.z)
+	Uniform2f(made.cloud_lower_offset_at, look.cloud_lower_offset, look.cloud_lower_offset * 0.3)
+	Uniform2f(made.cloud_upper_offset_at, look.cloud_upper_offset, look.cloud_upper_offset * 0.3)
+	ActiveTexture(TEXTURE0)
+	BindTexture(TEXTURE_2D, renderer.textures[look.cloud_lower].id)
+	ActiveTexture(TEXTURE1)
+	BindTexture(TEXTURE_2D, renderer.textures[look.cloud_upper].id)
+	ActiveTexture(TEXTURE2)
+	BindTexture(TEXTURE_2D, renderer.textures[look.sun].id)
+	ActiveTexture(TEXTURE0)
+	Disable(DEPTH_TEST)
+	DepthMask(0)
+	BindVertexArray(renderer.empty_vertex_array)
+	DrawArrays(TRIANGLES, 0, 3)
+	Enable(DEPTH_TEST)
+	DepthMask(1)
+	stats.draw_calls += 1
+}
+
+// Draws the water: its planes, blended over what's below, the depth
+// buffer read but not written.
+draw_water :: fun(renderer: ^Renderer, waters: ^[]Water_Plane, look: ^Sky_Look, view_projection: Mat4,
+	lighting: Cell_Lighting, camera: Camera, stats: ^Frame_Stats)
+{
+	vertices : [1024 * 6]Vec3
+	for plane in waters {
+		if vertices.len + 6 > vertices.cap do break
+		h := plane.height
+		&vertices + Vec3{plane.low_x, plane.low_y, h}
+		&vertices + Vec3{plane.high_x, plane.low_y, h}
+		&vertices + Vec3{plane.high_x, plane.high_y, h}
+		&vertices + Vec3{plane.low_x, plane.low_y, h}
+		&vertices + Vec3{plane.high_x, plane.high_y, h}
+		&vertices + Vec3{plane.low_x, plane.high_y, h}
+	}
+	made := &renderer.water_program
+	state := &look.state
+	UseProgram(made.program)
+	matrix := view_projection
+	UniformMatrix4fv(made.view_projection_at, 1, 0, &matrix[0][0])
+	Uniform3f(made.camera_position_at, camera.position.x, camera.position.y, camera.position.z)
+	Uniform1f(made.time_at, look.time)
+	Uniform3f(made.water_color_at, look.water_color.x, look.water_color.y, look.water_color.z)
+	Uniform3f(made.sky_upper_at, state.upper.x, state.upper.y, state.upper.z)
+	Uniform3f(made.sky_lower_at, state.lower.x, state.lower.y, state.lower.z)
+	Uniform3f(made.sky_horizon_at, state.horizon.x, state.horizon.y, state.horizon.z)
+	Uniform3f(made.sun_direction_at, state.sun_direction.x, state.sun_direction.y, state.sun_direction.z)
+	Uniform3f(made.sun_color_at, state.sun_color.x, state.sun_color.y, state.sun_color.z)
+	Uniform1f(made.daylight_at, state.daylight)
+	Uniform3f(made.fog_color_at, lighting.fog_color.x, lighting.fog_color.y, lighting.fog_color.z)
+	Uniform1f(made.fog_near_at, lighting.fog_near)
+	Uniform1f(made.fog_far_at, lighting.fog_far)
+	BindVertexArray(renderer.water_vertex_array)
+	BindBuffer(ARRAY_BUFFER, renderer.water_vertex_buffer)
+	BufferSubData(ARRAY_BUFFER, 0, isize(vertices.len * size_of(Vec3)), &vertices[0])
+	Disable(CULL_FACE)   // (seen from under the water too)
+	Enable(BLEND)
+	BlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
+	DepthMask(0)
+	DrawArrays(TRIANGLES, 0, i32(vertices.len))
+	DepthMask(1)
+	Disable(BLEND)
+	Enable(CULL_FACE)
+	stats.draw_calls += 1
 }
 
 // Draws the land in view: bindless, in one call; else a call for each
@@ -1038,12 +1377,11 @@ part_key :: fun(part: Mesh_Part, part_index: i64, bindless: bool) -> i64 {
 	return (group_key << 20) | part_index
 }
 
-// Draws the instances in view: their parts gathered — each part's
+// Gathers the instances in view for drawing: their parts — each part's
 // instances together, the parts of one state (and, without bindless, one
-// texture) together — and each gathering drawn with one call.
-draw_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, planes: ^View_Planes,
-	view_projection: Mat4, lighting: Cell_Lighting, sun: Vec3, camera: Camera, stats: ^Frame_Stats)
-{
+// texture) together — into the records and the commands, both put on the
+// card. draw_mesh_runs draws them, a call for each gathering.
+gather_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, planes: ^View_Planes, stats: ^Frame_Stats) {
 	bindless := renderer.use_bindless
 
 	// The instances in view, and how many of each part they draw.
@@ -1063,6 +1401,7 @@ draw_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Inst
 	}
 	stats.visible = renderer.visible.len
 	stats.drawn_parts = record_count
+	renderer.commands.len = 0
 	if record_count == 0 do return
 
 	// The parts in drawing order; each one's instances' place in the records.
@@ -1100,30 +1439,40 @@ draw_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Inst
 	}
 	for key in renderer.touched do renderer.part_counts[key & 0xFFFFF] = 0
 
-	made := &renderer.mesh_programs[which_program(renderer)]
-	UseProgram(made.program)
-	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
-	BindVertexArray(renderer.mesh_vertex_array)
 	BindBuffer(ARRAY_BUFFER, renderer.instance_buffer)
 	BufferData(ARRAY_BUFFER, MAX_DRAWN * size_of(Drawn_Instance), void, STREAM_DRAW)   // (a fresh buffer: no waiting on last frame's)
 	BufferSubData(ARRAY_BUFFER, 0, isize(record_count * size_of(Drawn_Instance)), &renderer.records[0])
 	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.indirect_buffer)
 	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.commands.len * size_of(Draw_Command)), &renderer.commands[0], STREAM_DRAW)
+}
 
-	// A call for each run of commands of one key.
+// Draws the gathered meshes' opaque runs, or their blended ones (after the
+// water): a call for each run of commands of one key.
+draw_mesh_runs :: fun(renderer: ^Renderer, view_projection: Mat4, lighting: Cell_Lighting, sun: Vec3, camera: Camera,
+	blended: bool, stats: ^Frame_Stats)
+{
+	if renderer.commands.len == 0 do return
+	bindless := renderer.use_bindless
+	made := &renderer.mesh_programs[which_program(renderer)]
+	UseProgram(made.program)
+	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
+	BindVertexArray(renderer.mesh_vertex_array)
+	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.indirect_buffer)
+	if blended {
+		Enable(BLEND)
+		BlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
+		DepthMask(0)
+	}
 	run_start : i64 = 0
-	blending := false
 	for run_start < renderer.commands.len {
 		group_key := renderer.touched[run_start] >> 20
 		run_end := run_start + 1
 		for run_end < renderer.commands.len and renderer.touched[run_end] >> 20 == group_key do run_end += 1
 
 		first_part := renderer.parts[renderer.touched[run_start] & 0xFFFFF]
-		if first_part.alpha_blend and not blending {
-			blending = true
-			Enable(BLEND)
-			BlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
-			DepthMask(0)
+		if first_part.alpha_blend != blended {
+			run_start = run_end
+			continue
 		}
 		if first_part.two_sided do Disable(CULL_FACE)
 		else do Enable(CULL_FACE)
