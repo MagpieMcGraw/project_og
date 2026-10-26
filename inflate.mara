@@ -285,6 +285,10 @@ stored_block :: fun(bits: ^Bits, output: ^[]byte) -> err {
 packed_block :: fun(bits: ^Bits, output: ^[]byte, literals: ^Huffman, distances: ^Huffman) -> err {
 	for true {
 		symbol := decode(bits, literals)?
+		// Past the input's end the bits are zeros, which decode as symbols
+		// like any others: a stream cut off mid-block would fill the output
+		// with them. (padding is 0 but near the end, so this costs a compare.)
+		if bits.padding != 0 and overran(bits) do return Input_Ended
 		if symbol < 256 {
 			if output.len == output.cap do return Output_Full
 			output[output.len] = u8(symbol)
@@ -307,6 +311,20 @@ packed_block :: fun(bits: ^Bits, output: ^[]byte, literals: ^Huffman, distances:
 		for i in 0:length do output[output.len + i] = output[from + i]
 		output.len += length
 	}
+}
+
+// Unpacks a block of a kind (its header's two bits) into output, with
+// room for its codes.
+read_block :: fun(bits: ^Bits, kind: i64, output: ^[]byte, literals: ^Huffman, distances: ^Huffman) -> err {
+	if kind == 0 do return stored_block(bits, output)
+	if kind == 1 {
+		fixed_codes(literals, distances)
+	elif kind == 2
+		read_codes(bits, literals, distances)?
+	else
+		return Bad_Block_Type
+	}
+	return packed_block(bits, output, literals, distances)
 }
 
 // The Adler-32 checksum of data: zlib's check on what it unpacks to.
@@ -354,18 +372,11 @@ unzip :: fun(input: []byte, output: ^[]byte) -> err {
 	for not last {
 		last = take(&bits, 1) == 1
 		kind := take(&bits, 2)
-		if kind == 0 {
-			stored_block(&bits, &room)?
-		elif kind == 1
-			fixed_codes(&literals, &distances)
-			packed_block(&bits, &room, &literals, &distances)?
-		elif kind == 2
-			read_codes(&bits, &literals, &distances)?
-			packed_block(&bits, &room, &literals, &distances)?
-		else
-			return Bad_Block_Type
-		}
+		block_error := read_block(&bits, kind, &room, &literals, &distances)
+		// Whatever a block made of the zeros past the input's end — bad code
+		// lengths, a bad distance — the input ended.
 		if overran(&bits) do return Input_Ended
+		if block_error do return block_error
 	}
 
 	// The checksum: big-endian, in the 4 bytes after the last block's byte.
