@@ -1,0 +1,151 @@
+// Reading DirectDraw Surface textures (.dds): Oblivion's textures.
+//
+// A DDS is "DDS ", a 124-byte header, then the image and its smaller
+// copies (mipmaps), each half the size of the one before, largest first.
+// Oblivion's are mostly block compressed — DXT1, DXT3, DXT5: each 4x4
+// pixels in 8 or 16 bytes, which graphics cards draw from as they are — and
+// a few are plain 24- or 32-bit pixels.
+module dds
+
+use mara.core
+
+// How a texture's pixels are stored.
+Pixel_Format :: union {
+	unknown = 0
+	dxt1         // 8 bytes a block: two colors and 2 bits a pixel; or 1-bit alpha
+	dxt3         // 16 bytes a block: 4 bits of alpha a pixel, then a DXT1 color block
+	dxt5         // 16 bytes a block: interpolated alpha, then a DXT1 color block
+	bgra8        // 32 bits a pixel: blue, green, red, alpha
+	bgr8         // 24 bits a pixel: blue, green, red
+	luminance8   // 8 bits a pixel, gray: Oblivion's glow maps
+	bgra4        // 16 bits a pixel, 4 each of blue, green, red, alpha: menu icons
+}
+
+// What reading a texture can fail with.
+Texture_Error :: error {
+	Not_A_Texture      // it doesn't start with "DDS "
+	Unknown_Format     // pixels stored a way this doesn't read
+	Truncated          // its images run past the end of the file
+}
+
+// The header's pixel format part, as the file has it.
+Dds_Pixel_Format :: struct {
+	size: u32
+	flags: u32           // DDPF_*
+	four_cc: [4!]utf8    // "DXT1"…, when flags has DDPF_FOUR_CC
+	bit_count: u32
+	red_mask: u32
+	green_mask: u32
+	blue_mask: u32
+	alpha_mask: u32
+}
+
+// The header after "DDS ", as the file has it: 124 bytes.
+Dds_Header :: struct {
+	size: u32
+	flags: u32
+	height: u32
+	width: u32
+	pitch: u32
+	depth: u32
+	mip_count: u32
+	reserved: [11!]u32
+	pixel_format: Dds_Pixel_Format
+	caps: [4!]u32
+	reserved2: u32
+}
+
+DDPF_ALPHA_PIXELS :: 0x1
+DDPF_FOUR_CC :: 0x4
+DDPF_RGB :: 0x40
+DDPF_LUMINANCE :: 0x20000
+
+// A texture's size and format, and where each of its images is.
+Texture :: struct {
+	width: i64 = 0
+	height: i64 = 0
+	format: Pixel_Format = .unknown
+	mips: [16]Mip            // largest first
+	pixels: []byte           // all of them: what follows the header
+}
+
+// One image of a texture: its size, and its bytes in the texture's pixels.
+Mip :: struct {
+	width: i64
+	height: i64
+	at: i64
+	size: i64
+}
+
+// The bytes an image of this size takes.
+image_size :: fun(format: Pixel_Format, width: i64, height: i64) -> i64 {
+	blocks_wide := (width + 3) / 4
+	blocks_high := (height + 3) / 4
+	match format {
+	dxt1
+		return blocks_wide * blocks_high * 8
+	dxt3
+		return blocks_wide * blocks_high * 16
+	dxt5
+		return blocks_wide * blocks_high * 16
+	bgra8
+		return width * height * 4
+	bgr8
+		return width * height * 3
+	luminance8
+		return width * height
+	bgra4
+		return width * height * 2
+	unknown
+		return 0
+	}
+}
+
+// Reads a texture's header: its size, its format, and where its images are
+// in data (which it views, no copy).
+read_texture :: fun(data: []byte) -> Texture, err {
+	texture := Texture()
+	texture.pixels = data[0:0]
+	if data.len < 128 do return texture, Not_A_Texture
+	magic : [4!]utf8 = data[0]
+	if magic[:] != "DDS " do return texture, Not_A_Texture
+	header : Dds_Header = data[4]
+
+	pixel_format := header.pixel_format
+	if pixel_format.flags & DDPF_FOUR_CC != 0 {
+		code := pixel_format.four_cc[:]
+		if code == "DXT1" do texture.format = .dxt1
+		elif code == "DXT3" do texture.format = .dxt3
+		elif code == "DXT5" do texture.format = .dxt5
+	elif pixel_format.flags & DDPF_RGB != 0
+		if pixel_format.bit_count == 32 and pixel_format.blue_mask == 0xFF do texture.format = .bgra8
+		elif pixel_format.bit_count == 24 and pixel_format.blue_mask == 0xFF do texture.format = .bgr8
+		elif pixel_format.bit_count == 16 and pixel_format.blue_mask == 0xF and pixel_format.alpha_mask == 0xF000 do texture.format = .bgra4
+	elif pixel_format.flags & DDPF_LUMINANCE != 0
+		if pixel_format.bit_count == 8 do texture.format = .luminance8
+	}
+	if texture.format == .unknown do return texture, Unknown_Format
+
+	texture.width = i64(header.width)
+	texture.height = i64(header.height)
+	texture.pixels = data[128 : data.len]
+
+	// The images, each half the one before, down to 1 pixel or the count given.
+	count := i64(header.mip_count)
+	if count < 1 do count = 1
+	if count > 16 do count = 16
+	width := texture.width
+	height := texture.height
+	at : i64 = 0
+	for i in 0:count {
+		size := image_size(texture.format, width, height)
+		if at + size > texture.pixels.len do break
+		&texture.mips + Mip{width = width, height = height, at = at, size = size}
+		at += size
+		if width == 1 and height == 1 do break
+		if width > 1 do width /= 2
+		if height > 1 do height /= 2
+	}
+	if texture.mips.len == 0 do return texture, Truncated
+	return texture
+}
