@@ -1,0 +1,168 @@
+// Reading Oblivion's plugins (.esm, .esp): the game's world, its people,
+// items and quests, as records.
+//
+// A plugin is a list of records and groups. A record has a four-letter type
+// (NPC_, CELL, WEAP…), a form id naming it, and fields: subrecords, each a
+// four-letter type and some bytes. A group (GRUP) holds records and other
+// groups: one group at the top for each record type, and under world spaces,
+// cells and dialogue topics, groups of what belongs to them.
+module esm
+
+use mara.core
+use inflate
+
+// What reading a plugin can fail with.
+Plugin_Error :: error {
+	Truncated        // a record or group runs past the end of the file
+	Bad_Packed_Size  // a packed record unpacked to another size than it said
+}
+
+// A record's header as the file has it: 20 bytes, its data after them.
+Record_Header :: struct {
+	kind: [4!]utf8   // NPC_, CELL, …
+	size: u32        // the bytes of data after this header
+	flags: u32       // RECORD_*
+	form_id: u32     // the record's id: the top byte says which plugin
+	version: u32     // the editor's version control stamp
+}
+
+// A group's header: the same 20 bytes, read another way.
+Group_Header :: struct {
+	kind: [4!]utf8   // GRUP
+	size: u32        // all of the group's bytes, this header's too
+	label: u32       // a top group: the type it holds; else a form id or a block number
+	group_type: i32  // GROUP_*
+	stamp: u32
+}
+
+// The size of a record's or a group's header.
+HEADER_SIZE :: 20
+
+// Record flags.
+RECORD_MASTER     :: 0x1         // on TES4: the plugin is a master (.esm)
+RECORD_DELETED    :: 0x20
+RECORD_PERSISTENT :: 0x400       // on a reference: loaded with its world, not its cell
+RECORD_DISABLED   :: 0x800       // on a reference: starts out not there
+RECORD_PACKED     :: 0x40000     // the data is zlib packed, its unpacked size first
+
+// Group types: what a group's label says.
+GROUP_TOP                 :: 0    // label: the record type it holds
+GROUP_WORLD_CHILDREN      :: 1    // label: the world space's form id
+GROUP_INTERIOR_BLOCK      :: 2    // label: the block's number
+GROUP_INTERIOR_SUB_BLOCK  :: 3    // label: the sub-block's number
+GROUP_EXTERIOR_BLOCK      :: 4    // label: the block's grid y and x, two i16s
+GROUP_EXTERIOR_SUB_BLOCK  :: 5    // label: the sub-block's grid y and x
+GROUP_CELL_CHILDREN       :: 6    // label: the cell's form id
+GROUP_TOPIC_CHILDREN      :: 7    // label: the dialogue topic's form id
+GROUP_CELL_PERSISTENT     :: 8    // label: the cell's form id
+GROUP_CELL_TEMPORARY      :: 9    // label: the cell's form id
+GROUP_CELL_VISIBLE_DISTANT :: 10  // label: the cell's form id
+
+// One field of a record: a subrecord's type and its bytes.
+Field :: struct {
+	kind: [4!]utf8
+	data: []byte
+}
+
+// A record's fields, read one after another with next_field.
+Fields :: struct {
+	data: []byte
+	at: i64
+	broken: bool   // a field ran past the record's end
+}
+
+// The next field of a record, and false when there are no more. A field
+// too big for its 16-bit size comes after an XXXX field holding the size.
+next_field :: fun(fields: ^Fields) -> Field, bool {
+	data := fields.data
+	none := Field{kind = "    ", data = data[0:0]}
+	if fields.at + 6 > data.len {
+		if fields.at != data.len do fields.broken = true
+		return none, false
+	}
+	kind : [4!]utf8 = data[fields.at]
+	small_size : u16 = data[fields.at + 4]
+	size := i64(small_size)
+	at := fields.at + 6
+	if kind[:] == "XXXX" and size == 4 and at + 10 <= data.len {
+		big_size : u32 = data[at]
+		kind = data[at + 4]
+		size = i64(big_size)
+		at += 10
+	}
+	if at + size > data.len {
+		fields.broken = true
+		return none, false
+	}
+	fields.at = at + size
+	return Field{kind = kind, data = data[at : at + size]}, true
+}
+
+// A record's data as its fields read it: unpacked into scratch when the
+// record is packed (scratch's len set to 0 first).
+record_data :: fun(header: Record_Header, body: []byte, scratch: ^[]byte) -> []byte, err {
+	if header.flags & RECORD_PACKED == 0 do return body
+	if body.len < 4 do return body[0:0], Truncated
+	unpacked_size : u32 = body[0]
+	scratch.len = 0
+	unzip(body[4 : body.len], scratch)?
+	if scratch.len != i64(unpacked_size) do return body[0:0], Bad_Packed_Size
+	return scratch[0 : scratch.len]
+}
+
+// What a plugin holds of one record type: for the stats command.
+Kind_Stats :: struct {
+	kind: [4!]utf8
+	records: i64
+	packed: i64     // how many of them were packed
+	bytes: i64      // their data, unpacked
+	fields: i64
+}
+
+// A count of what a plugin holds, record type by record type.
+Plugin_Stats :: struct {
+	kinds: [128]Kind_Stats
+	groups: i64
+	group_types: [11!]i64
+	broken_records: i64   // records whose fields didn't add up
+}
+
+// The entry for kind in stats, made when it's the first of its kind.
+kind_entry :: fun(stats: ^Plugin_Stats, kind: [4!]utf8) -> ^Kind_Stats {
+	for &entry in stats.kinds {
+		if entry.kind[:] == kind[:] do return entry
+	}
+	entry := next(&stats.kinds)
+	entry^ = Kind_Stats{kind = kind, records = 0, packed = 0, bytes = 0, fields = 0}
+	return entry
+}
+
+// Walks a whole plugin, every record unpacked and its fields read, and
+// counts what it holds into stats. Groups are walked into, not over: their
+// contents follow their headers, so one pass sees everything.
+plugin_stats :: fun(data: []byte, stats: ^Plugin_Stats, scratch: ^[]byte) -> err {
+	at : i64 = 0
+	for at < data.len {
+		if at + HEADER_SIZE > data.len do return Truncated
+		header : Record_Header = data[at]
+		if header.kind[:] == "GRUP" {
+			group_header : Group_Header = data[at]
+			stats.groups += 1
+			if group_header.group_type >= 0 and group_header.group_type <= 10 do stats.group_types[i64(group_header.group_type)] += 1
+			at += HEADER_SIZE
+			continue
+		}
+		end := at + HEADER_SIZE + i64(header.size)
+		if end > data.len do return Truncated
+		body := record_data(header, data[at + HEADER_SIZE : end], scratch)?
+
+		entry := kind_entry(stats, header.kind)
+		entry.records += 1
+		if header.flags & RECORD_PACKED != 0 do entry.packed += 1
+		entry.bytes += body.len
+		fields := Fields{data = body, at = 0, broken = false}
+		for field in next_field(&fields) do entry.fields += 1
+		if fields.broken do stats.broken_records += 1
+		at = end
+	}
+}

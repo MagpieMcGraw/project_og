@@ -1,0 +1,182 @@
+// sooblivion: an engine for The Elder Scrolls IV: Oblivion, written in
+// Mara. It runs on the game's own data files — the plugins (.esm, .esp)
+// and archives (.bsa) in its Data folder.
+//
+// For now it is a set of commands for looking into those files:
+//
+//     sooblivion esm [plugin]            what a plugin holds, by record type
+//     sooblivion bsa <archive>           an archive's folders and files
+//     sooblivion bsa <archive> <file>    one file from an archive, unpacked
+module sooblivion
+
+use mara.core
+use mara.os
+use mara.memory
+use mara.time
+use esm
+use bsa
+
+#allocator Arena_Basic(2 * GB)
+
+// Where the game's data is, unless a command is given a path.
+DATA_FOLDER :: "D:/SteamLibrary/steamapps/common/Oblivion/Data/"
+
+// A path given on the command line, or a file in the data folder.
+data_path :: fun(name: []utf8) -> Path {
+	path : Path
+	if contains_separator(name) {
+		&path + name
+	else
+		&path + DATA_FOLDER
+		&path + name
+	}
+	return path
+}
+
+contains_separator :: fun(name: []utf8) -> bool {
+	for c in name {
+		if path_separator(c) or c == ':' do return true
+	}
+	return false
+}
+
+// `sooblivion esm [plugin]`: reads a whole plugin and prints how many
+// records of each type it holds.
+command_esm :: fun(name: []utf8) {
+	path := data_path(name)
+	storage : [400 * MB]byte
+	start := time_now()
+	data, read_error := read_entire_file(path, &storage)
+	if read_error {
+		print("couldn't read %: %", path, read_error)
+		return
+	}
+	print("read % MB in % ms", data.len / MB, elapsed_ms(start))
+
+	stats : Plugin_Stats
+	scratch : [16 * MB]byte
+	walk_start := time_now()
+	walk_error := plugin_stats(data, &stats, &scratch)
+	if walk_error do print("stopped: %", walk_error)
+	print("walked in % ms: % groups, % record types, % broken records",
+		elapsed_ms(walk_start), stats.groups, stats.kinds.len, stats.broken_records)
+
+	total_records : i64 = 0
+	for entry in stats.kinds {
+		print("  %  % records (% packed), % fields, % KB",
+			entry.kind, entry.records, entry.packed, entry.fields, entry.bytes / KB)
+		total_records += entry.records
+	}
+	print("% records in all", total_records)
+}
+
+// `sooblivion bsa <archive> [file | -test]`: an archive's directory, one
+// of its files written out to the current folder, or every file unpacked
+// as a test.
+command_bsa :: fun(name: []utf8, what: []utf8) {
+	path := data_path(name)
+	directory_storage : [64 * MB]byte
+	archive, open_error := open_archive(path, &directory_storage)
+	if open_error {
+		print("couldn't open %: %", path, open_error)
+		return
+	}
+	defer close_archive(&archive)
+
+	if what.len == 0 {
+		print("% folders, % files, flags %, % with bad hashes",
+			archive.folders.len, archive.files.len, archive.header.flags, count_bad_hashes(&archive))
+		shown : i64 = 0
+		for folder in archive.folders {
+			if shown == 12 do break
+			print("  % (% files)", folder_name(&archive, folder), folder.file_count)
+			shown += 1
+		}
+		return
+	}
+
+	storage : [128 * MB]byte
+	if what == "-test" {
+		start := time_now()
+		failed : i64 = 0
+		total : i64 = 0
+		for file, i in archive.files {
+			storage.len = 0
+			data, read_error := read_file(&archive, i, &storage)
+			if read_error {
+				failed += 1
+				if failed <= 10 do print("  % failed: %", file_name(&archive, file), read_error)
+				continue
+			}
+			total += data.len
+		}
+		print("% files read, % failed, % MB unpacked, in % ms",
+			archive.files.len, failed, total / MB, elapsed_ms(start))
+		return
+	}
+
+	index, found := find_file(&archive, what)
+	if not found {
+		// A folder's name lists its files.
+		folder_at, is_folder := find_folder(&archive, what)
+		if not is_folder {
+			print("no % in %", what, path)
+			return
+		}
+		folder := archive.folders[folder_at]
+		for k in 0:folder.file_count {
+			file := archive.files[folder.first_file + k]
+			print("  %  (% bytes%)", file_name(&archive, file), file.size, if file.packed do ", packed" else "")
+		}
+		return
+	}
+	data, read_error := read_file(&archive, index, &storage)
+	if read_error {
+		print("couldn't read %: %", what, read_error)
+		return
+	}
+	out_name := get_file(what)
+	write_error := write_entire_file(out_name, data)
+	if write_error do print("couldn't write %: %", out_name, write_error)
+	else do print("wrote % (% bytes)", out_name, data.len)
+}
+
+// Writes data to a new file at path (or over the one there).
+write_entire_file :: fun(path: []utf8, data: []byte) -> err {
+	file := file_open_write(path)?
+	defer file_close(file)
+	rest := data
+	for rest.len > 0 {
+		written := file_write(file, &rest)?
+		if written <= 0 do return Write_Failed
+		rest = rest[written : rest.len]
+	}
+}
+
+usage :: fun() {
+	print("sooblivion esm [plugin]            what a plugin holds, by record type")
+	print("sooblivion bsa <archive>           an archive's folders and files")
+	print("sooblivion bsa <archive> <file>    one file from an archive, unpacked")
+}
+
+main :: (args: [][]utf8) {
+	if args.len < 2 {
+		usage()
+		return
+	}
+	command := args[1]
+	if command == "esm" {
+		if args.len > 2 do command_esm(args[2])
+		else do command_esm("Oblivion.esm")
+	elif command == "bsa" and args.len > 2
+		if args.len > 3 do command_bsa(args[2], args[3])
+		else do command_bsa(args[2], "")
+	else
+		usage()
+	}
+}
+
+// Milliseconds since start, a time_now.
+elapsed_ms :: fun(start: u64) -> i64 {
+	return i64((time_now() - start) / 1000000)
+}

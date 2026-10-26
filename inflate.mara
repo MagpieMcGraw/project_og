@@ -1,0 +1,384 @@
+// Unpacking zlib data: the compression Oblivion uses for files in its
+// archives (.bsa) and for some records in its plugins (.esm, .esp).
+//
+// zlib (RFC 1950) wraps deflate (RFC 1951): two header bytes, deflate
+// blocks, then an Adler-32 checksum of what the blocks unpack to. A block is
+// stored as it is, or packed with Huffman codes: fixed ones the format
+// defines, or ones the block describes before its data.
+module inflate
+
+use mara.core
+
+// What unpacking can fail with.
+Inflate_Error :: error {
+	Bad_Header          // not a zlib stream, or one that needs a preset dictionary
+	Bad_Block_Type      // a block of type 3, which deflate doesn't have
+	Bad_Stored_Length   // a stored block whose length and its complement disagree
+	Bad_Code_Lengths    // a block's code lengths don't make a Huffman code
+	Bad_Code            // bits that are no symbol's code
+	Bad_Distance        // a match reaching back before the start of the output
+	Input_Ended         // the data stops in the middle of a block
+	Output_Full         // the data unpacks to more than the output has room for
+	Bad_Checksum        // the Adler-32 at the end isn't the one of what was unpacked
+}
+
+// The longest code deflate uses, in bits.
+MAX_CODE_BITS :: 15
+// Codes this long or shorter are found with one look in a table.
+FAST_BITS :: 9
+FAST_SIZE :: 512   // 1 << FAST_BITS
+
+// The match lengths symbols 257 to 285 stand for: the shortest of each, and
+// how many extra bits follow the symbol to add to it.
+LENGTH_BASE :: [29!]i64{
+	3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+	35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258}
+LENGTH_EXTRA :: [29!]i64{
+	0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+	3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0}
+
+// The distances the 30 distance symbols stand for, the same way.
+DISTANCE_BASE :: [30!]i64{
+	1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+	257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
+	8193, 12289, 16385, 24577}
+DISTANCE_EXTRA :: [30!]i64{
+	0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+	7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13}
+
+// The order a dynamic block lists the lengths of its code-length code in.
+CODE_LENGTH_ORDER :: [19!]i64{
+	16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15}
+
+// The input, read a few bits at a time: the lowest bit of each byte first.
+Bits :: struct {
+	input: []byte
+	at: i64        // the next byte to load into held
+	held: u64      // the bits loaded, the next one in the lowest place
+	count: i64     // how many bits held has
+	padding: i64   // zero bytes loaded past the input's end
+}
+
+// Loads bytes until held has at least 56 bits. Past the input's end it
+// loads zeros, counted in padding: a stream that uses them was cut short.
+fill :: fun(bits: ^Bits) {
+	if bits.at + 8 <= bits.input.len {
+		// Eight bytes at once; the whole ones that fit above what's held stay.
+		chunk : u64 = bits.input[bits.at]
+		bits.held |= chunk << u64(bits.count)
+		taken := (63 - bits.count) / 8
+		bits.at += taken
+		bits.count += taken * 8
+		return
+	}
+	for bits.count <= 56 {
+		loaded : u64 = 0
+		if bits.at < bits.input.len {
+			byte_value : u8 = bits.input[bits.at]
+			loaded = u64(byte_value)
+			bits.at += 1
+		else
+			bits.padding += 1
+		}
+		bits.held |= loaded << u64(bits.count)
+		bits.count += 8
+	}
+}
+
+// The next n bits (up to 32), taken from the input: the first one lowest.
+take :: fun(bits: ^Bits, n: i64) -> i64 {
+	if bits.count < n do fill(bits)
+	value := bits.held & ((u64(1) << u64(n)) - 1)
+	bits.held >>= u64(n)
+	bits.count -= n
+	return i64(value)
+}
+
+// Whether the stream has used bits past the input's end.
+overran :: fun(bits: ^Bits) -> bool {
+	used := (bits.at + bits.padding) * 8 - bits.count
+	return used > bits.input.len * 8
+}
+
+// A Huffman code, made from each symbol's code length. Deflate's codes are
+// canonical: codes of one length go to their symbols in order, and each
+// length's codes follow on from the last of the length before, doubled.
+Huffman :: struct {
+	// Indexed by the next FAST_BITS bits of input: the symbol whose code
+	// they start with, as symbol | length << 9; 0 when its code is longer.
+	fast: [FAST_SIZE!]u16
+	counts: [16!]i64     // how many codes there are of each length
+	symbols: [288!]u16   // the symbols in code order: shortest codes first
+}
+
+// Turns n bits of code around: the first bit read becomes the lowest.
+reverse_bits :: fun(code: i64, n: i64) -> i64 {
+	reversed : i64 = 0
+	for i in 0:n {
+		reversed = (reversed << 1) | ((code >> i) & 1)
+	}
+	return reversed
+}
+
+// Makes code from each symbol's code length, 0 for a symbol not used.
+// Bad_Code_Lengths when some length has more codes than fit; a code with
+// room left over is allowed (a block with one distance has one).
+build :: fun(code: ^Huffman, lengths: []u8) -> err {
+	for i in 0:16 do code.counts[i] = 0
+	for length in lengths do code.counts[i64(length)] += 1
+	code.counts[0] = 0
+
+	// Each length has room for twice what was left at the length before.
+	left : i64 = 1
+	for length in 1..MAX_CODE_BITS {
+		left = left * 2 - code.counts[length]
+		if left < 0 do return Bad_Code_Lengths
+	}
+
+	// Where each length's symbols start in code.symbols, and its first code.
+	offsets : [16!]i64
+	next_code : [16!]i64
+	first : i64 = 0
+	for length in 1..MAX_CODE_BITS {
+		first = (first + code.counts[length - 1]) << 1
+		next_code[length] = first
+		if length < MAX_CODE_BITS do offsets[length + 1] = offsets[length] + code.counts[length]
+	}
+
+	for i in 0:FAST_SIZE do code.fast[i] = 0
+	for length_byte, symbol in lengths {
+		length := i64(length_byte)
+		if length == 0 do continue
+		code.symbols[offsets[length]] = u16(symbol)
+		offsets[length] += 1
+		if length <= FAST_BITS {
+			// Every table entry whose low bits are this code points at it.
+			entry := u16(symbol) | (u16(length) << 9)
+			at := reverse_bits(next_code[length], length)
+			for at < FAST_SIZE {
+				code.fast[at] = entry
+				at += 1 << length
+			}
+		}
+		next_code[length] += 1
+	}
+}
+
+// The next symbol in the input, its code read with code and taken.
+decode :: fun(bits: ^Bits, code: ^Huffman) -> i64, err {
+	if bits.count < MAX_CODE_BITS do fill(bits)
+	entry := code.fast[i64(bits.held & (FAST_SIZE - 1))]
+	if entry != 0 {
+		length := i64(entry >> 9)
+		bits.held >>= u64(length)
+		bits.count -= length
+		return i64(entry & 511)
+	}
+
+	// A longer code: walked a bit at a time. value is the bits so far, the
+	// first one highest; first the first code of this length; index where
+	// this length's symbols start.
+	held := bits.held
+	value : i64 = 0
+	first : i64 = 0
+	index : i64 = 0
+	for length in 1..MAX_CODE_BITS {
+		value |= i64(held & 1)
+		held >>= 1
+		count := code.counts[length]
+		if value - first < count {
+			bits.held >>= u64(length)
+			bits.count -= length
+			return i64(code.symbols[index + value - first])
+		}
+		index += count
+		first = (first + count) << 1
+		value <<= 1
+	}
+	return 0, Bad_Code
+}
+
+// The codes of a block packed with the fixed codes deflate defines.
+fixed_codes :: fun(literals: ^Huffman, distances: ^Huffman) {
+	lengths : [288!]u8
+	for i in 0:144 do lengths[i] = 8
+	for i in 144:256 do lengths[i] = 9
+	for i in 256:280 do lengths[i] = 7
+	for i in 280:288 do lengths[i] = 8
+	_ = build(literals, lengths[:])
+	for i in 0:30 do lengths[i] = 5
+	_ = build(distances, lengths[0:30])
+}
+
+// The codes a dynamic block starts with: their code lengths, themselves
+// packed with a third code, of code lengths.
+read_codes :: fun(bits: ^Bits, literals: ^Huffman, distances: ^Huffman) -> err {
+	literal_count := take(bits, 5) + 257
+	distance_count := take(bits, 5) + 1
+	length_count := take(bits, 4) + 4
+	if literal_count > 286 or distance_count > 30 do return Bad_Code_Lengths
+
+	code_lengths : [19!]u8
+	for i in 0:length_count do code_lengths[CODE_LENGTH_ORDER[i]] = u8(take(bits, 3))
+	length_code : Huffman
+	build(&length_code, code_lengths[:])?
+
+	// The literal and distance lengths, as one list. 16 repeats the length
+	// before 3 to 6 times; 17 is 3 to 10 zeros, 18 is 11 to 138.
+	lengths : [320!]u8
+	total := literal_count + distance_count
+	k : i64 = 0
+	for k < total {
+		symbol := decode(bits, &length_code)?
+		if symbol < 16 {
+			lengths[k] = u8(symbol)
+			k += 1
+			continue
+		}
+		value : u8 = 0
+		repeat : i64 = 0
+		if symbol == 16 {
+			if k == 0 do return Bad_Code_Lengths
+			value = lengths[k - 1]
+			repeat = 3 + take(bits, 2)
+		elif symbol == 17
+			repeat = 3 + take(bits, 3)
+		else
+			repeat = 11 + take(bits, 7)
+		}
+		if k + repeat > total do return Bad_Code_Lengths
+		for r in 0:repeat do lengths[k + r] = value
+		k += repeat
+	}
+	if lengths[256] == 0 do return Bad_Code_Lengths   // no end-of-block code
+
+	build(literals, lengths[0:literal_count])?
+	build(distances, lengths[literal_count:total])?
+}
+
+// A block stored as it is: the rest of the byte skipped, then its length,
+// the length's complement, and that many bytes.
+stored_block :: fun(bits: ^Bits, output: ^[]byte) -> err {
+	_ = take(bits, bits.count % 8)
+	length := take(bits, 16)
+	complement := take(bits, 16)
+	if length + complement != 65535 do return Bad_Stored_Length
+	if output.len + length > output.cap do return Output_Full
+
+	// The bytes already loaded first, then straight from the input.
+	for length > 0 and bits.count > 0 {
+		output[output.len] = u8(take(bits, 8))
+		output.len += 1
+		length -= 1
+	}
+	if bits.at + length > bits.input.len do return Input_Ended
+	// held's bits above count are the bytes at `at` (fill loads ahead):
+	// stale once those bytes are copied past.
+	bits.held = 0
+	source := bits.input[bits.at : bits.at + length]
+	output[output.len : output.len + length] = source
+	output.len += length
+	bits.at += length
+}
+
+// A block packed with Huffman codes: literal bytes, and matches — a length
+// and a distance back, copying what's there — up to the end-of-block symbol.
+packed_block :: fun(bits: ^Bits, output: ^[]byte, literals: ^Huffman, distances: ^Huffman) -> err {
+	for true {
+		symbol := decode(bits, literals)?
+		if symbol < 256 {
+			if output.len == output.cap do return Output_Full
+			output[output.len] = u8(symbol)
+			output.len += 1
+			continue
+		}
+		if symbol == 256 do return
+
+		which := symbol - 257
+		if which >= 29 do return Bad_Code
+		length := LENGTH_BASE[which] + take(bits, LENGTH_EXTRA[which])
+		place := decode(bits, distances)?
+		if place >= 30 do return Bad_Distance
+		distance := DISTANCE_BASE[place] + take(bits, DISTANCE_EXTRA[place])
+		if distance > output.len do return Bad_Distance
+		if output.len + length > output.cap do return Output_Full
+
+		// Byte by byte: a match can overlap what it writes (a run).
+		from := output.len - distance
+		for i in 0:length do output[output.len + i] = output[from + i]
+		output.len += length
+	}
+}
+
+// The Adler-32 checksum of data: zlib's check on what it unpacks to.
+adler32 :: fun(data: []byte) -> u32 {
+	low : u32 = 1
+	high : u32 = 0
+	at : i64 = 0
+	for at < data.len {
+		// 5552 bytes is the most that can be summed before high could overflow.
+		end := at + 5552
+		if end > data.len do end = data.len
+		for k in at:end {
+			value : u8 = data[k]
+			low += u32(value)
+			high += low
+		}
+		low %= 65521
+		high %= 65521
+		at = end
+	}
+	return (high << 16) | low
+}
+
+// Unpacks the zlib stream in input into output, after what output holds:
+// output.len moves past what it unpacked. Output_Full when that is more
+// than output has room for; the checksum at its end is checked.
+unzip :: fun(input: []byte, output: ^[]byte) -> err {
+	if input.len < 6 do return Input_Ended
+	compression : u8 = input[0]
+	flags : u8 = input[1]
+	if compression & 15 != 8 do return Bad_Header            // 8 is deflate
+	if (u32(compression) * 256 + u32(flags)) % 31 != 0 do return Bad_Header
+	if flags & 32 != 0 do return Bad_Header             // a preset dictionary
+
+	// The blocks unpack into the room after what output holds, so a match
+	// can't reach back into it.
+	start := output.len
+	room := output[start : output.cap]
+	room.len = 0
+	bits := Bits{input = input[2 : input.len], at = 0, held = 0, count = 0, padding = 0}
+
+	literals : Huffman
+	distances : Huffman
+	last := false
+	for not last {
+		last = take(&bits, 1) == 1
+		kind := take(&bits, 2)
+		if kind == 0 {
+			stored_block(&bits, &room)?
+		elif kind == 1
+			fixed_codes(&literals, &distances)
+			packed_block(&bits, &room, &literals, &distances)?
+		elif kind == 2
+			read_codes(&bits, &literals, &distances)?
+			packed_block(&bits, &room, &literals, &distances)?
+		else
+			return Bad_Block_Type
+		}
+		if overran(&bits) do return Input_Ended
+	}
+
+	// The checksum: big-endian, in the 4 bytes after the last block's byte.
+	_ = take(&bits, bits.count % 8)
+	end := 2 + bits.at + bits.padding - bits.count / 8
+	if end + 4 > input.len do return Input_Ended
+	b0 : u8 = input[end]
+	b1 : u8 = input[end + 1]
+	b2 : u8 = input[end + 2]
+	b3 : u8 = input[end + 3]
+	expected := (u32(b0) << 24) | (u32(b1) << 16) | (u32(b2) << 8) | u32(b3)
+	if adler32(room[0 : room.len]) != expected do return Bad_Checksum
+
+	output.len = start + room.len
+}

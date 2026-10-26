@@ -1,0 +1,10 @@
+*.exe
+*.pdb
+*.ll
+*.o
+*_build/
+crash.txt
+profile.txt
+memory.txt
+*.nif
+*.dds

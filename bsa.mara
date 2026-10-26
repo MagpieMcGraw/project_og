@@ -1,0 +1,324 @@
+// Reading Oblivion's archives (.bsa): the meshes, textures, sounds and
+// voices the game loads, many files packed into one.
+//
+// An archive starts with its directory: a header, a record for each folder,
+// then each folder's name and the records of its files, then all the files'
+// names. The files' data come after. A file is stored as it is or packed
+// with zlib, its unpacked size written in front.
+//
+// Folders are sorted by a hash of their names, and each folder's files by
+// a hash of theirs, so a file is found by two binary searches.
+module bsa
+
+use mara.core
+use mara.os
+use mara.string
+use inflate
+
+// What reading an archive can fail with, beyond what reading files can.
+Archive_Error :: error {
+	Not_An_Archive   // it doesn't start with "BSA"
+	Wrong_Version    // not an Oblivion archive (103)
+	Bad_Directory    // the directory's parts don't add up
+	Not_Found        // no file of that name in the archive
+	No_Room          // the storage given can't hold what was asked for
+}
+
+// The archive's header, as the file has it: 36 bytes.
+Archive_Header :: struct {
+	magic: [4!]utf8          // "BSA" and a 0
+	version: u32             // 103 for Oblivion
+	folders_at: u32          // where the folder records start: right after this
+	flags: u32               // ARCHIVE_*
+	folder_count: u32
+	file_count: u32
+	folder_names_size: u32   // all the folders' names, their 0s too
+	file_names_size: u32     // all the files' names, their 0s too
+	content_flags: u32       // which kinds of file it holds
+}
+
+OBLIVION_VERSION :: 103
+
+// Archive flags.
+ARCHIVE_FOLDER_NAMES :: 0x1   // folder names are stored
+ARCHIVE_FILE_NAMES   :: 0x2   // file names are stored
+ARCHIVE_PACKED       :: 0x4   // files are packed unless their size says otherwise
+
+// In a file record's size: the file is packed the other way from the archive's default.
+SIZE_PACKED_TOGGLE :: 0x40000000
+
+// A folder in an archive.
+Folder :: struct {
+	hash: u64
+	name_at: i64      // where its name is in the directory
+	name_len: i64
+	first_file: i64   // its first file in the archive's files
+	file_count: i64
+}
+
+// A file in an archive: its name, and where its data is.
+Archive_File :: struct {
+	hash: u64
+	folder: i64       // in the archive's folders
+	name_at: i64      // where its name is in the directory
+	name_len: i64
+	size: i64         // its bytes in the archive, packed or not
+	offset: i64       // where they start, from the archive's start
+	packed: bool
+}
+
+// An open archive with its directory read. The file stays open, for
+// reading files from it with read_file.
+Archive :: struct {
+	file: File_Id
+	header: Archive_Header
+	directory: []byte          // the archive from its start up to the files' data
+	folders: []Folder
+	files: []Archive_File
+}
+
+// A name of a folder or file in an archive, as text.
+folder_name :: fun(archive: ^Archive, folder: Folder) -> []utf8 {
+	names : []utf8 = archive.directory
+	return names[folder.name_at : folder.name_at + folder.name_len]
+}
+
+file_name :: fun(archive: ^Archive, file: Archive_File) -> []utf8 {
+	names : []utf8 = archive.directory
+	return names[file.name_at : file.name_at + file.name_len]
+}
+
+// Fills view from the file's current place: all of it, in as many reads as
+// that takes. Read_Failed when the file ends first.
+read_exactly :: fun(file: File_Id, view: []byte) -> err {
+	got : i64 = 0
+	for got < view.len {
+		rest := view[got : view.len]
+		file_read(file, &rest)?
+		if rest.len == 0 do return Read_Failed
+		got += rest.len
+	}
+}
+
+// Opens an archive and reads its directory into storage (its len moved
+// past it), with the tables of its folders and files.
+open_archive :: fun(path: []utf8, storage: ^[]byte) -> Archive, err {
+	file := file_open_read(path)?
+	defer? file_close(file)
+
+	header_bytes : [36!]byte
+	read_exactly(file, header_bytes[:])?
+	header : Archive_Header = header_bytes[0]
+	if header.magic[0:3] != "BSA" do return Archive{0}, Not_An_Archive
+	if header.version != OBLIVION_VERSION do return Archive{0}, Wrong_Version
+	if header.flags & ARCHIVE_FOLDER_NAMES == 0 or header.flags & ARCHIVE_FILE_NAMES == 0 do return Archive{0}, Bad_Directory
+
+	folder_count := i64(header.folder_count)
+	file_count := i64(header.file_count)
+	directory_size := 36 + folder_count * 16 + folder_count + i64(header.folder_names_size) + file_count * 16 + i64(header.file_names_size)
+	if storage.len + directory_size > storage.cap do return Archive{0}, No_Room
+
+	start := storage.len
+	directory := storage[start : start + directory_size]
+	_ = file_seek(file, 0, SEEK_SET)?
+	read_exactly(file, directory)?
+	storage.len = start + directory_size
+
+	folders := slice([:folder_count]Folder, storage)
+	files := slice([:file_count]Archive_File, storage)
+	archive_packed := header.flags & ARCHIVE_PACKED != 0
+
+	// Each folder's name and file records, one folder after another, after
+	// the folder records; then the file names, in the same order.
+	at := 36 + folder_count * 16
+	names_at := directory_size - i64(header.file_names_size)
+	for i in 0:folder_count {
+		record_at := 36 + i * 16
+		hash : u64 = directory[record_at]
+		count : u32 = directory[record_at + 8]
+
+		name_size : u8 = directory[at]   // its 0 counted
+		folder := next(&folders)
+		folder^ = Folder{
+			hash = hash,
+			name_at = at + 1,
+			name_len = i64(name_size) - 1,
+			first_file = files.len,
+			file_count = i64(count)}
+		at += 1 + i64(name_size)
+
+		for k in 0:i64(count) {
+			stored_hash : u64 = directory[at]
+			size : u32 = directory[at + 8]
+			offset : u32 = directory[at + 12]
+			at += 16
+
+			// The name: up to its 0.
+			name_end := names_at
+			for name_end < directory_size {
+				c : u8 = directory[name_end]
+				if c == 0 do break
+				name_end += 1
+			}
+			if name_end >= directory_size do return Archive{0}, Bad_Directory
+
+			toggled := size & SIZE_PACKED_TOGGLE != 0
+			entry := next(&files)
+			entry^ = Archive_File{
+				hash = stored_hash,
+				folder = i,
+				name_at = names_at,
+				name_len = name_end - names_at,
+				size = i64(size & 0x3FFFFFFF),
+				offset = i64(offset),
+				packed = archive_packed != toggled}
+			names_at = name_end + 1
+		}
+	}
+	if at != directory_size - i64(header.file_names_size) do return Archive{0}, Bad_Directory
+
+	return Archive{file = file, header = header, directory = directory, folders = folders, files = files}
+}
+
+close_archive :: fun(archive: ^Archive) {
+	file_close(archive.file)
+}
+
+// The hash an archive sorts a name by: a folder's whole name, or a file's
+// name before its extension (stem) and the extension, its dot included.
+// The name lower case, with '\\' between its parts.
+name_hash :: fun(stem: []utf8, extension: []utf8) -> u64 {
+	n := stem.len
+	if n == 0 do return 0
+	hash := u64(stem[n - 1]) | (u64(n) << 16) | (u64(stem[0]) << 24)
+	if n >= 3 do hash |= u64(stem[n - 2]) << 8
+	if n >= 4 {
+		middle : u32 = 0
+		for i in 1:n - 2 do middle = middle *% 0x1003F +% u32(stem[i])
+		hash = hash +% (u64(middle) << 32)
+	}
+	if extension.len == 0 do return hash
+
+	if extension == ".kf" do hash |= 0x80
+	elif extension == ".nif" do hash |= 0x8000
+	elif extension == ".dds" do hash |= 0x8080
+	elif extension == ".wav" do hash |= 0x80000000
+	ending : u32 = 0
+	for c in extension do ending = ending *% 0x1003F +% u32(c)
+	hash = hash +% (u64(ending) << 32)
+	return hash
+}
+
+// The hash of a file's name: split at its last dot.
+file_hash :: fun(name: []utf8) -> u64 {
+	dot := name.len
+	for i in 0:name.len {
+		if name[i] == '.' do dot = i
+	}
+	return name_hash(name[0 : dot], name[dot : name.len])
+}
+
+// How many of the archive's folders and files have a hash other than
+// their names give: none, unless name_hash is wrong.
+count_bad_hashes :: fun(archive: ^Archive) -> i64 {
+	bad : i64 = 0
+	for folder in archive.folders {
+		if name_hash(folder_name(archive, folder), "") != folder.hash do bad += 1
+	}
+	for file in archive.files {
+		if file_hash(file_name(archive, file)) != file.hash do bad += 1
+	}
+	return bad
+}
+
+// A path as an archive spells it: lower case, '\' between its parts.
+archive_path :: fun(path: []utf8) -> [512]utf8 {
+	clean : [512]utf8
+	for c in path {
+		if c == '/' do &clean + '\\'
+		else do &clean + lower(c)
+	}
+	return clean
+}
+
+// The folder at path in the archive, as an index into its folders; false
+// when there is none. Either '/' or '\' between the parts, any letter case.
+find_folder :: fun(archive: ^Archive, path: []utf8) -> i64, bool {
+	clean := archive_path(path)
+	return search_folders(archive.folders, name_hash(clean[:], ""))
+}
+
+// The file at path in the archive, as an index into its files; false when
+// there is none. Either '/' or '\' between the parts, any letter case.
+find_file :: fun(archive: ^Archive, path: []utf8) -> i64, bool {
+	clean := archive_path(path)
+	split : i64 = 0
+	for i in 0:clean.len {
+		if clean[i] == '\\' do split = i
+	}
+	if split == 0 do return 0, false
+	folder_part := clean[0 : split]
+	file_part := clean[split + 1 : clean.len]
+
+	folder_at, found_folder := search_folders(archive.folders, name_hash(folder_part, ""))
+	if not found_folder do return 0, false
+	folder := archive.folders[folder_at]
+	files := archive.files[folder.first_file : folder.first_file + folder.file_count]
+	file_at, found_file := search_files(files, file_hash(file_part))
+	if not found_file do return 0, false
+	return folder.first_file + file_at, true
+}
+
+// Binary searches over tables sorted by hash.
+search_folders :: fun(folders: []Folder, hash: u64) -> i64, bool {
+	low : i64 = 0
+	high := folders.len
+	for low < high {
+		middle := (low + high) / 2
+		if folders[middle].hash < hash do low = middle + 1
+		else do high = middle
+	}
+	if low < folders.len and folders[low].hash == hash do return low, true
+	return 0, false
+}
+
+search_files :: fun(files: []Archive_File, hash: u64) -> i64, bool {
+	low : i64 = 0
+	high := files.len
+	for low < high {
+		middle := (low + high) / 2
+		if files[middle].hash < hash do low = middle + 1
+		else do high = middle
+	}
+	if low < files.len and files[low].hash == hash do return low, true
+	return 0, false
+}
+
+// Reads a file of the archive into storage, after what it holds (its len
+// moved past it), unpacked: the file's bytes, a view of storage.
+read_file :: fun(archive: ^Archive, index: i64, storage: ^[]byte) -> []byte, err {
+	entry := archive.files[index]
+	start := storage.len
+	none := storage[start : start]
+	if start + entry.size > storage.cap do return none, No_Room
+	_ = file_seek(archive.file, entry.offset, SEEK_SET)?
+
+	if not entry.packed {
+		data := storage[start : start + entry.size]
+		read_exactly(archive.file, data)?
+		storage.len = start + entry.size
+		return data
+	}
+
+	// Packed: read into the end of storage's room, unpacked in front of it.
+	packed := storage[storage.cap - entry.size : storage.cap]
+	read_exactly(archive.file, packed)?
+	unpacked_size : u32 = packed[0]
+	if unpacked_size == 0 do return none   // an empty file: its size and nothing more
+	if start + i64(unpacked_size) > storage.cap - entry.size do return none, No_Room
+	output := storage[start : start + i64(unpacked_size)]
+	output.len = 0
+	unzip(packed[4 : packed.len], &output)?
+	storage.len = start + output.len
+	return storage[start : start + output.len]
+}
