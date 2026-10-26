@@ -4,7 +4,8 @@
 //
 // W, A, S, D fly, Left Shift faster; the right mouse button turns mouse
 // look on and off; E goes through the door nearest the camera; V turns
-// vsync on and off; Escape quits. The window's title says where, how many
+// vsync on and off; B switches between drawing bindless and binding
+// textures (where the card can do both); Escape quits. The window's title says where, how many
 // frames a second, and whether vsync is on; sooblivion.log, in the folder
 // it's run from, keeps what happened.
 module sooblivion
@@ -113,6 +114,10 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.platform = platform_open("sooblivion", 1280, 720)?
 	set_vsync(&viewer.platform, true)
 	renderer_init(&viewer.renderer, table_storage)?
+	note(&viewer.journal, if viewer.renderer.bindless_available do "the card draws bindless" else "the card can't draw bindless: textures are bound")
+	note(&viewer.journal, "; anisotropy ")
+	note(&viewer.journal, i64(viewer.renderer.anisotropy))
+	note_end(&viewer.journal)
 	scene_clear(&viewer.shown, table_storage)
 	viewer.camera = render.Camera(){position = Vec3{0, 0, 0}, yaw = 0, pitch = 0}
 	viewer.speed = 400
@@ -168,6 +173,7 @@ update_title :: fun(viewer: ^Viewer) {
 	&title + int_text(viewer.frames_a_second)[:]
 	&title + " fps, vsync "
 	&title + (if viewer.platform.vsync do "on" else "off")
+	&title + (if viewer.renderer.use_bindless do ", bindless" else ", bound textures")
 	&title + " — "
 	&title + int_text(viewer.drawn.visible)[:]
 	&title + " of "
@@ -201,6 +207,12 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		viewer.next_frame = time_now()
 		note(&viewer.journal, "vsync ")
 		note(&viewer.journal, if platform.vsync do "on" else "off")
+		note_end(&viewer.journal)
+		update_title(viewer)
+	}
+	if input.pressed[B] and viewer.renderer.bindless_available {
+		viewer.renderer.use_bindless = not viewer.renderer.use_bindless
+		note(&viewer.journal, if viewer.renderer.use_bindless do "drawing bindless" else "drawing with bound textures")
 		note_end(&viewer.journal)
 		update_title(viewer)
 	}

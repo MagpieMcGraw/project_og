@@ -168,13 +168,14 @@ LAND_MESH_INDICES :: 6144     // 4 x 16 x 16 x 6
 // The textures a quadrant can blend: its base, and up to 8 layers.
 QUADRANT_TEXTURES :: 9
 
-// A vertex of land as the renderer draws it: 64 bytes.
+// A vertex of land as the renderer draws it: 52 bytes. Which textures
+// it blends is its quadrant's: the renderer knows a vertex's quadrant by
+// its place (each quadrant's are QUADRANT_SIDE x QUADRANT_SIDE in a row).
 Land_Vertex :: struct {
 	position: Vec3
 	normal: Vec3
 	uv: [2!]f32
 	color: Vec3
-	layers: [12!]u8     // the quadrant's textures, as the renderer numbers them (it sets these)
 	weights: [8!]u8     // how much of each layer over the base, 0 to 255
 }
 
@@ -229,7 +230,6 @@ build_land_mesh :: fun(plugin: ^Plugin, land: ^Land, cell_x: i64, cell_y: i64, m
 				vertex.normal = land.normals[k]
 				vertex.uv = [f32(column) * TEXTURE_REPEATS / 16, f32(row) * TEXTURE_REPEATS / 16]
 				vertex.color = land.colors[k]
-				for i in 0:12 do vertex.layers[i] = 0
 				for i in 0:8 do vertex.weights[i] = 0
 				for i in 0:quadrant.layers.len {
 					opacity := quadrant.layers[i].opacity[row * QUADRANT_SIDE + column]

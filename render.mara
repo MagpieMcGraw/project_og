@@ -6,11 +6,17 @@
 // matrix, a sphere around it, the lights that reach it. Each frame, the
 // instances outside the camera's view are left out, the rest gathered by
 // mesh part, and each part drawn once for all its instances (instancing),
-// the parts that share a texture in one call (MultiDrawElementsIndirect).
+// many parts in each call (MultiDrawElementsIndirect).
+//
+// Textures stay as the game has them — their own format, size and
+// mipmaps — and are drawn bindless where the card can (ARB_bindless_texture):
+// each instance carries its texture's handle, so parts of any textures go
+// in one call, and the meshes take about three calls a frame. Where it
+// can't, parts are drawn in a call for each texture, bound to a unit.
 //
 // Land: every cell's land is laid out alike, so all of it shares one list
-// of indexes, and all its textures sit in one texture array: the cells in
-// view are drawn in one call, each pixel blending its quadrant's layers.
+// of indexes, and each pixel blends its quadrant's textures: their handles
+// in a storage buffer (bindless), or bound to units a quadrant at a time.
 //
 // Oblivion's world has z up, x east and y north; a unit is about 1.4 cm, a
 // cell 4096 units across.
@@ -19,6 +25,7 @@ module render
 use mara.core
 use mara.math
 use mara.string
+use mara.memory
 use mara.open_gl
 use model
 use dds
@@ -42,21 +49,28 @@ MAX_PARTS :: 65536
 MAX_TEXTURES :: 8192
 MAX_DRAWN :: 65536
 
-// The land texture array: each texture's size in it, and its layers.
-LAND_TEXTURE_SIZE :: 512
-LAND_TEXTURE_LEVELS :: 10     // 512 down to 1
-LAND_LAYERS :: 192
-// Cells of land on the card at once.
+// Cells of land on the card at once, and their quadrants.
 LAND_SLOTS :: 64
+LAND_QUADRANTS :: 256   // LAND_SLOTS x 4
+
+// How sharp textures stay seen at a slant: anisotropic filtering, at most.
+MOST_ANISOTROPY :: 16
+
+// The texture units a land quadrant's textures are bound to, without bindless.
+LAYER_UNITS :: [QUADRANT_TEXTURES!]GL_Texture_Unit{
+	TEXTURE0, TEXTURE1, TEXTURE2, TEXTURE3, TEXTURE4, TEXTURE5, TEXTURE6, TEXTURE7, TEXTURE8}
 
 // ---- shaders ---------------------------------------------------------------------
+// Each is written once and compiled two ways: with `#define BINDLESS` (and
+// the extension) at its top, or without.
 
-MESH_VERTEX_SHADER :: "#version 450 core
+MESH_VERTEX_SHADER :: "
 layout(location = 0) in vec3 position;
 layout(location = 1) in vec3 normal;
 layout(location = 2) in vec2 uv;
 layout(location = 3) in vec4 color;
-// Each instance's: its matrix's columns, its lights, its part's material.
+// Each instance's: its matrix's columns, its lights, its part's material,
+// its part's texture's handle.
 layout(location = 4) in vec4 world_x;
 layout(location = 5) in vec4 world_y;
 layout(location = 6) in vec4 world_z;
@@ -64,6 +78,7 @@ layout(location = 7) in vec4 world_w;
 layout(location = 8) in uvec4 lights_first;
 layout(location = 9) in uvec4 lights_second;
 layout(location = 10) in vec4 material;    // alpha threshold, emissive color
+layout(location = 11) in uvec2 texture_handle;
 
 uniform mat4 view_projection;
 
@@ -74,6 +89,7 @@ out vec4 vertex_color;
 flat out uvec4 light_set_first;
 flat out uvec4 light_set_second;
 flat out vec4 part_material;
+flat out uvec2 part_texture;
 
 void main() {
 	mat4 world = mat4(world_x, world_y, world_z, world_w);
@@ -86,10 +102,11 @@ void main() {
 	light_set_first = lights_first;
 	light_set_second = lights_second;
 	part_material = material;
+	part_texture = texture_handle;
 }
 "
 
-MESH_FRAGMENT_SHADER :: "#version 450 core
+MESH_FRAGMENT_SHADER :: "
 #define SCENE_LIGHTS 256
 in vec3 world_position;
 in vec3 world_normal;
@@ -98,8 +115,15 @@ in vec4 vertex_color;
 flat in uvec4 light_set_first;
 flat in uvec4 light_set_second;
 flat in vec4 part_material;
+flat in uvec2 part_texture;
 
+#ifdef BINDLESS
+#define BASE_TEXTURE sampler2D(part_texture)
+#else
 uniform sampler2D base_texture;
+#define BASE_TEXTURE base_texture
+#endif
+
 uniform vec3 sun_direction;       // where the light comes from
 uniform vec3 sun_color;
 uniform vec3 ambient_color;
@@ -122,7 +146,7 @@ vec3 point_light(uint index, vec3 normal) {
 }
 
 void main() {
-	vec4 base = texture(base_texture, texture_uv) * vertex_color;
+	vec4 base = texture(BASE_TEXTURE, texture_uv) * vertex_color;
 	if (base.a < part_material.x) discard;
 	vec3 normal = normalize(world_normal);
 	if (!gl_FrontFacing) normal = -normal;   // a two-sided part's back
@@ -144,16 +168,13 @@ void main() {
 }
 "
 
-LAND_VERTEX_SHADER :: "#version 450 core
+LAND_VERTEX_SHADER :: "
 layout(location = 0) in vec3 position;
 layout(location = 1) in vec3 normal;
 layout(location = 2) in vec2 uv;
 layout(location = 3) in vec3 color;
-layout(location = 4) in uvec4 layers_first;    // the base, then layers 1 to 3
-layout(location = 5) in uvec4 layers_second;   // layers 4 to 7
-layout(location = 6) in uvec4 layers_last;     // layer 8
-layout(location = 7) in vec4 weights_first;    // layers 1 to 4
-layout(location = 8) in vec4 weights_second;   // layers 5 to 8
+layout(location = 4) in vec4 weights_first;    // layers 1 to 4, over the base
+layout(location = 5) in vec4 weights_second;   // layers 5 to 8
 
 uniform mat4 view_projection;
 
@@ -161,11 +182,9 @@ out vec3 world_position;
 out vec3 world_normal;
 out vec2 texture_uv;
 out vec3 vertex_color;
-flat out uvec4 layer_set_first;
-flat out uvec4 layer_set_second;
-flat out uint layer_last;
 out vec4 layer_weights_first;
 out vec4 layer_weights_second;
+flat out uint quadrant;   // which of the land buffer's quadrants: 289 vertices each, in a row
 
 void main() {
 	gl_Position = view_projection * vec4(position, 1.0);
@@ -173,26 +192,36 @@ void main() {
 	world_normal = normal;
 	texture_uv = uv;
 	vertex_color = color;
-	layer_set_first = layers_first;
-	layer_set_second = layers_second;
-	layer_last = layers_last.x;
 	layer_weights_first = weights_first;
 	layer_weights_second = weights_second;
+	quadrant = uint(gl_VertexID) / 289u;
 }
 "
 
-LAND_FRAGMENT_SHADER :: "#version 450 core
+LAND_FRAGMENT_SHADER :: "
 in vec3 world_position;
 in vec3 world_normal;
 in vec2 texture_uv;
 in vec3 vertex_color;
-flat in uvec4 layer_set_first;
-flat in uvec4 layer_set_second;
-flat in uint layer_last;
 in vec4 layer_weights_first;
 in vec4 layer_weights_second;
+flat in uint quadrant;
 
-uniform sampler2DArray land_textures;
+#ifdef BINDLESS
+// Each quadrant's 9 textures' handles: its base, then its layers.
+layout(std430, binding = 1) readonly buffer Land_Textures {
+	uvec2 land_textures[];
+};
+vec3 layer_color(int layer) {
+	return texture(sampler2D(land_textures[quadrant * 9u + uint(layer)]), texture_uv).rgb;
+}
+#else
+uniform sampler2D layer_textures[9];
+vec3 layer_color(int layer) {
+	return texture(layer_textures[layer], texture_uv).rgb;
+}
+#endif
+
 uniform vec3 sun_direction;
 uniform vec3 sun_color;
 uniform vec3 ambient_color;
@@ -203,18 +232,12 @@ uniform float fog_far;
 
 out vec4 fragment_color;
 
-vec3 layer_color(uint layer) {
-	return texture(land_textures, vec3(texture_uv, float(layer))).rgb;
-}
-
 void main() {
-	uint layers[8] = uint[8](layer_set_first.y, layer_set_first.z, layer_set_first.w,
-		layer_set_second.x, layer_set_second.y, layer_set_second.z, layer_set_second.w, layer_last);
 	float weights[8] = float[8](layer_weights_first.x, layer_weights_first.y, layer_weights_first.z, layer_weights_first.w,
 		layer_weights_second.x, layer_weights_second.y, layer_weights_second.z, layer_weights_second.w);
-	vec3 color = layer_color(layer_set_first.x);
+	vec3 color = layer_color(0);
 	for (int i = 0; i < 8; i++) {
-		if (weights[i] > 0.0) color = mix(color, layer_color(layers[i]), weights[i]);
+		if (weights[i] > 0.0) color = mix(color, layer_color(i + 1), weights[i]);
 	}
 	color *= vertex_color;
 	vec3 normal = normalize(world_normal);
@@ -234,8 +257,7 @@ Mesh_Part :: struct {
 	first_index: u32
 	index_count: u32
 	base_vertex: i32
-	texture: u32           // its OpenGL texture
-	texture_slot: i64      // its place in the renderer's textures: parts are drawn grouped by it
+	texture_slot: i64      // its texture: its place in the renderer's textures
 	alpha_blend: bool
 	two_sided: bool
 	alpha_threshold: f32   // pixels less opaque are left out; 0 for none
@@ -270,18 +292,26 @@ Gpu_Land :: struct {
 	radius: f32
 }
 
-// A texture loaded once, by its path.
+// A land quadrant's textures: its base's and its layers' places in the
+// renderer's textures (the base's again where it has fewer layers).
+Quadrant_Slots :: struct {
+	textures: [QUADRANT_TEXTURES!]i64
+}
+
+// A texture on the card, loaded once, by its path.
 Cached_Texture :: struct {
 	path: [160]utf8
 	id: u32
+	handle: u64            // its bindless handle, resident; 0 without bindless
 }
 
-// What an instance of a mesh part is drawn with: its matrix, its lights,
-// the part's material — 96 bytes, as the mesh shader reads them.
+// What an instance of a mesh part is drawn with, as the mesh shader reads
+// it: its matrix, its lights, the part's material and texture — 104 bytes.
 Drawn_Instance :: struct {
 	world: Mat4
 	lights: [LIGHTS_PER_OBJECT!]u16
 	material: [4!]f32      // alpha threshold, emissive red, green, blue
+	texture: u64           // the bindless handle
 }
 
 // One draw of MultiDrawElementsIndirect, as OpenGL reads it: 20 bytes.
@@ -302,58 +332,67 @@ Frame_Stats :: struct {
 	land_cells: i64        // in view, drawn
 }
 
-// The renderer: its programs, its buffers, its textures, and room for a
-// frame's work.
-Renderer :: struct {
-	// The mesh program and its uniforms' places.
-	mesh_program: u32
-	mesh_view_projection_at: i32
-	mesh_sun_direction_at: i32
-	mesh_sun_color_at: i32
-	mesh_ambient_color_at: i32
-	mesh_camera_position_at: i32
-	mesh_fog_color_at: i32
-	mesh_fog_near_at: i32
-	mesh_fog_far_at: i32
+// Where the uniforms both kinds of program have are, in one program.
+Shared_Uniforms :: struct {
+	view_projection_at: i32
+	sun_direction_at: i32
+	sun_color_at: i32
+	ambient_color_at: i32
+	camera_position_at: i32
+	fog_color_at: i32
+	fog_near_at: i32
+	fog_far_at: i32
+}
+
+// A mesh program, and where its uniforms are.
+Mesh_Program :: struct {
+	program: u32
+	shared: Shared_Uniforms
 	light_position_at: [SCENE_LIGHTS!]i32
 	light_color_at: [SCENE_LIGHTS!]i32
 	light_reach_at: [SCENE_LIGHTS!]i32
+}
 
-	// The land program and its uniforms' places.
-	land_program: u32
-	land_view_projection_at: i32
-	land_sun_direction_at: i32
-	land_sun_color_at: i32
-	land_ambient_color_at: i32
-	land_camera_position_at: i32
-	land_fog_color_at: i32
-	land_fog_near_at: i32
-	land_fog_far_at: i32
+// A land program, and where its uniforms are.
+Land_Program :: struct {
+	program: u32
+	shared: Shared_Uniforms
+	layer_texture_at: [QUADRANT_TEXTURES!]i32   // without bindless: the samplers, units 0 to 8
+}
+
+// The renderer: its programs, its buffers, its textures, and room for a
+// frame's work.
+Renderer :: struct {
+	// Whether the card draws bindless, and whether it's used now (B in the
+	// viewer turns it off, to see the other way). Each program is compiled
+	// both ways when it can: [0] binds textures, [1] is bindless.
+	bindless_available: bool
+	use_bindless: bool
+	mesh_programs: [2!]Mesh_Program
+	land_programs: [2!]Land_Program
+	anisotropy: f32
 
 	// The shared mesh buffers, and how much of them is used.
 	mesh_vertex_array: u32
 	mesh_vertex_buffer: u32
 	mesh_index_buffer: u32
 	instance_buffer: u32
+	indirect_buffer: u32
 	vertices_used: i64
 	indices_used: i64
 	parts: [MAX_PARTS]Mesh_Part
 
-	// Indirect buffers: one for each draw call a frame makes.
-	indirect_buffers: [4096]u32
-
-	// The land's buffers, its slots, and its texture array.
+	// The land's buffers, its quadrants' textures, and their handles' buffer.
 	land_vertex_array: u32
 	land_vertex_buffer: u32
 	land_index_buffer: u32
 	land_indirect_buffer: u32
-	land_texture_array: u32                      // 0 until there's land: it's big
-	land_texture_paths: [LAND_LAYERS][160]utf8   // each layer's texture
+	land_texture_buffer: u32                   // each quadrant's 9 handles (bindless)
+	land_quadrants: [LAND_QUADRANTS!]Quadrant_Slots
 
 	// Textures, found by their paths' hashes.
 	textures: [MAX_TEXTURES]Cached_Texture
 	texture_index: Key_Index
-	white_texture: u32
 
 	// A frame's work.
 	visible: [MAX_DRAWN]i64        // instances in view
@@ -362,7 +401,7 @@ Renderer :: struct {
 	touched: [MAX_PARTS]i64        // the parts drawn, each as its sort key
 	records: [MAX_DRAWN]Drawn_Instance
 	commands: [MAX_DRAWN]Draw_Command
-	land_commands: [LAND_SLOTS]Draw_Command
+	land_commands: [LAND_QUADRANTS]Draw_Command
 }
 
 // What setting up the renderer can fail with.
@@ -372,35 +411,22 @@ Render_Error :: error {
 
 // ---- setting up ------------------------------------------------------------------
 
-// Compiles the programs, makes the buffers, the land texture array and the
-// white texture. The texture index is carved from storage.
+// Compiles the programs (both ways where the card draws bindless), makes
+// the buffers and the white texture. The texture index is carved from
+// storage.
 renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
-	renderer.mesh_program = compile_program(MESH_VERTEX_SHADER, MESH_FRAGMENT_SHADER)?
-	program := renderer.mesh_program
-	renderer.mesh_view_projection_at = GetUniformLocation(program, "view_projection")
-	renderer.mesh_sun_direction_at = GetUniformLocation(program, "sun_direction")
-	renderer.mesh_sun_color_at = GetUniformLocation(program, "sun_color")
-	renderer.mesh_ambient_color_at = GetUniformLocation(program, "ambient_color")
-	renderer.mesh_camera_position_at = GetUniformLocation(program, "camera_position")
-	renderer.mesh_fog_color_at = GetUniformLocation(program, "fog_color")
-	renderer.mesh_fog_near_at = GetUniformLocation(program, "fog_near")
-	renderer.mesh_fog_far_at = GetUniformLocation(program, "fog_far")
-	for i in 0:SCENE_LIGHTS {
-		renderer.light_position_at[i] = array_uniform(program, "light_positions[", i)
-		renderer.light_color_at[i] = array_uniform(program, "light_colors[", i)
-		renderer.light_reach_at[i] = array_uniform(program, "light_reaches[", i)
-	}
+	renderer.bindless_available = gl_has_extension("GL_ARB_bindless_texture") != 0
+	renderer.use_bindless = renderer.bindless_available
+	most : f32 = 0
+	GetFloatv(MAX_TEXTURE_MAX_ANISOTROPY, &most)
+	renderer.anisotropy = if most < MOST_ANISOTROPY do most else MOST_ANISOTROPY
 
-	renderer.land_program = compile_program(LAND_VERTEX_SHADER, LAND_FRAGMENT_SHADER)?
-	program = renderer.land_program
-	renderer.land_view_projection_at = GetUniformLocation(program, "view_projection")
-	renderer.land_sun_direction_at = GetUniformLocation(program, "sun_direction")
-	renderer.land_sun_color_at = GetUniformLocation(program, "sun_color")
-	renderer.land_ambient_color_at = GetUniformLocation(program, "ambient_color")
-	renderer.land_camera_position_at = GetUniformLocation(program, "camera_position")
-	renderer.land_fog_color_at = GetUniformLocation(program, "fog_color")
-	renderer.land_fog_near_at = GetUniformLocation(program, "fog_near")
-	renderer.land_fog_far_at = GetUniformLocation(program, "fog_far")
+	make_mesh_program(&renderer.mesh_programs[0], false)?
+	make_land_program(&renderer.land_programs[0], false)?
+	if renderer.bindless_available {
+		make_mesh_program(&renderer.mesh_programs[1], true)?
+		make_land_program(&renderer.land_programs[1], true)?
+	}
 
 	setup_mesh_buffers(renderer)
 	setup_land_buffers(renderer)
@@ -415,29 +441,92 @@ renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
 	}
 	renderer.textures.len = 0
 	renderer.texture_index = key_index(1 << 14, storage)
-	renderer.indirect_buffers.len = 0
-	renderer.land_texture_paths.len = 0
 
 	// The white texture: slot 0, for parts with none.
 	white : [4!]u8 = [255, 255, 255, 255]
-	GenTextures(1, &renderer.white_texture)
-	BindTexture(TEXTURE_2D, renderer.white_texture)
+	id : u32 = 0
+	GenTextures(1, &id)
+	BindTexture(TEXTURE_2D, id)
 	TexImage2D(TEXTURE_2D, 0, i32(RGBA8), 1, 1, 0, RGBA, UNSIGNED_BYTE, &white[0])
+	TexParameteri(TEXTURE_2D, TEXTURE_MAX_LEVEL, 0)
 	TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(LINEAR))
 	TexParameteri(TEXTURE_2D, TEXTURE_MAG_FILTER, i32(LINEAR))
 	entry := next(&renderer.textures)
 	entry.path.len = 0
-	entry.id = renderer.white_texture
+	entry.id = id
+	entry.handle = resident_handle(renderer, id)
+	for q in 0:LAND_QUADRANTS {
+		for k in 0:QUADRANT_TEXTURES do renderer.land_quadrants[q].textures[k] = 0
+	}
 }
 
-// A program of a vertex and a fragment shader.
-compile_program :: fun(vertex_source: []utf8, fragment_source: []utf8) -> u32, err {
-	vertex_shader := gl_compile_shader(VERTEX_SHADER, cstring(vertex_source))
-	fragment_shader := gl_compile_shader(FRAGMENT_SHADER, cstring(fragment_source))
+// A texture's bindless handle, made resident; 0 without bindless. Its
+// parameters are set for good after this.
+resident_handle :: fun(renderer: ^Renderer, id: u32) -> u64 {
+	if not renderer.bindless_available do return 0
+	handle := GetTextureHandleARB(id)
+	MakeTextureHandleResidentARB(handle)
+	return handle
+}
+
+// The program a frame's drawing uses: [1], bindless, when it's in use.
+which_program :: fun(renderer: ^Renderer) -> i64 {
+	return if renderer.use_bindless do 1 else 0
+}
+
+// A shader's source: the version, then — bindless — the extension and the
+// BINDLESS define, then its body. Into source.
+shader_source :: fun(body: []utf8, bindless: bool, source: ^[]utf8) {
+	source.len = 0
+	source + "#version 450 core\n"
+	if bindless do source + "#extension GL_ARB_bindless_texture : require\n#define BINDLESS 1\n"
+	source + body
+}
+
+// A program of a vertex and a fragment shader, compiled one way or the other.
+compile_program :: fun(vertex_body: []utf8, fragment_body: []utf8, bindless: bool) -> u32, err {
+	source : [16 * KB]utf8
+	shader_source(vertex_body, bindless, &source)
+	vertex_shader := gl_compile_shader(VERTEX_SHADER, cstring(source))
+	shader_source(fragment_body, bindless, &source)
+	fragment_shader := gl_compile_shader(FRAGMENT_SHADER, cstring(source))
 	if vertex_shader == 0 or fragment_shader == 0 do return 0, Shader_Failed
 	program := gl_link_program(vertex_shader, fragment_shader)
 	if program == 0 do return 0, Shader_Failed
 	return program
+}
+
+// Where a program's shared uniforms are.
+find_shared_uniforms :: fun(program: u32) -> Shared_Uniforms {
+	return Shared_Uniforms{
+		view_projection_at = GetUniformLocation(program, "view_projection"),
+		sun_direction_at = GetUniformLocation(program, "sun_direction"),
+		sun_color_at = GetUniformLocation(program, "sun_color"),
+		ambient_color_at = GetUniformLocation(program, "ambient_color"),
+		camera_position_at = GetUniformLocation(program, "camera_position"),
+		fog_color_at = GetUniformLocation(program, "fog_color"),
+		fog_near_at = GetUniformLocation(program, "fog_near"),
+		fog_far_at = GetUniformLocation(program, "fog_far")}
+}
+
+make_mesh_program :: fun(made: ^Mesh_Program, bindless: bool) -> err {
+	made.program = compile_program(MESH_VERTEX_SHADER, MESH_FRAGMENT_SHADER, bindless)?
+	made.shared = find_shared_uniforms(made.program)
+	for i in 0:SCENE_LIGHTS {
+		made.light_position_at[i] = array_uniform(made.program, "light_positions[", i)
+		made.light_color_at[i] = array_uniform(made.program, "light_colors[", i)
+		made.light_reach_at[i] = array_uniform(made.program, "light_reaches[", i)
+	}
+}
+
+make_land_program :: fun(made: ^Land_Program, bindless: bool) -> err {
+	made.program = compile_program(LAND_VERTEX_SHADER, LAND_FRAGMENT_SHADER, bindless)?
+	made.shared = find_shared_uniforms(made.program)
+	UseProgram(made.program)
+	for k in 0:QUADRANT_TEXTURES {
+		made.layer_texture_at[k] = array_uniform(made.program, "layer_textures[", k)
+		if not bindless do Uniform1i(made.layer_texture_at[k], i32(k))
+	}
 }
 
 // Where an item of a uniform array is in a program: name[index].
@@ -449,8 +538,21 @@ array_uniform :: fun(program: u32, name_start: []utf8, index: i64) -> i32 {
 	return GetUniformLocation(program, cstring(name))
 }
 
-// The shared mesh buffers and the instance buffer, and how the mesh
-// program reads them.
+// Gives a program its shared uniforms for a frame.
+set_shared_uniforms :: fun(at: Shared_Uniforms, view_projection: Mat4, lighting: Cell_Lighting, sun: Vec3, camera: Camera) {
+	matrix := view_projection
+	UniformMatrix4fv(at.view_projection_at, 1, 0, &matrix[0][0])
+	Uniform3f(at.sun_direction_at, sun.x, sun.y, sun.z)
+	Uniform3f(at.sun_color_at, lighting.directional.x, lighting.directional.y, lighting.directional.z)
+	Uniform3f(at.ambient_color_at, lighting.ambient.x, lighting.ambient.y, lighting.ambient.z)
+	Uniform3f(at.camera_position_at, camera.position.x, camera.position.y, camera.position.z)
+	Uniform3f(at.fog_color_at, lighting.fog_color.x, lighting.fog_color.y, lighting.fog_color.z)
+	Uniform1f(at.fog_near_at, lighting.fog_near)
+	Uniform1f(at.fog_far_at, lighting.fog_far)
+}
+
+// The shared mesh buffers, the instance buffer and the indirect buffer,
+// and how the mesh programs read them.
 setup_mesh_buffers :: fun(renderer: ^Renderer) {
 	GenVertexArrays(1, &renderer.mesh_vertex_array)
 	BindVertexArray(renderer.mesh_vertex_array)
@@ -492,11 +594,16 @@ setup_mesh_buffers :: fun(renderer: ^Renderer) {
 	EnableVertexAttribArray(10)
 	VertexAttribPointer(10, 4, FLOAT, 0, instance_stride, 80)          // material
 	VertexAttribDivisor(10, 1)
+	EnableVertexAttribArray(11)
+	VertexAttribIPointer(11, 2, UNSIGNED_INT, instance_stride, 96)     // texture handle
+	VertexAttribDivisor(11, 1)
 	BindVertexArray(0)
+
+	GenBuffers(1, &renderer.indirect_buffer)
 }
 
-// The land's buffers — its slots of vertices, the indexes they share — its
-// texture array, and how the land program reads them.
+// The land's buffers — its slots of vertices, the indexes they share, its
+// quadrants' textures' handles — and how the land programs read them.
 setup_land_buffers :: fun(renderer: ^Renderer) {
 	GenVertexArrays(1, &renderer.land_vertex_array)
 	BindVertexArray(renderer.land_vertex_array)
@@ -506,23 +613,17 @@ setup_land_buffers :: fun(renderer: ^Renderer) {
 	BufferData(ARRAY_BUFFER, LAND_SLOTS * LAND_MESH_VERTICES * size_of(Land_Vertex), void, STATIC_DRAW)
 	stride := i32(size_of(Land_Vertex))
 	EnableVertexAttribArray(0)
-	VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)         // position
+	VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)            // position
 	EnableVertexAttribArray(1)
-	VertexAttribPointer(1, 3, FLOAT, 0, stride, 12)        // normal
+	VertexAttribPointer(1, 3, FLOAT, 0, stride, 12)           // normal
 	EnableVertexAttribArray(2)
-	VertexAttribPointer(2, 2, FLOAT, 0, stride, 24)        // uv
+	VertexAttribPointer(2, 2, FLOAT, 0, stride, 24)           // uv
 	EnableVertexAttribArray(3)
-	VertexAttribPointer(3, 3, FLOAT, 0, stride, 32)        // color
+	VertexAttribPointer(3, 3, FLOAT, 0, stride, 32)           // color
 	EnableVertexAttribArray(4)
-	VertexAttribIPointer(4, 4, UNSIGNED_BYTE, stride, 44)  // the base and layers 1 to 3
+	VertexAttribPointer(4, 4, UNSIGNED_BYTE, 1, stride, 44)   // weights 1 to 4, 0 to 1
 	EnableVertexAttribArray(5)
-	VertexAttribIPointer(5, 4, UNSIGNED_BYTE, stride, 48)  // layers 4 to 7
-	EnableVertexAttribArray(6)
-	VertexAttribIPointer(6, 4, UNSIGNED_BYTE, stride, 52)  // layer 8
-	EnableVertexAttribArray(7)
-	VertexAttribPointer(7, 4, UNSIGNED_BYTE, 1, stride, 56)   // weights 1 to 4, 0 to 1
-	EnableVertexAttribArray(8)
-	VertexAttribPointer(8, 4, UNSIGNED_BYTE, 1, stride, 60)   // weights 5 to 8
+	VertexAttribPointer(5, 4, UNSIGNED_BYTE, 1, stride, 48)   // weights 5 to 8
 
 	indices : [LAND_MESH_INDICES]u16
 	land_indices(&indices)
@@ -531,22 +632,10 @@ setup_land_buffers :: fun(renderer: ^Renderer) {
 	BufferData(ELEMENT_ARRAY_BUFFER, isize(indices.len * 2), &indices[0], STATIC_DRAW)
 	BindVertexArray(0)
 	GenBuffers(1, &renderer.land_indirect_buffer)
-	renderer.land_texture_array = 0
-}
 
-// Makes the land texture array: room for LAND_LAYERS textures at every
-// level, about 270 MB on the card.
-make_land_texture_array :: fun(renderer: ^Renderer) {
-	GenTextures(1, &renderer.land_texture_array)
-	BindTexture(TEXTURE_2D_ARRAY, renderer.land_texture_array)
-	for level in 0:LAND_TEXTURE_LEVELS {
-		size := i32(LAND_TEXTURE_SIZE >> level)
-		TexImage3D(TEXTURE_2D_ARRAY, i32(level), i32(RGBA8), size, size, LAND_LAYERS, 0, RGBA, UNSIGNED_BYTE, void)
-	}
-	TexParameteri(TEXTURE_2D_ARRAY, TEXTURE_MIN_FILTER, i32(LINEAR_MIPMAP_LINEAR))
-	TexParameteri(TEXTURE_2D_ARRAY, TEXTURE_MAG_FILTER, i32(LINEAR))
-	TexParameteri(TEXTURE_2D_ARRAY, TEXTURE_WRAP_S, i32(REPEAT))
-	TexParameteri(TEXTURE_2D_ARRAY, TEXTURE_WRAP_T, i32(REPEAT))
+	GenBuffers(1, &renderer.land_texture_buffer)
+	BindBuffer(SHADER_STORAGE_BUFFER, renderer.land_texture_buffer)
+	BufferData(SHADER_STORAGE_BUFFER, LAND_QUADRANTS * QUADRANT_TEXTURES * 8, void, DYNAMIC_DRAW)
 }
 
 // ---- textures --------------------------------------------------------------------
@@ -561,7 +650,7 @@ texture_for :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratch
 	known, found := index_get(&renderer.texture_index, key)
 	if found do return known
 	if renderer.textures.len == renderer.textures.cap do return 0
-	id := load_texture(archive, path, scratch)
+	id := load_texture(renderer, archive, path, scratch)
 	slot : i64 = 0
 	if id != 0 {
 		slot = renderer.textures.len
@@ -569,6 +658,7 @@ texture_for :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratch
 		entry.path.len = 0
 		&entry.path + path
 		entry.id = id
+		entry.handle = resident_handle(renderer, id)
 	}
 	_ = index_put(&renderer.texture_index, key, slot)
 	return slot
@@ -585,14 +675,16 @@ text_hash :: fun(text: []utf8) -> u64 {
 }
 
 // Reads a texture from the archive onto the card: block compressed ones as
-// they are, the rest decoded to plain pixels. 0 when it can't be read.
-load_texture :: fun(archive: ^Archive, path: []utf8, scratch: ^[]byte) -> u32 {
+// they are, the rest decoded to plain pixels; its mipmaps as many as it
+// has, sharp at a slant. 0 when it can't be read.
+load_texture :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratch: ^[]byte) -> u32 {
 	texture, read_error := read_archive_texture(archive, path, scratch)
 	if read_error do return 0
 
 	id : u32 = 0
 	GenTextures(1, &id)
 	BindTexture(TEXTURE_2D, id)
+	levels : i64 = 0
 	for mip, level in texture.mips {
 		width := i32(mip.width)
 		height := i32(mip.height)
@@ -609,15 +701,16 @@ load_texture :: fun(archive: ^Archive, path: []utf8, scratch: ^[]byte) -> u32 {
 			if decode_error do break
 			TexImage2D(TEXTURE_2D, i32(level), i32(RGBA8), width, height, 0, RGBA, UNSIGNED_BYTE, &decoded[0])
 		}
+		levels += 1
 	}
-	// A texture without all its mipmaps can't use them (it would draw black).
-	last := texture.mips[texture.mips.len - 1]
-	full_chain := last.width == 1 and last.height == 1
-	if full_chain do TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(LINEAR_MIPMAP_LINEAR))
-	else do TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(LINEAR))
+	if levels == 0 do return 0
+	// Its mipmaps, as many as it has (many stop short of 1 pixel).
+	TexParameteri(TEXTURE_2D, TEXTURE_MAX_LEVEL, i32(levels - 1))
+	TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(LINEAR_MIPMAP_LINEAR))
 	TexParameteri(TEXTURE_2D, TEXTURE_MAG_FILTER, i32(LINEAR))
 	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_S, i32(REPEAT))
 	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_T, i32(REPEAT))
+	if renderer.anisotropy > 1 do TexParameterf(TEXTURE_2D, TEXTURE_MAX_ANISOTROPY, renderer.anisotropy)
 	return id
 }
 
@@ -665,15 +758,13 @@ upload_model :: fun(renderer: ^Renderer, built: Model, archive: ^Archive, scratc
 		BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.mesh_index_buffer)
 		BufferSubData(ELEMENT_ARRAY_BUFFER, isize(renderer.indices_used * 2), isize(part.indices.len * 2), &part.indices[0])
 
-		slot := texture_for(renderer, archive, part.texture[:], scratch)
 		threshold : f32 = 0
 		if part.alpha_test do threshold = part.alpha_threshold
 		next(&renderer.parts)^ = Mesh_Part{
 			first_index = u32(renderer.indices_used),
 			index_count = u32(part.indices.len),
 			base_vertex = i32(renderer.vertices_used),
-			texture = renderer.textures[slot].id,
-			texture_slot = slot,
+			texture_slot = texture_for(renderer, archive, part.texture[:], scratch),
 			alpha_blend = part.alpha_blend,
 			two_sided = part.two_sided,
 			alpha_threshold = threshold,
@@ -727,148 +818,49 @@ choose_lights :: fun(instance: ^Instance, lights: ^[]Point_Light) {
 	}
 }
 
-// Gives the mesh program the scene's lights: its first SCENE_LIGHTS.
+// Gives the mesh programs the scene's lights: its first SCENE_LIGHTS.
 set_scene_lights :: fun(renderer: ^Renderer, lights: ^[]Point_Light) {
-	UseProgram(renderer.mesh_program)
 	last := lights.len
 	if last > SCENE_LIGHTS do last = SCENE_LIGHTS
-	for i in 0:last {
-		light := lights[i]
-		Uniform3f(renderer.light_position_at[i], light.position.x, light.position.y, light.position.z)
-		Uniform3f(renderer.light_color_at[i], light.color.x, light.color.y, light.color.z)
-		Uniform1f(renderer.light_reach_at[i], light.radius)
+	programs : i64 = if renderer.bindless_available do 2 else 1
+	for which in 0:programs {
+		made := &renderer.mesh_programs[which]
+		UseProgram(made.program)
+		for i in 0:last {
+			light := lights[i]
+			Uniform3f(made.light_position_at[i], light.position.x, light.position.y, light.position.z)
+			Uniform3f(made.light_color_at[i], light.color.x, light.color.y, light.color.z)
+			Uniform1f(made.light_reach_at[i], light.radius)
+		}
 	}
 }
 
 // ---- land ---------------------------------------------------------------------------------
 
-// Puts the land of the cell at x, y on the card: its textures into the
-// land array (each one the first time), its vertices into a slot (0 to
-// LAND_SLOTS - 1, one no other land is in).
+// Puts the land of the cell at x, y on the card: its quadrants' textures
+// (loaded the first time each is asked for, their handles where the
+// quadrant's land reads them), its vertices into a slot (0 to LAND_SLOTS
+// - 1, one no other land is in).
 upload_land :: fun(renderer: ^Renderer, mesh: ^Land_Mesh, x: i64, y: i64, slot: i64, archive: ^Archive, scratch: ^[]byte) -> Gpu_Land {
-	// Each quadrant's textures' layers in the array, into its vertices.
 	for q in 0:4 {
 		textures := &mesh.textures[q]
-		layers : [QUADRANT_TEXTURES!]u8
-		for k in 0:textures.count do layers[k] = u8(land_layer_for(renderer, archive, textures.paths[k][:], scratch))
-		for k in textures.count:QUADRANT_TEXTURES do layers[k] = layers[0]
-		first := q * QUADRANT_SIDE * QUADRANT_SIDE
-		for v in first:first + QUADRANT_SIDE * QUADRANT_SIDE {
-			for k in 0:QUADRANT_TEXTURES do mesh.vertices[v].layers[k] = layers[k]
+		quadrant := &renderer.land_quadrants[slot * 4 + q]
+		handles : [QUADRANT_TEXTURES!]u64
+		for k in 0:QUADRANT_TEXTURES {
+			texture_slot := quadrant.textures[0]
+			if k < textures.count do texture_slot = texture_for(renderer, archive, textures.paths[k][:], scratch)
+			quadrant.textures[k] = texture_slot
+			handles[k] = renderer.textures[texture_slot].handle
+		}
+		if renderer.bindless_available {
+			BindBuffer(SHADER_STORAGE_BUFFER, renderer.land_texture_buffer)
+			BufferSubData(SHADER_STORAGE_BUFFER, isize((slot * 4 + q) * QUADRANT_TEXTURES * 8), QUADRANT_TEXTURES * 8, &handles[0])
 		}
 	}
 	BindBuffer(ARRAY_BUFFER, renderer.land_vertex_buffer)
 	BufferSubData(ARRAY_BUFFER, isize(slot * LAND_MESH_VERTICES * size_of(Land_Vertex)),
 		LAND_MESH_VERTICES * size_of(Land_Vertex), &mesh.vertices[0])
 	return Gpu_Land{x = x, y = y, slot = slot, center = mesh.center, radius = mesh.radius}
-}
-
-// The layer of the land texture array holding the texture at path, put
-// there the first time it's asked for. Layer 0 (the first loaded) when it
-// can't be read, or the array is full.
-land_layer_for :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratch: ^[]byte) -> i64 {
-	for known, layer in renderer.land_texture_paths {
-		if known[:] == path do return layer
-	}
-	if renderer.land_texture_paths.len == renderer.land_texture_paths.cap do return 0
-	if renderer.land_texture_array == 0 do make_land_texture_array(renderer)
-	texture, read_error := read_archive_texture(archive, path, scratch)
-	if read_error do return 0
-	layer := renderer.land_texture_paths.len
-	if not fill_land_layer(renderer, texture, layer, scratch) do return 0
-	entry := next(&renderer.land_texture_paths)
-	entry.len = 0
-	entry + path
-	return layer
-}
-
-// Puts a texture into a layer of the land array, at every level: from its
-// own mipmaps where it has the size, else its largest made to fit.
-fill_land_layer :: fun(renderer: ^Renderer, texture: Texture, layer: i64, scratch: ^[]byte) -> bool {
-	BindTexture(TEXTURE_2D_ARRAY, renderer.land_texture_array)
-	// The level of the texture to start from: the first no bigger than the layer.
-	start : i64 = 0
-	for mip, k in texture.mips {
-		start = k
-		if mip.width <= LAND_TEXTURE_SIZE do break
-	}
-	pixels_at := scratch.len
-	previous := scratch[0:0]
-	previous_size : i64 = 0
-	for level in 0:LAND_TEXTURE_LEVELS {
-		size := LAND_TEXTURE_SIZE >> level
-		mip_index := start + level
-		level_pixels := scratch[0:0]
-		if mip_index < texture.mips.len and texture.mips[mip_index].width == size and texture.mips[mip_index].height == size {
-			decoded, decode_error := decode_rgba(texture, mip_index, scratch)
-			if decode_error do return false
-			level_pixels = decoded
-		elif level == 0
-			// Smaller than a layer: its largest, stretched to fit.
-			decoded, decode_error := decode_rgba(texture, 0, scratch)
-			if decode_error do return false
-			stretched, fits := stretch(decoded, texture.mips[0].width, texture.mips[0].height, size, scratch)
-			if not fits do return false
-			level_pixels = stretched
-		else
-			// Past its mipmaps: the level above, halved.
-			halved, fits := halve(previous, previous_size, scratch)
-			if not fits do return false
-			level_pixels = halved
-		}
-		TexSubImage3D(TEXTURE_2D_ARRAY, i32(level), 0, 0, i32(layer), i32(size), i32(size), 1, RGBA, UNSIGNED_BYTE, &level_pixels[0])
-		previous = level_pixels
-		previous_size = size
-	}
-	scratch.len = pixels_at
-	return true
-}
-
-// Pixels stretched (or shrunk) to a square of size, nearest pixel: into
-// scratch, after what it holds.
-stretch :: fun(pixels: []byte, width: i64, height: i64, size: i64, scratch: ^[]byte) -> []byte, bool {
-	start := scratch.len
-	if start + size * size * 4 > scratch.cap do return scratch[0:0], false
-	out := scratch[start : start + size * size * 4]
-	for y in 0:size {
-		from_y := y * height / size
-		for x in 0:size {
-			from_x := x * width / size
-			for c in 0:4 do out[(y * size + x) * 4 + c] = pixels[(from_y * width + from_x) * 4 + c]
-		}
-	}
-	scratch.len = start + size * size * 4
-	return out, true
-}
-
-// A square of pixels halved: each 2 by 2 averaged. Into scratch, after
-// what it holds.
-halve :: fun(pixels: []byte, size: i64, scratch: ^[]byte) -> []byte, bool {
-	half := size / 2
-	if half < 1 do half = 1
-	start := scratch.len
-	if start + half * half * 4 > scratch.cap do return scratch[0:0], false
-	out := scratch[start : start + half * half * 4]
-	for y in 0:half {
-		for x in 0:half {
-			for c in 0:4 {
-				sum : i64 = 0
-				for dy in 0:2 {
-					for dx in 0:2 {
-						from_x := x * 2 + dx
-						from_y := y * 2 + dy
-						if from_x >= size do from_x = size - 1
-						if from_y >= size do from_y = size - 1
-						value : u8 = pixels[(from_y * size + from_x) * 4 + c]
-						sum += i64(value)
-					}
-				}
-				out[(y * half + x) * 4 + c] = u8(sum / 4)
-			}
-		}
-	}
-	scratch.len = start + half * half * 4
-	return out, true
 }
 
 // ---- the camera ----------------------------------------------------------------------
@@ -978,61 +970,82 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 
 	DepthMask(1)
 	Disable(BLEND)
+	ActiveTexture(TEXTURE0)
 	BindVertexArray(0)
 	return stats
 }
 
-// Draws the land in view: one call for all of it.
+// Draws the land in view: bindless, in one call; else a call for each
+// quadrant, its textures bound to units 0 to 8.
 draw_land :: fun(renderer: ^Renderer, grounds: ^[]Gpu_Land, planes: ^View_Planes, view_projection: Mat4,
 	lighting: Cell_Lighting, sun: Vec3, camera: Camera, stats: ^Frame_Stats)
 {
+	bindless := renderer.use_bindless
 	renderer.land_commands.len = 0
 	for ground in grounds {
 		if not sphere_in_view(planes, ground.center, ground.radius) do continue
-		&renderer.land_commands + Draw_Command{
-			count = LAND_MESH_INDICES,
-			instance_count = 1,
-			first_index = 0,
-			base_vertex = i32(ground.slot * LAND_MESH_VERTICES),
-			base_instance = 0}
+		stats.land_cells += 1
+		if bindless {
+			// The whole cell: its four quadrants' indexes, its slot's vertices.
+			&renderer.land_commands + Draw_Command{
+				count = LAND_MESH_INDICES, instance_count = 1, first_index = 0,
+				base_vertex = i32(ground.slot * LAND_MESH_VERTICES), base_instance = 0}
+		else
+			quadrant_indices := LAND_MESH_INDICES / 4
+			for q in 0:4 {
+				&renderer.land_commands + Draw_Command{
+					count = u32(quadrant_indices), instance_count = 1, first_index = u32(q * quadrant_indices),
+					base_vertex = i32(ground.slot * LAND_MESH_VERTICES), base_instance = u32(ground.slot * 4 + q)}
+			}
+		}
 	}
-	stats.land_cells = renderer.land_commands.len
 	if renderer.land_commands.len == 0 do return
 
-	UseProgram(renderer.land_program)
-	matrix := view_projection
-	UniformMatrix4fv(renderer.land_view_projection_at, 1, 0, &matrix[0][0])
-	Uniform3f(renderer.land_sun_direction_at, sun.x, sun.y, sun.z)
-	Uniform3f(renderer.land_sun_color_at, lighting.directional.x, lighting.directional.y, lighting.directional.z)
-	Uniform3f(renderer.land_ambient_color_at, lighting.ambient.x, lighting.ambient.y, lighting.ambient.z)
-	Uniform3f(renderer.land_camera_position_at, camera.position.x, camera.position.y, camera.position.z)
-	Uniform3f(renderer.land_fog_color_at, lighting.fog_color.x, lighting.fog_color.y, lighting.fog_color.z)
-	Uniform1f(renderer.land_fog_near_at, lighting.fog_near)
-	Uniform1f(renderer.land_fog_far_at, lighting.fog_far)
-	BindTexture(TEXTURE_2D_ARRAY, renderer.land_texture_array)
+	made := &renderer.land_programs[which_program(renderer)]
+	UseProgram(made.program)
+	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
 	BindVertexArray(renderer.land_vertex_array)
 	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.land_indirect_buffer)
 	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.land_commands.len * size_of(Draw_Command)), &renderer.land_commands[0], STREAM_DRAW)
-	MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, void, i32(renderer.land_commands.len), 0)
-	stats.draw_calls += 1
+	if bindless {
+		BindBufferBase(SHADER_STORAGE_BUFFER, 1, renderer.land_texture_buffer)
+		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, 0, i32(renderer.land_commands.len), 0)
+		stats.draw_calls += 1
+		return
+	}
+	// A quadrant at a time: its textures (named by its command's base
+	// instance) on units 0 to 8, then its command.
+	for command, k in renderer.land_commands {
+		quadrant := &renderer.land_quadrants[command.base_instance]
+		for unit in 0:QUADRANT_TEXTURES {
+			ActiveTexture(LAYER_UNITS[unit])
+			BindTexture(TEXTURE_2D, renderer.textures[quadrant.textures[unit]].id)
+		}
+		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, usize(k * size_of(Draw_Command)), 1, 0)
+		stats.draw_calls += 1
+	}
+	ActiveTexture(TEXTURE0)
 }
 
 // A part's sort key: blended parts after opaque ones; within those, the
-// two-sided after the rest; then by texture — so each run of one key is
-// one draw call. The part's index in the low bits.
-part_key :: fun(part: Mesh_Part, part_index: i64) -> i64 {
-	group_key := part.texture_slot
+// two-sided after the rest; without bindless, then by texture — so each
+// run of one key is one draw call. The part's index in the low bits.
+part_key :: fun(part: Mesh_Part, part_index: i64, bindless: bool) -> i64 {
+	group_key : i64 = 0
+	if not bindless do group_key = part.texture_slot
 	if part.two_sided do group_key += MAX_TEXTURES
 	if part.alpha_blend do group_key += 2 * MAX_TEXTURES
 	return (group_key << 20) | part_index
 }
 
 // Draws the instances in view: their parts gathered — each part's
-// instances together, the parts of one texture and state together — and
-// each gathering drawn with one call.
+// instances together, the parts of one state (and, without bindless, one
+// texture) together — and each gathering drawn with one call.
 draw_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, planes: ^View_Planes,
 	view_projection: Mat4, lighting: Cell_Lighting, sun: Vec3, camera: Camera, stats: ^Frame_Stats)
 {
+	bindless := renderer.use_bindless
+
 	// The instances in view, and how many of each part they draw.
 	renderer.visible.len = 0
 	renderer.touched.len = 0
@@ -1043,7 +1056,7 @@ draw_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Inst
 		if record_count + placed_model.part_count > MAX_DRAWN do break
 		&renderer.visible + index
 		for p in placed_model.first_part:placed_model.first_part + placed_model.part_count {
-			if renderer.part_counts[p] == 0 do &renderer.touched + part_key(renderer.parts[p], p)
+			if renderer.part_counts[p] == 0 do &renderer.touched + part_key(renderer.parts[p], p, bindless)
 			renderer.part_counts[p] += 1
 		}
 		record_count += placed_model.part_count
@@ -1082,28 +1095,23 @@ draw_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Inst
 			record.world = instance.world
 			record.lights = instance.lights
 			record.material = [part.alpha_threshold, part.emissive.x, part.emissive.y, part.emissive.z]
+			record.texture = renderer.textures[part.texture_slot].handle
 		}
 	}
 	for key in renderer.touched do renderer.part_counts[key & 0xFFFFF] = 0
 
-	UseProgram(renderer.mesh_program)
-	matrix := view_projection
-	UniformMatrix4fv(renderer.mesh_view_projection_at, 1, 0, &matrix[0][0])
-	Uniform3f(renderer.mesh_sun_direction_at, sun.x, sun.y, sun.z)
-	Uniform3f(renderer.mesh_sun_color_at, lighting.directional.x, lighting.directional.y, lighting.directional.z)
-	Uniform3f(renderer.mesh_ambient_color_at, lighting.ambient.x, lighting.ambient.y, lighting.ambient.z)
-	Uniform3f(renderer.mesh_camera_position_at, camera.position.x, camera.position.y, camera.position.z)
-	Uniform3f(renderer.mesh_fog_color_at, lighting.fog_color.x, lighting.fog_color.y, lighting.fog_color.z)
-	Uniform1f(renderer.mesh_fog_near_at, lighting.fog_near)
-	Uniform1f(renderer.mesh_fog_far_at, lighting.fog_far)
+	made := &renderer.mesh_programs[which_program(renderer)]
+	UseProgram(made.program)
+	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
 	BindVertexArray(renderer.mesh_vertex_array)
 	BindBuffer(ARRAY_BUFFER, renderer.instance_buffer)
 	BufferData(ARRAY_BUFFER, MAX_DRAWN * size_of(Drawn_Instance), void, STREAM_DRAW)   // (a fresh buffer: no waiting on last frame's)
 	BufferSubData(ARRAY_BUFFER, 0, isize(record_count * size_of(Drawn_Instance)), &renderer.records[0])
+	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.indirect_buffer)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.commands.len * size_of(Draw_Command)), &renderer.commands[0], STREAM_DRAW)
 
-	// A call for each run of commands of one key: one texture and state.
+	// A call for each run of commands of one key.
 	run_start : i64 = 0
-	call : i64 = 0
 	blending := false
 	for run_start < renderer.commands.len {
 		group_key := renderer.touched[run_start] >> 20
@@ -1119,21 +1127,11 @@ draw_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Inst
 		}
 		if first_part.two_sided do Disable(CULL_FACE)
 		else do Enable(CULL_FACE)
-		BindTexture(TEXTURE_2D, first_part.texture)
-
-		// Each call's commands in a buffer of its own, from its start:
-		// mara.open_gl's MultiDrawElementsIndirect takes no offset.
-		if call == renderer.indirect_buffers.len {
-			if renderer.indirect_buffers.len == renderer.indirect_buffers.cap do break
-			GenBuffers(1, next(&renderer.indirect_buffers))
-		}
-		BindBuffer(DRAW_INDIRECT_BUFFER, renderer.indirect_buffers[call])
-		BufferData(DRAW_INDIRECT_BUFFER, isize((run_end - run_start) * size_of(Draw_Command)), &renderer.commands[run_start], STREAM_DRAW)
-		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, void, i32(run_end - run_start), 0)
-		call += 1
+		if not bindless do BindTexture(TEXTURE_2D, renderer.textures[first_part.texture_slot].id)
+		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, usize(run_start * size_of(Draw_Command)), i32(run_end - run_start), 0)
+		stats.draw_calls += 1
 		run_start = run_end
 	}
-	stats.draw_calls += call
 }
 
 // Sorts keys, smallest first (Shell's sort: a few thousand at most).
