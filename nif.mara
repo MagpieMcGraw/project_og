@@ -1,0 +1,201 @@
+// Reading Gamebryo's model files (.nif): Oblivion's meshes, their
+// textures and materials, their collision and animation.
+//
+// A NIF is a header, then a list of blocks — objects of many types: nodes
+// in a scene tree (NiNode), shapes (NiTriShape) with their geometry
+// (NiTriShapeData), properties saying how they're drawn, Havok collision
+// (bhk*), animation controllers. Blocks name each other by their index in
+// the list. The header lists the block types the file uses and which one
+// each block is.
+//
+// Oblivion's NIFs have no block sizes (those came in 20.2.0.5), so a block
+// can only be stepped over by reading it: every type in the game's files
+// has to be known.
+module nif
+
+use mara.core
+use mara.string
+
+// NIF versions, as the header writes them: one byte for each part.
+VERSION_10_0_1_2 :: 0x0A000102   // Oblivion's oldest files
+VERSION_10_1_0_0 :: 0x0A010000
+VERSION_10_2_0_0 :: 0x0A020000
+VERSION_20_0_0_4 :: 0x14000004
+VERSION_20_0_0_5 :: 0x14000005   // most of Oblivion's files
+
+// Reads a NIF's bytes in order. A read past the end gives zeros and marks
+// the reader broken, so a block's reads can go on and be checked once.
+Nif_Reader :: struct {
+	data: []byte
+	at: i64
+	broken: bool
+	version: u32
+	user_version: u32
+	stream_version: u32   // Bethesda's own version, in the header's BS stream part
+}
+
+// Whether n more bytes are there to read; if not, the reader is broken.
+has :: fun(reader: ^Nif_Reader, n: i64) -> bool {
+	if reader.at + n <= reader.data.len do return true
+	reader.broken = true
+	reader.at = reader.data.len
+	return false
+}
+
+read_u8 :: fun(reader: ^Nif_Reader) -> u8 {
+	if not has(reader, 1) do return 0
+	value : u8 = reader.data[reader.at]
+	reader.at += 1
+	return value
+}
+
+read_u16 :: fun(reader: ^Nif_Reader) -> u16 {
+	if not has(reader, 2) do return 0
+	value : u16 = reader.data[reader.at]
+	reader.at += 2
+	return value
+}
+
+read_u32 :: fun(reader: ^Nif_Reader) -> u32 {
+	if not has(reader, 4) do return 0
+	value : u32 = reader.data[reader.at]
+	reader.at += 4
+	return value
+}
+
+read_i32 :: fun(reader: ^Nif_Reader) -> i32 {
+	if not has(reader, 4) do return 0
+	value : i32 = reader.data[reader.at]
+	reader.at += 4
+	return value
+}
+
+read_f32 :: fun(reader: ^Nif_Reader) -> f32 {
+	if not has(reader, 4) do return 0
+	value : f32 = reader.data[reader.at]
+	reader.at += 4
+	return value
+}
+
+// Steps over n bytes.
+skip :: fun(reader: ^Nif_Reader, n: i64) {
+	if has(reader, n) do reader.at += n
+}
+
+// n bytes as text, a view of the file's data.
+read_text :: fun(reader: ^Nif_Reader, n: i64) -> []utf8 {
+	text : []utf8 = reader.data
+	if not has(reader, n) do return text[0:0]
+	start := reader.at
+	reader.at += n
+	// (Some writers count a 0 at the end in the length.)
+	end := start + n
+	if end > start and text[end - 1] == utf8(0) do end -= 1
+	return text[start : end]
+}
+
+// Text written after its length as a u32: block type names, object names.
+read_string :: fun(reader: ^Nif_Reader) -> []utf8 {
+	n := i64(read_u32(reader))
+	return read_text(reader, n)
+}
+
+// Text written after its length as a u8: the header's export notes.
+read_short_string :: fun(reader: ^Nif_Reader) -> []utf8 {
+	n := i64(read_u8(reader))
+	return read_text(reader, n)
+}
+
+// A NIF's header: its versions, and the type of each of its blocks.
+Nif_Header :: struct {
+	title: []utf8              // "Gamebryo File Format, Version 20.0.0.5"
+	version: u32
+	user_version: u32
+	stream_version: u32
+	block_count: i64
+	type_names: [][]utf8       // the block types the file uses
+	block_types: []u16         // each block's type, an index into type_names
+	blocks_at: i64             // where the first block starts
+}
+
+// What reading a NIF can fail with.
+Nif_Error :: error {
+	Not_A_Nif          // it doesn't start with a Gamebryo or NetImmerse title
+	Old_Version        // before 10.0.1.0: Morrowind's, which Oblivion doesn't use
+	Big_Endian
+	Broken_Header      // the header runs past the end of the file
+}
+
+// Reads a NIF's header. The tables of block types are carved from storage.
+read_header :: fun(reader: ^Nif_Reader, storage: ^[]byte) -> Nif_Header, err {
+	// The title: text up to a newline.
+	text : []utf8 = reader.data
+	title_end : i64 = 0
+	for title_end < text.len and title_end < 128 {
+		if text[title_end] == '\n' do break
+		title_end += 1
+	}
+	if title_end >= text.len or title_end >= 128 do return Nif_Header{0}, Not_A_Nif
+	title := text[0 : title_end]
+	if not starts_with(title, "Gamebryo File Format") and not starts_with(title, "NetImmerse File Format") {
+		return Nif_Header{0}, Not_A_Nif
+	}
+	reader.at = title_end + 1
+
+	version := read_u32(reader)
+	if version < 0x0A000100 do return Nif_Header{0}, Old_Version
+	if version >= VERSION_20_0_0_4 {
+		if read_u8(reader) == 0 do return Nif_Header{0}, Big_Endian
+	}
+	user_version : u32 = 0
+	if version >= 0x0A000108 do user_version = read_u32(reader)
+	block_count := i64(read_u32(reader))
+
+	// Bethesda's part of the header: its own version, and notes on how the
+	// file was made.
+	stream_version : u32 = 0
+	has_stream_header := version == VERSION_10_0_1_2
+	if user_version >= 3 and version >= VERSION_10_1_0_0 and version <= VERSION_20_0_0_5 do has_stream_header = true
+	if has_stream_header {
+		stream_version = read_u32(reader)
+		_ = read_short_string(reader)   // who made it
+		_ = read_short_string(reader)   // the process script
+		_ = read_short_string(reader)   // the export script
+	}
+	reader.version = version
+	reader.user_version = user_version
+	reader.stream_version = stream_version
+
+	type_count := i64(read_u16(reader))
+	if reader.broken or type_count > 1000 or block_count > 1000000 do return Nif_Header{0}, Broken_Header
+	type_names := slice([:type_count][]utf8, storage)
+	for i in 0:type_count do &type_names + read_string(reader)
+	block_types := slice([:block_count]u16, storage)
+	for i in 0:block_count do &block_types + read_u16(reader)
+
+	// Groups: unused by Oblivion, but there to step over.
+	group_count := i64(read_u32(reader))
+	skip(reader, group_count * 4)
+	if reader.broken do return Nif_Header{0}, Broken_Header
+
+	return Nif_Header{
+		title = title,
+		version = version,
+		user_version = user_version,
+		stream_version = stream_version,
+		block_count = block_count,
+		type_names = type_names,
+		block_types = block_types,
+		blocks_at = reader.at}
+}
+
+// "20.0.0.5" for a version.
+version_text :: fun(version: u32) -> str64 {
+	text : str64
+	for part in 0:4 {
+		if part > 0 do &text + '.'
+		number := i64((version >> u32(24 - part * 8)) & 255)
+		&text + int_text(number)[:]
+	}
+	return text
+}
