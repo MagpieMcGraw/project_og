@@ -1,0 +1,67 @@
+// The game's journal: what it does — the places it shows, settings
+// changed, how long loading took — written to a log file and the console,
+// each line stamped with the seconds since the journal opened.
+//
+// A line is written a piece at a time, then ended:
+//
+//     note(&journal, "vsync ")
+//     note(&journal, "on")
+//     note_end(&journal)
+module logging
+
+use mara.core
+use mara.os
+use mara.string
+use mara.time
+
+Journal :: struct {
+	file: File_Id      // NO_FILE when the log couldn't be made: the console only
+	started: u64       // when the journal opened (time_now)
+	line: str1024      // the line being written
+}
+
+// A journal writing to a new file at path (over the one there).
+journal_open :: fun(path: []utf8) -> Journal {
+	file, _ := file_open_write(path)   // (failing, it's NO_FILE: no file, the console still)
+	return Journal{file = file, started = time_now(), line = []}
+}
+
+journal_close :: fun(journal: ^Journal) {
+	file_close(journal.file)
+}
+
+// Adds to the line being written: text, or a number. What doesn't fit in
+// the line is left off.
+note :: dispatch{ note_text, note_number }
+
+note_text :: fun(journal: ^Journal, text: []utf8) {
+	room := journal.line.cap - journal.line.len
+	if text.len <= room do &journal.line + text
+	else do &journal.line + text[0 : room]
+}
+
+note_number :: fun(journal: ^Journal, number: i64) {
+	note_text(journal, int_text(number)[:])
+}
+
+// Ends the line being written: printed, and written to the file after its
+// time stamp, the seconds since the journal opened.
+note_end :: fun(journal: ^Journal) {
+	print(journal.line)
+	milliseconds := i64((time_now() - journal.started) / 1000000)
+	stamped : str1024
+	&stamped + "["
+	&stamped + int_text(milliseconds / 1000)[:]
+	&stamped + "."
+	fraction := milliseconds % 1000
+	if fraction < 100 do &stamped + "0"
+	if fraction < 10 do &stamped + "0"
+	&stamped + int_text(fraction)[:]
+	&stamped + "] "
+	room := stamped.cap - stamped.len - 1
+	if journal.line.len <= room do &stamped + journal.line[:]
+	else do &stamped + journal.line[0 : room]
+	&stamped + "\n"
+	_ = file_write_text(journal.file, stamped[:])
+	journal.line.len = 0
+}

@@ -4,7 +4,9 @@
 //
 // W, A, S, D fly, Left Shift faster; the right mouse button turns mouse
 // look on and off; E goes through the door nearest the camera; V turns
-// vsync on and off; Escape quits.
+// vsync on and off; Escape quits. The window's title says where, how many
+// frames a second, and whether vsync is on; sooblivion.log, in the folder
+// it's run from, keeps what happened.
 module sooblivion
 
 use mara.core
@@ -18,6 +20,8 @@ use model
 use world
 use land
 use scene
+use logging
+use mara.string
 use sdl_platform
 render :: use render
 
@@ -31,9 +35,11 @@ DOOR_REACH :: 300
 MOST_FRAMES_A_SECOND :: 60
 // How long a frame may spend loading what's waiting, in nanoseconds.
 LOAD_BUDGET :: 6000000
+// Where the viewer's journal goes, in the folder it's run from.
+LOG_PATH :: "sooblivion.log"
 
 // What the viewer commands share: the archives, the window, drawing, what's
-// drawn, and the keyboard and mouse.
+// drawn, the keyboard and mouse, and the journal.
 Viewer :: struct {
 	meshes: Archive
 	textures: Archive
@@ -44,8 +50,17 @@ Viewer :: struct {
 	camera: render.Camera
 	speed: f32          // how fast the camera flies, in units a second
 	input: Input
-	frame_start: u64    // when the frame now drawn began (time_now)
+	journal: Journal
+	place: str256       // what's shown, for the window's title
 	chosen_door: i64    // the door view_frame stopped for
+
+	// Frames: when the one now drawn began; without vsync, when the next
+	// may begin; how many were drawn in the second counted so far.
+	frame_start: u64
+	next_frame: u64
+	frames_counted: i64
+	counting_since: u64
+	frames_a_second: i64
 
 	// Loading after walking into another cell: when it began, over how many frames.
 	loading_since: u64
@@ -60,19 +75,26 @@ View_Event :: union {
 	crossed     // outside, the camera went into another cell
 }
 
-// Opens the archives (their directories into directory_storage) and the
-// window, and sets up drawing, into viewer; the scene's tables are carved
-// from table_storage.
+// Opens the archives (their directories into directory_storage), the
+// window (with vsync) and the journal, and sets up drawing, into viewer;
+// the scene's tables are carved from table_storage.
 viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^[]byte) -> err {
+	viewer.journal = journal_open(LOG_PATH)
 	viewer.meshes = open_archive(data_path("Oblivion - Meshes.bsa"), directory_storage)?
 	viewer.textures = open_archive(data_path("Oblivion - Textures - Compressed.bsa"), directory_storage)?
 	viewer.platform = platform_open("sooblivion", 1280, 720)?
+	set_vsync(&viewer.platform, true)
 	renderer_init(&viewer.renderer)?
 	scene_clear(&viewer.shown, table_storage)
 	viewer.camera = render.Camera(){position = Vec3{0, 0, 0}, yaw = 0, pitch = 0}
 	viewer.speed = 400
-	viewer.frame_start = time_now()
+	viewer.place.len = 0
 	viewer.chosen_door = -1
+	viewer.frame_start = time_now()
+	viewer.next_frame = viewer.frame_start
+	viewer.frames_counted = 0
+	viewer.counting_since = viewer.frame_start
+	viewer.frames_a_second = 0
 	viewer.loading_since = 0
 	viewer.loading_frames = 0
 }
@@ -81,6 +103,7 @@ viewer_close :: fun(viewer: ^Viewer) {
 	platform_close(&viewer.platform)
 	close_archive(&viewer.textures)
 	close_archive(&viewer.meshes)
+	journal_close(&viewer.journal)
 }
 
 // The rooms loading uses, as views of storages the caller keeps: each up
@@ -98,6 +121,25 @@ viewer_loader :: fun(viewer: ^Viewer) -> Loader {
 	return Loader{renderer = &viewer.renderer, meshes = &viewer.meshes, textures = &viewer.textures, room = &viewer.room}
 }
 
+// Shows what's shown, how many frames a second, and whether vsync is on
+// in the window's title: "Inn of Ill Omen — 60 fps, vsync on".
+update_title :: fun(viewer: ^Viewer) {
+	title : str256
+	&title + viewer.place[:]
+	&title + " — "
+	&title + int_text(viewer.frames_a_second)[:]
+	&title + " fps, vsync "
+	&title + (if viewer.platform.vsync do "on" else "off")
+	_ = SetWindowTitle(viewer.platform.window, cstring(title))
+}
+
+// Names what's shown, in the title.
+set_place :: fun(viewer: ^Viewer, place: []utf8) {
+	viewer.place.len = 0
+	&viewer.place + place
+	update_title(viewer)
+}
+
 // One frame: reads the keyboard and mouse, moves the camera, draws the
 // scene from it. Tells what happened that the command has to answer.
 view_frame :: fun(viewer: ^Viewer) -> View_Event {
@@ -111,7 +153,11 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	if input.mouse_pressed[3] do set_mouse_look(platform, not platform.mouse_look)
 	if input.pressed[V] {
 		set_vsync(platform, not platform.vsync)
-		print("vsync %", if platform.vsync do "on" else "off")
+		viewer.next_frame = time_now()
+		note(&viewer.journal, "vsync ")
+		note(&viewer.journal, if platform.vsync do "on" else "off")
+		note_end(&viewer.journal)
+		update_title(viewer)
 	}
 	if input.pressed[E] {
 		viewer.chosen_door = nearest_door(shown, camera.position)
@@ -137,13 +183,8 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	draw_instances(&viewer.renderer, &shown.models, &shown.instances, &shown.lights, shown.lighting,
 		camera^, platform.width, platform.height)
 	present(platform)
-
-	// Without vsync, a frame done early waits out the rest of its time.
-	if not platform.vsync {
-		took := time_now() - now
-		shortest : u64 = 1000000000 / MOST_FRAMES_A_SECOND
-		if took < shortest do delay_ns(shortest - took)
-	}
+	if not platform.vsync do wait_for_next_frame(viewer)
+	count_frame(viewer)
 
 	if shown.world != 0 {
 		x, y := grid_of(camera.position)
@@ -152,16 +193,54 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	return .nothing
 }
 
+// Without vsync: waits for the next frame's time. Frames are due on a
+// schedule, a 60th of a second apart, so a wait that runs late is made up
+// by the next one's being shorter. Most of the wait sleeps; the last
+// millisecond spins, as sleeping can overrun by about that much. A frame
+// that ran past its time starts the schedule again from now.
+wait_for_next_frame :: fun(viewer: ^Viewer) {
+	period : u64 = 1000000000 / MOST_FRAMES_A_SECOND
+	viewer.next_frame += period
+	now := time_now()
+	if viewer.next_frame <= now {
+		viewer.next_frame = now
+		return
+	}
+	spin : u64 = 1000000
+	if viewer.next_frame - now > spin do delay_ns(viewer.next_frame - now - spin)
+	for time_now() < viewer.next_frame {}
+}
+
+// Counts a frame drawn; each second, the count goes in the title.
+count_frame :: fun(viewer: ^Viewer) {
+	viewer.frames_counted += 1
+	now := time_now()
+	if now - viewer.counting_since >= 1000000000 {
+		viewer.frames_a_second = viewer.frames_counted
+		viewer.frames_counted = 0
+		viewer.counting_since = now
+		update_title(viewer)
+	}
+}
+
 // Loads some of what's waiting, if anything is: a frame's budget of it.
-// Says how long catching up took once it's done.
+// Notes how long catching up took once it's done.
 load_some :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	shown := &viewer.shown
 	if not anything_waiting(shown) do return
 	viewer.loading_frames += 1
 	if load_waiting(shown, plugin, viewer_loader(viewer), LOAD_BUDGET) {
-		print("  caught up in % ms over % frames: % models loaded (% meshes failed)",
-			i64((time_now() - viewer.loading_since) / 1000000), viewer.loading_frames,
-			shown.models.len - shown.free_models.len, shown.failed_paths)
+		journal := &viewer.journal
+		note(journal, "  caught up in ")
+		note(journal, i64((time_now() - viewer.loading_since) / 1000000))
+		note(journal, " ms over ")
+		note(journal, viewer.loading_frames)
+		note(journal, " frames: ")
+		note(journal, shown.models.len - shown.free_models.len)
+		note(journal, " models loaded (")
+		note(journal, shown.failed_paths)
+		note(journal, " meshes failed)")
+		note_end(journal)
 	}
 }
 
@@ -204,6 +283,7 @@ command_view :: fun(what: []utf8) {
 		return
 	}
 	add_instance(shown, model_index, mat4_identity())
+	set_place(&viewer, what)
 
 	// Start back from the model's middle, far enough to see all of it.
 	gpu_model := shown.models[model_index]
@@ -291,6 +371,7 @@ command_view_world :: fun(name: []utf8, x: i64, y: i64) {
 // they need loaded a little each frame.
 explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	scratch : [16 * MB]byte
+	journal := &viewer.journal
 	for true {
 		match view_frame(viewer) {
 		nothing
@@ -300,10 +381,19 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 			x, y := grid_of(viewer.camera.position)
 			start := time_now()
 			show_error := show_exterior(&viewer.shown, plugin, viewer.shown.world, x, y)
-			if show_error do print("placing the cells stopped: %", show_error)
-			print("into % %: % instances placed in % ms, % waiting to load",
-				x, y, viewer.shown.instances.len, elapsed_ms(start),
-				viewer.shown.waiting.len + viewer.shown.waiting_land.len)
+			note(journal, "into ")
+			note(journal, x)
+			note(journal, " ")
+			note(journal, y)
+			note(journal, ": ")
+			note(journal, viewer.shown.instances.len)
+			note(journal, " instances placed in ")
+			note(journal, elapsed_ms(start))
+			note(journal, " ms, ")
+			note(journal, viewer.shown.waiting.len + viewer.shown.waiting_land.len)
+			note(journal, " waiting to load")
+			if show_error do note(journal, " (placing the cells stopped early)")
+			note_end(journal)
 			viewer.loading_since = start
 			viewer.loading_frames = 0
 		door
@@ -312,7 +402,8 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 			if not leads do continue
 			target := cell_of_reference(plugin, there.door)
 			if target == 0 {
-				print("that door's other side isn't in any cell found")
+				note(journal, "that door's other side isn't in any cell found")
+				note_end(journal)
 				continue
 			}
 			arrival := there.position + Vec3{0, 0, EYE_HEIGHT}
@@ -332,12 +423,26 @@ go_inside :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
 	shown := &viewer.shown
 	start := time_now()
 	show_error := show_interior(shown, plugin, cell, viewer_loader(viewer))
-	if show_error do print("reading the cell stopped: %", show_error)
 	viewer.speed = 400
-	title := record_name(plugin, cell)
-	_ = SetWindowTitle(viewer.platform.window, cstring(title))
-	print("% : % instances, % lights, % doors; % models loaded (% meshes failed), in % ms",
-		title, shown.instances.len, shown.lights.len, shown.doors.len, shown.models.len, shown.failed_paths, elapsed_ms(start))
+	name := record_name(plugin, cell)
+	set_place(viewer, name[:])
+	journal := &viewer.journal
+	note(journal, name[:])
+	note(journal, ": ")
+	note(journal, shown.instances.len)
+	note(journal, " instances, ")
+	note(journal, shown.lights.len)
+	note(journal, " lights, ")
+	note(journal, shown.doors.len)
+	note(journal, " doors; ")
+	note(journal, shown.models.len)
+	note(journal, " models loaded (")
+	note(journal, shown.failed_paths)
+	note(journal, " meshes failed), in ")
+	note(journal, elapsed_ms(start))
+	note(journal, " ms")
+	if show_error do note(journal, " (reading the cell stopped early)")
+	note_end(journal)
 	viewer.frame_start = time_now()
 }
 
@@ -348,15 +453,34 @@ go_outside :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32, place: Vec3) 
 	start := time_now()
 	x, y := grid_of(place)
 	show_error := show_exterior(shown, plugin, world_id, x, y)
-	if show_error do print("placing the cells stopped: %", show_error)
 	_ = load_waiting(shown, plugin, viewer_loader(viewer), 0xFFFFFFFFFFFFFFFF)
 	viewer.camera.position = place
 	viewer.speed = 1500
-	title := record_name(plugin, world_id)
-	_ = SetWindowTitle(viewer.platform.window, cstring(title))
-	print("% (% %): % instances, % lights, % doors, % land cells; % models loaded (% meshes failed), in % ms",
-		title, x, y, shown.instances.len, shown.lights.len, shown.doors.len, shown.terrain.len,
-		shown.models.len, shown.failed_paths, elapsed_ms(start))
+	name := record_name(plugin, world_id)
+	set_place(viewer, name[:])
+	journal := &viewer.journal
+	note(journal, name[:])
+	note(journal, " (")
+	note(journal, x)
+	note(journal, " ")
+	note(journal, y)
+	note(journal, "): ")
+	note(journal, shown.instances.len)
+	note(journal, " instances, ")
+	note(journal, shown.lights.len)
+	note(journal, " lights, ")
+	note(journal, shown.doors.len)
+	note(journal, " doors, ")
+	note(journal, shown.terrain.len)
+	note(journal, " land cells; ")
+	note(journal, shown.models.len)
+	note(journal, " models loaded (")
+	note(journal, shown.failed_paths)
+	note(journal, " meshes failed), in ")
+	note(journal, elapsed_ms(start))
+	note(journal, " ms")
+	if show_error do note(journal, " (placing the cells stopped early)")
+	note_end(journal)
 	viewer.frame_start = time_now()
 }
 
