@@ -1,9 +1,10 @@
 // Reading the blocks of a NIF's Havok collision: what the meshes collide
-// as — bodies, their shapes, and the constraints joining ragdoll bones.
-// Read to get past them for now; the engine will want the shapes later.
+// as — bodies and their shapes (kept: collision.mara makes triangles of
+// them), and the constraints joining ragdoll bones (read to get past).
 module nif
 
 use mara.core
+use mara.math
 
 // The sizes of the constraints' descriptions: pivots and axes as 4-float
 // Havok vectors, then their limits.
@@ -18,38 +19,46 @@ STIFF_SPRING_SIZE    :: 36    // two pivots and a length
 read_collision_object :: fun(reader: ^Nif_Reader) -> Block {
 	_ = read_ref(reader)   // target
 	skip(reader, 2)        // flags
-	_ = read_ref(reader)   // body
-	return .Other
+	body := read_ref(reader)
+	return Collision_Object{body = body}
 }
 
 // bhkBlendCollisionObject: a ragdoll bone's, blended with its animation.
 read_blend_collision_object :: fun(reader: ^Nif_Reader) -> Block {
 	_ = read_ref(reader)   // target
 	skip(reader, 2)        // flags
-	_ = read_ref(reader)   // body
+	body := read_ref(reader)
 	skip(reader, 8)        // heir gain, velocity gain
 	if reader.stream_version <= 8 do skip(reader, 8)
-	return .Other
+	return Collision_Object{body = body}
 }
 
-// bhkWorldObject: a shape in the Havok world, and what it collides with.
-skip_world_object :: fun(reader: ^Nif_Reader) {
-	_ = read_ref(reader)   // shape
+// bhkWorldObject: a shape in the Havok world, and what it collides with:
+// its shape, and its layer.
+read_world_object :: fun(reader: ^Nif_Reader) -> i64, u8 {
+	shape := read_ref(reader)
 	if reader.version <= VERSION_10_0_1_2 do skip(reader, 4)
-	skip(reader, 4)    // filter: layer, flags, group
+	layer := read_u8(reader)
+	skip(reader, 3)    // the filter's flags and group
 	skip(reader, 20)   // world object info: broadphase type and a property
+	return shape, layer
 }
 
-// bhkRigidBody, bhkRigidBodyT: a body that moves (or doesn't): its mass,
-// friction and how it moves.
-read_rigid_body :: fun(reader: ^Nif_Reader) -> Block {
-	skip_world_object(reader)
+// bhkRigidBody, bhkRigidBodyT: a body that moves (or doesn't): its shape,
+// where it is, its mass, friction and how it moves. moved: a T's
+// translation and rotation move its shape.
+read_rigid_body :: fun(reader: ^Nif_Reader, moved: bool) -> Block {
+	shape, layer := read_world_object(reader)
 	skip(reader, 4)   // entity info: response type, callback delay
 	if reader.version >= VERSION_10_1_0_0 {
 		skip(reader, 16)   // the filter again, the response type again
 	}
 	skip(reader, 4)
-	skip(reader, 64)   // translation, rotation, linear and angular velocity
+	translation := read_vec3(reader)
+	skip(reader, 4)
+	rotation : [4!]f32
+	for k in 0:4 do rotation[k] = read_f32(reader)
+	skip(reader, 32)   // linear and angular velocity
 	skip(reader, 48)   // inertia tensor: three rows of 3 floats and padding
 	skip(reader, 16)   // center
 	skip(reader, 20)   // mass, linear and angular damping, friction, restitution
@@ -58,12 +67,12 @@ read_rigid_body :: fun(reader: ^Nif_Reader) -> Block {
 	skip(reader, 12)
 	skip_refs(reader)  // constraints
 	skip(reader, 4)    // body flags
-	return .Other
+	return Rigid_Body{shape = shape, layer = layer, moved = moved, translation = translation, rotation = rotation}
 }
 
 // bhkSimpleShapePhantom: a shape that detects, not collides.
 read_simple_shape_phantom :: fun(reader: ^Nif_Reader) -> Block {
-	skip_world_object(reader)
+	_, _ = read_world_object(reader)
 	skip(reader, 8)
 	skip(reader, 64)   // transform
 	return .Other
@@ -82,26 +91,28 @@ HAVOK_PROPERTY_SIZE :: 12
 
 read_sphere_shape :: fun(reader: ^Nif_Reader) -> Block {
 	skip_havok_material(reader)
-	skip(reader, 4)   // radius
-	return .Other
+	radius := read_f32(reader)
+	return Sphere_Shape{radius = radius}
 }
 
 read_box_shape :: fun(reader: ^Nif_Reader) -> Block {
 	skip_havok_material(reader)
 	skip(reader, 4)    // radius
 	skip(reader, 8)
-	skip(reader, 12)   // half its size on each axis
+	half_size := read_vec3(reader)
 	skip(reader, 4)
-	return .Other
+	return Box_Shape{half_size = half_size}
 }
 
 read_capsule_shape :: fun(reader: ^Nif_Reader) -> Block {
 	skip_havok_material(reader)
-	skip(reader, 4)    // radius
+	radius := read_f32(reader)
 	skip(reader, 8)
-	skip(reader, 16)   // first point, its radius
-	skip(reader, 16)   // second point, its radius
-	return .Other
+	first := read_vec3(reader)
+	skip(reader, 4)    // its radius again
+	second := read_vec3(reader)
+	skip(reader, 4)
+	return Capsule_Shape{first = first, second = second, radius = radius}
 }
 
 read_convex_vertices_shape :: fun(reader: ^Nif_Reader) -> Block {
@@ -109,10 +120,10 @@ read_convex_vertices_shape :: fun(reader: ^Nif_Reader) -> Block {
 	skip(reader, 4)   // radius
 	skip(reader, HAVOK_PROPERTY_SIZE * 2)   // vertices' and normals' properties
 	vertex_count := i64(read_u32(reader))
-	skip(reader, vertex_count * 16)
-	normal_count := i64(read_u32(reader))
-	skip(reader, normal_count * 16)   // normal and distance: the hull's planes
-	return .Other
+	vertices := read_view(reader, vertex_count * 16)
+	plane_count := i64(read_u32(reader))
+	planes := read_view(reader, plane_count * 16)
+	return Convex_Shape{vertex_count = vertex_count, vertices = vertices, plane_count = plane_count, planes = planes}
 }
 
 read_multi_sphere_shape :: fun(reader: ^Nif_Reader) -> Block {
@@ -125,12 +136,13 @@ read_multi_sphere_shape :: fun(reader: ^Nif_Reader) -> Block {
 
 // bhkConvexTransformShape, bhkTransformShape: a shape moved and turned.
 read_transform_shape :: fun(reader: ^Nif_Reader) -> Block {
-	_ = read_ref(reader)   // shape
+	shape := read_ref(reader)
 	skip_havok_material(reader)
 	skip(reader, 4)    // radius
 	skip(reader, 8)
-	skip(reader, 64)   // transform
-	return .Other
+	transform : [16!]f32
+	for k in 0:16 do transform[k] = read_f32(reader)
+	return Transform_Shape{shape = shape, transform = transform}
 }
 
 read_convex_sweep_shape :: fun(reader: ^Nif_Reader) -> Block {
@@ -142,24 +154,24 @@ read_convex_sweep_shape :: fun(reader: ^Nif_Reader) -> Block {
 }
 
 read_list_shape :: fun(reader: ^Nif_Reader) -> Block {
-	skip_refs(reader)   // shapes
+	shapes := read_refs(reader)
 	skip_havok_material(reader)
 	skip(reader, HAVOK_PROPERTY_SIZE * 2)   // child shapes' and filters' properties
 	filter_count := i64(read_u32(reader))
 	skip(reader, filter_count * 4)
-	return .Other
+	return List_Shape{shapes = shapes}
 }
 
 // bhkMoppBvTreeShape: a shape with Havok's precomputed tree for finding
 // what in it is hit.
 read_mopp_shape :: fun(reader: ^Nif_Reader) -> Block {
-	_ = read_ref(reader)   // shape
+	shape := read_ref(reader)
 	skip(reader, 12)
 	skip(reader, 4)        // scale
 	code_size := i64(read_u32(reader))
 	if reader.version >= VERSION_10_1_0_0 do skip(reader, 16)   // origin, scale
 	skip(reader, code_size)
-	return .Other
+	return Mopp_Shape{shape = shape}
 }
 
 // bhkNiTriStripsShape: triangles to collide with, from NiTriStripsData blocks.
@@ -168,11 +180,15 @@ read_tri_strips_shape :: fun(reader: ^Nif_Reader) -> Block {
 	skip(reader, 4)    // radius
 	skip(reader, 20)
 	skip(reader, 4)    // grow by
-	if reader.version >= VERSION_10_1_0_0 do skip(reader, 16)   // scale
-	skip_refs(reader)  // strips data
+	scale := Vec3{1, 1, 1}
+	if reader.version >= VERSION_10_1_0_0 {
+		scale = read_vec3(reader)
+		skip(reader, 4)
+	}
+	strips := read_refs(reader)
 	filter_count := i64(read_u32(reader))
 	skip(reader, filter_count * 4)
-	return .Other
+	return Strips_Shape{scale = scale, strips = strips}
 }
 
 read_mesh_shape :: fun(reader: ^Nif_Reader) -> Block {
@@ -202,16 +218,16 @@ read_packed_tri_strips_shape :: fun(reader: ^Nif_Reader) -> Block {
 	skip(reader, 4)
 	skip(reader, 16)   // scale
 	skip(reader, 20)   // the radius and scale again
-	_ = read_ref(reader)   // data
-	return .Other
+	data := read_ref(reader)
+	return Packed_Shape{data = data}
 }
 
 read_packed_tri_strips_data :: fun(reader: ^Nif_Reader) -> Block {
 	triangle_count := i64(read_u32(reader))
-	skip(reader, triangle_count * 20)   // 3 vertex indexes, welding info, a normal
+	triangles := read_view(reader, triangle_count * 20)   // 3 vertex indexes, welding info, a normal
 	vertex_count := i64(read_u32(reader))
-	skip(reader, vertex_count * 12)
-	return .Other
+	vertices := read_view(reader, vertex_count * 12)
+	return Packed_Data{triangle_count = triangle_count, triangles = triangles, vertex_count = vertex_count, vertices = vertices}
 }
 
 // ---- constraints --------------------------------------------------------------

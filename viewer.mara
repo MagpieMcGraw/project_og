@@ -24,11 +24,19 @@ use land
 use scene
 use sky
 use distant
+use walking
 use logging
 use mara.string
 use sdl_platform
 gl :: use mara.open_gl
 render :: use render
+
+// How fast a walker goes, walking and running (Shift), units a second.
+WALK_SPEED :: 220
+RUN_SPEED :: 500
+// The longest frame a walker moves through at once, in seconds: a frame
+// that took longer (loading) doesn't throw it through a wall.
+LONGEST_STEP :: 0.05
 
 // How high above the floor the camera is when arriving: a person's eyes,
 // in Oblivion's units.
@@ -71,6 +79,8 @@ Viewer :: struct {
 	journal: Journal
 	place: str256       // what's shown, for the window's title
 	chosen_door: i64    // the door view_frame stopped for
+	walking: bool       // on foot (F), not flying
+	walker: Walker
 
 	// The sky outside: the world's climate and weather, the hour of the
 	// game's day, and what the sky and water look like now.
@@ -142,6 +152,8 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.speed = 400
 	viewer.place.len = 0
 	viewer.chosen_door = -1
+	viewer.walking = false
+	viewer.walker = Walker{position = Vec3{0, 0, 0}, rising = 0, on_ground = false}
 	viewer.sky_world = 0
 	viewer.hour = START_HOUR
 	viewer.look = Sky_Look{state = Sky_State{0}, cloud_lower = 0, cloud_upper = 0, sun = 0,
@@ -199,6 +211,7 @@ update_title :: fun(viewer: ^Viewer) {
 	&title + " fps, vsync "
 	&title + (if viewer.platform.vsync do "on" else "off")
 	&title + (if viewer.renderer.use_bindless do ", bindless" else ", bound textures")
+	&title + (if viewer.walking do ", walking" else ", flying")
 	&title + " — "
 	whole_hours := i64(viewer.hour)
 	minutes := i64((viewer.hour - f32(whole_hours)) * 60)
@@ -263,13 +276,29 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		if camera.pitch > 1.5 do camera.pitch = 1.5
 		if camera.pitch < -1.5 do camera.pitch = -1.5
 	}
-	forward, right, up := camera_axes(camera^)
-	step := f32(seconds) * viewer.speed
-	if input.held[LShift] do step *= 4
-	if input.held[W] do camera.position = camera.position + forward * step
-	if input.held[S] do camera.position = camera.position - forward * step
-	if input.held[D] do camera.position = camera.position + right * step
-	if input.held[A] do camera.position = camera.position - right * step
+	if input.pressed[F] do set_walking(viewer, not viewer.walking)
+	if viewer.walking {
+		// Across the ground, the way the camera faces; the camera at the eyes.
+		ahead := Vec3{sin_f32(camera.yaw), cos_f32(camera.yaw), 0}
+		side := Vec3{cos_f32(camera.yaw), -sin_f32(camera.yaw), 0}
+		going := Vec3{0, 0, 0}
+		if input.held[W] do going = going + ahead
+		if input.held[S] do going = going - ahead
+		if input.held[D] do going = going + side
+		if input.held[A] do going = going - side
+		if vec3_length(going) > 0 do going = vec3_normalize(going) * (if input.held[LShift] do RUN_SPEED else WALK_SPEED)
+		step_seconds := min_f32(f32(seconds), LONGEST_STEP)
+		walk(&viewer.walker, shown, going, input.pressed[Space], step_seconds)
+		camera.position = viewer.walker.position + Vec3{0, 0, EYE_HEIGHT}
+	else
+		forward, right, up := camera_axes(camera^)
+		step := f32(seconds) * viewer.speed
+		if input.held[LShift] do step *= 4
+		if input.held[W] do camera.position = camera.position + forward * step
+		if input.held[S] do camera.position = camera.position - forward * step
+		if input.held[D] do camera.position = camera.position + right * step
+		if input.held[A] do camera.position = camera.position - right * step
+	}
 
 	pass_time(viewer, f32(seconds), input.held[T])
 	drawing_start := time_now()
@@ -432,6 +461,20 @@ note_gl_errors :: fun(viewer: ^Viewer) {
 has_distant_land :: fun(viewer: ^Viewer) -> bool {
 	renderer := &viewer.renderer
 	return renderer.distant_pieces.len > 0 and renderer.distant_world == viewer.shown.world
+}
+
+// Walks (on foot, from where the camera's eyes are) or flies.
+set_walking :: fun(viewer: ^Viewer, on: bool) {
+	viewer.walking = on
+	place_walker(viewer)
+	note(&viewer.journal, if on do "walking" else "flying")
+	note_end(&viewer.journal)
+	update_title(viewer)
+}
+
+// Puts the walker's feet under the camera, standing still.
+place_walker :: fun(viewer: ^Viewer) {
+	viewer.walker = Walker{position = viewer.camera.position - Vec3{0, 0, EYE_HEIGHT}, rising = 0, on_ground = false}
 }
 
 // Moves the game's day on by a frame's seconds (much faster when hurried),
@@ -719,6 +762,7 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 			viewer.camera.position = arrival
 			viewer.camera.yaw = there.rotation.z
 			viewer.camera.pitch = 0
+			place_walker(viewer)
 		}
 		// (Not on the frame that placed cells: it's had its share of work.)
 		if not placed_this_frame do load_some(viewer, plugin)

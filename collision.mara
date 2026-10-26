@@ -1,0 +1,306 @@
+// Collision: what a model's solid parts are, for walking into. A model's
+// Havok shapes — the bodies on its nodes, on the layers that stand in the
+// way — made into triangles in the model's space and the game's units.
+//
+// Triangle shapes are taken as they are (their NiTriStripsData in the
+// game's units, the rest of a body's shapes in Havok's). Convex hulls are made face by
+// face from their planes: the corners on each plane, in order around their
+// middle. Boxes are their 12 triangles; spheres and capsules, for now, the
+// boxes around them.
+module collision
+
+use mara.core
+use mara.math
+use nif
+use model
+
+// Game units in one of Havok's.
+HAVOK_SCALE :: 7
+
+// How near a convex hull's corner must be to a face's plane to be on it,
+// in Havok units.
+ON_PLANE :: 0.01
+
+// The Havok layers that stand in the way of walking: statics (1), animated
+// statics (2), transparent things (3), clutter (4), trees (9), props (10),
+// terrain (13), traps (14), ground (17). Not triggers, water, projectiles,
+// spells, ragdolls' bones, or what collides with nothing.
+solid_layer :: fun(layer: u8) -> bool {
+	return layer == 1 or layer == 2 or layer == 3 or layer == 4 or layer == 9 or layer == 10 or
+		layer == 13 or layer == 14 or layer == 17
+}
+
+// A model's collision: its triangles, three points each, into points.
+add_collision :: fun(mesh: ^Nif, points: ^[]Vec3) {
+	for k in 0:mesh.roots.count {
+		root := mesh.roots.at(k)
+		if root >= 0 do add_object_collision(mesh, root, mat4_identity(), points)
+	}
+}
+
+// An object's collision and its children's: each placed by its place in
+// the model, under its parent's.
+add_object_collision :: fun(mesh: ^Nif, index: i64, parent: Mat4, points: ^[]Vec3) {
+	match mesh.blocks[index] {
+	Node node
+		if node.object.name == "EditorMarker" do return
+		transform := mat4_mul(parent, local_transform(node.object))
+		add_body(mesh, node.object.collision, transform, points)
+		for k in 0:node.children.count {
+			child := node.children.at(k)
+			if child >= 0 do add_object_collision(mesh, child, transform, points)
+		}
+	Shape shape
+		add_body(mesh, shape.object.collision, mat4_mul(parent, local_transform(shape.object)), points)
+	else
+	}
+}
+
+// The body of a collision object, if it's solid: its shape's triangles,
+// placed by the object's transform (and a moved body's own), from Havok's
+// units.
+add_body :: fun(mesh: ^Nif, collision_index: i64, transform: Mat4, points: ^[]Vec3) {
+	if collision_index < 0 do return
+	match mesh.blocks[collision_index] {
+	Collision_Object holder
+		if holder.body < 0 do return
+		match mesh.blocks[holder.body] {
+		Rigid_Body body
+			if not solid_layer(body.layer) do return
+			placed := transform
+			if body.moved {
+				placed = mat4_mul(placed, mat4_translate(body.translation * HAVOK_SCALE))
+				placed = mat4_mul(placed, quaternion_matrix(body.rotation))
+			}
+			placed = mat4_mul(placed, mat4_scale(Vec3{HAVOK_SCALE, HAVOK_SCALE, HAVOK_SCALE}))
+			add_shape_triangles(mesh, body.shape, placed, points)
+		else
+		}
+	else
+	}
+}
+
+// A turn as a matrix, from a quaternion (x, y, z, w).
+quaternion_matrix :: fun(q: [4!]f32) -> Mat4 {
+	x := q[0]
+	y := q[1]
+	z := q[2]
+	w := q[3]
+	m := mat4_identity()
+	m[0][0] = 1 - 2 * (y * y + z * z)
+	m[0][1] = 2 * (x * y + z * w)
+	m[0][2] = 2 * (x * z - y * w)
+	m[1][0] = 2 * (x * y - z * w)
+	m[1][1] = 1 - 2 * (x * x + z * z)
+	m[1][2] = 2 * (y * z + x * w)
+	m[2][0] = 2 * (x * z + y * w)
+	m[2][1] = 2 * (y * z - x * w)
+	m[2][2] = 1 - 2 * (x * x + y * y)
+	return m
+}
+
+// A shape's triangles, placed: into points.
+add_shape_triangles :: fun(mesh: ^Nif, index: i64, placed: Mat4, points: ^[]Vec3) {
+	if index < 0 do return
+	match mesh.blocks[index] {
+	Mopp_Shape tree_shape
+		add_shape_triangles(mesh, tree_shape.shape, placed, points)
+	List_Shape list_shape
+		for k in 0:list_shape.shapes.count do add_shape_triangles(mesh, list_shape.shapes.at(k), placed, points)
+	Transform_Shape moved_shape
+		turn := mat4_identity()
+		for column in 0:4 {
+			for row in 0:4 do turn[column][row] = moved_shape.transform[column * 4 + row]
+		}
+		add_shape_triangles(mesh, moved_shape.shape, mat4_mul(placed, turn), points)
+	Box_Shape box_shape
+		add_box(Vec3{0, 0, 0}, box_shape.half_size, placed, points)
+	Sphere_Shape sphere_shape
+		radius := sphere_shape.radius
+		add_box(Vec3{0, 0, 0}, Vec3{radius, radius, radius}, placed, points)
+	Capsule_Shape capsule_shape
+		add_capsule(capsule_shape.first, capsule_shape.second, capsule_shape.radius, placed, points)
+	Convex_Shape convex_shape
+		add_convex(convex_shape.vertex_count, convex_shape.vertices, convex_shape.plane_count, convex_shape.planes, placed, points)
+	Strips_Shape strips_shape
+		// (Its NiTriStripsData are in the game's units already.)
+		scaled := mat4_mul(placed, mat4_scale(strips_shape.scale * (1.0 / HAVOK_SCALE)))
+		for k in 0:strips_shape.strips.count {
+			data_index := strips_shape.strips.at(k)
+			if data_index < 0 do continue
+			match mesh.blocks[data_index] {
+			Shape_Data data
+				add_geometry(data.geometry, scaled, points)
+			else
+			}
+		}
+	Packed_Shape packed_shape
+		if packed_shape.data < 0 do return
+		match mesh.blocks[packed_shape.data] {
+		Packed_Data packed
+			for t in 0:packed.triangle_count {
+				corners : [3!]Vec3
+				whole := true
+				for c in 0:3 {
+					vertex : u16 = packed.triangles[t * 20 + c * 2]
+					if i64(vertex) >= packed.vertex_count {
+						whole = false
+					else
+						corner : Vec3 = packed.vertices[i64(vertex) * 12]
+						corners[c] = corner
+					}
+				}
+				if whole do add_triangle(placed, corners[0], corners[1], corners[2], points)
+			}
+		else
+		}
+	else
+	}
+}
+
+// A point, placed, into points (when there's room for a whole triangle's).
+add_point :: fun(placed: Mat4, local: Vec3, points: ^[]Vec3) {
+	if points.len == points.cap do return
+	at := mat4_mul_vec4(placed, Vec4{local.x, local.y, local.z, 1})
+	points + Vec3{at.x, at.y, at.z}
+}
+
+// Adds a triangle, its corners placed — all three, or none when there's no room.
+add_triangle :: fun(placed: Mat4, a: Vec3, b: Vec3, c: Vec3, points: ^[]Vec3) {
+	if points.len + 3 > points.cap do return
+	add_point(placed, a, points)
+	add_point(placed, b, points)
+	add_point(placed, c, points)
+}
+
+// The faces of a box by its corners (each corner's bits: 1 across, 2 up
+// the second axis, 4 up the third): two triangles each.
+BOX_FACES :: [24!]i64{0, 2, 6, 4,  1, 5, 7, 3,  0, 4, 5, 1,  2, 3, 7, 6,  0, 1, 3, 2,  4, 6, 7, 5}
+
+// A box's triangles: its corners from its middle, half its size along
+// each axis.
+add_box :: fun(middle: Vec3, half_size: Vec3, placed: Mat4, points: ^[]Vec3) {
+	corners : [8!]Vec3
+	for k in 0:8 {
+		corners[k] = middle + Vec3{
+			if k & 1 != 0 do half_size.x else -half_size.x,
+			if k & 2 != 0 do half_size.y else -half_size.y,
+			if k & 4 != 0 do half_size.z else -half_size.z}
+	}
+	add_box_faces(&corners, placed, points)
+}
+
+// A box's twelve triangles from its eight corners.
+add_box_faces :: fun(corners: ^[8!]Vec3, placed: Mat4, points: ^[]Vec3) {
+	for face in 0:6 {
+		a := corners[BOX_FACES[face * 4]]
+		b := corners[BOX_FACES[face * 4 + 1]]
+		c := corners[BOX_FACES[face * 4 + 2]]
+		d := corners[BOX_FACES[face * 4 + 3]]
+		add_triangle(placed, a, b, c, points)
+		add_triangle(placed, a, c, d, points)
+	}
+}
+
+// A capsule, as the box around it: along its middle line, a radius out on
+// every side.
+add_capsule :: fun(first: Vec3, second: Vec3, radius: f32, placed: Mat4, points: ^[]Vec3) {
+	along := second - first
+	extent := vec3_length(along)
+	if extent < 0.0001 {
+		add_box(first, Vec3{radius, radius, radius}, placed, points)
+		return
+	}
+	axis := along * (1 / extent)
+	// Two ways across it.
+	other := if abs_f32(axis.z) < 0.9 do Vec3{0, 0, 1} else Vec3{1, 0, 0}
+	across := vec3_normalize(cross(axis, other))
+	up := cross(axis, across)
+	corners : [8!]Vec3
+	for k in 0:8 {
+		end := if k & 4 != 0 do second + axis * radius else first - axis * radius
+		corners[k] = end + across * (if k & 1 != 0 do radius else -radius) + up * (if k & 2 != 0 do radius else -radius)
+	}
+	add_box_faces(&corners, placed, points)
+}
+
+// A convex hull's faces (a Convex_Shape's corners and planes): for each
+// plane, the corners on it, in order around their middle, as a fan of
+// triangles.
+add_convex :: fun(vertex_count: i64, vertices: []byte, plane_count: i64, planes: []byte, placed: Mat4, points: ^[]Vec3) {
+	for p in 0:plane_count {
+		plane : [4!]f32 = planes[p * 16]
+		normal := Vec3{plane[0], plane[1], plane[2]}
+		on : [64]Vec3
+		for v in 0:vertex_count {
+			corner : Vec3 = vertices[v * 16]
+			if abs_f32(dot(normal, corner) + plane[3]) < ON_PLANE and on.len < on.cap do &on + corner
+		}
+		if on.len < 3 do continue
+		middle := Vec3{0, 0, 0}
+		for corner in on do middle = middle + corner
+		middle = middle * (1 / f32(on.len))
+		across := vec3_normalize(on[0] - middle)
+		up := cross(normal, across)
+		// Each corner's place around the middle (as an angle grows, though not an angle).
+		turns : [64]f32
+		for corner in on {
+			offset := corner - middle
+			&turns + turn_around(dot(offset, across), dot(offset, up))
+		}
+		order : [64]i64
+		for k in 0:on.len do &order + k
+		// (A face has a few corners: sorted by insertion.)
+		for k in 1:order.len {
+			j := k
+			for j > 0 and turns[order[j - 1]] > turns[order[j]] {
+				swapped := order[j]
+				order[j] = order[j - 1]
+				order[j - 1] = swapped
+				j -= 1
+			}
+		}
+		for k in 1:order.len - 1 do add_triangle(placed, on[order[0]], on[order[k]], on[order[k + 1]], points)
+	}
+}
+
+// Where a direction (x, y) is around a circle, 0 to 4 as its angle goes
+// 0 to a whole turn: in order like the angle, without the trigonometry.
+turn_around :: fun(x: f32, y: f32) -> f32 {
+	size := abs_f32(x) + abs_f32(y)
+	if size == 0 do return 0
+	if y >= 0 do return 1 - x / size
+	return 3 + x / size
+}
+
+// A NiTriStripsData's (or NiTriShapeData's) triangles, placed.
+add_geometry :: fun(geometry: Geometry, placed: Mat4, points: ^[]Vec3) {
+	if geometry.vertices.len == 0 do return
+	if geometry.triangles.len != 0 {
+		for t in 0:geometry.triangle_count {
+			corners : [3!]Vec3
+			for c in 0:3 {
+				index : u16 = geometry.triangles[(t * 3 + c) * 2]
+				corner : Vec3 = geometry.vertices[i64(index) * 12]
+				corners[c] = corner
+			}
+			add_triangle(placed, corners[0], corners[1], corners[2], points)
+		}
+		return
+	}
+	strip_start : i64 = 0
+	for s in 0:geometry.strip_count {
+		strip_length : u16 = geometry.strip_lengths[s * 2]
+		for k in 2:i64(strip_length) {
+			a : u16 = geometry.strips[(strip_start + k - 2) * 2]
+			b : u16 = geometry.strips[(strip_start + k - 1) * 2]
+			c : u16 = geometry.strips[(strip_start + k) * 2]
+			if a == b or b == c or a == c do continue
+			first : Vec3 = geometry.vertices[i64(a) * 12]
+			second : Vec3 = geometry.vertices[i64(b) * 12]
+			third : Vec3 = geometry.vertices[i64(c) * 12]
+			add_triangle(placed, first, second, third, points)
+		}
+		strip_start += i64(strip_length)
+	}
+}

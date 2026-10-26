@@ -260,6 +260,69 @@ Block :: union {
 		name: []utf8     // BSXFlags' is "BSX"
 		value: u32
 	}
+
+	// Havok collision: what an object collides as. A collision object
+	// (bhkCollisionObject, and the SP and blend ones) on a node names its
+	// body; the body its shape. Shapes are in Havok's units (HAVOK_SCALE
+	// game units each).
+	Collision_Object {
+		body: i64
+	}
+	// bhkRigidBody, bhkRigidBodyT: its shape, and its layer (what it
+	// collides as: a wall, a trigger, a ragdoll's bone…). A T's shape is
+	// moved and turned by its translation and rotation (a quaternion).
+	Rigid_Body {
+		shape: i64
+		layer: u8
+		moved: bool
+		translation: Vec3
+		rotation: [4!]f32    // x, y, z, w
+	}
+	Sphere_Shape {
+		radius: f32
+	}
+	Box_Shape {
+		half_size: Vec3
+	}
+	Capsule_Shape {
+		first: Vec3          // the ends of its middle line
+		second: Vec3
+		radius: f32
+	}
+	// bhkConvexVerticesShape: a convex hull, by its corners and its faces' planes.
+	Convex_Shape {
+		vertex_count: i64
+		vertices: []byte     // 4 f32s each, the last unused
+		plane_count: i64
+		planes: []byte       // a normal and a distance, 4 f32s each: n·x + d is 0 on the face
+	}
+	// bhkConvexTransformShape, bhkTransformShape: a shape moved and turned.
+	Transform_Shape {
+		shape: i64
+		transform: [16!]f32  // column by column, the translation last
+	}
+	List_Shape {
+		shapes: Refs
+	}
+	// bhkMoppBvTreeShape: its shape, with Havok's tree for finding what in it is hit.
+	Mopp_Shape {
+		shape: i64
+	}
+	// bhkNiTriStripsShape: triangles from NiTriStripsData blocks, scaled.
+	Strips_Shape {
+		scale: Vec3
+		strips: Refs
+	}
+	// bhkPackedNiTriStripsShape: triangles in an hkPackedNiTriStripsData.
+	Packed_Shape {
+		data: i64
+	}
+	Packed_Data {
+		triangle_count: i64
+		triangles: []byte    // 3 u16 vertex indexes, welding (u16), a normal: 20 bytes each
+		vertex_count: i64
+		vertices: []byte     // a Vec3 each
+	}
 }
 
 // A whole NIF: its header, its blocks, and the blocks at the top of its tree.
@@ -533,9 +596,9 @@ read_block :: fun(reader: ^Nif_Reader, block_type: Block_Type) -> Block {
 	bhkBlendCollisionObject
 		return read_blend_collision_object(reader)
 	bhkRigidBody
-		return read_rigid_body(reader)
+		return read_rigid_body(reader, false)
 	bhkRigidBodyT
-		return read_rigid_body(reader)
+		return read_rigid_body(reader, true)
 	bhkSimpleShapePhantom
 		return read_simple_shape_phantom(reader)
 	bhkSphereShape

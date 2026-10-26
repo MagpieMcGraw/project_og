@@ -27,6 +27,7 @@ use sky
 use shader_package
 use distant
 use grass
+use collision
 render :: use render
 use mara.math
 use sdl_platform
@@ -238,6 +239,8 @@ command_nifs :: fun(name: []utf8) {
 	part_total : i64 = 0
 	triangle_total : i64 = 0
 	untextured : i64 = 0
+	// The Havok blocks: how many of each type, in how many files.
+	havok_types : [64]Type_Count
 	start := time_now()
 
 	for file, i in archive.files {
@@ -254,6 +257,23 @@ command_nifs :: fun(name: []utf8) {
 		mesh, nif_error := read_nif(data, &nif_storage, &failure)
 		if not nif_error {
 			block_total += mesh.blocks.len
+			for b in 0:mesh.blocks.len {
+				type_name := mesh.header.type_names[i64(mesh.header.block_types[b])]
+				if not starts_with(type_name, "bhk") and not starts_with(type_name, "hk") do continue
+				counted := false
+				for &entry in havok_types {
+					if entry.name[:] == type_name {
+						entry.count += 1
+						counted = true
+					}
+				}
+				if not counted and havok_types.len < havok_types.cap {
+					entry := next(&havok_types)
+					entry.name.len = 0
+					&entry.name + type_name
+					entry.count = 1
+				}
+			}
 			if mesh.trailing_bytes > 0 do with_trailing += 1
 			model_storage.len = 0
 			built, model_error := build_model(&mesh, &model_storage)
@@ -284,6 +304,13 @@ command_nifs :: fun(name: []utf8) {
 	for entry in failures {
 		print("  % files stopped at %: %   (first: %)", entry.files, entry.type_name, entry.reason, entry.example)
 	}
+	for &entry in havok_types do print("  % %", entry.count, entry.name)
+}
+
+// A block type's name and how many there are.
+Type_Count :: struct {
+	name: [64]utf8
+	count: i64
 }
 
 // The entry for a failure at a block type, made when it's the first.
@@ -1116,6 +1143,119 @@ command_sky :: fun(name: []utf8) {
 // `sooblivion lod <world> <x> <y>`: the piece of distant land a cell is
 // in, and its normal map beside the cell's own land's normals at a few of
 // the land's points, to see which way the map's axes go.
+// `sooblivion collision <mesh>`: a mesh's collision, as walking meets it:
+// its triangles, and the box around them beside the box around what's
+// drawn. `collision -all`: every mesh's, counted; and how many of the
+// convex hulls' faces are found with the planes' distance added (as
+// collision.mara takes it) and subtracted.
+command_collision :: fun(what: []utf8) {
+	path := data_path("Oblivion - Meshes.bsa")
+	directory_storage : [64 * MB]byte
+	archive, open_error := open_archive(path, &directory_storage)
+	if open_error {
+		print("couldn't open %: %", path, open_error)
+		return
+	}
+	defer close_archive(&archive)
+	storage : [64 * MB]byte
+	nif_storage : [16 * MB]byte
+	points : [600000]Vec3
+
+	if what == "-all" {
+		start := time_now()
+		with_collision : i64 = 0
+		triangles : i64 = 0
+		most : i64 = 0
+		most_name : [256]utf8
+		faces_added : i64 = 0
+		faces_subtracted : i64 = 0
+		planes : i64 = 0
+		for file, i in archive.files {
+			if not ends_with(file_name(&archive, file), ".nif") do continue
+			storage.len = 0
+			data, read_error := read_file(&archive, i, &storage)
+			if read_error do continue
+			nif_storage.len = 0
+			failure := Nif_Failure{block = 0, type_name = storage[0:0]}
+			mesh, nif_error := read_nif(data, &nif_storage, &failure)
+			if nif_error do continue
+			points.len = 0
+			add_collision(&mesh, &points)
+			if points.len > 0 do with_collision += 1
+			triangles += points.len / 3
+			if points.len / 3 > most {
+				most = points.len / 3
+				most_name.len = 0
+				&most_name + file_name(&archive, file)
+			}
+			for &block in mesh.blocks {
+				match block^ {
+				Convex_Shape convex
+					for p in 0:convex.plane_count {
+						plane : [4!]f32 = convex.planes[p * 16]
+						added : i64 = 0
+						subtracted : i64 = 0
+						for v in 0:convex.vertex_count {
+							corner : Vec3 = convex.vertices[v * 16]
+							along := corner.x * plane[0] + corner.y * plane[1] + corner.z * plane[2]
+							if abs_f32(along + plane[3]) < ON_PLANE do added += 1
+							if abs_f32(along - plane[3]) < ON_PLANE do subtracted += 1
+						}
+						planes += 1
+						if added >= 3 do faces_added += 1
+						if subtracted >= 3 do faces_subtracted += 1
+					}
+				else
+				}
+			}
+		}
+		print("% meshes with collision, % triangles, the most % (%), in % ms", with_collision, triangles, most, most_name, elapsed_ms(start))
+		print("convex hulls: % planes, % faces found adding their distance, % subtracting it", planes, faces_added, faces_subtracted)
+		return
+	}
+
+	index, found := find_file(&archive, what)
+	if not found {
+		print("no % in %", what, path)
+		return
+	}
+	data, read_error := read_file(&archive, index, &storage)
+	if read_error {
+		print("couldn't read %: %", what, read_error)
+		return
+	}
+	failure := Nif_Failure{block = 0, type_name = storage[0:0]}
+	mesh, nif_error := read_nif(data, &nif_storage, &failure)
+	if nif_error {
+		print("couldn't read % as a NIF: %", what, nif_error)
+		return
+	}
+	add_collision(&mesh, &points)
+	model_storage : [64 * MB]byte
+	built, model_error := build_model(&mesh, &model_storage)
+	low := Vec3{1000000, 1000000, 1000000}
+	high := Vec3{-1000000, -1000000, -1000000}
+	for point in points {
+		for axis in 0:3 {
+			if point[axis] < low[axis] do low[axis] = point[axis]
+			if point[axis] > high[axis] do high[axis] = point[axis]
+		}
+	}
+	print("% collision triangles, from % to %", points.len / 3, low, high)
+	if not model_error do print("drawn: from % to %", built.bounds_min, built.bounds_max)
+	for &block, k in mesh.blocks {
+		type_name := mesh.header.type_names[i64(mesh.header.block_types[k])]
+		match block^ {
+		Rigid_Body body
+			print("  block % (%): a body on layer %, its shape block % %", k, type_name, body.layer, body.shape, if body.moved do "(moved)" else "")
+		Other
+			if starts_with(type_name, "bhk") do print("  block % (%): kept as Other", k, type_name)
+		else
+			if starts_with(type_name, "bhk") do print("  block % (%)", k, type_name)
+		}
+	}
+}
+
 // `sooblivion grass <world> <x> <y>`: the grass a cell's land grows, as
 // the viewer places it: how many blades of each kind, how tall, how high
 // above the water. No window (the kinds' models aren't loaded: each
@@ -1538,6 +1678,8 @@ main :: (args: [][]utf8) {
 		command_map(if args.len > 2 do args[2] else "Tamriel")
 	elif command == "sky"
 		command_sky(if args.len > 2 do args[2] else "Tamriel")
+	elif command == "collision" and args.len > 2
+		command_collision(args[2])
 	elif command == "grass" and args.len > 4
 		x, x_ok := parse_number(args[3])
 		y, y_ok := parse_number(args[4])
