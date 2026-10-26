@@ -2364,6 +2364,7 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 		if tree_cells.len > 0 do draw_trees(renderer, tree_cells, &near_cells, false, &far_planes, far_view_projection, lighting, sun, camera, &stats)
 		draw_far_water(renderer, waters, look, far_view_projection, lighting, camera, &stats)
 		if distant_instances.len > 0 do draw_mesh_runs(renderer, far_view_projection, lighting, sun, camera, true, &stats)
+		DepthMask(1)   // (a clear writes depth only where depth may be written)
 		Clear(DEPTH_BUFFER_BIT)
 	}
 	if grounds.len > 0 do draw_land(renderer, grounds, &planes, view_projection, lighting, sun, camera, &stats)
@@ -2714,6 +2715,13 @@ draw_mesh_runs :: fun(renderer: ^Renderer, view_projection: Mat4, lighting: Cell
 		stats.draw_calls += 1
 		run_start = run_end
 	}
+	// As it was: what's drawn next (the near pass, after the far's blended
+	// meshes) writes depth, unblended, culled.
+	if blended {
+		DepthMask(1)
+		Disable(BLEND)
+	}
+	Enable(CULL_FACE)
 }
 
 // Sorts keys, smallest first (Shell's sort: a few thousand at most).
