@@ -6,6 +6,12 @@ use mara.core
 use mara.sdl
 use mara.open_gl
 
+// glFinish: waits for the card to draw everything asked of it. (Not in
+// mara.open_gl yet.)
+foreign static_lib "opengl32" prefix gl {
+	fun Finish()
+}
+
 // What opening the window can fail with.
 Platform_Error :: error {
 	Init_Failed
@@ -35,6 +41,7 @@ Platform :: struct {
 	width: i64        // the window's size in pixels
 	height: i64
 	mouse_look: bool  // the mouse turns the camera, held in the window
+	vsync: bool       // frames wait for the display's refresh
 }
 
 // Opens a window of the size given, with an OpenGL 4.5 core context.
@@ -53,10 +60,12 @@ platform_open :: fun(title: []utf8, width: i64, height: i64) -> Platform, err {
 	context := sdl.GL_CreateContext(window)
 	if context == void do return Platform{0}, Context_Failed
 	if not sdl.GL_MakeCurrent(window, context) do return Platform{0}, Context_Failed
-	_ = sdl.GL_SetSwapInterval(1)
+	// Without vsync: with it, the frames the driver queues ahead hold back
+	// what the mouse does (set_vsync turns it on).
+	_ = sdl.GL_SetSwapInterval(0)
 	gl_load(GL_GetProcAddress)
 
-	platform := Platform{window = window, context = context, width = width, height = height, mouse_look = false}
+	platform := Platform{window = window, context = context, width = width, height = height, mouse_look = false, vsync = false}
 	update_size(&platform)
 	return platform
 }
@@ -124,7 +133,18 @@ read_input :: fun(platform: ^Platform, input: ^Input) {
 	}
 }
 
-// Shows what was drawn this frame.
+// Shows what was drawn this frame, then waits for the card to finish it,
+// so no frames queue up behind it: the next frame starts from input read
+// after this one is up.
 present :: fun(platform: ^Platform) {
 	_ = GL_SwapWindow(platform.window)
+	Finish()
+}
+
+// Turns waiting for the display's refresh on or off.
+set_vsync :: fun(platform: ^Platform, on: bool) {
+	platform.vsync = on
+	interval : i32 = 0
+	if on do interval = 1
+	_ = sdl.GL_SetSwapInterval(interval)
 }

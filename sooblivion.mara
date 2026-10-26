@@ -694,6 +694,122 @@ command_area :: fun(name: []utf8, x: i64, y: i64) {
 	print("the ground in the middle of % % is at %", x, y, ground_height(&plugin, world_id, middle, &scratch))
 }
 
+// `sooblivion walk <world> <x> <y> <cells>`: walks east from a cell, one
+// cell at a time, and times what each step costs: placing the cells around
+// it, and reading what they need that earlier steps didn't — meshes (read,
+// unpacked, made models), their textures, the land. No window: the
+// graphics card's part isn't counted.
+command_walk :: fun(name: []utf8, x: i64, y: i64, steps: i64) {
+	data_storage : [400 * MB]byte
+	index_storage : [96 * MB]byte
+	plugin, load_error := load_oblivion(&data_storage, &index_storage)
+	if load_error {
+		print("couldn't load the plugin: %", load_error)
+		return
+	}
+	scratch : [16 * MB]byte
+	world_id := find_world(&plugin, name, &scratch)
+	if world_id == 0 {
+		print("no world %", name)
+		return
+	}
+	directory_storage : [64 * MB]byte
+	meshes, meshes_error := open_archive(data_path("Oblivion - Meshes.bsa"), &directory_storage)
+	if meshes_error do return
+	defer close_archive(&meshes)
+	textures, textures_error := open_archive(data_path("Oblivion - Textures - Compressed.bsa"), &directory_storage)
+	if textures_error do return
+	defer close_archive(&textures)
+
+	table_storage : [2 * MB]byte
+	walked : Scene
+	scene_clear(&walked, &table_storage)
+	seen_textures := key_index(1 << 14, &table_storage)
+	file_room : [64 * MB]byte
+	block_room : [16 * MB]byte
+	model_room : [64 * MB]byte
+	texture_room : [64 * MB]byte
+
+	for step in 0..steps {
+		cell_x := x + step
+		// The land left behind, forgotten (as drop_terrain would, without a card).
+		area := area_around(cell_x, y)
+		k : i64 = 0
+		for k < walked.terrain.len {
+			ground := walked.terrain[k]
+			if ground.x < area.low_x or ground.x > area.high_x {
+				walked.terrain[k] = walked.terrain[walked.terrain.len - 1]
+				walked.terrain.len -= 1
+			else
+				k += 1
+			}
+		}
+		place_start := time_now()
+		_ = show_exterior(&walked, &plugin, world_id, cell_x, y)
+		place_ms := elapsed_ms(place_start)
+
+		// What's waiting, read as loading would: the meshes and their
+		// textures, then the land, each timed.
+		mesh_start := time_now()
+		mesh_count : i64 = 0
+		texture_count : i64 = 0
+		texture_ns : u64 = 0
+		for &item in walked.waiting {
+			_, known := known_model(&walked, item.path[:])
+			if known do continue
+			_ = index_put(&walked.paths, text_hash(item.path[:]), 1)
+			index, found := find_file(&meshes, item.path[:])
+			if not found do continue
+			file_room.len = 0
+			data, read_error := read_file(&meshes, index, &file_room)
+			if read_error do continue
+			block_room.len = 0
+			failure := Nif_Failure{block = 0, type_name = file_room[0:0]}
+			mesh, nif_error := read_nif(data, &block_room, &failure)
+			if nif_error do continue
+			model_room.len = 0
+			built, model_error := build_model(&mesh, &model_room)
+			if model_error do continue
+			mesh_count += 1
+			texture_start := time_now()
+			for part in built.parts {
+				key := text_hash(part.texture[:])
+				_, had := index_get(&seen_textures, key)
+				if had or part.texture.len == 0 do continue
+				_ = index_put(&seen_textures, key, 1)
+				texture_index, texture_found := find_file(&textures, part.texture[:])
+				if not texture_found do continue
+				texture_room.len = 0
+				texture_data, texture_error := read_file(&textures, texture_index, &texture_room)
+				if texture_error do continue
+				_, _ = read_texture(texture_data)
+				texture_count += 1
+			}
+			texture_ns += time_now() - texture_start
+		}
+		mesh_ms := elapsed_ms(mesh_start) - i64(texture_ns / 1000000)
+
+		land_start := time_now()
+		cell_land : Land
+		for item in walked.waiting_land {
+			land_at, has_land := find_land(&plugin, item.cell)
+			if not has_land do continue
+			file_room.len = 0
+			record, record_error := record_at(&plugin, land_at, &file_room)
+			if record_error do continue
+			read_land(record.data, &cell_land)
+			model_room.len = 0
+			_ = build_land_model(&plugin, &cell_land, item.x, item.y, &model_room)
+			&walked.terrain + Terrain_Cell{x = item.x, y = item.y, model = 0}
+		}
+		print("step to % %: placing % ms (% instances ready, % waiting); % new meshes % ms; % new textures % ms; % land cells % ms",
+			cell_x, y, place_ms, walked.instances.len, walked.waiting.len, mesh_count, mesh_ms,
+			texture_count, i64(texture_ns / 1000000), walked.waiting_land.len, elapsed_ms(land_start))
+		walked.waiting.len = 0
+		walked.waiting_land.len = 0
+	}
+}
+
 usage :: fun() {
 	print("sooblivion esm [plugin]            what a plugin holds, by record type")
 	print("sooblivion bsa <archive>           an archive's folders and files")
@@ -722,6 +838,12 @@ main :: (args: [][]utf8) {
 		x, x_ok := parse_number(args[3])
 		y, y_ok := parse_number(args[4])
 		if x_ok and y_ok do command_area(args[2], i64(x), i64(y))
+		else do usage()
+	elif command == "walk" and args.len > 5
+		x, x_ok := parse_number(args[3])
+		y, y_ok := parse_number(args[4])
+		steps, steps_ok := parse_number(args[5])
+		if x_ok and y_ok and steps_ok do command_walk(args[2], i64(x), i64(y), i64(steps))
 		else do usage()
 	elif command == "view-world"
 		if args.len > 4 {

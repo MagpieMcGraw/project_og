@@ -3,7 +3,8 @@
 // to other cells.
 //
 // W, A, S, D fly, Left Shift faster; the right mouse button turns mouse
-// look on and off; E goes through the door nearest the camera; Escape quits.
+// look on and off; E goes through the door nearest the camera; V turns
+// vsync on and off; Escape quits.
 module sooblivion
 
 use mara.core
@@ -25,9 +26,13 @@ render :: use render
 EYE_HEIGHT :: 120
 // How near a door must be to go through it.
 DOOR_REACH :: 300
+// Without vsync, frames are kept to this many a second at most.
+MOST_FRAMES_A_SECOND :: 240
+// How long a frame may spend loading what's waiting, in nanoseconds.
+LOAD_BUDGET :: 6000000
 
-// What the viewer commands share: the archives, the window, drawing, and
-// what's drawn.
+// What the viewer commands share: the archives, the window, drawing, what's
+// drawn, and the keyboard and mouse.
 Viewer :: struct {
 	meshes: Archive
 	textures: Archive
@@ -36,12 +41,20 @@ Viewer :: struct {
 	shown: Scene
 	room: Load_Room
 	camera: render.Camera
-	chosen_door: i64    // the door view_loop stopped for
+	speed: f32          // how fast the camera flies, in units a second
+	input: Input
+	frame_start: u64    // when the frame now drawn began (time_now)
+	chosen_door: i64    // the door view_frame stopped for
+
+	// Loading after walking into another cell: when it began, over how many frames.
+	loading_since: u64
+	loading_frames: i64
 }
 
-// Why the viewer's loop stopped.
+// What happened in a frame that the command has to answer.
 View_Event :: union {
-	quit = 0
+	nothing = 0
+	quit
 	door        // E was pressed near a door: viewer.chosen_door
 	crossed     // outside, the camera went into another cell
 }
@@ -56,7 +69,11 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	renderer_init(&viewer.renderer)?
 	scene_clear(&viewer.shown, table_storage)
 	viewer.camera = render.Camera(){position = Vec3{0, 0, 0}, yaw = 0, pitch = 0}
+	viewer.speed = 400
+	viewer.frame_start = time_now()
 	viewer.chosen_door = -1
+	viewer.loading_since = 0
+	viewer.loading_frames = 0
 }
 
 viewer_close :: fun(viewer: ^Viewer) {
@@ -75,49 +92,76 @@ load_room :: fun(file_room: ^[]byte, block_room: ^[]byte, model_room: ^[]byte, t
 		texture = texture_room[0 : texture_room.cap]}
 }
 
-// The viewer's loop: draws the scene from the camera, flying it speed
-// units a second, until something happens that the command answers.
-view_loop :: fun(viewer: ^Viewer, speed: f32) -> View_Event {
+// Where the viewer's scene loads models from.
+viewer_loader :: fun(viewer: ^Viewer) -> Loader {
+	return Loader{renderer = &viewer.renderer, meshes = &viewer.meshes, textures = &viewer.textures, room = &viewer.room}
+}
+
+// One frame: reads the keyboard and mouse, moves the camera, draws the
+// scene from it. Tells what happened that the command has to answer.
+view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	platform := &viewer.platform
 	camera := &viewer.camera
 	shown := &viewer.shown
-	input : Input
-	frame_start := time_now()
-	for true {
-		read_input(platform, &input)
-		if input.quit or input.pressed[Escape] do return .quit
-		if input.mouse_pressed[3] do set_mouse_look(platform, not platform.mouse_look)
-		if input.pressed[E] {
-			viewer.chosen_door = nearest_door(shown, camera.position)
-			if viewer.chosen_door >= 0 do return .door
-		}
+	input := &viewer.input
 
-		seconds, now := time_since(frame_start)
-		frame_start = now
-		if platform.mouse_look {
-			camera.yaw += input.mouse_moved_x * 0.003
-			camera.pitch -= input.mouse_moved_y * 0.003
-			if camera.pitch > 1.5 do camera.pitch = 1.5
-			if camera.pitch < -1.5 do camera.pitch = -1.5
-		}
-		forward, right, up := camera_axes(camera^)
-		step := f32(seconds) * speed
-		if input.held[LShift] do step *= 4
-		if input.held[W] do camera.position = camera.position + forward * step
-		if input.held[S] do camera.position = camera.position - forward * step
-		if input.held[D] do camera.position = camera.position + right * step
-		if input.held[A] do camera.position = camera.position - right * step
-
-		if shown.world != 0 {
-			x, y := grid_of(camera.position)
-			if x != shown.center_x or y != shown.center_y do return .crossed
-		}
-
-		draw_instances(&viewer.renderer, &shown.models, &shown.instances, &shown.lights, shown.lighting,
-			camera^, platform.width, platform.height)
-		present(platform)
+	read_input(platform, input)
+	if input.quit or input.pressed[Escape] do return .quit
+	if input.mouse_pressed[3] do set_mouse_look(platform, not platform.mouse_look)
+	if input.pressed[V] {
+		set_vsync(platform, not platform.vsync)
+		print("vsync %", if platform.vsync do "on" else "off")
 	}
-	return .quit
+	if input.pressed[E] {
+		viewer.chosen_door = nearest_door(shown, camera.position)
+		if viewer.chosen_door >= 0 do return .door
+	}
+
+	seconds, now := time_since(viewer.frame_start)
+	viewer.frame_start = now
+	if platform.mouse_look {
+		camera.yaw += input.mouse_moved_x * 0.003
+		camera.pitch -= input.mouse_moved_y * 0.003
+		if camera.pitch > 1.5 do camera.pitch = 1.5
+		if camera.pitch < -1.5 do camera.pitch = -1.5
+	}
+	forward, right, up := camera_axes(camera^)
+	step := f32(seconds) * viewer.speed
+	if input.held[LShift] do step *= 4
+	if input.held[W] do camera.position = camera.position + forward * step
+	if input.held[S] do camera.position = camera.position - forward * step
+	if input.held[D] do camera.position = camera.position + right * step
+	if input.held[A] do camera.position = camera.position - right * step
+
+	draw_instances(&viewer.renderer, &shown.models, &shown.instances, &shown.lights, shown.lighting,
+		camera^, platform.width, platform.height)
+	present(platform)
+
+	// Without vsync, a frame done early waits out the rest of its time.
+	if not platform.vsync {
+		took := time_now() - now
+		shortest : u64 = 1000000000 / MOST_FRAMES_A_SECOND
+		if took < shortest do delay_ns(shortest - took)
+	}
+
+	if shown.world != 0 {
+		x, y := grid_of(camera.position)
+		if x != shown.center_x or y != shown.center_y do return .crossed
+	}
+	return .nothing
+}
+
+// Loads some of what's waiting, if anything is: a frame's budget of it.
+// Says how long catching up took once it's done.
+load_some :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	shown := &viewer.shown
+	if not anything_waiting(shown) do return
+	viewer.loading_frames += 1
+	if load_waiting(shown, plugin, viewer_loader(viewer), LOAD_BUDGET) {
+		print("  caught up in % ms over % frames: % models loaded (% meshes failed)",
+			i64((time_now() - viewer.loading_since) / 1000000), viewer.loading_frames,
+			shown.models.len - shown.free_models.len, shown.failed_paths)
+	}
 }
 
 // The door nearest a place, within reach of it: its index in the scene's
@@ -153,17 +197,18 @@ command_view :: fun(what: []utf8) {
 	viewer.room = load_room(&file_room, &block_room, &model_room, &texture_room)
 
 	shown := &viewer.shown
-	model_index := scene_model(shown, &viewer.renderer, &viewer.meshes, &viewer.textures, what, &viewer.room)
+	model_index := scene_model(shown, viewer_loader(&viewer), what)
 	if model_index < 0 {
 		print("couldn't load %", what)
 		return
 	}
-	&shown.instances + render.Instance{model = model_index, world = mat4_identity()}
+	add_instance(shown, model_index, mat4_identity())
 
 	// Start back from the model's middle, far enough to see all of it.
 	gpu_model := shown.models[model_index]
 	viewer.camera.position = gpu_model.center - Vec3{0, gpu_model.radius * 2, 0}
-	for view_loop(&viewer, gpu_model.radius) != .quit {}
+	viewer.speed = gpu_model.radius
+	for view_frame(&viewer) != .quit {}
 }
 
 // `sooblivion view-cell <editor id>`: shows an interior cell in the
@@ -241,21 +286,25 @@ command_view_world :: fun(name: []utf8, x: i64, y: i64) {
 }
 
 // Flies around until the viewer quits: through doors when E is pressed at
-// one, and loading the cells around the camera as it moves outside.
+// one, and outside, into the cells around the camera as it moves — what
+// they need loaded a little each frame.
 explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	scratch : [16 * MB]byte
 	for true {
-		speed : f32 = 400
-		if viewer.shown.world != 0 do speed = 1500
-		event := view_loop(viewer, speed)
-		match event {
+		match view_frame(viewer) {
+		nothing
 		quit
 			return
 		crossed
 			x, y := grid_of(viewer.camera.position)
-			show_error := show_exterior(&viewer.shown, plugin, viewer.shown.world, x, y,
-				&viewer.renderer, &viewer.meshes, &viewer.textures, &viewer.room)
-			if show_error do print("loading the cells stopped: %", show_error)
+			start := time_now()
+			show_error := show_exterior(&viewer.shown, plugin, viewer.shown.world, x, y)
+			if show_error do print("placing the cells stopped: %", show_error)
+			print("into % %: % instances placed in % ms, % waiting to load",
+				x, y, viewer.shown.instances.len, elapsed_ms(start),
+				viewer.shown.waiting.len + viewer.shown.waiting_land.len)
+			viewer.loading_since = start
+			viewer.loading_frames = 0
 		door
 			scratch.len = 0
 			there, leads := door_destination(plugin, viewer.shown.doors[viewer.chosen_door].reference, &scratch)
@@ -273,35 +322,41 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 			viewer.camera.yaw = there.rotation.z
 			viewer.camera.pitch = 0
 		}
+		load_some(viewer, plugin)
 	}
 }
 
-// Shows an interior cell, its name in the window's title.
+// Shows an interior cell, all of it loaded, its name in the window's title.
 go_inside :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
 	shown := &viewer.shown
 	start := time_now()
-	show_error := show_interior(shown, plugin, cell, &viewer.renderer, &viewer.meshes, &viewer.textures, &viewer.room)
+	show_error := show_interior(shown, plugin, cell, viewer_loader(viewer))
 	if show_error do print("reading the cell stopped: %", show_error)
+	viewer.speed = 400
 	title := record_name(plugin, cell)
 	_ = SetWindowTitle(viewer.platform.window, cstring(title))
 	print("% : % instances, % lights, % doors; % models loaded (% meshes failed), in % ms",
 		title, shown.instances.len, shown.lights.len, shown.doors.len, shown.models.len, shown.failed_paths, elapsed_ms(start))
+	viewer.frame_start = time_now()
 }
 
-// Shows a world's cells around a place in it, the world's name in the
-// window's title, the camera there.
+// Shows a world's cells around a place in it, all of them loaded, the
+// world's name in the window's title, the camera there.
 go_outside :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32, place: Vec3) {
 	shown := &viewer.shown
 	start := time_now()
 	x, y := grid_of(place)
-	show_error := show_exterior(shown, plugin, world_id, x, y, &viewer.renderer, &viewer.meshes, &viewer.textures, &viewer.room)
-	if show_error do print("loading the cells stopped: %", show_error)
+	show_error := show_exterior(shown, plugin, world_id, x, y)
+	if show_error do print("placing the cells stopped: %", show_error)
+	_ = load_waiting(shown, plugin, viewer_loader(viewer), 0xFFFFFFFFFFFFFFFF)
 	viewer.camera.position = place
+	viewer.speed = 1500
 	title := record_name(plugin, world_id)
 	_ = SetWindowTitle(viewer.platform.window, cstring(title))
 	print("% (% %): % instances, % lights, % doors, % land cells; % models loaded (% meshes failed), in % ms",
 		title, x, y, shown.instances.len, shown.lights.len, shown.doors.len, shown.terrain.len,
 		shown.models.len, shown.failed_paths, elapsed_ms(start))
+	viewer.frame_start = time_now()
 }
 
 // A record's name for people (FULL), else its editor id.

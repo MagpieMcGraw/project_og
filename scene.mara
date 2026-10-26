@@ -1,11 +1,17 @@
-// What's drawn: the models a cell needs, each loaded once, and the
-// instances of them placed by the cell's references.
+// What's drawn: the models the shown cells need, each loaded once, and
+// the instances of them placed by the cells' references.
+//
+// Loading is spread over frames: a cell's references whose meshes aren't
+// on the card yet wait in a queue (and land in another), and each frame
+// loads from the queues for a few milliseconds. Arriving somewhere new
+// loads everything at once; walking into the next cell outside doesn't.
 module scene
 
 use mara.core
 use mara.math
 use mara.string
 use mara.memory
+use mara.time
 use bsa
 use nif
 use model
@@ -48,6 +54,19 @@ Scene_Door :: struct {
 	position: Vec3
 }
 
+// A reference waiting for its mesh to be put on the card.
+Waiting_Instance :: struct {
+	path: [256]utf8
+	world: Mat4
+}
+
+// A cell waiting for its land to be put on the card.
+Waiting_Land :: struct {
+	cell: u32
+	x: i64
+	y: i64
+}
+
 // The models on the card, and what's drawn with them: instances, lights,
 // doors and lighting — an interior cell's, or the exterior cells around
 // the camera. Meshes' models stay loaded from cell to cell; land's are
@@ -65,6 +84,30 @@ Scene :: struct {
 	center_x: i64                // the cell the exterior was loaded around
 	center_y: i64
 	terrain: [128]Terrain_Cell
+
+	// What's still to load, in order, and how far along that is.
+	waiting: [16384]Waiting_Instance
+	waiting_next: i64
+	waiting_land: [64]Waiting_Land
+	waiting_land_next: i64
+}
+
+// Where the scene's models come from: the archives, and the renderer that
+// puts them on the card, with the rooms loading uses.
+Loader :: struct {
+	renderer: ^Renderer
+	meshes: ^Archive
+	textures: ^Archive
+	room: ^Load_Room
+}
+
+// The rooms loading uses: for a mesh's file, its blocks, its model, and
+// for reading and decoding textures.
+Load_Room :: struct {
+	file: []byte
+	blocks: []byte
+	model: []byte
+	texture: []byte
 }
 
 // An empty scene, its lighting daylight; its table of paths carved from
@@ -77,6 +120,18 @@ scene_clear :: fun(scene: ^Scene, storage: ^[]byte) {
 	scene.terrain.len = 0
 	scene.world = 0
 	scene_clear_cell(scene)
+}
+
+// The scene without its cells: the models kept, nothing waiting.
+scene_clear_cell :: fun(scene: ^Scene) {
+	scene.instances.len = 0
+	scene.lights.len = 0
+	scene.doors.len = 0
+	scene.lighting = DAYLIGHT
+	scene.waiting.len = 0
+	scene.waiting_next = 0
+	scene.waiting_land.len = 0
+	scene.waiting_land_next = 0
 }
 
 // A slot for a model: one freed before, else a new one. -1 when full.
@@ -101,42 +156,35 @@ text_hash :: fun(text: []utf8) -> u64 {
 	return hash
 }
 
-// The scene without its cell: the models kept.
-scene_clear_cell :: fun(scene: ^Scene) {
-	scene.instances.len = 0
-	scene.lights.len = 0
-	scene.doors.len = 0
-	scene.lighting = DAYLIGHT
-}
-
-// The rooms loading uses: for a mesh's file, its blocks, its model, and
-// for reading and decoding textures.
-Load_Room :: struct {
-	file: []byte
-	blocks: []byte
-	model: []byte
-	texture: []byte
-}
+// ---- models ---------------------------------------------------------------------
 
 // The scene's model for a mesh path: loaded the first time it's asked
 // for. -1 when it can't be.
-scene_model :: fun(scene: ^Scene, renderer: ^Renderer, meshes: ^Archive, textures: ^Archive, path: []utf8, room: ^Load_Room) -> i64 {
+scene_model :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64 {
 	key := text_hash(path)
 	known, found := index_get(&scene.paths, key)
 	if found do return known - 1
-	model_index := load_model(scene, renderer, meshes, textures, path, room)
+	model_index := load_model(scene, loader, path)
 	if model_index < 0 do scene.failed_paths += 1
 	_ = index_put(&scene.paths, key, model_index + 1)
 	return model_index
 }
 
+// Whether a mesh path's model has been asked for before: its index (-1
+// when it couldn't be loaded), and false when it hasn't.
+known_model :: fun(scene: ^Scene, path: []utf8) -> i64, bool {
+	known, found := index_get(&scene.paths, text_hash(path))
+	return known - 1, found
+}
+
 // Reads a mesh, makes its model and puts it on the card: its index in the
 // scene's models, or -1.
-load_model :: fun(scene: ^Scene, renderer: ^Renderer, meshes: ^Archive, textures: ^Archive, path: []utf8, room: ^Load_Room) -> i64 {
-	index, found := find_file(meshes, path)
+load_model :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64 {
+	room := loader.room
+	index, found := find_file(loader.meshes, path)
 	if not found do return -1
 	room.file.len = 0
-	data, read_error := read_file(meshes, index, &room.file)
+	data, read_error := read_file(loader.meshes, index, &room.file)
 	if read_error do return -1
 
 	room.blocks.len = 0
@@ -149,7 +197,7 @@ load_model :: fun(scene: ^Scene, renderer: ^Renderer, meshes: ^Archive, textures
 
 	slot := model_slot(scene)
 	if slot < 0 do return -1
-	upload_model(renderer, built, textures, &room.texture, &scene.models[slot])
+	upload_model(loader.renderer, built, loader.textures, &room.texture, &scene.models[slot])
 	return slot
 }
 
@@ -159,9 +207,17 @@ is_marker :: fun(path: []utf8) -> bool {
 	return starts_with(path, "meshes\\marker")
 }
 
-// Places a cell's references in the scene — their models, the lights
-// they give and the doors that lead somewhere — those in the area only.
-add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, renderer: ^Renderer, meshes: ^Archive, textures: ^Archive, room: ^Load_Room) -> err {
+// Adds an instance, when there's room.
+add_instance :: fun(scene: ^Scene, model_index: i64, placement: Mat4) {
+	if scene.instances.len < scene.instances.cap do &scene.instances + Instance{model = model_index, world = placement}
+}
+
+// ---- cells -----------------------------------------------------------------------
+
+// Places a cell's references in the scene, those in the area only: their
+// instances (or, for meshes not yet loaded, their places in the queue),
+// the lights they give and the doors that lead somewhere.
+add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area) -> err {
 	references : [16384]Reference
 	cell_references(plugin, cell, &references)?
 	scratch : [4 * MB]byte
@@ -181,10 +237,46 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, rend
 
 		path := model_path(base)
 		if path.len == 0 or is_marker(path[:]) do continue
-		model_index := scene_model(scene, renderer, meshes, textures, path[:], room)
-		if model_index < 0 or scene.instances.len == scene.instances.cap do continue
-		next(&scene.instances)^ = Instance{model = model_index, world = reference_transform(reference)}
+		model_index, known := known_model(scene, path[:])
+		if known {
+			if model_index >= 0 do add_instance(scene, model_index, reference_transform(reference))
+		elif scene.waiting.len < scene.waiting.cap
+			waiting := next(&scene.waiting)
+			waiting.path.len = 0
+			&waiting.path + path[:]
+			waiting.world = reference_transform(reference)
+		}
 	}
+}
+
+// Loads what's waiting until it's all loaded (true) or budget nanoseconds
+// have gone (false) — at least one thing each call. Land first.
+load_waiting :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, budget: u64) -> bool {
+	start := time_now()
+	for scene.waiting_land_next < scene.waiting_land.len {
+		if time_now() - start > budget do return false
+		item := scene.waiting_land[scene.waiting_land_next]
+		scene.waiting_land_next += 1
+		ground := terrain_model(scene, plugin, item.cell, item.x, item.y, loader)
+		if ground >= 0 do add_instance(scene, ground, mat4_identity())
+	}
+	for scene.waiting_next < scene.waiting.len {
+		if time_now() - start > budget do return false
+		item := &scene.waiting[scene.waiting_next]
+		scene.waiting_next += 1
+		model_index := scene_model(scene, loader, item.path[:])
+		if model_index >= 0 do add_instance(scene, model_index, item.world)
+	}
+	scene.waiting.len = 0
+	scene.waiting_next = 0
+	scene.waiting_land.len = 0
+	scene.waiting_land_next = 0
+	return true
+}
+
+// Whether anything is waiting to be loaded.
+anything_waiting :: fun(scene: ^Scene) -> bool {
+	return scene.waiting_next < scene.waiting.len or scene.waiting_land_next < scene.waiting_land.len
 }
 
 // Where one arrives in the scene's cell through one of its doors: the
@@ -203,15 +295,18 @@ scene_entrance :: fun(scene: ^Scene, plugin: ^Plugin) -> Door_Destination, bool 
 }
 
 // Shows an interior cell: its references and its lighting, in place of
-// what the scene showed.
-show_interior :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, renderer: ^Renderer, meshes: ^Archive, textures: ^Archive, room: ^Load_Room) -> err {
+// what the scene showed, all loaded.
+show_interior :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, loader: Loader) -> err {
 	drop_terrain(scene, EVERYWHERE, true)
 	scene_clear_cell(scene)
 	scene.world = 0
 	scratch : [1 * MB]byte
 	scene.lighting = cell_lighting(plugin, cell, &scratch)
-	add_cell(scene, plugin, cell, EVERYWHERE, renderer, meshes, textures, room)?
+	add_cell(scene, plugin, cell, EVERYWHERE)?
+	_ = load_waiting(scene, plugin, loader, 0xFFFFFFFFFFFFFFFF)
 }
+
+// ---- outside ------------------------------------------------------------------------
 
 // The area of cells loaded around a cell.
 area_around :: fun(x: i64, y: i64) -> Grid_Area {
@@ -237,12 +332,20 @@ drop_terrain :: fun(scene: ^Scene, area: Grid_Area, all: bool) {
 	}
 }
 
+// The model of a cell's land, if it's loaded: its index, and false if not.
+loaded_terrain :: fun(scene: ^Scene, x: i64, y: i64) -> i64, bool {
+	for loaded in scene.terrain {
+		if loaded.x == x and loaded.y == y do return loaded.model, true
+	}
+	return -1, false
+}
+
 // The model of a cell's land, loaded if it isn't: its index, or -1 when
 // the cell has no land.
-terrain_model :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64, renderer: ^Renderer, textures: ^Archive, room: ^Load_Room) -> i64 {
-	for loaded in scene.terrain {
-		if loaded.x == x and loaded.y == y do return loaded.model
-	}
+terrain_model :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64, loader: Loader) -> i64 {
+	loaded, found := loaded_terrain(scene, x, y)
+	if found do return loaded
+	room := loader.room
 	land_at, has_land := find_land(plugin, cell)
 	if not has_land do return -1
 	room.file.len = 0
@@ -254,7 +357,7 @@ terrain_model :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64, 
 	built := build_land_model(plugin, &cell_land, x, y, &room.model)
 	slot := model_slot(scene)
 	if slot < 0 or scene.terrain.len == scene.terrain.cap do return -1
-	upload_model(renderer, built, textures, &room.texture, &scene.models[slot])
+	upload_model(loader.renderer, built, loader.textures, &room.texture, &scene.models[slot])
 	&scene.terrain + Terrain_Cell{x = x, y = y, model = slot}
 	return slot
 }
@@ -269,9 +372,10 @@ exterior_lighting :: fun() -> Cell_Lighting {
 }
 
 // Shows a world's cells around the one at x, y: their land and references,
-// and the world's persistent references among them. Land loaded before
-// and still in the area is kept.
-show_exterior :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, x: i64, y: i64, renderer: ^Renderer, meshes: ^Archive, textures: ^Archive, room: ^Load_Room) -> err {
+// and the world's persistent references among them. What's on the card
+// already shows at once; the rest waits to be loaded, the nearest cells'
+// first. Land loaded before and still in the area is kept.
+show_exterior :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, x: i64, y: i64) -> err {
 	area := area_around(x, y)
 	if scene.world != world_id do drop_terrain(scene, area, true)
 	else do drop_terrain(scene, area, false)
@@ -281,17 +385,24 @@ show_exterior :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, x: i64, y: i
 	scene.center_y = y
 	scene.lighting = exterior_lighting()
 
-	for cell_y in area.low_y..area.high_y {
-		for cell_x in area.low_x..area.high_x {
-			cell := exterior_cell(plugin, world_id, cell_x, cell_y)
-			if cell == 0 do continue
-			ground := terrain_model(scene, plugin, cell, cell_x, cell_y, renderer, textures, room)
-			if ground >= 0 and scene.instances.len < scene.instances.cap {
-				&scene.instances + Instance{model = ground, world = mat4_identity()}
+	// Ring by ring outward from the middle: the nearest wait first.
+	for ring in 0..EXTERIOR_RADIUS {
+		for cell_y in y - ring..y + ring {
+			for cell_x in x - ring..x + ring {
+				on_ring := cell_x == x - ring or cell_x == x + ring or cell_y == y - ring or cell_y == y + ring
+				if not on_ring do continue
+				cell := exterior_cell(plugin, world_id, cell_x, cell_y)
+				if cell == 0 do continue
+				ground, found := loaded_terrain(scene, cell_x, cell_y)
+				if found {
+					add_instance(scene, ground, mat4_identity())
+				elif scene.waiting_land.len < scene.waiting_land.cap
+					&scene.waiting_land + Waiting_Land{cell = cell, x = cell_x, y = cell_y}
+				}
+				add_cell(scene, plugin, cell, EVERYWHERE)?
 			}
-			add_cell(scene, plugin, cell, EVERYWHERE, renderer, meshes, textures, room)?
 		}
 	}
 	persistent := persistent_cell(plugin, world_id)
-	if persistent != 0 do add_cell(scene, plugin, persistent, area, renderer, meshes, textures, room)?
+	if persistent != 0 do add_cell(scene, plugin, persistent, area)?
 }
