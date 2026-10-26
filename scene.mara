@@ -38,6 +38,7 @@ Grid_Area :: struct {
 }
 
 EVERYWHERE :: Grid_Area{everywhere = true, low_x = 0, low_y = 0, high_x = 0, high_y = 0}
+NOWHERE :: Grid_Area{everywhere = false, low_x = 1, low_y = 1, high_x = 0, high_y = 0}
 
 // Whether a place is in an area.
 area_holds :: fun(area: Grid_Area, position: Vec3) -> bool {
@@ -200,16 +201,17 @@ choose_all_lights :: fun(scene: ^Scene) {
 
 // ---- cells -----------------------------------------------------------------------
 
-// Places a cell's references in the scene, those in the area only: their
-// instances (or, for meshes not yet loaded, their places in the queue),
-// the lights they give and the doors that lead somewhere.
-add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area) -> err {
+// Places a cell's references in the scene, those in area and not in placed
+// (where they're placed already): their instances (or, for meshes not yet
+// loaded, their places in the queue), the lights they give and the doors
+// that lead somewhere.
+add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, placed: Grid_Area) -> err {
 	references : [16384]Reference
 	cell_references(plugin, cell, &references)?
 	scratch : [4 * MB]byte
 	for reference in references {
 		if reference.flags & RECORD_DISABLED != 0 do continue
-		if not area_holds(area, reference.position) do continue
+		if not area_holds(area, reference.position) or area_holds(placed, reference.position) do continue
 		scratch.len = 0
 		base, base_error := find_record(plugin, reference.base, &scratch)
 		if base_error do continue
@@ -246,12 +248,17 @@ load_waiting :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, budget: u64)
 		if time_now() - start > budget do return false
 		item := scene.waiting_land[scene.waiting_land_next]
 		scene.waiting_land_next += 1
-		load_land(scene, plugin, item.cell, item.x, item.y, loader)
+		area := shown_area(scene)
+		inside := item.x >= area.low_x and item.x <= area.high_x and item.y >= area.low_y and item.y <= area.high_y
+		if inside do load_land(scene, plugin, item.cell, item.x, item.y, loader)
 	}
 	for scene.waiting_next < scene.waiting.len {
 		if time_now() - start > budget do return false
 		item := &scene.waiting[scene.waiting_next]
 		scene.waiting_next += 1
+		// (Outside, the camera may have moved on since it was queued.)
+		place := Vec3{item.world[3][0], item.world[3][1], item.world[3][2]}
+		if scene.world != 0 and not area_holds(shown_area(scene), place) do continue
 		model_index := scene_model(scene, loader, item.path[:])
 		if model_index >= 0 do add_instance(scene, model_index, item.world)
 	}
@@ -290,7 +297,7 @@ show_interior :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, loader: Loader) 
 	scene.world = 0
 	scratch : [1 * MB]byte
 	scene.lighting = cell_lighting(plugin, cell, &scratch)
-	add_cell(scene, plugin, cell, EVERYWHERE)?
+	add_cell(scene, plugin, cell, EVERYWHERE, NOWHERE)?
 	_ = load_waiting(scene, plugin, loader, 0xFFFFFFFFFFFFFFFF)
 	choose_all_lights(scene)
 }
@@ -367,18 +374,32 @@ exterior_lighting :: fun() -> Cell_Lighting {
 	return lighting
 }
 
+// The area of cells shown outside: around the cell it was loaded around.
+shown_area :: fun(scene: ^Scene) -> Grid_Area {
+	return area_around(scene.center_x, scene.center_y)
+}
+
 // Shows a world's cells around the one at x, y: their land and references,
 // and the world's persistent references among them. What's on the card
 // already shows at once; the rest waits to be loaded, the nearest cells'
-// first. Land loaded before and still in the area is kept.
+// first.
+//
+// Moving within the world shown, only what's changed is: what's left the
+// area is let go, and only the cells come into it are read and placed.
 show_exterior :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, x: i64, y: i64) -> err {
 	area := area_around(x, y)
-	drop_land(scene, area, scene.world != world_id)
-	scene_clear_cell(scene)
+	placed := NOWHERE   // what's placed already, and stays
+	if scene.world == world_id {
+		placed = shown_area(scene)
+		drop_outside(scene, area)
+	else
+		drop_land(scene, area, true)
+		scene_clear_cell(scene)
+		scene.lighting = exterior_lighting()
+	}
 	scene.world = world_id
 	scene.center_x = x
 	scene.center_y = y
-	scene.lighting = exterior_lighting()
 
 	// Ring by ring outward from the middle: the nearest wait first.
 	for ring in 0..EXTERIOR_RADIUS {
@@ -386,16 +407,55 @@ show_exterior :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, x: i64, y: i
 			for cell_x in x - ring..x + ring {
 				on_ring := cell_x == x - ring or cell_x == x + ring or cell_y == y - ring or cell_y == y + ring
 				if not on_ring do continue
+				already := cell_x >= placed.low_x and cell_x <= placed.high_x and cell_y >= placed.low_y and cell_y <= placed.high_y
+				if already do continue
 				cell := exterior_cell(plugin, world_id, cell_x, cell_y)
 				if cell == 0 do continue
 				if not land_loaded(scene, cell_x, cell_y) and scene.waiting_land.len < scene.waiting_land.cap {
 					&scene.waiting_land + Waiting_Land{cell = cell, x = cell_x, y = cell_y}
 				}
-				add_cell(scene, plugin, cell, EVERYWHERE)?
+				add_cell(scene, plugin, cell, EVERYWHERE, NOWHERE)?
 			}
 		}
 	}
 	persistent := persistent_cell(plugin, world_id)
-	if persistent != 0 do add_cell(scene, plugin, persistent, area)?
+	if persistent != 0 do add_cell(scene, plugin, persistent, area, placed)?
 	choose_all_lights(scene)
+	scene.lights_changed = true
+}
+
+// Lets go of what's placed outside an area: instances, lights and doors by
+// where they are, and land. The instances' lights are chosen again after,
+// as the lights' places in the list move.
+drop_outside :: fun(scene: ^Scene, area: Grid_Area) {
+	kept : i64 = 0
+	for k in 0:scene.instances.len {
+		placement := scene.instances[k].world
+		if area_holds(area, Vec3{placement[3][0], placement[3][1], placement[3][2]}) {
+			scene.instances[kept] = scene.instances[k]
+			kept += 1
+		}
+	}
+	scene.instances.len = kept
+
+	kept = 0
+	for k in 0:scene.lights.len {
+		if area_holds(area, scene.lights[k].position) {
+			scene.lights[kept] = scene.lights[k]
+			kept += 1
+		}
+	}
+	scene.lights.len = kept
+
+	kept = 0
+	for k in 0:scene.doors.len {
+		if area_holds(area, scene.doors[k].position) {
+			scene.doors[kept] = scene.doors[k]
+			kept += 1
+		}
+	}
+	scene.doors.len = kept
+
+	drop_land(scene, area, false)
+	// What still waits is let go as it comes up, if it's left the area.
 }

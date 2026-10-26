@@ -783,6 +783,8 @@ command_walk :: fun(name: []utf8, x: i64, y: i64, steps: i64) {
 		texture_count : i64 = 0
 		texture_ns : u64 = 0
 		for &item in walked.waiting {
+			// Placed as loading would place it (as model 0: there's no card here).
+			add_instance(&walked, 0, item.world)
 			_, known := known_model(&walked, item.path[:])
 			if known do continue
 			_ = index_put(&walked.paths, text_hash(item.path[:]), 1)

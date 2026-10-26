@@ -85,6 +85,7 @@ Viewer :: struct {
 
 	// Since the last summary: frames, refreshes missed, the longest, and
 	// the CPU's and card's time in all, in nanoseconds.
+	last_shown: u64     // when the last frame was shown
 	summary_since: u64
 	summary_frames: i64
 	summary_missed: i64
@@ -127,6 +128,7 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.drawing_time = 0
 	viewer.card_time = 0
 	viewer.waiting_time = 0
+	viewer.last_shown = time_now()
 	viewer.loading_time = 0
 	viewer.crossing_time = 0
 	start_summary(viewer)
@@ -209,9 +211,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 
 	seconds, now := time_since(viewer.frame_start)
 	viewer.frame_start = now
-	add_to_summary(viewer, u64(seconds * 1000000000))
-	viewer.loading_time = 0
-	viewer.crossing_time = 0
+
 	if platform.mouse_look {
 		camera.yaw += input.mouse_moved_x * 0.003
 		camera.pitch -= input.mouse_moved_y * 0.003
@@ -239,7 +239,14 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	waiting_start := time_now()
 	viewer.card_time = waiting_start - card_start
 	present(platform)
-	viewer.waiting_time = time_now() - waiting_start
+	shown_at := time_now()
+	viewer.waiting_time = shown_at - waiting_start
+	// The time since the last frame was shown: what's seen. (Loading and
+	// placing after a frame count toward the next.)
+	add_to_summary(viewer, shown_at - viewer.last_shown)
+	viewer.last_shown = shown_at
+	viewer.loading_time = 0
+	viewer.crossing_time = 0
 	note_gl_errors(viewer)
 	if not platform.vsync do wait_for_next_frame(viewer)
 	count_frame(viewer)
@@ -312,12 +319,13 @@ add_to_summary :: fun(viewer: ^Viewer, frame_length: u64) {
 	start_summary(viewer)
 }
 
-// Notes nanoseconds as milliseconds to a tenth: "2.4".
+// Notes nanoseconds as milliseconds to a hundredth: "2.41".
 note_milliseconds :: fun(journal: ^Journal, nanoseconds: u64) {
-	tenths := i64(nanoseconds / 100000)
-	note(journal, tenths / 10)
+	hundredths := i64(nanoseconds / 10000)
+	note(journal, hundredths / 100)
 	note(journal, ".")
-	note(journal, tenths % 10)
+	if hundredths % 100 < 10 do note(journal, "0")
+	note(journal, hundredths % 100)
 }
 
 // Notes a frame that missed a refresh, and where its time went: drawing
@@ -532,11 +540,13 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	scratch : [16 * MB]byte
 	journal := &viewer.journal
 	for true {
+		placed_this_frame := false
 		match view_frame(viewer) {
 		nothing
 		quit
 			return
 		crossed
+			placed_this_frame = true
 			x, y := grid_of(viewer.camera.position)
 			start := time_now()
 			show_error := show_exterior(&viewer.shown, plugin, viewer.shown.world, x, y)
@@ -574,7 +584,8 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 			viewer.camera.yaw = there.rotation.z
 			viewer.camera.pitch = 0
 		}
-		load_some(viewer, plugin)
+		// (Not on the frame that placed cells: it's had its share of work.)
+		if not placed_this_frame do load_some(viewer, plugin)
 	}
 }
 
