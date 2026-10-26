@@ -18,35 +18,36 @@ World_Error :: error {
 	Index_Full
 }
 
-// ---- finding records by form id ------------------------------------------
+// ---- finding records ---------------------------------------------------------
 
-// Where each record (or group) is in a plugin's data, by a form id: a table
-// a power of two in size, kept under half full; a form id is looked for
-// from its hash's slot onward.
-Form_Index :: struct {
-	keys: []u32       // form ids; 0 in an empty slot
-	places: []u32     // where in the data
+// A table from keys — form ids, or a world and a cell's place in it
+// (grid_key) — to values: where a record is, or another form id. A power of
+// two in size, kept under half full; a key is looked for from its hash's
+// slot onward.
+Key_Index :: struct {
+	keys: []u64       // 0 in an empty slot
+	values: []u32
 	count: i64
 }
 
 // An empty index with room for capacity entries (a power of two).
-form_index :: fun(capacity: i64, storage: ^[]byte) -> Form_Index {
-	keys := slice([:capacity]u32, storage)
-	places := slice([:capacity]u32, storage)
+key_index :: fun(capacity: i64, storage: ^[]byte) -> Key_Index {
+	keys := slice([:capacity]u64, storage)
+	values := slice([:capacity]u32, storage)
 	for i in 0:capacity {
-		&keys + u32(0)
-		&places + u32(0)
+		&keys + u64(0)
+		&values + u32(0)
 	}
-	return Form_Index{keys = keys, places = places, count = 0}
+	return Key_Index{keys = keys, values = values, count = 0}
 }
 
-// The slot a form id's search starts at.
-first_slot :: fun(index: ^Form_Index, key: u32) -> i64 {
-	mixed := (u64(key) *% 0x9E3779B97F4A7C15) >> 32
+// The slot a key's search starts at.
+first_slot :: fun(index: ^Key_Index, key: u64) -> i64 {
+	mixed := (key *% 0x9E3779B97F4A7C15) >> 32
 	return i64(mixed) & (index.keys.len - 1)
 }
 
-index_put :: fun(index: ^Form_Index, key: u32, place: i64) -> err {
+index_put :: fun(index: ^Key_Index, key: u64, value: i64) -> err {
 	if (index.count + 1) * 2 > index.keys.len do return Index_Full
 	slot := first_slot(index, key)
 	for index.keys[slot] != 0 and index.keys[slot] != key {
@@ -54,18 +55,24 @@ index_put :: fun(index: ^Form_Index, key: u32, place: i64) -> err {
 	}
 	if index.keys[slot] == 0 do index.count += 1
 	index.keys[slot] = key
-	index.places[slot] = u32(place)
+	index.values[slot] = u32(value)
 }
 
-// Where the form id's record is, and false when the index doesn't have it.
-index_get :: fun(index: ^Form_Index, key: u32) -> i64, bool {
+// The key's value, and false when the index doesn't have it.
+index_get :: fun(index: ^Key_Index, key: u64) -> i64, bool {
 	if key == 0 do return 0, false
 	slot := first_slot(index, key)
 	for index.keys[slot] != 0 {
-		if index.keys[slot] == key do return i64(index.places[slot]), true
+		if index.keys[slot] == key do return i64(index.values[slot]), true
 		slot = (slot + 1) & (index.keys.len - 1)
 	}
 	return 0, false
+}
+
+// The key of an exterior cell: its world, and its place on the world's
+// grid (cells 4096 units square, 0 0 the one north-east of the origin).
+grid_key :: fun(world: u32, x: i64, y: i64) -> u64 {
+	return (u64(world) << 32) | (u64(x & 0xFFFF) << 16) | u64(y & 0xFFFF)
 }
 
 // ---- a plugin, indexed ------------------------------------------------------
@@ -73,9 +80,12 @@ index_get :: fun(index: ^Form_Index, key: u32) -> i64, bool {
 // A plugin read into memory, with where its records and cells are.
 Plugin :: struct {
 	data: []byte
-	records: Form_Index         // each record by its form id
-	cell_children: Form_Index   // each cell's group of references, by the cell's form id
-	interior_cells_at: i64      // the top group of interior cells
+	records: Key_Index           // each record's place, by its form id
+	cell_children: Key_Index     // each cell's group of references' place, by the cell's form id
+	exterior_cells: Key_Index    // each exterior cell's form id, by grid_key
+	cell_worlds: Key_Index       // each exterior cell's world, by the cell's form id
+	persistent_cells: Key_Index  // each world's cell for its persistent references, by the world
+	interior_cells_at: i64       // the top group of interior cells
 	interior_cells_end: i64
 }
 
@@ -84,19 +94,35 @@ Plugin :: struct {
 index_plugin :: fun(data: []byte, storage: ^[]byte) -> Plugin, err {
 	plugin := Plugin{
 		data = data,
-		records = form_index(1 << 22, storage),
-		cell_children = form_index(1 << 17, storage),
+		records = key_index(1 << 22, storage),
+		cell_children = key_index(1 << 17, storage),
+		exterior_cells = key_index(1 << 17, storage),
+		cell_worlds = key_index(1 << 17, storage),
+		persistent_cells = key_index(1 << 10, storage),
 		interior_cells_at = 0,
 		interior_cells_end = 0}
+	// The world whose group the walk is in, where that group ends, and
+	// whether its blocks of cells have begun: the cell before them is the
+	// world's persistent one.
+	world : u32 = 0
+	world_end : i64 = 0
+	in_blocks := false
 	at : i64 = 0
 	for at < data.len {
 		if at + HEADER_SIZE > data.len do return plugin, Truncated
+		if world != 0 and at >= world_end do world = 0
 		header : Record_Header = data[at]
 		if header.kind[:] == "GRUP" {
 			group_header : Group_Header = data[at]
 			if group_header.group_type == GROUP_CELL_CHILDREN {
-				index_put(&plugin.cell_children, group_header.label, at)?
+				index_put(&plugin.cell_children, u64(group_header.label), at)?
 			}
+			if group_header.group_type == GROUP_WORLD_CHILDREN {
+				world = group_header.label
+				world_end = at + i64(group_header.size)
+				in_blocks = false
+			}
+			if group_header.group_type == GROUP_EXTERIOR_BLOCK do in_blocks = true
 			if group_header.group_type == GROUP_TOP {
 				label : [4!]utf8 = data[at + 8]
 				if label[:] == "CELL" {
@@ -107,8 +133,21 @@ index_plugin :: fun(data: []byte, storage: ^[]byte) -> Plugin, err {
 			at += HEADER_SIZE
 			continue
 		}
-		if header.form_id != 0 do index_put(&plugin.records, header.form_id, at)?
-		at += HEADER_SIZE + i64(header.size)
+		next_at := at + HEADER_SIZE + i64(header.size)
+		if header.form_id != 0 do index_put(&plugin.records, u64(header.form_id), at)?
+		if world != 0 and header.kind[:] == "CELL" {
+			index_put(&plugin.cell_worlds, u64(header.form_id), i64(world))?
+			body := data[at + HEADER_SIZE : next_at]
+			grid, has_grid := find_field(body, "XCLC")
+			if not in_blocks {
+				index_put(&plugin.persistent_cells, u64(world), i64(header.form_id))?
+			elif has_grid and grid.len >= 8
+				x : i32 = grid[0]
+				y : i32 = grid[4]
+				index_put(&plugin.exterior_cells, grid_key(world, i64(x), i64(y)), i64(header.form_id))?
+			}
+		}
+		at = next_at
 	}
 	return plugin
 }
@@ -129,7 +168,7 @@ record_at :: fun(plugin: ^Plugin, at: i64, scratch: ^[]byte) -> Record, err {
 
 // The record with a form id.
 find_record :: fun(plugin: ^Plugin, form_id: u32, scratch: ^[]byte) -> Record, err {
-	at, found := index_get(&plugin.records, form_id)
+	at, found := index_get(&plugin.records, u64(form_id))
 	if not found do return Record{header = Record_Header{0}, data = plugin.data[0:0]}, No_Such_Record
 	return record_at(plugin, at, scratch)
 }
@@ -195,7 +234,7 @@ Reference :: struct {
 // The references in a cell (REFR records; actors aren't yet), into
 // references.
 cell_references :: fun(plugin: ^Plugin, cell: u32, references: ^[]Reference) -> err {
-	group_at, found := index_get(&plugin.cell_children, cell)
+	group_at, found := index_get(&plugin.cell_children, u64(cell))
 	if not found do return
 	group_header : Group_Header = plugin.data[group_at]
 	end := group_at + i64(group_header.size)
@@ -385,14 +424,57 @@ door_destination :: fun(plugin: ^Plugin, reference: u32, scratch: ^[]byte) -> Do
 // The cell a reference is in: the one whose group of references holds its
 // record. 0 when none does.
 cell_of_reference :: fun(plugin: ^Plugin, reference: u32) -> u32 {
-	at, found := index_get(&plugin.records, reference)
+	at, found := index_get(&plugin.records, u64(reference))
 	if not found do return 0
 	cells := &plugin.cell_children
 	for key, slot in cells.keys {
 		if key == 0 do continue
-		group_at := i64(cells.places[slot])
+		group_at := i64(cells.values[slot])
 		group_header : Group_Header = plugin.data[group_at]
-		if at > group_at and at < group_at + i64(group_header.size) do return key
+		if at > group_at and at < group_at + i64(group_header.size) do return u32(key)
+	}
+	return 0
+}
+
+// ---- exterior cells ------------------------------------------------------------
+
+// The size of an exterior cell, in units.
+CELL_SIZE :: 4096
+
+// The world an exterior cell is in, 0 for an interior one.
+cell_world :: fun(plugin: ^Plugin, cell: u32) -> u32 {
+	world, found := index_get(&plugin.cell_worlds, u64(cell))
+	if not found do return 0
+	return u32(world)
+}
+
+// The exterior cell at a place on a world's grid, 0 when there's none.
+exterior_cell :: fun(plugin: ^Plugin, world: u32, x: i64, y: i64) -> u32 {
+	cell, found := index_get(&plugin.exterior_cells, grid_key(world, x, y))
+	if not found do return 0
+	return u32(cell)
+}
+
+// The world's cell holding its persistent references (doors, quest
+// things…), 0 when it has none.
+persistent_cell :: fun(plugin: ^Plugin, world: u32) -> u32 {
+	cell, found := index_get(&plugin.persistent_cells, u64(world))
+	if not found do return 0
+	return u32(cell)
+}
+
+// The place on the grid a point in the world is in.
+grid_of :: fun(position: Vec3) -> i64, i64 {
+	return i64(floor_f32(position.x / CELL_SIZE)), i64(floor_f32(position.y / CELL_SIZE))
+}
+
+// The world whose editor id is name (any letter case): its form id.
+find_world :: fun(plugin: ^Plugin, name: []utf8, scratch: ^[]byte) -> u32 {
+	for key, slot in plugin.persistent_cells.keys {
+		if key == 0 do continue
+		record, record_error := find_record(plugin, u32(key), scratch)
+		if record_error do continue
+		if compare_folded(editor_id(record.data), name) == 0 do return u32(key)
 	}
 	return 0
 }

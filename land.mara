@@ -1,0 +1,244 @@
+// The ground of exterior cells: each cell's LAND record — heights,
+// normals, colors and texture layers — made into a model to draw.
+//
+// A cell's land is 33 by 33 vertices, 128 units apart, row by row from
+// the south, each row west to east. Its texturing is by quarters
+// (quadrants: south-west, south-east, north-west, north-east; 17 by 17
+// vertices, sharing their edges): a base texture, then up to eight layers
+// laid over it, each as opaque at each vertex as its VTXT says.
+module land
+
+use mara.core
+use mara.math
+use mara.string
+use esm
+use world
+use model
+
+LAND_SIDE :: 33        // vertices along a cell's side
+LAND_SPACING :: 128    // units between them
+QUADRANT_SIDE :: 17    // vertices along a quadrant's side
+// How many times a land texture repeats across a quadrant.
+TEXTURE_REPEATS :: 6
+// The texture under a quadrant whose LAND names none.
+DEFAULT_LAND_TEXTURE :: "textures\\landscape\\terrainhddirt01.dds"
+
+// A texture laid over a quadrant: an LTEX record, and how opaque it is at
+// each of the quadrant's vertices.
+Land_Layer :: struct {
+	texture: u32
+	opacity: [289!]f32    // 17 x 17, row by row from the south
+}
+
+// A quadrant's texturing: its base texture (an LTEX, 0 for the default),
+// and the layers over it.
+Land_Quadrant :: struct {
+	base: u32
+	layers: [8]Land_Layer
+}
+
+// A cell's land, read.
+Land :: struct {
+	heights: [1089!]f32    // 33 x 33
+	normals: [1089!]Vec3
+	colors: [1089!]Vec3
+	quadrants: [4!]Land_Quadrant
+}
+
+// Reads a LAND record's fields into land.
+read_land :: fun(data: []byte, land: ^Land) {
+	for i in 0:LAND_SIDE * LAND_SIDE {
+		land.heights[i] = 0
+		land.normals[i] = Vec3{0, 0, 1}
+		land.colors[i] = Vec3{1, 1, 1}
+	}
+	for q in 0:4 {
+		land.quadrants[q].base = 0
+		land.quadrants[q].layers.len = 0
+	}
+	// The quadrant and layer an ATXT starts: its VTXT comes next.
+	layer_quadrant : i64 = -1
+	fields := Fields{data = data, at = 0, broken = false}
+	for field in next_field(&fields) {
+		kind := field.kind[:]
+		bytes := field.data
+		if kind == "VHGT" and bytes.len >= 4 + 1089 {
+			read_heights(bytes, land)
+		elif kind == "VNML" and bytes.len >= 1089 * 3
+			for i in 0:1089 {
+				x : i8 = bytes[i * 3]
+				y : i8 = bytes[i * 3 + 1]
+				z : i8 = bytes[i * 3 + 2]
+				land.normals[i] = vec3_normalize(Vec3{f32(x), f32(y), f32(z)})
+			}
+		elif kind == "VCLR" and bytes.len >= 1089 * 3
+			for i in 0:1089 do land.colors[i] = byte_color(bytes, i * 3)
+		elif kind == "BTXT" and bytes.len >= 8
+			texture : u32 = bytes[0]
+			quadrant : u8 = bytes[4]
+			if quadrant < 4 do land.quadrants[i64(quadrant)].base = texture
+		elif kind == "ATXT" and bytes.len >= 8
+			texture : u32 = bytes[0]
+			quadrant : u8 = bytes[4]
+			layer_quadrant = -1
+			layers := &land.quadrants[i64(quadrant) & 3].layers
+			if quadrant < 4 and layers.len < layers.cap {
+				layer_quadrant = i64(quadrant)
+				layer := next(layers)
+				layer.texture = texture
+				for k in 0:289 do layer.opacity[k] = 0
+			}
+		elif kind == "VTXT" and layer_quadrant >= 0
+			layers := &land.quadrants[layer_quadrant].layers
+			layer := &layers[layers.len - 1]
+			// Each entry: the vertex (0 to 288), 2 bytes unused, the opacity.
+			for k in 0:bytes.len / 8 {
+				place : u16 = bytes[k * 8]
+				opacity : f32 = bytes[k * 8 + 4]
+				if place < 289 do layer.opacity[i64(place)] = opacity
+			}
+			layer_quadrant = -1
+		}
+	}
+}
+
+// VHGT: a starting height, then a change for each vertex — from the vertex
+// before it in its row, or for a row's first, from the first of the row
+// below. In units of 8.
+read_heights :: fun(bytes: []byte, land: ^Land) {
+	row_start : f32 = bytes[0]
+	for y in 0:LAND_SIDE {
+		first_change : i8 = bytes[4 + y * LAND_SIDE]
+		row_start += f32(first_change)
+		height := row_start
+		land.heights[y * LAND_SIDE] = height * 8
+		for x in 1:LAND_SIDE {
+			change : i8 = bytes[4 + y * LAND_SIDE + x]
+			height += f32(change)
+			land.heights[y * LAND_SIDE + x] = height * 8
+		}
+	}
+}
+
+// The LAND record of an exterior cell: its place in the plugin's data, and
+// false when the cell has none.
+find_land :: fun(plugin: ^Plugin, cell: u32) -> i64, bool {
+	group_at, found := index_get(&plugin.cell_children, u64(cell))
+	if not found do return 0, false
+	group_header : Group_Header = plugin.data[group_at]
+	end := group_at + i64(group_header.size)
+	at := group_at + HEADER_SIZE
+	for at < end {
+		header : Record_Header = plugin.data[at]
+		if header.kind[:] == "GRUP" {
+			at += HEADER_SIZE
+			continue
+		}
+		if header.kind[:] == "LAND" do return at, true
+		at += HEADER_SIZE + i64(header.size)
+	}
+	return 0, false
+}
+
+// The archive path of an LTEX record's texture, into path; the default
+// one when the record can't be read.
+land_texture_path :: fun(plugin: ^Plugin, texture: u32, path: ^[160]utf8, scratch: ^[]byte) {
+	path.len = 0
+	if texture != 0 {
+		record, record_error := find_record(plugin, texture, scratch)
+		if not record_error {
+			icon, has_icon := find_field(record.data, "ICON")
+			if has_icon {
+				path + "textures\\landscape\\"
+				for c in field_text(icon) {
+					if path.len == path.cap do break
+					if c == '/' do path + '\\'
+					else do path + lower(c)
+				}
+				return
+			}
+		}
+	}
+	path + DEFAULT_LAND_TEXTURE
+}
+
+// Makes the model of a cell's land at a place on the grid, its vertices
+// in the world's space: for each quadrant, a part with its base texture
+// and one blended part for each layer.
+build_land_model :: fun(plugin: ^Plugin, land: ^Land, cell_x: i64, cell_y: i64, storage: ^[]byte) -> Model {
+	built := Model{
+		parts = slice([:36]Model_Part, storage),
+		bounds_min = Vec3{1000000, 1000000, 1000000},
+		bounds_max = Vec3{-1000000, -1000000, -1000000}}
+	scratch : [64 * 1024]byte
+	for q in 0:4 {
+		quadrant := &land.quadrants[q]
+		first_x := (q & 1) * (QUADRANT_SIDE - 1)
+		first_y := (q >> 1) * (QUADRANT_SIDE - 1)
+
+		base := add_land_part(&built, land, cell_x, cell_y, first_x, first_y, storage)
+		scratch.len = 0
+		land_texture_path(plugin, quadrant.base, &base.texture, &scratch)
+
+		for &layer in quadrant.layers {
+			part := add_land_part(&built, land, cell_x, cell_y, first_x, first_y, storage)
+			scratch.len = 0
+			land_texture_path(plugin, layer.texture, &part.texture, &scratch)
+			part.alpha_blend = true
+			for k in 0:289 do part.vertices[k].color[3] = layer.opacity[k]
+		}
+	}
+	return built
+}
+
+// Adds a part with a quadrant's vertices and triangles, white and opaque,
+// its texture still to set.
+add_land_part :: fun(built: ^Model, land: ^Land, cell_x: i64, cell_y: i64, first_x: i64, first_y: i64, storage: ^[]byte) -> ^Model_Part {
+	origin_x := f32(cell_x * CELL_SIZE)
+	origin_y := f32(cell_y * CELL_SIZE)
+	vertices := slice([:289]Vertex, storage)
+	for row in 0:QUADRANT_SIDE {
+		for column in 0:QUADRANT_SIDE {
+			x := first_x + column
+			y := first_y + row
+			k := y * LAND_SIDE + x
+			color := land.colors[k]
+			position := Vec3{origin_x + f32(x * LAND_SPACING), origin_y + f32(y * LAND_SPACING), land.heights[k]}
+			&vertices + Vertex{
+				position = position,
+				normal = land.normals[k],
+				uv = [f32(column) * TEXTURE_REPEATS / 16, f32(row) * TEXTURE_REPEATS / 16],
+				color = [color.x, color.y, color.z, 1]}
+			grow_bounds(built, position)
+		}
+	}
+	// Two triangles for each square, counter-clockwise seen from above.
+	indices := slice([:16 * 16 * 6]u16, storage)
+	for row in 0:QUADRANT_SIDE - 1 {
+		for column in 0:QUADRANT_SIDE - 1 {
+			south_west := u16(row * QUADRANT_SIDE + column)
+			south_east := south_west + 1
+			north_west := south_west + u16(QUADRANT_SIDE)
+			north_east := north_west + 1
+			&indices + south_west
+			&indices + south_east
+			&indices + north_east
+			&indices + south_west
+			&indices + north_east
+			&indices + north_west
+		}
+	}
+	part := next(&built.parts)
+	part.vertices = vertices
+	part.indices = indices
+	part.texture.len = 0
+	part.glow_texture.len = 0
+	part.alpha_blend = false
+	part.alpha_test = false
+	part.alpha_threshold = 0
+	part.two_sided = false
+	part.diffuse = Vec3{1, 1, 1}
+	part.emissive = Vec3{0, 0, 0}
+	part.alpha = 1
+	return part
+}

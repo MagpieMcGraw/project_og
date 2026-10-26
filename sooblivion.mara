@@ -21,6 +21,7 @@ use png
 use model
 use world
 use scene
+use land
 render :: use render
 use mara.math
 use sdl_platform
@@ -409,7 +410,8 @@ load_oblivion :: fun(data_storage: ^[]byte, index_storage: ^[]byte) -> Plugin, e
 	start := time_now()
 	data := read_entire_file(path, data_storage)?
 	plugin := index_plugin(data, index_storage)?
-	print("indexed % records of % in % ms", plugin.records.count, path, elapsed_ms(start))
+	print("indexed % records of % in % ms: % cells with references, % exterior cells, % worlds with persistent cells",
+		plugin.records.count, path, elapsed_ms(start), plugin.cell_children.count, plugin.exterior_cells.count, plugin.persistent_cells.count)
 	return plugin
 }
 
@@ -548,6 +550,89 @@ command_cell :: fun(name: []utf8) {
 	print("% references' meshes loaded", loaded)
 }
 
+// `sooblivion map [world]`: draws a world's land as a picture, map.png:
+// 8 pixels for each cell's side, its heights shaded, below water blue.
+command_map :: fun(name: []utf8) {
+	data_storage : [400 * MB]byte
+	index_storage : [96 * MB]byte
+	plugin, load_error := load_oblivion(&data_storage, &index_storage)
+	if load_error {
+		print("couldn't load the plugin: %", load_error)
+		return
+	}
+	scratch : [16 * MB]byte
+	world_id := find_world(&plugin, name, &scratch)
+	if world_id == 0 {
+		print("no world %", name)
+		return
+	}
+	// The world's cells' extent on the grid.
+	low_x : i64 = 1000000
+	low_y : i64 = 1000000
+	high_x : i64 = -1000000
+	high_y : i64 = -1000000
+	for key in plugin.exterior_cells.keys {
+		if key == 0 or u32(key >> 32) != world_id do continue
+		x := i64(i16(u16((key >> 16) & 0xFFFF)))
+		y := i64(i16(u16(key & 0xFFFF)))
+		if x < low_x do low_x = x
+		if x > high_x do high_x = x
+		if y < low_y do low_y = y
+		if y > high_y do high_y = y
+	}
+	print("% cells from % % to % %", plugin.exterior_cells.count, low_x, low_y, high_x, high_y)
+
+	PIXELS_PER_CELL :: 8
+	width := (high_x - low_x + 1) * PIXELS_PER_CELL
+	height := (high_y - low_y + 1) * PIXELS_PER_CELL
+	pixels : [64 * MB]byte
+	for i in 0:width * height * 4 do &pixels + u8(0)
+	cell_land : Land
+	lands : i64 = 0
+	for cell_y in low_y..high_y {
+		for cell_x in low_x..high_x {
+			cell := exterior_cell(&plugin, world_id, cell_x, cell_y)
+			if cell == 0 do continue
+			land_at, has_land := find_land(&plugin, cell)
+			if not has_land do continue
+			scratch.len = 0
+			record, record_error := record_at(&plugin, land_at, &scratch)
+			if record_error do continue
+			read_land(record.data, &cell_land)
+			lands += 1
+			for row in 0:PIXELS_PER_CELL {
+				for column in 0:PIXELS_PER_CELL {
+					vertex := (row * 4) * LAND_SIDE + column * 4
+					ground := cell_land.heights[vertex]
+					// The picture's rows go down from the north.
+					x := (cell_x - low_x) * PIXELS_PER_CELL + column
+					y := (high_y - cell_y) * PIXELS_PER_CELL + (PIXELS_PER_CELL - 1 - row)
+					at := (y * width + x) * 4
+					shade := cell_land.normals[vertex].z * 0.6 + 0.4
+					if ground < 0 {
+						pixels[at] = u8(40)
+						pixels[at + 1] = u8(70)
+						pixels[at + 2] = u8(140)
+					else
+						level := ground / 16000
+						if level > 1 do level = 1
+						pixels[at] = u8(255 * shade * (0.35 + level * 0.6))
+						pixels[at + 1] = u8(255 * shade * (0.55 + level * 0.4))
+						pixels[at + 2] = u8(255 * shade * (0.25 + level * 0.7))
+					}
+					pixels[at + 3] = u8(255)
+				}
+			}
+		}
+	}
+	png_storage : [80 * MB]byte
+	row_storage : [80 * MB]byte
+	encode_png(pixels[:], width, height, &png_storage, &row_storage)
+	write_error := write_entire_file("map.png", png_storage[:])
+	if write_error do print("couldn't write map.png: %", write_error)
+	else do print("wrote map.png: % x %, % cells with land", width, height, lands)
+}
+
 usage :: fun() {
 	print("sooblivion esm [plugin]            what a plugin holds, by record type")
 	print("sooblivion bsa <archive>           an archive's folders and files")
@@ -576,6 +661,9 @@ main :: (args: [][]utf8) {
 		else do command_cells("")
 	elif command == "view-cell" and args.len > 2
 		command_view_cell(args[2])
+	elif command == "map"
+		if args.len > 2 do command_map(args[2])
+		else do command_map("Tamriel")
 	elif command == "cell" and args.len > 2
 		command_cell(args[2])
 	elif command == "textures"
