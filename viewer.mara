@@ -293,11 +293,12 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	leading := leading_door(shown, targeted)
 	usable := leading >= 0 or (targeted != 0 and swings(shown, targeted))
 	if input.pressed[E] and usable {
-		// The door's sound: opening, or (one open) closing — heard on after
-		// going through, where the door was.
-		opening := leading >= 0 or not door_open(shown, targeted)
-		sound, place := door_sound(shown, targeted, opening)
-		if sound >= 0 do play_once(&viewer.audio, &viewer.sounds, &shown.sound_kinds[sound], place, listener_of(camera^))
+		// The door's opening sound — heard on after going through, where the
+		// door was. (A door closing sounds when it shuts.)
+		if leading >= 0 or not door_open(shown, targeted) {
+			sound, place := door_sound(shown, targeted, true)
+			if sound >= 0 do play_once(&viewer.audio, &viewer.sounds, &shown.sound_kinds[sound], place, listener_of(camera^))
+		}
 		if leading >= 0 {
 			viewer.chosen_door = leading
 			return .door
@@ -348,7 +349,12 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	}
 
 	pass_time(viewer, f32(seconds), input.held[T])
-	swing_doors(shown, f32(seconds))
+	shut : [16]u32
+	swing_doors(shown, f32(seconds), &shut)
+	for shut_door in shut {
+		sound, place := door_sound(shown, shut_door, false)
+		if sound >= 0 do play_once(&viewer.audio, &viewer.sounds, &shown.sound_kinds[sound], place, listener_of(camera^))
+	}
 	if change_lights(shown, f32(seconds)) do shown.lights_changed = true
 	drawing_start := time_now()
 	if shown.waters_changed {

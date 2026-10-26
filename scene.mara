@@ -1014,8 +1014,9 @@ swings :: fun(scene: ^Scene, reference: u32) -> bool {
 }
 
 // Moves the doors that are opening or closing on by a frame: their
-// pieces' instances posed as their tracks say, until they're done.
-swing_doors :: fun(scene: ^Scene, seconds: f32) {
+// pieces' instances posed as their tracks say, until they're done. The
+// doors that shut in this frame (closing, now closed) go into shut.
+swing_doors :: fun(scene: ^Scene, seconds: f32, shut: ^[]u32) {
 	for &door in scene.swinging {
 		if not door.moving do continue
 		kind := &scene.door_kinds[door.kind]
@@ -1027,6 +1028,7 @@ swing_doors :: fun(scene: ^Scene, seconds: f32) {
 			at = stop
 			door.moving = false
 			door.open = door.opening
+			if not door.opening and shut.len < shut.cap do shut + door.reference
 		}
 		for &piece in kind.pieces {
 			track := if door.opening do &piece.opening else &piece.closing
