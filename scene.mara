@@ -24,6 +24,7 @@ use render
 use world
 use esm
 use land
+use grass
 
 // How many cells around the camera's are loaded outside: 2 is 5 by 5.
 EXTERIOR_RADIUS :: 2
@@ -86,6 +87,7 @@ Scene :: struct {
 	center_x: i64                // the cell the exterior was loaded around
 	center_y: i64
 	grounds: [LAND_SLOTS]Gpu_Land
+	grass_cells: [LAND_SLOTS]Gpu_Grass   // each land's grass, in its land's slot
 	waters: [WATER_SLOTS]Water_Cell
 	waters_changed: bool         // since the renderer was last given them (upload_waters)
 
@@ -101,6 +103,14 @@ Scene :: struct {
 	kinds: [1024]Tree_Kind
 	waiting_trees: [TREE_CELLS]Waiting_Land
 	waiting_trees_next: i64
+
+	// Grass: each kind's look and model (by its GRAS's form id: its index
+	// + 1; 0 for one that can't be drawn), and each land texture's grasses
+	// (by its LTEX's form id: its index + 1).
+	grass_index: Key_Index
+	grass_kinds: [256]Grass_Kind
+	texture_grass_index: Key_Index
+	texture_grasses: [1024]Texture_Grasses
 
 	// What's still to load, in order, and how far along that is.
 	waiting: [16384]Waiting_Instance
@@ -143,6 +153,11 @@ scene_clear :: fun(scene: ^Scene, storage: ^[]byte) {
 	scene.world = 0
 	scene.tree_kinds = key_index(1 << 11, storage)
 	scene.kinds.len = 0
+	scene.grass_index = key_index(1 << 9, storage)
+	scene.grass_kinds.len = 0
+	scene.texture_grass_index = key_index(1 << 11, storage)
+	scene.texture_grasses.len = 0
+	scene.grass_cells.len = 0
 	drop_trees(scene, NOWHERE)
 	scene.trees_world = 0
 	scene_clear_cell(scene)
@@ -517,6 +532,18 @@ drop_land :: fun(scene: ^Scene, area: Grid_Area, all: bool) {
 			k += 1
 		}
 	}
+	// The grass goes with its land.
+	k = 0
+	for k < scene.grass_cells.len {
+		cell := &scene.grass_cells[k]
+		inside := cell.x >= area.low_x and cell.x <= area.high_x and cell.y >= area.low_y and cell.y <= area.high_y
+		if all or not inside {
+			scene.grass_cells[k] = scene.grass_cells[scene.grass_cells.len - 1]
+			scene.grass_cells.len -= 1
+		else
+			k += 1
+		}
+	}
 }
 
 // Whether the land of the cell at x, y is on the card.
@@ -555,6 +582,83 @@ load_land :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64, load
 	mesh : Land_Mesh
 	build_land_mesh(plugin, &cell_land, x, y, &mesh)
 	&scene.grounds + upload_land(loader.renderer, &mesh, x, y, slot, loader.textures, &room.texture)
+	load_grass(scene, plugin, cell, x, y, &cell_land, slot, loader)
+}
+
+// ---- grass ----------------------------------------------------------------------
+
+// Places a cell's grass over its land and puts it on the card, in the
+// land's slot.
+load_grass :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64, cell_land: ^Land, slot: i64, loader: Loader) {
+	if scene.grass_cells.len == scene.grass_cells.cap do return
+	// The grasses of each texture in the land.
+	textures : [40]Texture_Grasses
+	for &quadrant in cell_land.quadrants {
+		add_texture_grasses(scene, plugin, quadrant.base, &textures, loader)
+		for &layer in quadrant.layers do add_texture_grasses(scene, plugin, layer.texture, &textures, loader)
+	}
+	scratch : [64 * KB]byte
+	water_height, has_water := cell_water(plugin, cell, &scratch)
+	if not has_water do water_height = -1000000
+	blades : [GRASS_PER_CELL]Placed_Grass
+	place_grass(cell_land, x, y, water_height, textures[:], &scene.grass_kinds, &blades)
+	&scene.grass_cells + upload_grass(loader.renderer, &scene.models, &blades, x, y, slot)
+}
+
+// Adds a land texture's grasses to textures, unless they're there.
+add_texture_grasses :: fun(scene: ^Scene, plugin: ^Plugin, texture: u32, textures: ^[]Texture_Grasses, loader: Loader) {
+	if texture == 0 or textures.len == textures.cap do return
+	for &entry in textures {
+		if entry.texture == texture do return
+	}
+	textures + texture_grasses_of(scene, plugin, texture, loader)
+}
+
+// A land texture's grasses (its first GRASSES_PER_TEXTURE GNAMs): the
+// scene's kinds, read and their models loaded the first time.
+texture_grasses_of :: fun(scene: ^Scene, plugin: ^Plugin, texture: u32, loader: Loader) -> Texture_Grasses {
+	known, seen := index_get(&scene.texture_grass_index, u64(texture))
+	if seen do return scene.texture_grasses[known - 1]
+	grasses := Texture_Grasses{texture = texture, kinds = [-1, -1]}
+	scratch : [64 * KB]byte
+	record, record_error := find_record(plugin, texture, &scratch)
+	if not record_error {
+		count : i64 = 0
+		fields := Fields{data = record.data, at = 0, broken = false}
+		for field in next_field(&fields) {
+			if field.kind != "GNAM" or field.data.len < 4 or count == GRASSES_PER_TEXTURE do continue
+			grass_id : u32 = field.data[0]
+			grasses.kinds[count] = grass_kind(scene, plugin, grass_id, loader)
+			count += 1
+		}
+	}
+	if scene.texture_grasses.len < scene.texture_grasses.cap {
+		&scene.texture_grasses + grasses
+		_ = index_put(&scene.texture_grass_index, u64(texture), scene.texture_grasses.len)
+	}
+	return grasses
+}
+
+// A grass's kind in the scene: its look read and its model loaded the
+// first time; -1 when it can't be drawn.
+grass_kind :: fun(scene: ^Scene, plugin: ^Plugin, grass_id: u32, loader: Loader) -> i64 {
+	known, seen := index_get(&scene.grass_index, u64(grass_id))
+	if seen do return known - 1
+	kind_index : i64 = -1
+	scratch : [64 * KB]byte
+	record, record_error := find_record(plugin, grass_id, &scratch)
+	if not record_error and scene.grass_kinds.len < scene.grass_kinds.cap {
+		look, readable := read_grass_look(record)
+		if readable {
+			grass_model := scene_model(scene, loader, look.model[:])
+			if grass_model >= 0 {
+				&scene.grass_kinds + Grass_Kind{look = look, model = grass_model}
+				kind_index = scene.grass_kinds.len - 1
+			}
+		}
+	}
+	_ = index_put(&scene.grass_index, u64(grass_id), kind_index + 1)
+	return kind_index
 }
 
 // The lighting outside, until weather is read: daylight, and fog hiding

@@ -74,6 +74,14 @@ TREE_CELLS :: 1024
 TREES_PER_CELL :: 128
 TREE_RUNS :: 16
 
+// Grass: blades a cell's land can have at once (its grid has 51 x 51
+// points), the parts of its kinds of grass; where it thins out to nothing
+// (the game's fGrassStartFadeDistance and fGrassEndDistance).
+GRASS_PER_CELL :: 4096
+GRASS_RUNS :: 32
+GRASS_FADE_START :: 7000
+GRASS_FADE_END :: 8000
+
 // The cells left out of the far land and water — those drawn in full —
 // are a bit each, HIDDEN_SIDE x HIDDEN_SIDE of them around the camera's.
 HIDDEN_SIDE :: 16
@@ -410,6 +418,106 @@ void main() {
 	if (color.a < 0.5) discard;
 	// The picture is shaded already: lit as a whole, more as the sun's higher.
 	vec3 lit = color.rgb * brightness * (ambient_color + sun_color * (0.35 + 0.4 * max(sun_direction.z, 0.0)));
+	if (fog_far > fog_near) {
+		float fog = clamp((length(world_position - camera_position) - fog_near) / (fog_far - fog_near), 0.0, 1.0);
+		lit = mix(lit, fog_color, fog);
+	}
+	fragment_color = vec4(lit, 1.0);
+}
+"
+
+// Grass: each blade an instance of its grass's mesh (from the shared mesh
+// buffers), turned about z, scaled, stood along the way it stands, swaying
+// — the higher, the more — in a wave across the field; lit as the land
+// under it is. Past fade_start blades go, each at its own distance, till
+// none are left at fade_end.
+GRASS_VERTEX_SHADER :: "
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec3 normal;
+layout(location = 2) in vec2 uv;
+layout(location = 3) in vec4 color;
+layout(location = 4) in vec4 place;        // where it stands; its turn about z
+layout(location = 5) in vec4 stand;        // the way it stands; its width
+layout(location = 6) in vec4 lit_by;       // the land's normal under it; its height
+layout(location = 7) in vec4 look;         // its brightness, alpha threshold, sway period
+layout(location = 8) in uvec2 texture_in;
+uniform mat4 view_projection;
+uniform vec3 camera_position;
+uniform float time;
+uniform float fade_start;
+uniform float fade_end;
+out vec3 world_position;
+out vec2 texture_uv;
+out vec4 vertex_color;
+out vec3 land_normal;
+flat out float brightness;
+flat out float threshold;
+flat out uvec2 texture_handle;
+
+void main() {
+	float away = distance(camera_position.xy, place.xy);
+	float fade = clamp((away - fade_start) / (fade_end - fade_start), 0.0, 1.0);
+	float its_own = fract(sin(dot(place.xy, vec2(12.9898, 78.233))) * 43758.5453);
+	if (its_own < fade) {
+		gl_Position = vec4(0.0, 0.0, -2.0, 1.0);   // (gone: behind the near plane)
+		return;
+	}
+	vec3 local = position * vec3(stand.w, stand.w, lit_by.w);
+	float sway = sin(time * 6.2831853 / max(look.z * 0.1, 0.5) + dot(place.xy, vec2(0.004, 0.003)));
+	local.xy += vec2(0.8, 0.6) * sway * 0.1 * max(local.z, 0.0);
+	float c = cos(place.w);
+	float s = sin(place.w);
+	local.xy = vec2(c * local.x - s * local.y, s * local.x + c * local.y);
+	// Stood along the way it stands: straight up turned to it.
+	vec3 up = normalize(stand.xyz);
+	vec3 axis = vec3(-up.y, up.x, 0.0);
+	float sin_angle = length(axis);
+	if (sin_angle > 0.0001) {
+		axis /= sin_angle;
+		local = local * up.z + cross(axis, local) * sin_angle + axis * dot(axis, local) * (1.0 - up.z);
+	}
+	world_position = place.xyz + local;
+	texture_uv = uv;
+	vertex_color = color;
+	land_normal = lit_by.xyz;
+	brightness = look.x;
+	threshold = look.y;
+	texture_handle = texture_in;
+	gl_Position = view_projection * vec4(world_position, 1.0);
+}
+"
+
+GRASS_FRAGMENT_SHADER :: "
+in vec3 world_position;
+in vec2 texture_uv;
+in vec4 vertex_color;
+in vec3 land_normal;
+flat in float brightness;
+flat in float threshold;
+flat in uvec2 texture_handle;
+
+#ifdef BINDLESS
+vec4 picture() { return texture(sampler2D(texture_handle), texture_uv); }
+#else
+uniform sampler2D picture_texture;
+vec4 picture() { return texture(picture_texture, texture_uv); }
+#endif
+
+uniform vec3 sun_direction;
+uniform vec3 sun_color;
+uniform vec3 ambient_color;
+uniform vec3 camera_position;
+uniform vec3 fog_color;
+uniform float fog_near;
+uniform float fog_far;
+
+out vec4 fragment_color;
+
+void main() {
+	vec4 color = picture() * vertex_color;
+	if (color.a < threshold) discard;
+	vec3 normal = normalize(land_normal);
+	vec3 lit = color.rgb * brightness * (ambient_color + sun_color * max(dot(normal, sun_direction), 0.0));
 	if (fog_far > fog_near) {
 		float fog = clamp((length(world_position - camera_position) - fog_near) / (fog_far - fog_near), 0.0, 1.0);
 		lit = mix(lit, fog_color, fog);
@@ -762,6 +870,64 @@ Gpu_Trees :: struct {
 	runs: [TREE_RUNS]Tree_Run
 }
 
+// A blade of grass placed, before it's on the card: its grass's model,
+// where it stands, turned how far about z, its scales, the way it stands
+// and the land's normal under it, its shade, how slowly it sways.
+Placed_Grass :: struct {
+	model: i64
+	position: Vec3
+	angle: f32
+	width: f32
+	height: f32
+	up: Vec3
+	normal: Vec3
+	brightness: f32
+	wave_period: f32
+}
+
+// A blade as the grass program reads it: 72 bytes.
+Grass_Instance :: struct {
+	position: Vec3
+	angle: f32
+	up: Vec3
+	width: f32
+	normal: Vec3
+	height: f32
+	brightness: f32
+	threshold: f32         // its texture's alpha below this is left out
+	wave_period: f32
+	unused: f32
+	handle: u64            // its part's texture (bindless)
+}
+
+// A run of a cell's blades of one mesh part: drawn in one go.
+Grass_Run :: struct {
+	model: i64
+	part: i64              // in the renderer's parts
+	first: u32             // its first blade in the cell's slot
+	count: u32
+}
+
+// A cell's grass on the card: in the land's slot of the grass buffer, in
+// runs by mesh part, inside a sphere.
+Gpu_Grass :: struct {
+	x: i64
+	y: i64
+	slot: i64
+	center: Vec3
+	radius: f32
+	runs: [GRASS_RUNS]Grass_Run
+}
+
+// A grass program, and where its uniforms are.
+Grass_Program :: struct {
+	program: u32
+	shared: Shared_Uniforms
+	time_at: i32
+	fade_start_at: i32
+	fade_end_at: i32
+}
+
 // A tree program, and where its uniforms are.
 Tree_Program :: struct {
 	program: u32
@@ -874,6 +1040,7 @@ Renderer :: struct {
 	land_programs: [2!]Land_Program
 	distant_programs: [2!]Distant_Program
 	tree_programs: [2!]Tree_Program
+	grass_programs: [2!]Grass_Program
 	sky_program: Sky_Program
 	water_program: Water_Program
 	anisotropy: f32
@@ -913,6 +1080,13 @@ Renderer :: struct {
 	tree_index_buffer: u32
 	tree_indirect_buffer: u32
 	tree_commands: [8192]Draw_Command
+
+	// Grass: its instances (a slot of GRASS_PER_CELL for each land slot),
+	// drawn from the mesh buffers.
+	grass_vertex_array: u32
+	grass_instance_buffer: u32
+	grass_indirect_buffer: u32
+	grass_commands: [2048]Draw_Command
 
 	// The shared mesh buffers, and how much of them is used.
 	mesh_vertex_array: u32
@@ -969,8 +1143,10 @@ renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
 	make_water_program(&renderer.water_program)?
 	make_distant_program(&renderer.distant_programs[0], false)?
 	make_tree_program(&renderer.tree_programs[0], false)?
+	make_grass_program(&renderer.grass_programs[0], false)?
 	if renderer.bindless_available {
 		make_tree_program(&renderer.tree_programs[1], true)?
+		make_grass_program(&renderer.grass_programs[1], true)?
 		make_mesh_program(&renderer.mesh_programs[1], true)?
 		make_land_program(&renderer.land_programs[1], true)?
 		make_distant_program(&renderer.distant_programs[1], true)?
@@ -981,6 +1157,7 @@ renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
 	setup_water_buffers(renderer)
 	setup_distant_buffers(renderer)
 	setup_tree_buffers(renderer)
+	setup_grass_buffers(renderer)
 
 	renderer.parts.len = 0
 	// Every part's count and start, by its index: all there, all 0.
@@ -1129,6 +1306,16 @@ make_distant_program :: fun(made: ^Distant_Program, bindless: bool) -> err {
 make_tree_program :: fun(made: ^Tree_Program, bindless: bool) -> err {
 	made.program = compile_program(TREE_VERTEX_SHADER, TREE_FRAGMENT_SHADER, bindless)?
 	made.shared = find_shared_uniforms(made.program)
+	UseProgram(made.program)
+	if not bindless do Uniform1i(GetUniformLocation(made.program, "picture_texture"), 0)
+}
+
+make_grass_program :: fun(made: ^Grass_Program, bindless: bool) -> err {
+	made.program = compile_program(GRASS_VERTEX_SHADER, GRASS_FRAGMENT_SHADER, bindless)?
+	made.shared = find_shared_uniforms(made.program)
+	made.time_at = GetUniformLocation(made.program, "time")
+	made.fade_start_at = GetUniformLocation(made.program, "fade_start")
+	made.fade_end_at = GetUniformLocation(made.program, "fade_end")
 	UseProgram(made.program)
 	if not bindless do Uniform1i(GetUniformLocation(made.program, "picture_texture"), 0)
 }
@@ -1501,6 +1688,148 @@ draw_trees :: fun(renderer: ^Renderer, tree_cells: ^[]Gpu_Trees, hidden: ^Hidden
 			for run in cell.runs {
 				if k == renderer.tree_commands.len do break
 				BindTexture(TEXTURE_2D, renderer.textures[run.texture].id)
+				MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, usize(k * size_of(Draw_Command)), 1, 0)
+				stats.draw_calls += 1
+				k += 1
+			}
+		}
+	}
+	Enable(CULL_FACE)
+}
+
+// ---- grass ----------------------------------------------------------------------
+
+// The grass's buffers: the mesh buffers' vertices and indexes (set up
+// first: setup_mesh_buffers), read with the grass's instances.
+setup_grass_buffers :: fun(renderer: ^Renderer) {
+	GenVertexArrays(1, &renderer.grass_vertex_array)
+	BindVertexArray(renderer.grass_vertex_array)
+	BindBuffer(ARRAY_BUFFER, renderer.mesh_vertex_buffer)
+	stride := i32(size_of(Vertex))
+	EnableVertexAttribArray(0)
+	VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)    // position
+	EnableVertexAttribArray(1)
+	VertexAttribPointer(1, 3, FLOAT, 0, stride, 12)   // normal
+	EnableVertexAttribArray(2)
+	VertexAttribPointer(2, 2, FLOAT, 0, stride, 24)   // uv
+	EnableVertexAttribArray(3)
+	VertexAttribPointer(3, 4, FLOAT, 0, stride, 32)   // color
+	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.mesh_index_buffer)
+
+	GenBuffers(1, &renderer.grass_instance_buffer)
+	BindBuffer(ARRAY_BUFFER, renderer.grass_instance_buffer)
+	BufferData(ARRAY_BUFFER, LAND_SLOTS * GRASS_PER_CELL * size_of(Grass_Instance), [], STATIC_DRAW)
+	instance_stride := i32(size_of(Grass_Instance))
+	for column in 0:4 {
+		location := u32(4 + column)
+		EnableVertexAttribArray(location)
+		VertexAttribPointer(location, 4, FLOAT, 0, instance_stride, usize(column * 16))
+		VertexAttribDivisor(location, 1)
+	}
+	EnableVertexAttribArray(8)
+	VertexAttribIPointer(8, 2, UNSIGNED_INT, instance_stride, 64)   // texture handle
+	VertexAttribDivisor(8, 1)
+	BindVertexArray(0)
+	GenBuffers(1, &renderer.grass_indirect_buffer)
+}
+
+// Puts a cell's grass on the card in a land slot: its blades grouped into
+// runs by mesh part, each model's parts in turn. Blades past the slot's
+// room, or of parts past GRASS_RUNS, are left out.
+upload_grass :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, blades: ^[]Placed_Grass, x: i64, y: i64, slot: i64) -> Gpu_Grass {
+	placed := Gpu_Grass{x = x, y = y, slot = slot, center = Vec3{0, 0, 0}, radius = 0, runs = []}
+	if blades.len == 0 do return placed
+	instances : [GRASS_PER_CELL]Grass_Instance
+	low := blades[0].position
+	high := low
+	for k in 0:blades.len {
+		blade_model := blades[k].model
+		seen := false
+		for run in placed.runs {
+			if run.model == blade_model do seen = true
+		}
+		if seen do continue
+		gpu := models[blade_model]
+		for p in 0:gpu.part_count {
+			if placed.runs.len == placed.runs.cap do break
+			part_index := gpu.first_part + p
+			part := renderer.parts[part_index]
+			// Grass is cut out of its texture, whatever its alpha says.
+			threshold := part.alpha_threshold
+			if threshold <= 0 do threshold = 0.5
+			handle := renderer.textures[part.texture_slot].handle
+			run := next(&placed.runs)
+			run.model = blade_model
+			run.part = part_index
+			run.first = u32(instances.len)
+			run.count = 0
+			for &blade in blades[k : blades.len] {
+				if blade.model != blade_model or instances.len == instances.cap do continue
+				&instances + Grass_Instance{position = blade.position, angle = blade.angle, up = blade.up,
+					width = blade.width, normal = blade.normal, height = blade.height, brightness = blade.brightness,
+					threshold = threshold, wave_period = blade.wave_period, unused = 0, handle = handle}
+				run.count += 1
+				for axis in 0:3 {
+					if blade.position[axis] < low[axis] do low[axis] = blade.position[axis]
+					if blade.position[axis] > high[axis] do high[axis] = blade.position[axis]
+				}
+			}
+		}
+	}
+	// The sphere around them, with room for a tall blade.
+	placed.center = (low + high) * 0.5
+	placed.radius = vec3_length(high - low) * 0.5 + 200
+	if instances.len > 0 {
+		BindBuffer(ARRAY_BUFFER, renderer.grass_instance_buffer)
+		BufferSubData(ARRAY_BUFFER, isize(slot * GRASS_PER_CELL * size_of(Grass_Instance)), instances[:])
+	}
+	return placed
+}
+
+// Draws the grass in view and near enough (fade_end): bindless, in one
+// call; else a call for each run, its texture bound.
+draw_grass :: fun(renderer: ^Renderer, grass_cells: ^[]Gpu_Grass, planes: ^View_Planes, view_projection: Mat4,
+	lighting: Cell_Lighting, sun: Vec3, camera: Camera, time: f32, fade_start: f32, fade_end: f32, stats: ^Frame_Stats)
+{
+	renderer.grass_commands.len = 0
+	for &cell in grass_cells {
+		if cell.runs.len == 0 do continue
+		if vec3_length(cell.center - camera.position) > fade_end + cell.radius do continue
+		if not sphere_in_view(planes, cell.center, cell.radius) do continue
+		for run in cell.runs {
+			if renderer.grass_commands.len == renderer.grass_commands.cap do break
+			part := &renderer.parts[run.part]
+			&renderer.grass_commands + Draw_Command{count = part.index_count, instance_count = run.count,
+				first_index = part.first_index, base_vertex = part.base_vertex,
+				base_instance = u32(cell.slot * GRASS_PER_CELL) + run.first}
+		}
+	}
+	if renderer.grass_commands.len == 0 do return
+
+	made := &renderer.grass_programs[which_program(renderer)]
+	UseProgram(made.program)
+	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
+	Uniform1f(made.time_at, time)
+	Uniform1f(made.fade_start_at, fade_start)
+	Uniform1f(made.fade_end_at, fade_end)
+	BindVertexArray(renderer.grass_vertex_array)
+	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.grass_indirect_buffer)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.grass_commands.len * size_of(Draw_Command)), renderer.grass_commands[:], STREAM_DRAW)
+	Disable(CULL_FACE)
+	if renderer.use_bindless {
+		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, 0, i32(renderer.grass_commands.len), 0)
+		stats.draw_calls += 1
+	else
+		// The commands' runs, in the order they were made: each with its texture.
+		ActiveTexture(TEXTURE0)
+		k : i64 = 0
+		for &cell in grass_cells {
+			if cell.runs.len == 0 do continue
+			if vec3_length(cell.center - camera.position) > fade_end + cell.radius do continue
+			if not sphere_in_view(planes, cell.center, cell.radius) do continue
+			for run in cell.runs {
+				if k == renderer.grass_commands.len do break
+				BindTexture(TEXTURE_2D, renderer.textures[renderer.parts[run.part].texture_slot].id)
 				MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, usize(k * size_of(Draw_Command)), 1, 0)
 				stats.draw_calls += 1
 				k += 1
@@ -1963,7 +2292,8 @@ sphere_in_view :: fun(planes: ^View_Planes, center: Vec3, radius: f32) -> bool {
 // then the instances in view — opaque parts, then blended — lit by the
 // lighting and the lights set with set_scene_lights. Tells what it drew.
 draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, grounds: ^[]Gpu_Land,
-	waters: ^[]Water_Cell, tree_cells: ^[]Gpu_Trees, look: ^Sky_Look, lighting: Cell_Lighting, camera: Camera, width: i64, height: i64) -> Frame_Stats
+	waters: ^[]Water_Cell, tree_cells: ^[]Gpu_Trees, grass_cells: ^[]Gpu_Grass, look: ^Sky_Look, lighting: Cell_Lighting,
+	camera: Camera, width: i64, height: i64) -> Frame_Stats
 {
 	stats := Frame_Stats{instances = instances.len, visible = 0, drawn_parts = 0, draw_calls = 0, land_cells = 0}
 	Viewport(0, 0, i32(width), i32(height))
@@ -2003,6 +2333,9 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 	gather_meshes(renderer, models, instances, &planes, &stats)
 	draw_mesh_runs(renderer, view_projection, lighting, sun, camera, false, &stats)
 	if look.outside and tree_cells.len > 0 do draw_trees(renderer, tree_cells, &near_cells, true, &planes, view_projection, lighting, sun, camera, &stats)
+	if look.outside and grass_cells.len > 0 {
+		draw_grass(renderer, grass_cells, &planes, view_projection, lighting, sun, camera, look.time, GRASS_FADE_START, GRASS_FADE_END, &stats)
+	}
 	if waters.len > 0 do draw_water(renderer, waters, &planes, look, view_projection, lighting, camera, &stats)
 	draw_mesh_runs(renderer, view_projection, lighting, sun, camera, true, &stats)
 

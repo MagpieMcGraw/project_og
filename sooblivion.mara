@@ -26,6 +26,7 @@ use land
 use sky
 use shader_package
 use distant
+use grass
 render :: use render
 use mara.math
 use sdl_platform
@@ -1115,6 +1116,103 @@ command_sky :: fun(name: []utf8) {
 // `sooblivion lod <world> <x> <y>`: the piece of distant land a cell is
 // in, and its normal map beside the cell's own land's normals at a few of
 // the land's points, to see which way the map's axes go.
+// `sooblivion grass <world> <x> <y>`: the grass a cell's land grows, as
+// the viewer places it: how many blades of each kind, how tall, how high
+// above the water. No window (the kinds' models aren't loaded: each
+// kind's "model" is its index here).
+command_grass :: fun(name: []utf8, x: i64, y: i64) {
+	data_storage : [400 * MB]byte
+	index_storage : [96 * MB]byte
+	plugin, load_error := load_oblivion(&data_storage, &index_storage)
+	if load_error {
+		print("couldn't load the plugin: %", load_error)
+		return
+	}
+	scratch : [16 * MB]byte
+	world_id := find_world(&plugin, name, &scratch)
+	cell := exterior_cell(&plugin, world_id, x, y)
+	land_at, has_land := find_land(&plugin, cell)
+	if world_id == 0 or cell == 0 or not has_land {
+		print("no land at % % in %", x, y, name)
+		return
+	}
+	scratch.len = 0
+	record, record_error := record_at(&plugin, land_at, &scratch)
+	if record_error {
+		print("couldn't read the land: %", record_error)
+		return
+	}
+	cell_land : Land
+	read_land(record.data, &cell_land)
+
+	// The land's textures and their grasses, as the scene reads them.
+	kinds : [256]Grass_Kind
+	kind_ids : [256]u32
+	textures : [40]Texture_Grasses
+	for &quadrant in cell_land.quadrants {
+		texture_ids : [9]u32
+		&texture_ids + quadrant.base
+		for &layer in quadrant.layers do &texture_ids + layer.texture
+		for texture in texture_ids {
+			known := false
+			for &entry in textures {
+				if entry.texture == texture do known = true
+			}
+			if known or texture == 0 or textures.len == textures.cap do continue
+			grasses := Texture_Grasses{texture = texture, kinds = [-1, -1]}
+			scratch.len = 0
+			texture_record, texture_error := find_record(&plugin, texture, &scratch)
+			if texture_error do continue
+			count : i64 = 0
+			fields := Fields{data = texture_record.data, at = 0, broken = false}
+			for field in next_field(&fields) {
+				if field.kind != "GNAM" or field.data.len < 4 or count == GRASSES_PER_TEXTURE do continue
+				grass_id : u32 = field.data[0]
+				kind_index : i64 = -1
+				for id, k in kind_ids {
+					if id == grass_id do kind_index = k
+				}
+				if kind_index < 0 {
+					grass_scratch : [64 * KB]byte
+					grass_record, grass_error := find_record(&plugin, grass_id, &grass_scratch)
+					if not grass_error {
+						look, readable := read_grass_look(grass_record)
+						if readable {
+							&kinds + Grass_Kind{look = look, model = kinds.len}
+							&kind_ids + grass_id
+							kind_index = kinds.len - 1
+						}
+					}
+				}
+				grasses.kinds[count] = kind_index
+				count += 1
+			}
+			print("texture % (%): grasses % and %", texture, editor_id_of(&plugin, texture), grasses.kinds[0], grasses.kinds[1])
+			&textures + grasses
+		}
+	}
+	water_height, has_water := cell_water(&plugin, cell, &scratch)
+	if not has_water do water_height = -1000000
+	blades : [4096]render.Placed_Grass   // render.GRASS_PER_CELL (a module's constant can't size an array yet)
+	start := time_now()
+	place_grass(&cell_land, x, y, water_height, textures[:], &kinds, &blades)
+	print("% blades in % us; water at %", blades.len, (time_now() - start) / 1000, if has_water do water_height else 0)
+	for &kind, k in kinds {
+		count : i64 = 0
+		lowest : f32 = 1000000
+		tallest : f32 = 0
+		for &blade in blades {
+			if blade.model != k do continue
+			count += 1
+			if blade.position.z - water_height < lowest do lowest = blade.position.z - water_height
+			if blade.height > tallest do tallest = blade.height
+		}
+		print("  %: % (density %, slopes % to %, water rule % at %) — % blades, the tallest x%, the lowest % above the water",
+			k, kind.look.model, kind.look.density, kind.look.least_slope, kind.look.most_slope,
+			kind.look.water_rule, kind.look.water_distance, count, tallest, lowest)
+	}
+}
+
 command_lod :: fun(name: []utf8, x: i64, y: i64) {
 	data_storage : [400 * MB]byte
 	index_storage : [96 * MB]byte
@@ -1326,6 +1424,11 @@ main :: (args: [][]utf8) {
 		command_map(if args.len > 2 do args[2] else "Tamriel")
 	elif command == "sky"
 		command_sky(if args.len > 2 do args[2] else "Tamriel")
+	elif command == "grass" and args.len > 4
+		x, x_ok := parse_number(args[3])
+		y, y_ok := parse_number(args[4])
+		if x_ok and y_ok do command_grass(args[2], i64(x), i64(y))
+		else do usage()
 	elif command == "lod" and args.len > 4
 		x, x_ok := parse_number(args[3])
 		y, y_ok := parse_number(args[4])

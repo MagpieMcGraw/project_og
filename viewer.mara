@@ -280,7 +280,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		shown.lights_changed = false
 	}
 	viewer.drawn = draw_frame(&viewer.renderer, &shown.models, &shown.instances, &shown.grounds, &shown.waters,
-		&shown.tree_cells, &viewer.look, shown.lighting, camera^, platform.width, platform.height)
+		&shown.tree_cells, &shown.grass_cells, &viewer.look, shown.lighting, camera^, platform.width, platform.height)
 	card_start := time_now()
 	viewer.drawing_time = card_start - drawing_start
 	wait_for_card()
