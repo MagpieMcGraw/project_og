@@ -116,10 +116,6 @@ Load_Room :: struct {
 	blocks: []byte
 	model: []byte
 	texture: []byte
-	// The NIF reader, kept here: a mesh's blocks view its data, and Mara
-	// counts those as views of the reader, so it must live as long as
-	// the blocks' room.
-	reader: Nif_Reader
 }
 
 // The scene's model for a mesh path: loaded the first time it's asked
@@ -144,9 +140,8 @@ load_model :: fun(scene: ^Scene, renderer: ^Renderer, meshes: ^Archive, textures
 	if read_error do return -1
 
 	room.blocks.len = 0
-	room.reader = nif_reader(data)
 	failure := Nif_Failure{block = 0, type_name = room.file[0:0]}
-	mesh, nif_error := read_nif(&room.reader, &room.blocks, &failure)
+	mesh, nif_error := read_nif(data, &room.blocks, &failure)
 	if nif_error do return -1
 	room.model.len = 0
 	built, model_error := build_model(&mesh, &room.model)
@@ -179,7 +174,7 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, rend
 
 		light, gives_light := light_of(base, reference)
 		if gives_light and scene.lights.len < scene.lights.cap do &scene.lights + light
-		if base.header.kind[:] == "DOOR" and scene.doors.len < scene.doors.cap {
+		if base.header.kind == "DOOR" and scene.doors.len < scene.doors.cap {
 			_, leads := door_destination(plugin, reference.form_id, &scratch)
 			if leads do &scene.doors + Scene_Door{reference = reference.form_id, position = reference.position}
 		}

@@ -112,7 +112,7 @@ index_plugin :: fun(data: []byte, storage: ^[]byte) -> Plugin, err {
 		if at + HEADER_SIZE > data.len do return plugin, Truncated
 		if world != 0 and at >= world_end do world = 0
 		header : Record_Header = data[at]
-		if header.kind[:] == "GRUP" {
+		if header.kind == "GRUP" {
 			group_header : Group_Header = data[at]
 			if group_header.group_type == GROUP_CELL_CHILDREN {
 				index_put(&plugin.cell_children, u64(group_header.label), at)?
@@ -125,7 +125,7 @@ index_plugin :: fun(data: []byte, storage: ^[]byte) -> Plugin, err {
 			if group_header.group_type == GROUP_EXTERIOR_BLOCK do in_blocks = true
 			if group_header.group_type == GROUP_TOP {
 				label : [4!]utf8 = data[at + 8]
-				if label[:] == "CELL" {
+				if label == "CELL" {
 					plugin.interior_cells_at = at + HEADER_SIZE
 					plugin.interior_cells_end = at + i64(group_header.size)
 				}
@@ -135,7 +135,7 @@ index_plugin :: fun(data: []byte, storage: ^[]byte) -> Plugin, err {
 		}
 		next_at := at + HEADER_SIZE + i64(header.size)
 		if header.form_id != 0 do index_put(&plugin.records, u64(header.form_id), at)?
-		if world != 0 and header.kind[:] == "CELL" {
+		if world != 0 and header.kind == "CELL" {
 			index_put(&plugin.cell_worlds, u64(header.form_id), i64(world))?
 			body := data[at + HEADER_SIZE : next_at]
 			grid, has_grid := find_field(body, "XCLC")
@@ -177,10 +177,7 @@ find_record :: fun(plugin: ^Plugin, form_id: u32, scratch: ^[]byte) -> Record, e
 find_field :: fun(data: []byte, kind: []utf8) -> []byte, bool {
 	fields := Fields{data = data, at = 0, broken = false}
 	for field in next_field(&fields) {
-		// The same bytes as field.data, but sliced from data itself: Mara
-		// counts field.data as a view of the local `fields`, which can't
-		// be returned.
-		if field.kind[:] == kind do return data[fields.at - field.data.len : fields.at], true
+		if field.kind == kind do return field.data, true
 	}
 	return data[0:0], false
 }
@@ -208,11 +205,11 @@ find_interior_cell :: fun(plugin: ^Plugin, name: []utf8, scratch: ^[]byte) -> u3
 	at := plugin.interior_cells_at
 	for at < plugin.interior_cells_end {
 		header : Record_Header = plugin.data[at]
-		if header.kind[:] == "GRUP" {
+		if header.kind == "GRUP" {
 			at += HEADER_SIZE
 			continue
 		}
-		if header.kind[:] == "CELL" {
+		if header.kind == "CELL" {
 			record := record_at(plugin, at, scratch)?
 			if compare_folded(editor_id(record.data), name) == 0 do return header.form_id
 		}
@@ -241,12 +238,12 @@ cell_references :: fun(plugin: ^Plugin, cell: u32, references: ^[]Reference) -> 
 	at := group_at + HEADER_SIZE
 	for at < end {
 		header : Record_Header = plugin.data[at]
-		if header.kind[:] == "GRUP" {
+		if header.kind == "GRUP" {
 			at += HEADER_SIZE   // the persistent, temporary and distant groups: into them
 			continue
 		}
 		next_at := at + HEADER_SIZE + i64(header.size)
-		if header.kind[:] == "REFR" and references.len < references.cap {
+		if header.kind == "REFR" and references.len < references.cap {
 			body := plugin.data[at + HEADER_SIZE : next_at]
 			references + read_reference(header, body)
 		}
@@ -266,7 +263,7 @@ read_reference :: fun(header: Record_Header, data: []byte) -> Reference {
 		flags = header.flags}
 	fields := Fields{data = data, at = 0, broken = false}
 	for field in next_field(&fields) {
-		kind := field.kind[:]
+		kind := field.kind
 		if kind == "NAME" and field.data.len >= 4 {
 			reference.base = field.data[0]
 		elif kind == "DATA" and field.data.len >= 24
@@ -391,7 +388,7 @@ Point_Light :: struct {
 // it gives none (off, negative, or no data).
 light_of :: fun(base: Record, reference: Reference) -> Point_Light, bool {
 	none := Point_Light{position = reference.position, radius = 0, color = Vec3{0, 0, 0}}
-	if base.header.kind[:] != "LIGH" do return none, false
+	if base.header.kind != "LIGH" do return none, false
 	field, found := find_field(base.data, "DATA")
 	if not found or field.len < 16 do return none, false
 	radius : u32 = field[4]

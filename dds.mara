@@ -108,12 +108,12 @@ read_texture :: fun(data: []byte) -> Texture, err {
 	texture.pixels = data[0:0]
 	if data.len < 128 do return texture, Not_A_Texture
 	magic : [4!]utf8 = data[0]
-	if magic[:] != "DDS " do return texture, Not_A_Texture
+	if magic != "DDS " do return texture, Not_A_Texture
 	header : Dds_Header = data[4]
 
 	pixel_format := header.pixel_format
 	if pixel_format.flags & DDPF_FOUR_CC != 0 {
-		code := pixel_format.four_cc[:]
+		code := pixel_format.four_cc
 		if code == "DXT1" do texture.format = .dxt1
 		elif code == "DXT3" do texture.format = .dxt3
 		elif code == "DXT5" do texture.format = .dxt5

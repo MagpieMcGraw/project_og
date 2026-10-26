@@ -72,8 +72,7 @@ load_room :: fun(file_room: ^[]byte, block_room: ^[]byte, model_room: ^[]byte, t
 		file = file_room[0 : file_room.cap],
 		blocks = block_room[0 : block_room.cap],
 		model = model_room[0 : model_room.cap],
-		texture = texture_room[0 : texture_room.cap],
-		reader = nif_reader(file_room[0:0])}
+		texture = texture_room[0 : texture_room.cap]}
 }
 
 // The viewer's loop: draws the scene from the camera, flying it speed

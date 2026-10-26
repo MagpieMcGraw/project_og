@@ -60,7 +60,7 @@ read_land :: fun(data: []byte, land: ^Land) {
 	layer_quadrant : i64 = -1
 	fields := Fields{data = data, at = 0, broken = false}
 	for field in next_field(&fields) {
-		kind := field.kind[:]
+		kind := field.kind
 		bytes := field.data
 		if kind == "VHGT" and bytes.len >= 4 + 1089 {
 			read_heights(bytes, land)
@@ -130,11 +130,11 @@ find_land :: fun(plugin: ^Plugin, cell: u32) -> i64, bool {
 	at := group_at + HEADER_SIZE
 	for at < end {
 		header : Record_Header = plugin.data[at]
-		if header.kind[:] == "GRUP" {
+		if header.kind == "GRUP" {
 			at += HEADER_SIZE
 			continue
 		}
-		if header.kind[:] == "LAND" do return at, true
+		if header.kind == "LAND" do return at, true
 		at += HEADER_SIZE + i64(header.size)
 	}
 	return 0, false
@@ -229,16 +229,17 @@ add_land_part :: fun(built: ^Model, land: ^Land, cell_x: i64, cell_y: i64, first
 		}
 	}
 	part := next(&built.parts)
-	part.vertices = vertices
-	part.indices = indices
-	part.texture.len = 0
-	part.glow_texture.len = 0
-	part.alpha_blend = false
-	part.alpha_test = false
-	part.alpha_threshold = 0
-	part.two_sided = false
-	part.diffuse = Vec3{1, 1, 1}
-	part.emissive = Vec3{0, 0, 0}
-	part.alpha = 1
+	part^ = Model_Part{
+		vertices = vertices,
+		indices = indices,
+		texture = [],
+		glow_texture = [],
+		alpha_blend = false,
+		alpha_test = false,
+		alpha_threshold = 0,
+		two_sided = false,
+		diffuse = Vec3{1, 1, 1},
+		emissive = Vec3{0, 0, 0},
+		alpha = 1}
 	return part
 }

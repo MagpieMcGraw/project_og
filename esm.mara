@@ -84,7 +84,7 @@ next_field :: fun(fields: ^Fields) -> Field, bool {
 	small_size : u16 = data[fields.at + 4]
 	size := i64(small_size)
 	at := fields.at + 6
-	if kind[:] == "XXXX" and size == 4 and at + 10 <= data.len {
+	if kind == "XXXX" and size == 4 and at + 10 <= data.len {
 		big_size : u32 = data[at]
 		kind = data[at + 4]
 		size = i64(big_size)
@@ -130,7 +130,7 @@ Plugin_Stats :: struct {
 // The entry for kind in stats, made when it's the first of its kind.
 kind_entry :: fun(stats: ^Plugin_Stats, kind: [4!]utf8) -> ^Kind_Stats {
 	for &entry in stats.kinds {
-		if entry.kind[:] == kind[:] do return entry
+		if entry.kind == kind do return entry
 	}
 	entry := next(&stats.kinds)
 	entry^ = Kind_Stats{kind = kind, records = 0, packed = 0, bytes = 0, fields = 0}
@@ -145,7 +145,7 @@ plugin_stats :: fun(data: []byte, stats: ^Plugin_Stats, scratch: ^[]byte) -> err
 	for at < data.len {
 		if at + HEADER_SIZE > data.len do return Truncated
 		header : Record_Header = data[at]
-		if header.kind[:] == "GRUP" {
+		if header.kind == "GRUP" {
 			group_header : Group_Header = data[at]
 			stats.groups += 1
 			if group_header.group_type >= 0 and group_header.group_type <= 10 do stats.group_types[i64(group_header.group_type)] += 1

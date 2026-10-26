@@ -195,7 +195,7 @@ name_hash :: fun(stem: []utf8, extension: []utf8) -> u64 {
 	if n >= 4 {
 		middle : u32 = 0
 		for i in 1:n - 2 do middle = middle *% 0x1003F +% u32(stem[i])
-		hash = hash +% (u64(middle) << 32)
+		hash +%= u64(middle) << 32
 	}
 	if extension.len == 0 do return hash
 
@@ -205,7 +205,7 @@ name_hash :: fun(stem: []utf8, extension: []utf8) -> u64 {
 	elif extension == ".wav" do hash |= 0x80000000
 	ending : u32 = 0
 	for c in extension do ending = ending *% 0x1003F +% u32(c)
-	hash = hash +% (u64(ending) << 32)
+	hash +%= u64(ending) << 32
 	return hash
 }
 

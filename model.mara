@@ -184,19 +184,19 @@ add_shape :: fun(nif: ^Nif, geometry: Geometry, transform: Mat4, properties: Inh
 		}
 	}
 
-	// (Field by field: a literal can't give a list field an empty list.)
 	part := next(&model.parts)
-	part.vertices = vertices
-	part.indices = indices
-	part.texture.len = 0
-	part.glow_texture.len = 0
-	part.alpha_blend = false
-	part.alpha_test = false
-	part.alpha_threshold = 0
-	part.two_sided = false
-	part.diffuse = Vec3{1, 1, 1}
-	part.emissive = Vec3{0, 0, 0}
-	part.alpha = 1
+	part^ = Model_Part{
+		vertices = vertices,
+		indices = indices,
+		texture = [],
+		glow_texture = [],
+		alpha_blend = false,
+		alpha_test = false,
+		alpha_threshold = 0,
+		two_sided = false,
+		diffuse = Vec3{1, 1, 1},
+		emissive = Vec3{0, 0, 0},
+		alpha = 1}
 	apply_properties(nif, properties, part)
 }
 

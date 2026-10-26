@@ -275,8 +275,7 @@ stored_block :: fun(bits: ^Bits, output: ^[]byte) -> err {
 	// held's bits above count are the bytes at `at` (fill loads ahead):
 	// stale once those bytes are copied past.
 	bits.held = 0
-	source := bits.input[bits.at : bits.at + length]
-	output[output.len : output.len + length] = source
+	output[output.len : output.len + length] = bits.input[bits.at : bits.at + length]
 	output.len += length
 	bits.at += length
 }
