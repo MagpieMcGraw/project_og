@@ -37,6 +37,9 @@ RUN_SPEED :: 500
 // The longest frame a walker moves through at once, in seconds: a frame
 // that took longer (loading) doesn't throw it through a wall.
 LONGEST_STEP :: 0.05
+// How quickly the eyes catch up with the feet over steps: the share of
+// the way a second (as a rate; a frame takes its part).
+EYES_CATCH_UP :: 12
 
 // How high above the floor the camera is when arriving: a person's eyes,
 // in Oblivion's units.
@@ -81,6 +84,7 @@ Viewer :: struct {
 	chosen_door: i64    // the door view_frame stopped for
 	walking: bool       // on foot (F), not flying
 	walker: Walker
+	eyes: f32           // how high the walker's eyes are: smoothed over steps
 
 	// The sky outside: the world's climate and weather, the hour of the
 	// game's day, and what the sky and water look like now.
@@ -154,6 +158,7 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.chosen_door = -1
 	viewer.walking = false
 	viewer.walker = Walker{position = Vec3{0, 0, 0}, rising = 0, on_ground = false}
+	viewer.eyes = 0
 	viewer.sky_world = 0
 	viewer.hour = START_HOUR
 	viewer.look = Sky_Look{state = Sky_State{0}, cloud_lower = 0, cloud_upper = 0, sun = 0,
@@ -289,7 +294,16 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		if vec3_length(going) > 0 do going = vec3_normalize(going) * (if input.held[LShift] do RUN_SPEED else WALK_SPEED)
 		step_seconds := min_f32(f32(seconds), LONGEST_STEP)
 		walk(&viewer.walker, shown, going, input.pressed[Space], step_seconds)
-		camera.position = viewer.walker.position + Vec3{0, 0, EYE_HEIGHT}
+		// The feet climb a step in a frame; the eyes follow over a few, so
+		// stairs are a slope to them. Falling and jumping, they keep up.
+		feet := viewer.walker.position
+		eyes_wanted := feet.z + EYE_HEIGHT
+		if viewer.walker.on_ground and abs_f32(eyes_wanted - viewer.eyes) < STEP_HEIGHT * 2 {
+			viewer.eyes += (eyes_wanted - viewer.eyes) * min_f32(1, step_seconds * EYES_CATCH_UP)
+		else
+			viewer.eyes = eyes_wanted
+		}
+		camera.position = Vec3{feet.x, feet.y, viewer.eyes}
 	else
 		forward, right, up := camera_axes(camera^)
 		step := f32(seconds) * viewer.speed
@@ -475,6 +489,7 @@ set_walking :: fun(viewer: ^Viewer, on: bool) {
 // Puts the walker's feet under the camera, standing still.
 place_walker :: fun(viewer: ^Viewer) {
 	viewer.walker = Walker{position = viewer.camera.position - Vec3{0, 0, EYE_HEIGHT}, rising = 0, on_ground = false}
+	viewer.eyes = viewer.camera.position.z
 }
 
 // Moves the game's day on by a frame's seconds (much faster when hurried),
