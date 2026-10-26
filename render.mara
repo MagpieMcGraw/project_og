@@ -123,6 +123,7 @@ layout(location = 8) in uvec4 lights_first;
 layout(location = 9) in uvec4 lights_second;
 layout(location = 10) in vec4 material;    // alpha threshold, emissive color
 layout(location = 11) in uvec2 texture_handle;
+layout(location = 12) in uvec2 glow_handle;   // its glow map's (bindless; else 1 for one), 0 for none
 
 uniform mat4 view_projection;
 
@@ -134,6 +135,7 @@ flat out uvec4 light_set_first;
 flat out uvec4 light_set_second;
 flat out vec4 part_material;
 flat out uvec2 part_texture;
+flat out uvec2 part_glow;
 
 void main() {
 	mat4 world = mat4(world_x, world_y, world_z, world_w);
@@ -147,6 +149,7 @@ void main() {
 	light_set_second = lights_second;
 	part_material = material;
 	part_texture = texture_handle;
+	part_glow = glow_handle;
 }
 "
 
@@ -160,12 +163,16 @@ flat in uvec4 light_set_first;
 flat in uvec4 light_set_second;
 flat in vec4 part_material;
 flat in uvec2 part_texture;
+flat in uvec2 part_glow;
 
 #ifdef BINDLESS
 #define BASE_TEXTURE sampler2D(part_texture)
+#define GLOW_TEXTURE sampler2D(part_glow)
 #else
 uniform sampler2D base_texture;
+uniform sampler2D glow_texture;
 #define BASE_TEXTURE base_texture
+#define GLOW_TEXTURE glow_texture
 #endif
 
 uniform vec3 sun_direction;       // where the light comes from
@@ -194,7 +201,12 @@ void main() {
 	if (base.a < part_material.x) discard;
 	vec3 normal = normalize(world_normal);
 	if (!gl_FrontFacing) normal = -normal;   // a two-sided part's back
-	vec3 light = ambient_color + part_material.yzw + sun_color * max(dot(normal, sun_direction), 0.0);
+	// The material's own light: through its glow map where it has one (as
+	// the game's SLS2002.pso: emittance times the map, a light the
+	// texture is lit by), else all over it.
+	vec3 emitted = part_material.yzw;
+	if (part_glow != uvec2(0u)) emitted *= texture(GLOW_TEXTURE, texture_uv).rgb;
+	vec3 light = ambient_color + emitted + sun_color * max(dot(normal, sun_direction), 0.0);
 	for (int i = 0; i < 4; i++) {
 		if (light_set_first[i] == 65535u) break;
 		light += point_light(light_set_first[i], normal);
@@ -733,6 +745,7 @@ Mesh_Part :: struct {
 	index_count: u32
 	base_vertex: i32
 	texture_slot: i64      // its texture: its place in the renderer's textures
+	glow_slot: i64         // its glow map's, -1 for none
 	alpha_blend: bool
 	two_sided: bool
 	alpha_threshold: f32   // pixels less opaque are left out; 0 for none
@@ -1005,6 +1018,7 @@ Drawn_Instance :: struct {
 	lights: [LIGHTS_PER_OBJECT!]u16
 	material: [4!]f32      // alpha threshold, emissive red, green, blue
 	texture: u64           // the bindless handle
+	glow: u64              // its glow map's bindless handle (without bindless, 1 when it has one); 0 for none
 }
 
 // One draw of MultiDrawElementsIndirect, as OpenGL reads it: 20 bytes.
@@ -1279,6 +1293,10 @@ find_shared_uniforms :: fun(program: u32) -> Shared_Uniforms {
 make_mesh_program :: fun(made: ^Mesh_Program, bindless: bool) -> err {
 	made.program = compile_program(MESH_VERTEX_SHADER, MESH_FRAGMENT_SHADER, bindless)?
 	made.shared = find_shared_uniforms(made.program)
+	if not bindless {
+		UseProgram(made.program)
+		Uniform1i(GetUniformLocation(made.program, "glow_texture"), 1)
+	}
 	for i in 0:SCENE_LIGHTS {
 		made.light_position_at[i] = array_uniform(made.program, "light_positions[", i)
 		made.light_color_at[i] = array_uniform(made.program, "light_colors[", i)
@@ -1972,6 +1990,9 @@ setup_mesh_buffers :: fun(renderer: ^Renderer) {
 	EnableVertexAttribArray(11)
 	VertexAttribIPointer(11, 2, UNSIGNED_INT, instance_stride, 96)     // texture handle
 	VertexAttribDivisor(11, 1)
+	EnableVertexAttribArray(12)
+	VertexAttribIPointer(12, 2, UNSIGNED_INT, instance_stride, 104)    // glow map handle
+	VertexAttribDivisor(12, 1)
 	BindVertexArray(0)
 
 	GenBuffers(1, &renderer.indirect_buffer)
@@ -2143,6 +2164,7 @@ upload_model :: fun(renderer: ^Renderer, built: Model, archive: ^Archive, scratc
 			index_count = u32(part.indices.len),
 			base_vertex = i32(renderer.vertices_used),
 			texture_slot = texture_for(renderer, archive, part.texture[:], scratch, part.clamp_mode),
+			glow_slot = glow_map_for(renderer, archive, &part, scratch),
 			alpha_blend = part.alpha_blend,
 			two_sided = part.two_sided,
 			alpha_threshold = threshold,
@@ -2152,6 +2174,27 @@ upload_model :: fun(renderer: ^Renderer, built: Model, archive: ^Archive, scratc
 		gpu.part_count += 1
 	}
 	return gpu
+}
+
+// A part's glow map: where its material's own light shows, in the
+// material's emissive color. Its texturing's glow map if it names one,
+// else its texture's with _g, as the game finds them (runestone02a.dds,
+// runestone02a_g.dds). Its texture slot; -1 for none, or when its
+// material emits nothing (the map would show nothing).
+glow_map_for :: fun(renderer: ^Renderer, archive: ^Archive, part: ^Model_Part, scratch: ^[]byte) -> i64 {
+	if part.emissive.x <= 0 and part.emissive.y <= 0 and part.emissive.z <= 0 do return -1
+	path : [160]utf8
+	if part.glow_texture.len > 0 {
+		&path + part.glow_texture[:]
+	elif part.texture.len > 4 and ends_with(part.texture[:], ".dds")
+		&path + part.texture[0 : part.texture.len - 4]
+		&path + "_g.dds"
+	else
+		return -1
+	}
+	_, found := find_file(archive, path[:])
+	if not found do return -1
+	return texture_for(renderer, archive, path[:], scratch, part.clamp_mode)
 }
 
 // An instance of a model placed in the world: its sphere worked out, no
@@ -2690,6 +2733,8 @@ gather_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]In
 			record.lights = instance.lights
 			record.material = [part.alpha_threshold, part.emissive.x, part.emissive.y, part.emissive.z]
 			record.texture = renderer.textures[part.texture_slot].handle
+			record.glow = 0
+			if part.glow_slot >= 0 do record.glow = if bindless do renderer.textures[part.glow_slot].handle else 1
 		}
 	}
 	for key in renderer.touched do renderer.part_counts[key & 0xFFFFF] = 0
@@ -2731,7 +2776,14 @@ draw_mesh_runs :: fun(renderer: ^Renderer, view_projection: Mat4, lighting: Cell
 		}
 		if first_part.two_sided do Disable(CULL_FACE)
 		else do Enable(CULL_FACE)
-		if not bindless do BindTexture(TEXTURE_2D, renderer.textures[first_part.texture_slot].id)
+		if not bindless {
+			BindTexture(TEXTURE_2D, renderer.textures[first_part.texture_slot].id)
+			if first_part.glow_slot >= 0 {
+				ActiveTexture(TEXTURE1)
+				BindTexture(TEXTURE_2D, renderer.textures[first_part.glow_slot].id)
+				ActiveTexture(TEXTURE0)
+			}
+		}
 		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, usize(run_start * size_of(Draw_Command)), i32(run_end - run_start), 0)
 		stats.draw_calls += 1
 		run_start = run_end

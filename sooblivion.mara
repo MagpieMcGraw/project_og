@@ -504,7 +504,7 @@ command_model :: fun(what: []utf8, name: []utf8) {
 			}
 		}
 		if part.vertices.len > 0 do print("  texture coordinates from % to %; first vertex %", low_uv, high_uv, part.vertices[0])
-		print("  material: diffuse %, emissive %, alpha %", part.diffuse, part.emissive, part.alpha)
+		print("  material: diffuse %, emissive %, alpha %; glow map %", part.diffuse, part.emissive, part.alpha, part.glow_texture)
 		if part.indices.len >= 3 {
 			// Which way its first triangle faces, by its winding (counter-clockwise seen from the front).
 			a := part.vertices[i64(part.indices[0])].position
@@ -1317,6 +1317,51 @@ command_door :: fun(what: []utf8) {
 	}
 }
 
+// `sooblivion find <editor id>`: where a base record is placed: each
+// reference's cell (its grid place, outside) and position.
+command_find :: fun(name: []utf8) {
+	data_storage : [400 * MB]byte
+	index_storage : [96 * MB]byte
+	plugin, load_error := load_oblivion(&data_storage, &index_storage)
+	if load_error {
+		print("couldn't load the plugin: %", load_error)
+		return
+	}
+	scratch : [1 * MB]byte
+	base_id := find_by_editor_id_any(&plugin, name, &scratch)
+	if base_id == 0 {
+		print("no record %", name)
+		return
+	}
+	references : [16384]Reference
+	found : i64 = 0
+	for key in plugin.cell_children.keys {
+		if key == 0 do continue
+		references.len = 0
+		_ = cell_references(&plugin, u32(key), &references)
+		for reference in references {
+			if reference.base != base_id do continue
+			found += 1
+			x, y := grid_of(reference.position)
+			cell_name := editor_id_of(&plugin, u32(key))
+			print("  in % (grid % % if outside) at %", cell_name, x, y, reference.position)
+		}
+	}
+	print("% placed", found)
+}
+
+// A record's form id by its editor id, of any kind; 0 for none.
+find_by_editor_id_any :: fun(plugin: ^Plugin, name: []utf8, scratch: ^[]byte) -> u32 {
+	for key, slot in plugin.records.keys {
+		if key == 0 do continue
+		scratch.len = 0
+		record, record_error := record_at(plugin, i64(plugin.records.values[slot]), scratch)
+		if record_error do continue
+		if compare_folded(editor_id(record.data), name) == 0 do return u32(key)
+	}
+	return 0
+}
+
 // A base record and how many references place it.
 Base_Count :: struct {
 	base: u32
@@ -1860,6 +1905,8 @@ main :: (args: [][]utf8) {
 		command_sky(if args.len > 2 do args[2] else "Tamriel")
 	elif command == "doors"
 		command_doors()
+	elif command == "find" and args.len > 2
+		command_find(args[2])
 	elif command == "door" and args.len > 2
 		command_door(args[2])
 	elif command == "collision" and args.len > 2
