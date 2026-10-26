@@ -270,3 +270,33 @@ land_height :: fun(shown: ^Scene, place: Vec3) -> f32, bool {
 	}
 	return 0, false
 }
+
+// What the eyes look at: the instance whose collision a line from them
+// (by way, its length 1) meets first, within reach — walls in the way
+// first, as they are. Its index in the scene's instances, and how far;
+// false when nothing is met.
+pick :: fun(shown: ^Scene, from: Vec3, way: Vec3, reach: f32) -> i64, f32, bool {
+	nearest : f32 = reach
+	picked : i64 = -1
+	for &instance, index in shown.instances {
+		range := shown.model_collision[instance.model]
+		if range.count == 0 do continue
+		// Only those whose sphere the line passes through.
+		to_center := instance.center - from
+		along := dot(to_center, way)
+		if along < -instance.radius or along > nearest + instance.radius do continue
+		if vec3_length(to_center - way * along) > instance.radius do continue
+		to_model := mat4_inverse(instance.world)
+		start := to_space(to_model, from, 1)
+		local_way := to_space(to_model, way, 0)
+		for t in 0:range.count / 3 {
+			at := range.first + t * 3
+			distance, hit := line_hits(start, local_way, shown.collision_points[at], shown.collision_points[at + 1], shown.collision_points[at + 2])
+			if hit and distance < nearest {
+				nearest = distance
+				picked = index
+			}
+		}
+	}
+	return picked, nearest, picked >= 0
+}

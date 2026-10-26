@@ -67,6 +67,7 @@ Scene_Door :: struct {
 Waiting_Instance :: struct {
 	path: [256]utf8
 	world: Mat4
+	reference: u32
 }
 
 // A model's collision: its points in the scene's collision, three a triangle.
@@ -265,10 +266,10 @@ is_marker :: fun(path: []utf8) -> bool {
 
 // Places an instance of a model, when there's room: lit by the scene's
 // lights as they are now (choose_all_lights does them all again).
-add_instance :: fun(scene: ^Scene, model_index: i64, placement: Mat4) {
+add_instance :: fun(scene: ^Scene, model_index: i64, placement: Mat4, reference: u32 = 0) {
 	if scene.instances.len == scene.instances.cap do return
 	instance := next(&scene.instances)
-	instance^ = place_instance(scene.models[model_index], model_index, placement)
+	instance^ = place_instance(scene.models[model_index], model_index, placement, reference)
 	choose_lights(instance, &scene.lights)
 }
 
@@ -310,9 +311,10 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, plac
 		if path.len == 0 or is_marker(path[:]) do continue
 		model_index, known := known_model(scene, path[:])
 		if known {
-			if model_index >= 0 do add_instance(scene, model_index, reference_transform(reference))
+			if model_index >= 0 do add_instance(scene, model_index, reference_transform(reference), reference.form_id)
 		elif scene.waiting.len < scene.waiting.cap
 			waiting := next(&scene.waiting)
+			waiting.reference = reference.form_id
 			waiting.path.len = 0
 			&waiting.path + path[:]
 			waiting.world = reference_transform(reference)
@@ -340,7 +342,7 @@ load_waiting :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, budget: u64)
 		place := Vec3{item.world[3][0], item.world[3][1], item.world[3][2]}
 		if scene.world != 0 and not area_holds(shown_area(scene), place) do continue
 		model_index := scene_model(scene, loader, item.path[:])
-		if model_index >= 0 do add_instance(scene, model_index, item.world)
+		if model_index >= 0 do add_instance(scene, model_index, item.world, item.reference)
 	}
 	for scene.waiting_trees_next < scene.waiting_trees.len {
 		if time_now() - start > budget do return false
@@ -648,7 +650,7 @@ load_distant_objects :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, loade
 			_, has_far := find_file(loader.meshes, far[:])
 			model_index := scene_model(scene, loader, if has_far do far[:] else path[:])
 			if model_index < 0 do continue
-			&scene.distant_instances + place_instance(scene.models[model_index], model_index, reference_transform(reference))
+			&scene.distant_instances + place_instance(scene.models[model_index], model_index, reference_transform(reference), reference.form_id)
 		}
 	}
 	return scene.distant_instances.len

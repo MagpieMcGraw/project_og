@@ -751,6 +751,7 @@ Gpu_Model :: struct {
 // A model placed in the world, with what drawing it needs worked out once.
 Instance :: struct {
 	model: i64             // in the models drawn
+	reference: u32         // the reference it places (its form id), 0 for none
 	world: Mat4
 	center: Vec3           // a sphere around it, in the world
 	radius: f32
@@ -2155,7 +2156,7 @@ upload_model :: fun(renderer: ^Renderer, built: Model, archive: ^Archive, scratc
 
 // An instance of a model placed in the world: its sphere worked out, no
 // lights yet (choose_lights).
-place_instance :: fun(gpu: Gpu_Model, model_index: i64, placement: Mat4) -> Instance {
+place_instance :: fun(gpu: Gpu_Model, model_index: i64, placement: Mat4, reference: u32 = 0) -> Instance {
 	placed := mat4_mul_vec4(placement, Vec4{gpu.center.x, gpu.center.y, gpu.center.z, 1})
 	// The scale: how long the matrix's x axis is.
 	scale := vec3_length(Vec3{placement[0][0], placement[0][1], placement[0][2]})
@@ -2164,6 +2165,7 @@ place_instance :: fun(gpu: Gpu_Model, model_index: i64, placement: Mat4) -> Inst
 		world = placement,
 		center = Vec3{placed.x, placed.y, placed.z},
 		radius = gpu.radius * scale,
+		reference = reference,
 		lights = []}
 	for k in 0:LIGHTS_PER_OBJECT do instance.lights[k] = NO_LIGHT
 	return instance
@@ -2237,6 +2239,25 @@ upload_land :: fun(renderer: ^Renderer, mesh: ^Land_Mesh, x: i64, y: i64, slot: 
 	BindBuffer(ARRAY_BUFFER, renderer.land_vertex_buffer)
 	BufferSubData(ARRAY_BUFFER, isize(slot * LAND_MESH_VERTICES * size_of(Land_Vertex)), mesh.vertices[:])
 	return Gpu_Land{x = x, y = y, slot = slot, center = mesh.center, radius = mesh.radius}
+}
+
+// ---- the reticle ---------------------------------------------------------------------
+
+// A dot in the middle of the screen, where the eyes point: white with a
+// dark rim (seen on the sky and on snow), yellow when it's on something
+// to use. Two small clears, no shader.
+draw_reticle :: fun(width: i64, height: i64, on_something: bool) {
+	middle_x := i32(width / 2)
+	middle_y := i32(height / 2)
+	Enable(SCISSOR_TEST)
+	Scissor(middle_x - 3, middle_y - 3, 6, 6)
+	ClearColor(0.05, 0.05, 0.05, 1)
+	Clear(COLOR_BUFFER_BIT)
+	Scissor(middle_x - 2, middle_y - 2, 4, 4)
+	if on_something do ClearColor(1, 0.85, 0.3, 1)
+	else do ClearColor(0.95, 0.95, 0.95, 1)
+	Clear(COLOR_BUFFER_BIT)
+	Disable(SCISSOR_TEST)
 }
 
 // ---- the camera ----------------------------------------------------------------------

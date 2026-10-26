@@ -457,6 +457,41 @@ command_model :: fun(what: []utf8, name: []utf8) {
 		return
 	}
 	print("% blocks, % parts, from % to %", mesh.blocks.len, built.parts.len, built.bounds_min, built.bounds_max)
+	// Its blocks' types, each with how many.
+	types : [64]Type_Count
+	for b in 0:mesh.blocks.len {
+		type_name := mesh.header.type_names[i64(mesh.header.block_types[b])]
+		counted := false
+		for &entry in types {
+			if entry.name[:] == type_name {
+				entry.count += 1
+				counted = true
+			}
+		}
+		if not counted and types.len < types.cap {
+			entry := next(&types)
+			entry.name.len = 0
+			&entry.name + type_name
+			entry.count = 1
+		}
+	}
+	line : str1024
+	for &entry in types {
+		&line + entry.name[:]
+		&line + " "
+		&line + int_text(entry.count)[:]
+		&line + "  "
+	}
+	print("blocks: %", line)
+	for &block in mesh.blocks {
+		match block^ {
+		String_Extra extra
+			print("  string extra data % = %", extra.name, extra.value)
+		Node node
+			print("  node %: at %, flags %", node.object.name, node.object.translation, node.object.flags)
+		else
+		}
+	}
 	for part in built.parts {
 		// Where its texture coordinates reach, and its first vertex.
 		low_uv : [2!]f32 = [1000000, 1000000]
@@ -1143,6 +1178,66 @@ command_sky :: fun(name: []utf8) {
 // `sooblivion lod <world> <x> <y>`: the piece of distant land a cell is
 // in, and its normal map beside the cell's own land's normals at a few of
 // the land's points, to see which way the map's axes go.
+// `sooblivion doors`: the doors placed in all the cells: how many lead
+// somewhere (load doors), and the bases of those that don't (that open
+// in place), the most placed first, with their meshes.
+command_doors :: fun() {
+	data_storage : [400 * MB]byte
+	index_storage : [96 * MB]byte
+	plugin, load_error := load_oblivion(&data_storage, &index_storage)
+	if load_error {
+		print("couldn't load the plugin: %", load_error)
+		return
+	}
+	scratch : [1 * MB]byte
+	references : [16384]Reference
+	leading : i64 = 0
+	in_place : i64 = 0
+	bases : [2048]Base_Count
+	for key in plugin.cell_children.keys {
+		if key == 0 do continue
+		references.len = 0
+		_ = cell_references(&plugin, u32(key), &references)
+		for reference in references {
+			scratch.len = 0
+			base, base_error := find_record(&plugin, reference.base, &scratch)
+			if base_error or base.header.kind != "DOOR" do continue
+			_, leads := door_destination(&plugin, reference.form_id, &scratch)
+			if leads {
+				leading += 1
+				continue
+			}
+			in_place += 1
+			counted := false
+			for &entry in bases {
+				if entry.base == reference.base {
+					entry.count += 1
+					counted = true
+				}
+			}
+			if not counted and bases.len < bases.cap do &bases + Base_Count{base = reference.base, count = 1}
+		}
+	}
+	print("% doors lead somewhere, % open in place, of % bases", leading, in_place, bases.len)
+	for shown in 0:12 {
+		most : i64 = -1
+		for &entry, k in bases {
+			if entry.count > 0 and (most < 0 or entry.count > bases[most].count) do most = k
+		}
+		if most < 0 do break
+		scratch.len = 0
+		record, record_error := find_record(&plugin, bases[most].base, &scratch)
+		if not record_error do print("  % % %", bases[most].count, editor_id(record.data), model_path(record))
+		bases[most].count = 0
+	}
+}
+
+// A base record and how many references place it.
+Base_Count :: struct {
+	base: u32
+	count: i64
+}
+
 // `sooblivion collision <mesh>`: a mesh's collision, as walking meets it:
 // its triangles, and the box around them beside the box around what's
 // drawn. `collision -all`: every mesh's, counted; and how many of the
@@ -1678,6 +1773,8 @@ main :: (args: [][]utf8) {
 		command_map(if args.len > 2 do args[2] else "Tamriel")
 	elif command == "sky"
 		command_sky(if args.len > 2 do args[2] else "Tamriel")
+	elif command == "doors"
+		command_doors()
 	elif command == "collision" and args.len > 2
 		command_collision(args[2])
 	elif command == "grass" and args.len > 4

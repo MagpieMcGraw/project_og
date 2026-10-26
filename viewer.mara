@@ -44,7 +44,7 @@ EYES_CATCH_UP :: 12
 // How high above the floor the camera is when arriving: a person's eyes,
 // in Oblivion's units.
 EYE_HEIGHT :: 120
-// How near a door must be to go through it.
+// How near a door must be to use it: how far the eyes reach.
 DOOR_REACH :: 300
 // Without vsync, frames are kept to this many a second at most: the game
 // has to feel good at 60.
@@ -267,9 +267,11 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		note_end(&viewer.journal)
 		update_title(viewer)
 	}
-	if input.pressed[E] {
-		viewer.chosen_door = nearest_door(shown, camera.position)
-		if viewer.chosen_door >= 0 do return .door
+	// What the reticle is on: E uses it (a door, for now).
+	targeted := targeted_door(shown, camera^)
+	if input.pressed[E] and targeted >= 0 {
+		viewer.chosen_door = targeted
+		return .door
 	}
 
 	seconds, now := time_since(viewer.frame_start)
@@ -326,6 +328,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	}
 	viewer.drawn = draw_frame(&viewer.renderer, &shown.models, &shown.instances, &shown.distant_instances, &shown.grounds, &shown.waters,
 		&shown.tree_cells, &shown.grass_cells, &viewer.look, shown.lighting, camera^, platform.width, platform.height)
+	draw_reticle(platform.width, platform.height, targeted >= 0)
 	card_start := time_now()
 	viewer.drawing_time = card_start - drawing_start
 	wait_for_card()
@@ -605,19 +608,18 @@ load_some :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	}
 }
 
-// The door nearest a place, within reach of it: its index in the scene's
-// doors, or -1. (A door's place is at its foot; the eyes are above it.)
-nearest_door :: fun(shown: ^Scene, place: Vec3) -> i64 {
-	nearest : i64 = -1
-	nearest_distance : f32 = DOOR_REACH
+// The door the reticle is on, within reach: its index in the scene's
+// doors, or -1 — the first thing the eyes meet, if it's a door that leads
+// somewhere (a wall between hides it).
+targeted_door :: fun(shown: ^Scene, camera: render.Camera) -> i64 {
+	forward, _, _ := camera_axes(camera)
+	picked, _, hit := pick(shown, camera.position, forward, DOOR_REACH)
+	if not hit do return -1
+	reference := shown.instances[picked].reference
 	for candidate, i in shown.doors {
-		distance := vec3_length(candidate.position + Vec3{0, 0, EYE_HEIGHT} - place)
-		if distance < nearest_distance {
-			nearest = i
-			nearest_distance = distance
-		}
+		if candidate.reference == reference do return i
 	}
-	return nearest
+	return -1
 }
 
 // `sooblivion view <mesh>`: shows a mesh in the window.
