@@ -18,6 +18,13 @@
 // of indexes, and each pixel blends its quadrant's textures: their handles
 // in a storage buffer (bindless), or bound to units a quadrant at a time.
 //
+// Distant land: past the cells loaded in full, the game's own low-detail
+// land (and its far water) is drawn first, with its own depth range out
+// to where the fog ends; then the depth buffer is cleared and the near
+// cells drawn over it. The near cells are all nearer than the far land
+// (it leaves them out), so nothing near can be hidden wrongly, and each
+// gets the depth buffer's precision to itself.
+//
 // Oblivion's world has z up, x east and y north; a unit is about 1.4 cm, a
 // cell 4096 units across.
 module render
@@ -53,6 +60,17 @@ MAX_DRAWN :: 65536
 // Cells of land on the card at once, and their quadrants.
 LAND_SLOTS :: 64
 LAND_QUADRANTS :: 256   // LAND_SLOTS x 4
+
+// Distant land: pieces on the card at once, and room for their vertices
+// and indexes. Its near plane: the far pass starts this close.
+DISTANT_PIECES :: 256
+DISTANT_VERTEX_ROOM :: 1048576
+DISTANT_INDEX_ROOM :: 4194304
+DISTANT_NEAR :: 256
+
+// The cells left out of the far land and water — those drawn in full —
+// are a bit each, HIDDEN_SIDE x HIDDEN_SIDE of them around the camera's.
+HIDDEN_SIDE :: 16
 
 // How sharp textures stay seen at a slant: anisotropic filtering, at most.
 MOST_ANISOTROPY :: 16
@@ -251,6 +269,79 @@ void main() {
 }
 "
 
+// Whether a place is in a cell drawn in full, so the far land and water
+// leave it out: a bit for each of 16 x 16 cells from hidden_x, hidden_y.
+HIDDEN_CELLS_FUNCTION :: "
+uniform int hidden_x;
+uniform int hidden_y;
+uniform int hidden_rows[16];
+bool hidden_cell(vec2 place) {
+	ivec2 cell = ivec2(floor(place / 4096.0)) - ivec2(hidden_x, hidden_y);
+	if (cell.x < 0 || cell.x >= 16 || cell.y < 0 || cell.y >= 16) return false;
+	return (hidden_rows[cell.y] & (1 << cell.x)) != 0;
+}
+"
+
+// Distant land: its colors, shaded by its normal map, fogged; left out
+// where the cells are drawn in full. Which piece a vertex is of comes in
+// as an instance's number: the draw command's base instance.
+DISTANT_VERTEX_SHADER :: "
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec2 uv;
+layout(location = 2) in uint piece;
+uniform mat4 view_projection;
+out vec3 world_position;
+out vec2 texture_uv;
+flat out uint piece_index;
+void main() {
+	gl_Position = view_projection * vec4(position, 1.0);
+	world_position = position;
+	texture_uv = uv;
+	piece_index = piece;
+}
+"
+
+DISTANT_FRAGMENT_SHADER :: "
+in vec3 world_position;
+in vec2 texture_uv;
+flat in uint piece_index;
+
+#ifdef BINDLESS
+// Each piece's two textures' handles: its colors', its normals'.
+layout(std430, binding = 2) readonly buffer Distant_Textures {
+	uvec2 distant_textures[];
+};
+vec3 piece_color() { return texture(sampler2D(distant_textures[piece_index * 2u]), texture_uv).rgb; }
+vec3 piece_normal() { return texture(sampler2D(distant_textures[piece_index * 2u + 1u]), texture_uv).rgb; }
+#else
+uniform sampler2D color_texture;
+uniform sampler2D normal_texture;
+vec3 piece_color() { return texture(color_texture, texture_uv).rgb; }
+vec3 piece_normal() { return texture(normal_texture, texture_uv).rgb; }
+#endif
+
+uniform vec3 sun_direction;
+uniform vec3 sun_color;
+uniform vec3 ambient_color;
+uniform vec3 camera_position;
+uniform vec3 fog_color;
+uniform float fog_near;
+uniform float fog_far;
+
+out vec4 fragment_color;
+
+void main() {
+	if (hidden_cell(world_position.xy)) discard;
+	vec3 normal = normalize(piece_normal() * 2.0 - 1.0);
+	vec3 color = piece_color() * (ambient_color + sun_color * max(dot(normal, sun_direction), 0.0));
+	if (fog_far > fog_near) {
+		float fog = clamp((length(world_position - camera_position) - fog_near) / (fog_far - fog_near), 0.0, 1.0);
+		color = mix(color, fog_color, fog);
+	}
+	fragment_color = vec4(color, 1.0);
+}
+"
+
 // The sky's color seen looking a way: up from the horizon to the top of
 // the sky, down from it to the sky's lower color. Shared by the sky and
 // the water (which shows it reflected).
@@ -372,6 +463,9 @@ const float depth_scale = 125.0;
 const float ripple_size = 862.3;
 
 void main() {
+	// (The far water leaves out the cells whose own water is drawn.)
+	if (hidden_cell(world_position.xy)) discard;
+
 	// The ripples, as strong as the original's near the eye, gone flat by
 	// 10000 units away; two layers of the texture, against its repeating.
 	float flat_distance = length(camera_position.xy - world_position.xy);
@@ -419,8 +513,9 @@ void main() {
 WATER_SIDE :: 33
 WATER_VERTICES :: 1089    // 33 x 33
 WATER_INDICES :: 6144     // 32 x 32 x 6
-// Stretches of water on the card at once.
+// Stretches of water on the card at once; and past them, a slot for the far water.
 WATER_SLOTS :: 64
+FAR_WATER_SLOT :: 64
 // The ripple texture's size.
 RIPPLE_SIZE :: 256
 
@@ -521,9 +616,50 @@ Sky_Program :: struct {
 	cloud_upper_offset_at: i32
 }
 
+// The cells left out of the far land or water, around the cell at x, y:
+// a bit for each of HIDDEN_SIDE x HIDDEN_SIDE, row by row from the south.
+Hidden_Cells :: struct {
+	x: i64
+	y: i64
+	rows: [HIDDEN_SIDE!]i32
+}
+
+// Where a program's hidden cells' uniforms are.
+Hidden_At :: struct {
+	x_at: i32
+	y_at: i32
+	rows_at: [HIDDEN_SIDE!]i32
+}
+
+// A point of distant land: where it is, and where on its piece's textures.
+Distant_Vertex :: struct {
+	position: Vec3
+	uv: [2!]f32
+}
+
+// A piece of distant land on the card: its range of the distant buffers,
+// a sphere around it, its textures (slots in the renderer's).
+Distant_Piece :: struct {
+	first_index: u32
+	index_count: u32
+	base_vertex: i32
+	center: Vec3
+	radius: f32
+	color_texture: i64
+	normal_texture: i64
+}
+
+// A distant land program, and where its uniforms are.
+Distant_Program :: struct {
+	program: u32
+	shared: Shared_Uniforms
+	hidden: Hidden_At
+}
+
 // The water program and where its uniforms are.
 Water_Program :: struct {
 	program: u32
+	hidden: Hidden_At
 	view_projection_at: i32
 	camera_position_at: i32
 	time_at: i32
@@ -617,6 +753,7 @@ Renderer :: struct {
 	use_bindless: bool
 	mesh_programs: [2!]Mesh_Program
 	land_programs: [2!]Land_Program
+	distant_programs: [2!]Distant_Program
 	sky_program: Sky_Program
 	water_program: Water_Program
 	anisotropy: f32
@@ -630,6 +767,24 @@ Renderer :: struct {
 	water_indirect_buffer: u32
 	water_commands: [WATER_SLOTS]Draw_Command
 	ripple_texture: u32
+	far_water_ready: bool    // the far water's slot holds it
+
+	// Distant land: the world it's of, its pieces, the buffers they're in
+	// (and how much is used), each piece's number by instance, their
+	// textures' handles (bindless), and the texture standing in for a
+	// missing normal map.
+	distant_world: u32
+	distant_pieces: [DISTANT_PIECES]Distant_Piece
+	distant_commands: [DISTANT_PIECES]Draw_Command
+	distant_vertex_array: u32
+	distant_vertex_buffer: u32
+	distant_index_buffer: u32
+	distant_piece_buffer: u32
+	distant_texture_buffer: u32
+	distant_indirect_buffer: u32
+	distant_vertices_used: i64
+	distant_indices_used: i64
+	flat_normal_texture: i64
 
 	// The shared mesh buffers, and how much of them is used.
 	mesh_vertex_array: u32
@@ -684,14 +839,17 @@ renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
 	make_land_program(&renderer.land_programs[0], false)?
 	make_sky_program(&renderer.sky_program)?
 	make_water_program(&renderer.water_program)?
+	make_distant_program(&renderer.distant_programs[0], false)?
 	if renderer.bindless_available {
 		make_mesh_program(&renderer.mesh_programs[1], true)?
 		make_land_program(&renderer.land_programs[1], true)?
+		make_distant_program(&renderer.distant_programs[1], true)?
 	}
 
 	setup_mesh_buffers(renderer)
 	setup_land_buffers(renderer)
 	setup_water_buffers(renderer)
+	setup_distant_buffers(renderer)
 
 	renderer.parts.len = 0
 	// Every part's count and start, by its index: all there, all 0.
@@ -704,12 +862,22 @@ renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
 	renderer.textures.len = 0
 	renderer.texture_index = key_index(1 << 14, storage)
 
-	// The white texture: slot 0, for parts with none.
-	white : [4!]u8 = [255, 255, 255, 255]
+	// The white texture: slot 0, for parts with none. Then a flat normal
+	// map's, straight up, for distant land missing its own.
+	_ = one_pixel_texture(renderer, [255, 255, 255, 255])
+	renderer.flat_normal_texture = one_pixel_texture(renderer, [128, 128, 255, 255])
+	for q in 0:LAND_QUADRANTS {
+		for k in 0:QUADRANT_TEXTURES do renderer.land_quadrants[q].textures[k] = 0
+	}
+}
+
+// A texture of one pixel, in the next slot: that slot.
+one_pixel_texture :: fun(renderer: ^Renderer, pixel: [4!]u8) -> i64 {
+	color := pixel
 	id : u32 = 0
 	GenTextures(1, &id)
 	BindTexture(TEXTURE_2D, id)
-	TexImage2D(TEXTURE_2D, 0, i32(RGBA8), 1, 1, 0, RGBA, UNSIGNED_BYTE, &white[0])
+	TexImage2D(TEXTURE_2D, 0, i32(RGBA8), 1, 1, 0, RGBA, UNSIGNED_BYTE, &color[0])
 	TexParameteri(TEXTURE_2D, TEXTURE_MAX_LEVEL, 0)
 	TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(LINEAR))
 	TexParameteri(TEXTURE_2D, TEXTURE_MAG_FILTER, i32(LINEAR))
@@ -717,9 +885,7 @@ renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
 	entry.path.len = 0
 	entry.id = id
 	entry.handle = resident_handle(renderer, id)
-	for q in 0:LAND_QUADRANTS {
-		for k in 0:QUADRANT_TEXTURES do renderer.land_quadrants[q].textures[k] = 0
-	}
+	return renderer.textures.len - 1
 }
 
 // A texture's bindless handle, made resident; 0 without bindless. Its
@@ -815,9 +981,24 @@ make_sky_program :: fun(made: ^Sky_Program) -> err {
 	Uniform1i(GetUniformLocation(program, "sun_texture"), 2)
 }
 
+make_distant_program :: fun(made: ^Distant_Program, bindless: bool) -> err {
+	made.program = compile_program(DISTANT_VERTEX_SHADER, DISTANT_FRAGMENT_SHADER, bindless, HIDDEN_CELLS_FUNCTION)?
+	made.shared = find_shared_uniforms(made.program)
+	made.hidden = find_hidden_uniforms(made.program)
+	UseProgram(made.program)
+	if not bindless {
+		Uniform1i(GetUniformLocation(made.program, "color_texture"), 0)
+		Uniform1i(GetUniformLocation(made.program, "normal_texture"), 1)
+	}
+}
+
 make_water_program :: fun(made: ^Water_Program) -> err {
-	made.program = compile_program(WATER_VERTEX_SHADER, WATER_FRAGMENT_SHADER, false, SKY_COLOR_FUNCTION)?
+	shared : [4 * KB]utf8
+	&shared + SKY_COLOR_FUNCTION
+	&shared + HIDDEN_CELLS_FUNCTION
+	made.program = compile_program(WATER_VERTEX_SHADER, WATER_FRAGMENT_SHADER, false, shared[:])?
 	program := made.program
+	made.hidden = find_hidden_uniforms(program)
 	made.view_projection_at = GetUniformLocation(program, "view_projection")
 	made.camera_position_at = GetUniformLocation(program, "camera_position")
 	made.time_at = GetUniformLocation(program, "time")
@@ -847,7 +1028,7 @@ setup_water_buffers :: fun(renderer: ^Renderer) {
 	BindVertexArray(renderer.water_vertex_array)
 	GenBuffers(1, &renderer.water_vertex_buffer)
 	BindBuffer(ARRAY_BUFFER, renderer.water_vertex_buffer)
-	BufferData(ARRAY_BUFFER, WATER_SLOTS * WATER_VERTICES * size_of(Water_Vertex), void, DYNAMIC_DRAW)
+	BufferData(ARRAY_BUFFER, (WATER_SLOTS + 1) * WATER_VERTICES * size_of(Water_Vertex), void, DYNAMIC_DRAW)
 	stride := i32(size_of(Water_Vertex))
 	EnableVertexAttribArray(0)
 	VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)    // position
@@ -938,25 +1119,163 @@ make_ripple_texture :: fun(renderer: ^Renderer) {
 	Uniform1i(GetUniformLocation(renderer.water_program.program, "normal_map"), 0)
 }
 
-// Puts the stretches of water on the card, each in its slot: their points
-// over their rectangles, at their heights, with their depths.
+// Puts the stretches of water on the card, each in its slot.
 upload_waters :: fun(renderer: ^Renderer, waters: ^[]Water_Cell) {
-	BindBuffer(ARRAY_BUFFER, renderer.water_vertex_buffer)
-	points : [WATER_VERTICES]Water_Vertex
 	for k in 0:waters.len {
 		if k == WATER_SLOTS do break
-		water := &waters[k]
-		points.len = 0
-		for row in 0:WATER_SIDE {
-			for column in 0:WATER_SIDE {
-				x := water.low_x + (water.high_x - water.low_x) * f32(column) / (WATER_SIDE - 1)
-				y := water.low_y + (water.high_y - water.low_y) * f32(row) / (WATER_SIDE - 1)
-				&points + Water_Vertex{position = Vec3{x, y, water.height}, depth = water.depths[row * WATER_SIDE + column]}
-			}
-		}
-		BufferSubData(ARRAY_BUFFER, isize(k * WATER_VERTICES * size_of(Water_Vertex)),
-			WATER_VERTICES * size_of(Water_Vertex), &points[0])
+		upload_water(renderer, &waters[k], k)
 	}
+}
+
+// Puts a stretch of water in a slot on the card: its points over its
+// rectangle, at its height, with its depths.
+upload_water :: fun(renderer: ^Renderer, water: ^Water_Cell, slot: i64) {
+	points : [WATER_VERTICES]Water_Vertex
+	for row in 0:WATER_SIDE {
+		for column in 0:WATER_SIDE {
+			x := water.low_x + (water.high_x - water.low_x) * f32(column) / (WATER_SIDE - 1)
+			y := water.low_y + (water.high_y - water.low_y) * f32(row) / (WATER_SIDE - 1)
+			&points + Water_Vertex{position = Vec3{x, y, water.height}, depth = water.depths[row * WATER_SIDE + column]}
+		}
+	}
+	BindBuffer(ARRAY_BUFFER, renderer.water_vertex_buffer)
+	BufferSubData(ARRAY_BUFFER, isize(slot * WATER_VERTICES * size_of(Water_Vertex)),
+		WATER_VERTICES * size_of(Water_Vertex), &points[0])
+}
+
+// The far water: a stretch over a rectangle at a height, deep all over.
+set_far_water :: fun(renderer: ^Renderer, low_x: f32, low_y: f32, high_x: f32, high_y: f32, height: f32) {
+	water : Water_Cell
+	water.low_x = low_x
+	water.low_y = low_y
+	water.high_x = high_x
+	water.high_y = high_y
+	water.height = height
+	for k in 0:WATER_VERTICES do water.depths[k] = 1000
+	upload_water(renderer, &water, FAR_WATER_SLOT)
+	renderer.far_water_ready = true
+}
+
+// ---- distant land ----------------------------------------------------------------
+
+// Distant land's buffers: its vertices, its indexes, each piece's number
+// (read once for each instance), its textures' handles.
+setup_distant_buffers :: fun(renderer: ^Renderer) {
+	GenVertexArrays(1, &renderer.distant_vertex_array)
+	BindVertexArray(renderer.distant_vertex_array)
+	GenBuffers(1, &renderer.distant_vertex_buffer)
+	BindBuffer(ARRAY_BUFFER, renderer.distant_vertex_buffer)
+	BufferData(ARRAY_BUFFER, DISTANT_VERTEX_ROOM * size_of(Distant_Vertex), void, STATIC_DRAW)
+	stride := i32(size_of(Distant_Vertex))
+	EnableVertexAttribArray(0)
+	VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)    // position
+	EnableVertexAttribArray(1)
+	VertexAttribPointer(1, 2, FLOAT, 0, stride, 12)   // uv
+
+	numbers : [DISTANT_PIECES]u32
+	for k in 0:DISTANT_PIECES do &numbers + u32(k)
+	GenBuffers(1, &renderer.distant_piece_buffer)
+	BindBuffer(ARRAY_BUFFER, renderer.distant_piece_buffer)
+	BufferData(ARRAY_BUFFER, DISTANT_PIECES * 4, &numbers[0], STATIC_DRAW)
+	EnableVertexAttribArray(2)
+	VertexAttribIPointer(2, 1, UNSIGNED_INT, 4, 0)    // the piece
+	VertexAttribDivisor(2, 1)
+
+	GenBuffers(1, &renderer.distant_index_buffer)
+	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.distant_index_buffer)
+	BufferData(ELEMENT_ARRAY_BUFFER, DISTANT_INDEX_ROOM * 2, void, STATIC_DRAW)
+	BindVertexArray(0)
+	GenBuffers(1, &renderer.distant_indirect_buffer)
+	GenBuffers(1, &renderer.distant_texture_buffer)
+	BindBuffer(SHADER_STORAGE_BUFFER, renderer.distant_texture_buffer)
+	BufferData(SHADER_STORAGE_BUFFER, DISTANT_PIECES * 16, void, DYNAMIC_DRAW)
+	clear_distant_land(renderer)
+}
+
+// No distant land, and no far water. (Their textures stay loaded.)
+clear_distant_land :: fun(renderer: ^Renderer) {
+	renderer.distant_world = 0
+	renderer.distant_pieces.len = 0
+	renderer.distant_vertices_used = 0
+	renderer.distant_indices_used = 0
+	renderer.far_water_ready = false
+}
+
+// Puts a piece of distant land on the card: a model's part, its colors'
+// and normals' textures. False when there's no room.
+upload_distant_piece :: fun(renderer: ^Renderer, part: ^Model_Part, color_texture: i64, normal_texture: i64) -> bool {
+	vertex_count := part.vertices.len
+	index_count := part.indices.len
+	if vertex_count == 0 or index_count == 0 do return false
+	if renderer.distant_pieces.len == renderer.distant_pieces.cap do return false
+	if renderer.distant_vertices_used + vertex_count > DISTANT_VERTEX_ROOM do return false
+	if renderer.distant_indices_used + index_count > DISTANT_INDEX_ROOM do return false
+
+	// Its vertices as the program reads them, and the box around them.
+	points : [65536]Distant_Vertex
+	low := part.vertices[0].position
+	high := low
+	for vertex in part.vertices {
+		&points + Distant_Vertex{position = vertex.position, uv = vertex.uv}
+		for axis in 0:3 {
+			if vertex.position[axis] < low[axis] do low[axis] = vertex.position[axis]
+			if vertex.position[axis] > high[axis] do high[axis] = vertex.position[axis]
+		}
+	}
+	BindVertexArray(0)   // (binding an index buffer would change a bound vertex array's)
+	BindBuffer(ARRAY_BUFFER, renderer.distant_vertex_buffer)
+	BufferSubData(ARRAY_BUFFER, isize(renderer.distant_vertices_used * size_of(Distant_Vertex)),
+		isize(points.len * size_of(Distant_Vertex)), &points[0])
+	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.distant_index_buffer)
+	BufferSubData(ELEMENT_ARRAY_BUFFER, isize(renderer.distant_indices_used * 2), isize(index_count * 2), &part.indices[0])
+
+	piece_number := renderer.distant_pieces.len
+	if renderer.bindless_available {
+		handles : [2!]u64 = [renderer.textures[color_texture].handle, renderer.textures[normal_texture].handle]
+		BindBuffer(SHADER_STORAGE_BUFFER, renderer.distant_texture_buffer)
+		BufferSubData(SHADER_STORAGE_BUFFER, isize(piece_number * 16), 16, &handles[0])
+	}
+	&renderer.distant_pieces + Distant_Piece{
+		first_index = u32(renderer.distant_indices_used),
+		index_count = u32(index_count),
+		base_vertex = i32(renderer.distant_vertices_used),
+		center = (low + high) * 0.5,
+		radius = vec3_length(high - low) * 0.5,
+		color_texture = color_texture,
+		normal_texture = normal_texture}
+	renderer.distant_vertices_used += vertex_count
+	renderer.distant_indices_used += index_count
+	return true
+}
+
+// ---- the cells drawn in full ------------------------------------------------------
+
+// No cells hidden yet, around the cell a place is in.
+hidden_around :: fun(place: Vec3) -> Hidden_Cells {
+	x, y := grid_of(place)
+	hidden := Hidden_Cells{x = x - HIDDEN_SIDE / 2, y = y - HIDDEN_SIDE / 2, rows = []}
+	for row in 0:HIDDEN_SIDE do hidden.rows[row] = 0
+	return hidden
+}
+
+// Hides a cell, if it's among those around.
+hide_cell :: fun(hidden: ^Hidden_Cells, x: i64, y: i64) {
+	column := x - hidden.x
+	row := y - hidden.y
+	if column < 0 or column >= HIDDEN_SIDE or row < 0 or row >= HIDDEN_SIDE do return
+	hidden.rows[row] = hidden.rows[row] | i32(1 << column)
+}
+
+find_hidden_uniforms :: fun(program: u32) -> Hidden_At {
+	at := Hidden_At{x_at = GetUniformLocation(program, "hidden_x"), y_at = GetUniformLocation(program, "hidden_y"), rows_at = []}
+	for row in 0:HIDDEN_SIDE do at.rows_at[row] = array_uniform(program, "hidden_rows[", row)
+	return at
+}
+
+set_hidden_cells :: fun(at: ^Hidden_At, hidden: ^Hidden_Cells) {
+	Uniform1i(at.x_at, i32(hidden.x))
+	Uniform1i(at.y_at, i32(hidden.y))
+	for row in 0:HIDDEN_SIDE do Uniform1i(at.rows_at[row], hidden.rows[row])
 }
 
 // Where an item of a uniform array is in a program: name[index].
@@ -1396,6 +1715,18 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 	sun := vec3_normalize(lighting.direction)
 
 	if look.outside do draw_sky(renderer, look, view_projection, lighting, camera, &stats)
+	if look.outside and renderer.distant_pieces.len > 0 {
+		// The far pass: out to where the fog ends, then the depth cleared
+		// for the near.
+		reach := lighting.fog_far * 1.1
+		if reach < camera.far do reach = camera.far
+		far_projection := mat4_perspective(camera.field_of_view, f32(width) / f32(height), DISTANT_NEAR, reach)
+		far_view_projection := mat4_mul(far_projection, view_matrix(camera))
+		far_planes := view_planes(far_view_projection)
+		draw_distant_land(renderer, grounds, &far_planes, far_view_projection, lighting, sun, camera, &stats)
+		draw_far_water(renderer, waters, look, far_view_projection, lighting, camera, &stats)
+		Clear(DEPTH_BUFFER_BIT)
+	}
 	if grounds.len > 0 do draw_land(renderer, grounds, &planes, view_projection, lighting, sun, camera, &stats)
 	gather_meshes(renderer, models, instances, &planes, &stats)
 	draw_mesh_runs(renderer, view_projection, lighting, sun, camera, false, &stats)
@@ -1444,9 +1775,65 @@ draw_sky :: fun(renderer: ^Renderer, look: ^Sky_Look, view_projection: Mat4, lig
 	stats.draw_calls += 1
 }
 
+// Draws the distant land in view, but for the cells whose own land is
+// drawn: bindless, in one call; else a call for each piece, its textures
+// bound to units 0 and 1.
+draw_distant_land :: fun(renderer: ^Renderer, grounds: ^[]Gpu_Land, planes: ^View_Planes, view_projection: Mat4,
+	lighting: Cell_Lighting, sun: Vec3, camera: Camera, stats: ^Frame_Stats)
+{
+	renderer.distant_commands.len = 0
+	for piece, k in renderer.distant_pieces {
+		if not sphere_in_view(planes, piece.center, piece.radius) do continue
+		&renderer.distant_commands + Draw_Command{count = piece.index_count, instance_count = 1,
+			first_index = piece.first_index, base_vertex = piece.base_vertex, base_instance = u32(k)}
+	}
+	if renderer.distant_commands.len == 0 do return
+	hidden := hidden_around(camera.position)
+	for ground in grounds do hide_cell(&hidden, ground.x, ground.y)
+
+	made := &renderer.distant_programs[which_program(renderer)]
+	UseProgram(made.program)
+	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
+	set_hidden_cells(&made.hidden, &hidden)
+	BindVertexArray(renderer.distant_vertex_array)
+	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.distant_indirect_buffer)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.distant_commands.len * size_of(Draw_Command)), &renderer.distant_commands[0], STREAM_DRAW)
+	if renderer.use_bindless {
+		BindBufferBase(SHADER_STORAGE_BUFFER, 2, renderer.distant_texture_buffer)
+		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, 0, i32(renderer.distant_commands.len), 0)
+		stats.draw_calls += 1
+		return
+	}
+	for command, k in renderer.distant_commands {
+		piece := &renderer.distant_pieces[command.base_instance]
+		ActiveTexture(TEXTURE0)
+		BindTexture(TEXTURE_2D, renderer.textures[piece.color_texture].id)
+		ActiveTexture(TEXTURE1)
+		BindTexture(TEXTURE_2D, renderer.textures[piece.normal_texture].id)
+		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, usize(k * size_of(Draw_Command)), 1, 0)
+		stats.draw_calls += 1
+	}
+	ActiveTexture(TEXTURE0)
+}
+
+// Draws the far water, but for the cells whose own water is drawn.
+draw_far_water :: fun(renderer: ^Renderer, waters: ^[]Water_Cell, look: ^Sky_Look, view_projection: Mat4,
+	lighting: Cell_Lighting, camera: Camera, stats: ^Frame_Stats)
+{
+	if not renderer.far_water_ready do return
+	hidden := hidden_around(camera.position)
+	for &water in waters {
+		x, y := grid_of(Vec3{(water.low_x + water.high_x) / 2, (water.low_y + water.high_y) / 2, 0})
+		hide_cell(&hidden, x, y)
+	}
+	renderer.water_commands.len = 0
+	&renderer.water_commands + Draw_Command{count = WATER_INDICES, instance_count = 1, first_index = 0,
+		base_vertex = i32(FAR_WATER_SLOT * WATER_VERTICES), base_instance = 0}
+	draw_water_commands(renderer, look, view_projection, lighting, camera, &hidden, stats)
+}
+
 // Draws the water in view (put on the card with upload_waters): one call
-// for all of it, blended over what's below, the depth buffer read but not
-// written.
+// for all of it.
 draw_water :: fun(renderer: ^Renderer, waters: ^[]Water_Cell, planes: ^View_Planes, look: ^Sky_Look, view_projection: Mat4,
 	lighting: Cell_Lighting, camera: Camera, stats: ^Frame_Stats)
 {
@@ -1461,11 +1848,20 @@ draw_water :: fun(renderer: ^Renderer, waters: ^[]Water_Cell, planes: ^View_Plan
 			base_vertex = i32(k * WATER_VERTICES), base_instance = 0}
 	}
 	if renderer.water_commands.len == 0 do return
+	nothing_hidden := hidden_around(camera.position)
+	draw_water_commands(renderer, look, view_projection, lighting, camera, &nothing_hidden, stats)
+}
 
+// Draws the water program's commands: blended over what's below, the
+// depth buffer read but not written; leaving out the hidden cells.
+draw_water_commands :: fun(renderer: ^Renderer, look: ^Sky_Look, view_projection: Mat4,
+	lighting: Cell_Lighting, camera: Camera, hidden: ^Hidden_Cells, stats: ^Frame_Stats)
+{
 	made := &renderer.water_program
 	state := &look.state
 	water := &look.water
 	UseProgram(made.program)
+	set_hidden_cells(&made.hidden, hidden)
 	matrix := view_projection
 	UniformMatrix4fv(made.view_projection_at, 1, 0, &matrix[0][0])
 	Uniform3f(made.camera_position_at, camera.position.x, camera.position.y, camera.position.z)

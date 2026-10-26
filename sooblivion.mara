@@ -24,6 +24,7 @@ use scene
 use land
 use sky
 use shader_package
+use distant
 render :: use render
 use mara.math
 use sdl_platform
@@ -395,6 +396,16 @@ command_model :: fun(what: []utf8, name: []utf8) {
 	}
 	print("% blocks, % parts, from % to %", mesh.blocks.len, built.parts.len, built.bounds_min, built.bounds_max)
 	for part in built.parts {
+		// Where its texture coordinates reach, and its first vertex.
+		low_uv : [2!]f32 = [1000000, 1000000]
+		high_uv : [2!]f32 = [-1000000, -1000000]
+		for vertex in part.vertices {
+			for k in 0:2 {
+				if vertex.uv[k] < low_uv[k] do low_uv[k] = vertex.uv[k]
+				if vertex.uv[k] > high_uv[k] do high_uv[k] = vertex.uv[k]
+			}
+		}
+		if part.vertices.len > 0 do print("  texture coordinates from % to %; first vertex %", low_uv, high_uv, part.vertices[0])
 		print("  % vertices, % triangles, texture % % % %",
 			part.vertices.len, part.indices.len / 3, part.texture,
 			if part.alpha_blend do "blended" else "",
@@ -586,10 +597,26 @@ command_map :: fun(name: []utf8) {
 	for i in 0:width * height * 4 do &pixels + u8(0)
 	cell_land : Land
 	lands : i64 = 0
+	// The water's heights, and how many cells have each.
+	water_heights : [64]f32
+	water_counts : [64]i64
 	for cell_y in low_y..high_y {
 		for cell_x in low_x..high_x {
 			cell := exterior_cell(&plugin, world_id, cell_x, cell_y)
 			if cell == 0 do continue
+			water_height, has_water := cell_water(&plugin, cell, &scratch)
+			if has_water {
+				known := -1
+				for height, k in water_heights {
+					if height == water_height do known = k
+				}
+				if known >= 0 {
+					water_counts[known] += 1
+				elif water_heights.len < water_heights.cap
+					&water_heights + water_height
+					&water_counts + 1
+				}
+			}
 			land_at, has_land := find_land(&plugin, cell)
 			if not has_land do continue
 			scratch.len = 0
@@ -628,6 +655,7 @@ command_map :: fun(name: []utf8) {
 	write_error := write_entire_file("map.png", png_storage[:])
 	if write_error do print("couldn't write map.png: %", write_error)
 	else do print("wrote map.png: % x %, % cells with land", width, height, lands)
+	for height, k in water_heights do print("  water at %: % cells", height, water_counts[k])
 }
 
 // `sooblivion area <world> <x> <y>`: what the viewer would load around a
@@ -959,6 +987,114 @@ command_sky :: fun(name: []utf8) {
 	}
 }
 
+// `sooblivion lod <world> <x> <y>`: the piece of distant land a cell is
+// in, and its normal map beside the cell's own land's normals at a few of
+// the land's points, to see which way the map's axes go.
+command_lod :: fun(name: []utf8, x: i64, y: i64) {
+	data_storage : [400 * MB]byte
+	index_storage : [96 * MB]byte
+	plugin, load_error := load_oblivion(&data_storage, &index_storage)
+	if load_error {
+		print("couldn't load the plugin: %", load_error)
+		return
+	}
+	scratch : [16 * MB]byte
+	world_id := find_world(&plugin, name, &scratch)
+	if world_id == 0 {
+		print("no world %", name)
+		return
+	}
+	directory_storage : [64 * MB]byte
+	meshes, meshes_error := open_archive(data_path("Oblivion - Meshes.bsa"), &directory_storage)
+	if meshes_error {
+		print("couldn't open the meshes: %", meshes_error)
+		return
+	}
+	defer close_archive(&meshes)
+	textures, open_error := open_archive(data_path("Oblivion - Textures - Compressed.bsa"), &directory_storage)
+	if open_error {
+		print("couldn't open the textures: %", open_error)
+		return
+	}
+	defer close_archive(&textures)
+
+	// All the world's pieces, read as the viewer reads them.
+	file_room : [16 * MB]byte
+	block_room : [16 * MB]byte
+	model_room : [16 * MB]byte
+	texture_room : [1 * KB]byte
+	room := load_room(&file_room, &block_room, &model_room, &texture_room)
+	start := time_now()
+	pieces : i64 = 0
+	vertices : i64 = 0
+	triangles : i64 = 0
+	steps := LOD_REACH * 2 / LOD_CELLS
+	for row in 0:steps {
+		for column in 0:steps {
+			piece_name := lod_name(world_id, column * LOD_CELLS - LOD_REACH, row * LOD_CELLS - LOD_REACH)
+			built, found := read_lod_mesh(&meshes, &room, piece_name[:])
+			if not found do continue
+			pieces += 1
+			for part in built.parts {
+				vertices += part.vertices.len
+				triangles += part.indices.len / 3
+			}
+		}
+	}
+	print("% pieces of distant land, % vertices, % triangles, read in % ms", pieces, vertices, triangles, elapsed_ms(start))
+
+	corner_x := lod_corner(x)
+	corner_y := lod_corner(y)
+	piece := lod_name(world_id, corner_x, corner_y)
+	print("cell % % is in piece %", x, y, piece)
+	path : [256]utf8
+	&path + "textures\\landscapelod\\generated\\"
+	&path + piece[:]
+	&path + "_fn.dds"
+	texture_storage : [16 * MB]byte
+	texture, read_error := render.read_archive_texture(&textures, path[:], &texture_storage)
+	if read_error {
+		print("couldn't read %: %", path, read_error)
+		return
+	}
+	pixel_storage : [8 * MB]byte
+	pixels, decode_error := decode_rgba(texture, 0, &pixel_storage)
+	if decode_error {
+		print("couldn't decode %: %", path, decode_error)
+		return
+	}
+
+	cell := exterior_cell(&plugin, world_id, x, y)
+	land_at, has_land := find_land(&plugin, cell)
+	if cell == 0 or not has_land {
+		print("no land in cell % %", x, y)
+		return
+	}
+	scratch.len = 0
+	record, record_error := record_at(&plugin, land_at, &scratch)
+	if record_error {
+		print("couldn't read the land: %", record_error)
+		return
+	}
+	cell_land : Land
+	read_land(record.data, &cell_land)
+	piece_size := f32(LOD_CELLS * CELL_SIZE)
+	columns : [5!]i64 = [4, 16, 28, 8, 20]
+	rows : [5!]i64 = [4, 16, 8, 28, 30]
+	for k in 0:5 {
+		column := columns[k]
+		row := rows[k]
+		// Where the point is on the piece's textures: u east, v north.
+		u := (f32((x - corner_x) * CELL_SIZE) + f32(column) * LAND_SPACING) / piece_size
+		v := (f32((y - corner_y) * CELL_SIZE) + f32(row) * LAND_SPACING) / piece_size
+		pixel_x := i64(u * f32(texture.width))
+		pixel_y := i64(v * f32(texture.height))
+		at := (pixel_y * texture.width + pixel_x) * 4
+		mapped := Vec3{f32(pixels[at]) / 255 * 2 - 1, f32(pixels[at + 1]) / 255 * 2 - 1, f32(pixels[at + 2]) / 255 * 2 - 1}
+		print("  point % %: the land's normal %, the map's %", column, row, cell_land.normals[row * LAND_SIDE + column], mapped)
+	}
+}
+
 // `sooblivion shader [name] [package]`: the shaders in one of the game's
 // shader packages (Data\Shaders\shaderpackage019.sdp unless named), or
 // one of them disassembled, its constants' names listed first.
@@ -1067,6 +1203,11 @@ main :: (args: [][]utf8) {
 		command_map(if args.len > 2 do args[2] else "Tamriel")
 	elif command == "sky"
 		command_sky(if args.len > 2 do args[2] else "Tamriel")
+	elif command == "lod" and args.len > 4
+		x, x_ok := parse_number(args[3])
+		y, y_ok := parse_number(args[4])
+		if x_ok and y_ok do command_lod(args[2], i64(x), i64(y))
+		else do usage()
 	elif command == "shader"
 		name : []utf8 = args[0][0:0]
 		if args.len > 2 do name = args[2]

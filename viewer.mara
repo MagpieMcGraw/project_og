@@ -23,6 +23,7 @@ use world
 use land
 use scene
 use sky
+use distant
 use logging
 use mara.string
 use sdl_platform
@@ -422,6 +423,12 @@ note_gl_errors :: fun(viewer: ^Viewer) {
 	}
 }
 
+// Whether the world shown has its distant land on the card.
+has_distant_land :: fun(viewer: ^Viewer) -> bool {
+	renderer := &viewer.renderer
+	return renderer.distant_pieces.len > 0 and renderer.distant_world == viewer.shown.world
+}
+
 // Moves the game's day on by a frame's seconds (much faster when hurried),
 // and outside, the sky with it: its colors, the clouds' drift, the light
 // everything's drawn with.
@@ -442,7 +449,9 @@ pass_time :: fun(viewer: ^Viewer, seconds: f32, hurried: bool) {
 		look.water = lit_water(viewer.water, lighting.ambient * 2)
 		return
 	}
+	// Without distant land, the fog ends where the loaded cells do.
 	most_fog : f32 = CELL_SIZE * (EXTERIOR_RADIUS + 0.5)
+	if has_distant_land(viewer) do most_fog = 1000000
 	look.state = sky_at(viewer.climate, &viewer.weather, viewer.hour, most_fog)
 	look.cloud_lower_offset += seconds * scale / TIME_SCALE * viewer.weather.cloud_speed_lower
 	look.cloud_upper_offset += seconds * scale / TIME_SCALE * viewer.weather.cloud_speed_upper
@@ -744,6 +753,18 @@ go_outside :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32, place: Vec3) 
 	shown := &viewer.shown
 	start := time_now()
 	take_sky(viewer, plugin, world_id)
+	if viewer.renderer.distant_world != world_id {
+		distant_start := time_now()
+		pieces := load_distant_land(&viewer.renderer, world_id, viewer_loader(viewer))
+		note(&viewer.journal, "distant land: ")
+		note(&viewer.journal, pieces)
+		note(&viewer.journal, " pieces, ")
+		note(&viewer.journal, viewer.renderer.distant_vertices_used)
+		note(&viewer.journal, " vertices, in ")
+		note(&viewer.journal, elapsed_ms(distant_start))
+		note(&viewer.journal, " ms")
+		note_end(&viewer.journal)
+	}
 	x, y := grid_of(place)
 	show_error := show_exterior(shown, plugin, world_id, x, y)
 	_ = load_waiting(shown, plugin, viewer_loader(viewer), 0xFFFFFFFFFFFFFFFF)
