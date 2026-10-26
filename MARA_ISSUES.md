@@ -7,17 +7,7 @@ against Mara at the time written. When one is fixed, move it to Fixed
 
 ## Open
 
-### 1. An err can't be had as text
-
-Found 2026-10-26. `print` shows an err (`Parse_Error.Not_A_Digit`), but
-nothing gives its name as text to keep: `name : []utf8 = e` is "cannot
-assign err", `e.name` "cannot access field", and there's no format into a
-buffer. So sooblivion's journal, which writes a log file, can say what
-failed but not why: the why goes to the console with `print` beside it
-(viewer.mara, note_failures and its neighbors).
-
-Wanted: an err's name as text (`e.text()`, say, or a print into a
-buffer), so it can go in a file or a window's title.
+None.
 
 ## Answered (not issues)
 
@@ -28,6 +18,9 @@ buffer), so it can go in a file or a window's title.
 
 ## Fixed
 
+- An err couldn't be had as text (the journal's log could say what failed,
+  not why) — b6926f2 (`e.text()`) and eb25281 (`e.where()`: where it was
+  made, carried by `?`). sooblivion's journal writes both (note_error).
 - An inner loop's index named as the outer loop's was the same variable
   (`for value, i in …` around `for i in 0:2`: the outer loop never ended)
   — 9d5d110: a loop's name hiding an enclosing one is an error, as a

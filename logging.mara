@@ -49,6 +49,17 @@ note_number :: fun(journal: ^Journal, number: i64) {
 	note_text(journal, int_text(number)[:])
 }
 
+// An err in the line: its name, and where it was made ("Archive_Error.Not_Found
+// (scene.mara:310:4 in load_model)").
+note_error :: fun(journal: ^Journal, reason: err) {
+	note_text(journal, reason.text())
+	place : []utf8 = reason.where()
+	if place.len == 0 do return
+	note_text(journal, " (")
+	note_text(journal, place)
+	note_text(journal, ")")
+}
+
 // Ends the line being written: printed, and written to the file after its
 // time stamp, the seconds since the journal opened.
 note_end :: fun(journal: ^Journal) {
