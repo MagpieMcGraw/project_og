@@ -61,6 +61,9 @@ MAX_PARTICLE_SQUARES :: 16384   // a frame's
 MAX_PARTICLE_RUNS :: 1024
 // How far away particles are drawn, at most (beyond, they'd be a few pixels).
 PARTICLE_REACH :: 6000
+// Effects and particles fade out over this many units as they near what's
+// behind them (a floor a mist goes into, a wall), not cut off by it.
+SOFT_DISTANCE :: 24
 MAX_FLIP_FRAMES :: 16384
 MAX_BILLBOARDS :: 4096
 MAX_TEXTURES :: 8192
@@ -207,8 +210,19 @@ uniform vec3 fog_color;
 uniform float fog_near;
 uniform float fog_far;            // no fog when it isn't past fog_near
 uniform int adding;               // blended by adding (fire): fogged by fading out
+// Effects fade out as they near what's behind them (the depth drawn
+// before them, in unit 2), over soft_distance units; 0 for none.
+uniform sampler2D scene_depth;
+uniform float soft_distance;
+uniform vec2 depth_range;         // the projection's near and far
 
 out vec4 fragment_color;
+
+// How far from the eye a depth (0 to 1, the depth buffer's) is.
+float eye_distance(float depth) {
+	float z = depth * 2.0 - 1.0;
+	return 2.0 * depth_range.x * depth_range.y / (depth_range.y + depth_range.x - z * (depth_range.y - depth_range.x));
+}
 
 vec3 point_light(uint index, vec3 normal) {
 	Scene_Light light = scene_lights[index];
@@ -244,6 +258,10 @@ void main() {
 		float fog = clamp((length(world_position - camera_position) - fog_near) / (fog_far - fog_near), 0.0, 1.0);
 		if (adding != 0) base.a *= 1.0 - fog;
 		else color = mix(color, fog_color, fog);
+	}
+	if (soft_distance > 0.0) {
+		float behind = eye_distance(texelFetch(scene_depth, ivec2(gl_FragCoord.xy), 0).r);
+		base.a *= clamp((behind - eye_distance(gl_FragCoord.z)) / soft_distance, 0.0, 1.0);
 	}
 	fragment_color = vec4(color, base.a);
 }
@@ -282,8 +300,17 @@ uniform float fog_near;
 uniform float fog_far;            // no fog when it isn't past fog_near
 uniform int adding;               // blended by adding: fogged by fading out
 uniform float alpha_threshold;    // pixels less opaque are left out
+// Particles fade out as they near what's behind them, as effect meshes do.
+uniform sampler2D scene_depth;
+uniform float soft_distance;
+uniform vec2 depth_range;
 
 out vec4 fragment_color;
+
+float eye_distance(float depth) {
+	float z = depth * 2.0 - 1.0;
+	return 2.0 * depth_range.x * depth_range.y / (depth_range.y + depth_range.x - z * (depth_range.y - depth_range.x));
+}
 
 void main() {
 	vec4 color = texture(particle_texture, texture_uv) * particle_color;
@@ -292,6 +319,10 @@ void main() {
 		float fog = clamp((length(world_position - camera_position) - fog_near) / (fog_far - fog_near), 0.0, 1.0);
 		if (adding != 0) color.a *= 1.0 - fog;
 		else color.rgb = mix(color.rgb, fog_color, fog);
+	}
+	if (soft_distance > 0.0) {
+		float behind = eye_distance(texelFetch(scene_depth, ivec2(gl_FragCoord.xy), 0).r);
+		color.a *= clamp((behind - eye_distance(gl_FragCoord.z)) / soft_distance, 0.0, 1.0);
 	}
 	fragment_color = color;
 }
@@ -886,6 +917,8 @@ Particle_Program :: struct {
 	shared: Shared_Uniforms
 	adding_at: i32
 	alpha_threshold_at: i32
+	soft_distance_at: i32
+	depth_range_at: i32
 }
 
 // A model placed in the world, with what drawing it needs worked out once.
@@ -1183,6 +1216,8 @@ Mesh_Program :: struct {
 	program: u32
 	shared: Shared_Uniforms
 	adding_at: i32
+	soft_distance_at: i32
+	depth_range_at: i32
 }
 
 // A land program, and where its uniforms are.
@@ -1297,6 +1332,18 @@ Renderer :: struct {
 	first_texture_failure: [160]utf8
 	first_texture_reason: err
 
+	// The frame is drawn into a framebuffer of its own (a color and a depth
+	// texture, the window's size); before the water and blended things its
+	// depth is copied into a texture they read (to fade out near what's
+	// behind them); last, its color is copied into the window.
+	scene_framebuffer: u32
+	scene_color: u32
+	scene_depth: u32
+	depth_copy_framebuffer: u32
+	depth_copy: u32
+	framebuffer_width: i64
+	framebuffer_height: i64
+
 	// A frame's work.
 	visible: [MAX_DRAWN]i64        // instances in view
 	part_counts: [MAX_PARTS]i64    // instances of each part this frame
@@ -1310,7 +1357,8 @@ Renderer :: struct {
 // What setting up the renderer can fail with.
 Render_Error :: error {
 	Shader_Failed
-	Empty_Texture    // a texture with no image the card could take
+	Empty_Texture             // a texture with no image the card could take
+	Framebuffer_Incomplete    // the card can't draw into the frame's framebuffer
 }
 
 // ---- setting up ------------------------------------------------------------------
@@ -1348,6 +1396,11 @@ renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
 	setup_tree_buffers(renderer)
 	setup_grass_buffers(renderer)
 	setup_particle_buffers(renderer)
+	// The frame's framebuffers: made at the first frame's size.
+	renderer.scene_framebuffer = 0
+	renderer.depth_copy_framebuffer = 0
+	renderer.framebuffer_width = 0
+	renderer.framebuffer_height = 0
 
 	renderer.parts.len = 0
 	// Every part's count and start, by its index: all there, all 0.
@@ -1445,10 +1498,11 @@ make_mesh_program :: fun(made: ^Mesh_Program, bindless: bool) -> err {
 	made.program = compile_program(MESH_VERTEX_SHADER, MESH_FRAGMENT_SHADER, bindless)?
 	made.shared = find_shared_uniforms(made.program)
 	made.adding_at = GetUniformLocation(made.program, "adding")
-	if not bindless {
-		UseProgram(made.program)
-		Uniform1i(GetUniformLocation(made.program, "glow_texture"), 1)
-	}
+	made.soft_distance_at = GetUniformLocation(made.program, "soft_distance")
+	made.depth_range_at = GetUniformLocation(made.program, "depth_range")
+	UseProgram(made.program)
+	Uniform1i(GetUniformLocation(made.program, "scene_depth"), 2)
+	if not bindless do Uniform1i(GetUniformLocation(made.program, "glow_texture"), 1)
 }
 
 make_particle_program :: fun(made: ^Particle_Program) -> err {
@@ -1456,6 +1510,10 @@ make_particle_program :: fun(made: ^Particle_Program) -> err {
 	made.shared = find_shared_uniforms(made.program)
 	made.adding_at = GetUniformLocation(made.program, "adding")
 	made.alpha_threshold_at = GetUniformLocation(made.program, "alpha_threshold")
+	made.soft_distance_at = GetUniformLocation(made.program, "soft_distance")
+	made.depth_range_at = GetUniformLocation(made.program, "depth_range")
+	UseProgram(made.program)
+	Uniform1i(GetUniformLocation(made.program, "scene_depth"), 2)
 }
 
 make_land_program :: fun(made: ^Land_Program, bindless: bool) -> err {
@@ -1715,6 +1773,63 @@ setup_distant_buffers :: fun(renderer: ^Renderer) {
 	BindBuffer(SHADER_STORAGE_BUFFER, renderer.distant_texture_buffer)
 	BufferData(SHADER_STORAGE_BUFFER, DISTANT_PIECES * 16, [], DYNAMIC_DRAW)
 	clear_distant_land(renderer)
+}
+
+// Makes the frame's framebuffers for a size (again when it changes): the
+// one drawn into, and the one its depth is copied into.
+size_framebuffers :: fun(renderer: ^Renderer, width: i64, height: i64) -> err {
+	if renderer.framebuffer_width == width and renderer.framebuffer_height == height do return
+	if renderer.scene_framebuffer == 0 {
+		GenFramebuffers(1, &renderer.scene_framebuffer)
+		GenFramebuffers(1, &renderer.depth_copy_framebuffer)
+	else
+		DeleteTextures(1, &renderer.scene_color)
+		DeleteTextures(1, &renderer.scene_depth)
+		DeleteTextures(1, &renderer.depth_copy)
+	}
+	renderer.framebuffer_width = 0
+	renderer.framebuffer_height = 0
+	renderer.scene_color = framebuffer_texture(u32(RGBA8), width, height)
+	renderer.scene_depth = framebuffer_texture(u32(DEPTH_COMPONENT24), width, height)
+	renderer.depth_copy = framebuffer_texture(u32(DEPTH_COMPONENT24), width, height)
+	BindFramebuffer(FRAMEBUFFER, renderer.scene_framebuffer)
+	FramebufferTexture2D(FRAMEBUFFER, COLOR_ATTACHMENT0, TEXTURE_2D, renderer.scene_color, 0)
+	FramebufferTexture2D(FRAMEBUFFER, DEPTH_ATTACHMENT, TEXTURE_2D, renderer.scene_depth, 0)
+	scene_status := CheckFramebufferStatus(FRAMEBUFFER)
+	BindFramebuffer(FRAMEBUFFER, renderer.depth_copy_framebuffer)
+	FramebufferTexture2D(FRAMEBUFFER, DEPTH_ATTACHMENT, TEXTURE_2D, renderer.depth_copy, 0)
+	copy_status := CheckFramebufferStatus(FRAMEBUFFER)
+	BindFramebuffer(FRAMEBUFFER, 0)
+	if scene_status != u32(FRAMEBUFFER_COMPLETE) or copy_status != u32(FRAMEBUFFER_COMPLETE) do return Framebuffer_Incomplete
+	renderer.framebuffer_width = width
+	renderer.framebuffer_height = height
+}
+
+// A texture to draw into: one level, read pixel for pixel.
+framebuffer_texture :: fun(format: u32, width: i64, height: i64) -> u32 {
+	id : u32 = 0
+	GenTextures(1, &id)
+	BindTexture(TEXTURE_2D, id)
+	TexStorage2D(TEXTURE_2D, 1, format, i32(width), i32(height))
+	TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(NEAREST))
+	TexParameteri(TEXTURE_2D, TEXTURE_MAG_FILTER, i32(NEAREST))
+	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_S, i32(CLAMP_TO_EDGE))
+	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_T, i32(CLAMP_TO_EDGE))
+	return id
+}
+
+// Copies the depth drawn so far into the depth copy, and puts it in unit
+// 2, for what's drawn next to read.
+copy_depth :: fun(renderer: ^Renderer) {
+	width := i32(renderer.framebuffer_width)
+	height := i32(renderer.framebuffer_height)
+	BindFramebuffer(READ_FRAMEBUFFER, renderer.scene_framebuffer)
+	BindFramebuffer(DRAW_FRAMEBUFFER, renderer.depth_copy_framebuffer)
+	BlitFramebuffer(0, 0, width, height, 0, 0, width, height, DEPTH_BUFFER_BIT, NEAREST)
+	BindFramebuffer(FRAMEBUFFER, renderer.scene_framebuffer)
+	ActiveTexture(TEXTURE2)
+	BindTexture(TEXTURE_2D, renderer.depth_copy)
+	ActiveTexture(TEXTURE0)
 }
 
 // The particles' buffers: their corners (filled each frame), and the
@@ -2649,11 +2764,17 @@ sphere_in_view :: fun(planes: ^View_Planes, center: Vec3, radius: f32) -> bool {
 // Draws a frame width by height pixels from the camera: the land in view,
 // then the instances in view — opaque parts, then blended — lit by the
 // lighting and the lights set with set_scene_lights. Tells what it drew.
+// When the frame's framebuffer can't be made, it's drawn into the window
+// (its effects cut off where they meet what's behind them), and why is
+// given back.
 draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, distant_instances: ^[]Instance, grounds: ^[]Gpu_Land,
 	waters: ^[]Water_Cell, tree_cells: ^[]Gpu_Trees, grass_cells: ^[]Gpu_Grass, look: ^Sky_Look, lighting: Cell_Lighting,
-	camera: Camera, width: i64, height: i64) -> Frame_Stats
+	camera: Camera, width: i64, height: i64) -> Frame_Stats, err
 {
 	stats := Frame_Stats{instances = instances.len, visible = 0, drawn_parts = 0, draw_calls = 0, land_cells = 0}
+	framebuffer_error := size_framebuffers(renderer, width, height)
+	soft := not framebuffer_error
+	if soft do BindFramebuffer(FRAMEBUFFER, renderer.scene_framebuffer)
 	Viewport(0, 0, i32(width), i32(height))
 	fog := lighting.fog_color
 	ClearColor(fog.x, fog.y, fog.z, 1.0)
@@ -2688,31 +2809,39 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 		// own references are).
 		if distant_instances.len > 0 {
 			gather_meshes(renderer, models, distant_instances, &far_planes, &near_cells, camera, look.time, &stats)
-			draw_mesh_runs(renderer, far_view_projection, lighting, sun, camera, false, &stats)
+			draw_mesh_runs(renderer, far_view_projection, lighting, sun, camera, false, false, &stats)
 		}
 		if tree_cells.len > 0 do draw_trees(renderer, tree_cells, &near_cells, false, &far_planes, far_view_projection, lighting, sun, camera, &stats)
 		draw_far_water(renderer, waters, look, far_view_projection, lighting, camera, &stats)
-		if distant_instances.len > 0 do draw_mesh_runs(renderer, far_view_projection, lighting, sun, camera, true, &stats)
+		if distant_instances.len > 0 do draw_mesh_runs(renderer, far_view_projection, lighting, sun, camera, true, false, &stats)
 		DepthMask(1)   // (a clear writes depth only where depth may be written)
 		Clear(DEPTH_BUFFER_BIT)
 	}
 	if grounds.len > 0 do draw_land(renderer, grounds, &planes, view_projection, lighting, sun, camera, &stats)
 	nothing_left_out := hidden_around(camera.position)
 	gather_meshes(renderer, models, instances, &planes, &nothing_left_out, camera, look.time, &stats)
-	draw_mesh_runs(renderer, view_projection, lighting, sun, camera, false, &stats)
+	draw_mesh_runs(renderer, view_projection, lighting, sun, camera, false, false, &stats)
 	if look.outside and tree_cells.len > 0 do draw_trees(renderer, tree_cells, &near_cells, true, &planes, view_projection, lighting, sun, camera, &stats)
 	if look.outside and grass_cells.len > 0 {
 		draw_grass(renderer, grass_cells, &planes, view_projection, lighting, sun, camera, look, GRASS_FADE_START, GRASS_FADE_END, &stats)
 	}
+	if soft do copy_depth(renderer)
 	if waters.len > 0 do draw_water(renderer, waters, &planes, look, view_projection, lighting, camera, &stats)
-	draw_mesh_runs(renderer, view_projection, lighting, sun, camera, true, &stats)
-	draw_particles(renderer, models, instances, view_projection, lighting, sun, camera, look.time, &stats)
+	draw_mesh_runs(renderer, view_projection, lighting, sun, camera, true, soft, &stats)
+	draw_particles(renderer, models, instances, view_projection, lighting, sun, camera, look.time, soft, &stats)
 
 	DepthMask(1)
 	Disable(BLEND)
 	ActiveTexture(TEXTURE0)
 	BindVertexArray(0)
-	return stats
+	// The frame into the window.
+	if soft {
+		BindFramebuffer(READ_FRAMEBUFFER, renderer.scene_framebuffer)
+		BindFramebuffer(DRAW_FRAMEBUFFER, 0)
+		BlitFramebuffer(0, 0, i32(width), i32(height), 0, 0, i32(width), i32(height), COLOR_BUFFER_BIT, NEAREST)
+		BindFramebuffer(FRAMEBUFFER, 0)
+	}
+	return stats, framebuffer_error
 }
 
 // Draws the sky behind everything: its triangle over the screen, the
@@ -3119,9 +3248,10 @@ gather_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]In
 }
 
 // Draws the gathered meshes' opaque runs, or their blended ones (after the
-// water): a call for each run of commands of one key.
+// water): a call for each run of commands of one key. Soft: effects (blended,
+// writing no depth) fade out near what's behind them (the depth copy).
 draw_mesh_runs :: fun(renderer: ^Renderer, view_projection: Mat4, lighting: Cell_Lighting, sun: Vec3, camera: Camera,
-	blended: bool, stats: ^Frame_Stats)
+	blended: bool, soft: bool, stats: ^Frame_Stats)
 {
 	if renderer.commands.len == 0 do return
 	bindless := renderer.use_bindless
@@ -3132,6 +3262,8 @@ draw_mesh_runs :: fun(renderer: ^Renderer, view_projection: Mat4, lighting: Cell
 	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.indirect_buffer)
 	if blended do Enable(BLEND)
 	Uniform1i(made.adding_at, 0)
+	Uniform1f(made.soft_distance_at, 0)
+	Uniform2f(made.depth_range_at, camera.near, camera.far)
 	run_start : i64 = 0
 	for run_start < renderer.commands.len {
 		group_key := renderer.touched[run_start] >> 20
@@ -3150,6 +3282,7 @@ draw_mesh_runs :: fun(renderer: ^Renderer, view_projection: Mat4, lighting: Cell
 			if first_part.additive do BlendFunc(SRC_ALPHA, ONE)
 			else do BlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
 			Uniform1i(made.adding_at, if first_part.additive do 1 else 0)
+			Uniform1f(made.soft_distance_at, if soft and not first_part.depth_write do SOFT_DISTANCE else 0)
 		}
 		if not bindless {
 			BindTexture(TEXTURE_2D, renderer.textures[shown_texture(renderer, first_part)].id)
@@ -3173,9 +3306,10 @@ draw_mesh_runs :: fun(renderer: ^Renderer, view_projection: Mat4, lighting: Cell
 // Draws the particles of the instances in view (gather_meshes' last: the
 // near pass's), farthest first: each system's squares made for the time,
 // blended, after the blended meshes. An instance's particles are seeded by
-// its reference (its index without one), so no two fires are alike.
+// its reference (its index without one), so no two fires are alike. Soft:
+// they fade out near what's behind them (the depth copy).
 draw_particles :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, view_projection: Mat4,
-	lighting: Cell_Lighting, sun: Vec3, camera: Camera, time: f32, stats: ^Frame_Stats)
+	lighting: Cell_Lighting, sun: Vec3, camera: Camera, time: f32, soft: bool, stats: ^Frame_Stats)
 {
 	renderer.particle_runs.len = 0
 	renderer.particle_vertices.len = 0
@@ -3206,6 +3340,7 @@ draw_particles :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]I
 	made := &renderer.particle_program
 	UseProgram(made.program)
 	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
+	Uniform2f(made.depth_range_at, camera.near, camera.far)
 	BindVertexArray(renderer.particle_vertex_array)
 	Enable(BLEND)
 	Disable(CULL_FACE)
@@ -3218,6 +3353,7 @@ draw_particles :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]I
 		else do BlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
 		Uniform1i(made.adding_at, if look.additive do 1 else 0)
 		Uniform1f(made.alpha_threshold_at, if look.alpha_test do look.alpha_threshold else 0)
+		Uniform1f(made.soft_distance_at, if soft and not look.depth_write do SOFT_DISTANCE else 0)
 		slot := kind.texture_slot
 		if kind.flip >= 0 do slot = renderer.flips[kind.flip].shown
 		BindTexture(TEXTURE_2D, renderer.textures[slot].id)

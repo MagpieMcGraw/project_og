@@ -116,6 +116,7 @@ Viewer :: struct {
 	loading_time: u64
 	crossing_time: u64
 	drawn: Frame_Stats
+	told_framebuffer: bool   // the journal has said the frame's framebuffer couldn't be made
 
 	// Since the last summary: frames, refreshes missed, the longest, and
 	// the CPU's and card's time in all, in nanoseconds.
@@ -180,6 +181,7 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.crossing_time = 0
 	start_summary(viewer)
 	viewer.drawn = Frame_Stats{instances = 0, visible = 0, drawn_parts = 0, draw_calls = 0, land_cells = 0}
+	viewer.told_framebuffer = false
 	viewer.gl_errors_seen.len = 0
 }
 
@@ -334,8 +336,17 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		set_scene_lights(&viewer.renderer, &shown.lights)
 		shown.lights_changed = false
 	}
-	viewer.drawn = draw_frame(&viewer.renderer, &shown.models, &shown.instances, &shown.distant_instances, &shown.grounds, &shown.waters,
-		&shown.tree_cells, &shown.grass_cells, &viewer.look, shown.lighting, camera^, platform.width, platform.height)
+	drawn, framebuffer_error := draw_frame(&viewer.renderer, &shown.models, &shown.instances, &shown.distant_instances, &shown.grounds,
+		&shown.waters, &shown.tree_cells, &shown.grass_cells, &viewer.look, shown.lighting, camera^, platform.width, platform.height)
+	viewer.drawn = drawn
+	if framebuffer_error and not viewer.told_framebuffer {
+		// Said once: the frames are drawn into the window from here, as well
+		// as they can be.
+		note(&viewer.journal, "the frame's framebuffer couldn't be made, so effects are cut off where they meet walls: ")
+		note_error(&viewer.journal, framebuffer_error)
+		note_end(&viewer.journal)
+		viewer.told_framebuffer = true
+	}
 	draw_reticle(platform.width, platform.height, usable)
 	card_start := time_now()
 	viewer.drawing_time = card_start - drawing_start
