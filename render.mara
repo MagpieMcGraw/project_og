@@ -363,17 +363,20 @@ uniform float fog_near;
 uniform float fog_far;
 out vec4 fragment_color;
 
-// The least opacity: what the game's VarAmounts.z holds (not known; this looks right).
-const float least_opacity = 0.35;
-// Units of depth to the depth map's 1.
-const float depth_scale = 160.0;
+// The game's settings (Oblivion.ini's [Water]): the least opacity
+// (fAlpha, what the shader's VarAmounts.z holds), the units of depth to
+// the depth map's 1 (uDepthRange), and the ripples' repeats across a cell
+// (fTileTextureDivisor: 4096 / 4.75 units a repeat).
+const float least_opacity = 0.5;
+const float depth_scale = 125.0;
+const float ripple_size = 862.3;
 
 void main() {
 	// The ripples, as strong as the original's near the eye, gone flat by
 	// 10000 units away; two layers of the texture, against its repeating.
 	float flat_distance = length(camera_position.xy - world_position.xy);
 	float near = clamp(1.0 - flat_distance * 0.0001, 0.0, 1.0);
-	vec2 at = world_position.xy / 900.0;
+	vec2 at = world_position.xy / ripple_size;
 	vec3 first = texture(normal_map, at + scroll * time).xyz * 2.0 - 1.0;
 	vec3 second = texture(normal_map, at * 2.37 - scroll.yx * time * 1.4 + 0.5).xyz * 2.0 - 1.0;
 	vec3 normal = first + second;
