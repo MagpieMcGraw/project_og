@@ -212,7 +212,7 @@ update_title :: fun(viewer: ^Viewer) {
 	&title + " in view, "
 	&title + int_text(viewer.drawn.draw_calls)[:]
 	&title + " draw calls"
-	_ = SetWindowTitle(viewer.platform.window, title[:])
+	_ = SetWindowTitle(viewer.platform.window, title)   // (the list: a 0 follows the title in its room)
 }
 
 // Names what's shown, in the title.

@@ -1035,13 +1035,16 @@ which_program :: fun(renderer: ^Renderer) -> i64 {
 
 // A shader's source: the version, then — bindless — the extension and the
 // BINDLESS define, then shared (functions it uses), then its body. Into
-// source.
+// source, with a 0 after it in its room, for C (source is used again, so
+// what's past the text may be an older shader's).
 shader_source :: fun(shared: []utf8, body: []utf8, bindless: bool, source: ^[]utf8) {
 	source.len = 0
 	source + "#version 450 core\n"
 	if bindless do source + "#extension GL_ARB_bindless_texture : require\n#define BINDLESS 1\n"
 	source + shared
 	source + body
+	source + utf8(0)
+	source.len -= 1
 }
 
 // A program of a vertex and a fragment shader, compiled one way or the
@@ -1049,9 +1052,9 @@ shader_source :: fun(shared: []utf8, body: []utf8, bindless: bool, source: ^[]ut
 compile_program :: fun(vertex_body: []utf8, fragment_body: []utf8, bindless: bool, shared: []utf8 = "") -> u32, err {
 	source : [16 * KB]utf8
 	shader_source("", vertex_body, bindless, &source)
-	vertex_shader := gl_compile_shader(VERTEX_SHADER, source[:])
+	vertex_shader := gl_compile_shader(VERTEX_SHADER, source)
 	shader_source(shared, fragment_body, bindless, &source)
-	fragment_shader := gl_compile_shader(FRAGMENT_SHADER, source[:])
+	fragment_shader := gl_compile_shader(FRAGMENT_SHADER, source)
 	if vertex_shader == 0 or fragment_shader == 0 do return 0, Shader_Failed
 	program := gl_link_program(vertex_shader, fragment_shader)
 	if program == 0 do return 0, Shader_Failed
@@ -1551,7 +1554,7 @@ array_uniform :: fun(program: u32, name_start: []utf8, index: i64) -> i32 {
 	&name + name_start
 	&name + int_text(index)[:]
 	&name + "]"
-	return GetUniformLocation(program, name[:])
+	return GetUniformLocation(program, name)   // (the list, its room past the name 0s: C reads up to one)
 }
 
 // Gives a program its shared uniforms for a frame.
