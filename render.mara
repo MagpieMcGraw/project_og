@@ -70,9 +70,14 @@ Gpu_Part :: struct {
 	emissive: Vec3
 }
 
-// A model on the graphics card: its parts, and where it is.
+// A model on the graphics card: its parts.
 Gpu_Model :: struct {
 	parts: [64]Gpu_Part
+}
+
+// A model placed in the world.
+Instance :: struct {
+	model: i64     // in the models drawn
 	world: Mat4
 }
 
@@ -190,7 +195,6 @@ load_texture :: fun(archive: ^Archive, path: []utf8, scratch: ^[]byte) -> u32 {
 // Puts a model's parts on the card, their textures read from the archive.
 upload_model :: fun(renderer: ^Renderer, built: Model, archive: ^Archive, scratch: ^[]byte, gpu: ^Gpu_Model) {
 	gpu.parts.len = 0
-	gpu.world = mat4_identity()
 	for part in built.parts {
 		if gpu.parts.len == gpu.parts.cap do break
 		if part.indices.len == 0 do continue
@@ -265,9 +269,9 @@ view_matrix :: fun(camera: Camera) -> Mat4 {
 	return view
 }
 
-// Draws models from the camera, into a frame width by height pixels:
-// opaque parts first, then the blended ones over them.
-draw_models :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, camera: Camera, width: i64, height: i64) {
+// Draws the instances of models from the camera, into a frame width by
+// height pixels: opaque parts first, then the blended ones over them.
+draw_instances :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, camera: Camera, width: i64, height: i64) {
 	Viewport(0, 0, i32(width), i32(height))
 	ClearColor(0.45, 0.6, 0.8, 1.0)
 	Clear(COLOR_BUFFER_BIT | DEPTH_BUFFER_BIT)
@@ -293,11 +297,11 @@ draw_models :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, camera: Camera, wi
 			Disable(BLEND)
 			DepthMask(1)
 		}
-		for &gpu_model in models {
-			world_view_projection := mat4_mul(view_projection, gpu_model.world)
+		for &instance in instances {
+			world_view_projection := mat4_mul(view_projection, instance.world)
 			UniformMatrix4fv(renderer.world_view_projection_at, 1, 0, &world_view_projection[0][0])
-			UniformMatrix4fv(renderer.world_at, 1, 0, &gpu_model.world[0][0])
-			for part in gpu_model.parts {
+			UniformMatrix4fv(renderer.world_at, 1, 0, &instance.world[0][0])
+			for part in models[instance.model].parts {
 				if part.alpha_blend != blended_pass do continue
 				if part.two_sided do Disable(CULL_FACE)
 				else do Enable(CULL_FACE)

@@ -1,0 +1,285 @@
+// The game's world as a plugin describes it: records found by their form
+// ids, cells found by their editor ids, and the objects placed in them.
+//
+// Cells hold references (REFR): a base object (a STAT, DOOR, LIGH…, whose
+// record names its mesh) placed somewhere, turned and scaled. A cell's
+// references are in the group right after its record.
+module world
+
+use mara.core
+use mara.math
+use mara.string
+use esm
+
+// What finding things in the world can fail with.
+World_Error :: error {
+	No_Such_Cell
+	No_Such_Record
+	Index_Full
+}
+
+// ---- finding records by form id ------------------------------------------
+
+// Where each record (or group) is in a plugin's data, by a form id: a table
+// a power of two in size, kept under half full; a form id is looked for
+// from its hash's slot onward.
+Form_Index :: struct {
+	keys: []u32       // form ids; 0 in an empty slot
+	places: []u32     // where in the data
+	count: i64
+}
+
+// An empty index with room for capacity entries (a power of two).
+form_index :: fun(capacity: i64, storage: ^[]byte) -> Form_Index {
+	keys := slice([:capacity]u32, storage)
+	places := slice([:capacity]u32, storage)
+	for i in 0:capacity {
+		&keys + u32(0)
+		&places + u32(0)
+	}
+	return Form_Index{keys = keys, places = places, count = 0}
+}
+
+// The slot a form id's search starts at.
+first_slot :: fun(index: ^Form_Index, key: u32) -> i64 {
+	mixed := (u64(key) *% 0x9E3779B97F4A7C15) >> 32
+	return i64(mixed) & (index.keys.len - 1)
+}
+
+index_put :: fun(index: ^Form_Index, key: u32, place: i64) -> err {
+	if (index.count + 1) * 2 > index.keys.len do return Index_Full
+	slot := first_slot(index, key)
+	for index.keys[slot] != 0 and index.keys[slot] != key {
+		slot = (slot + 1) & (index.keys.len - 1)
+	}
+	if index.keys[slot] == 0 do index.count += 1
+	index.keys[slot] = key
+	index.places[slot] = u32(place)
+}
+
+// Where the form id's record is, and false when the index doesn't have it.
+index_get :: fun(index: ^Form_Index, key: u32) -> i64, bool {
+	if key == 0 do return 0, false
+	slot := first_slot(index, key)
+	for index.keys[slot] != 0 {
+		if index.keys[slot] == key do return i64(index.places[slot]), true
+		slot = (slot + 1) & (index.keys.len - 1)
+	}
+	return 0, false
+}
+
+// ---- a plugin, indexed ------------------------------------------------------
+
+// A plugin read into memory, with where its records and cells are.
+Plugin :: struct {
+	data: []byte
+	records: Form_Index         // each record by its form id
+	cell_children: Form_Index   // each cell's group of references, by the cell's form id
+	interior_cells_at: i64      // the top group of interior cells
+	interior_cells_end: i64
+}
+
+// Indexes a plugin's data: one walk over every group and record. The
+// indexes are carved from storage.
+index_plugin :: fun(data: []byte, storage: ^[]byte) -> Plugin, err {
+	plugin := Plugin{
+		data = data,
+		records = form_index(1 << 22, storage),
+		cell_children = form_index(1 << 17, storage),
+		interior_cells_at = 0,
+		interior_cells_end = 0}
+	at : i64 = 0
+	for at < data.len {
+		if at + HEADER_SIZE > data.len do return plugin, Truncated
+		header : Record_Header = data[at]
+		if header.kind[:] == "GRUP" {
+			group_header : Group_Header = data[at]
+			if group_header.group_type == GROUP_CELL_CHILDREN {
+				index_put(&plugin.cell_children, group_header.label, at)?
+			}
+			if group_header.group_type == GROUP_TOP {
+				label : [4!]utf8 = data[at + 8]
+				if label[:] == "CELL" {
+					plugin.interior_cells_at = at + HEADER_SIZE
+					plugin.interior_cells_end = at + i64(group_header.size)
+				}
+			}
+			at += HEADER_SIZE
+			continue
+		}
+		if header.form_id != 0 do index_put(&plugin.records, header.form_id, at)?
+		at += HEADER_SIZE + i64(header.size)
+	}
+	return plugin
+}
+
+// A record: its header and its data, unpacked into scratch when packed.
+Record :: struct {
+	header: Record_Header
+	data: []byte
+}
+
+// The record at a place in the plugin's data.
+record_at :: fun(plugin: ^Plugin, at: i64, scratch: ^[]byte) -> Record, err {
+	header : Record_Header = plugin.data[at]
+	body := plugin.data[at + HEADER_SIZE : at + HEADER_SIZE + i64(header.size)]
+	data := record_data(header, body, scratch)?
+	return Record{header = header, data = data}
+}
+
+// The record with a form id.
+find_record :: fun(plugin: ^Plugin, form_id: u32, scratch: ^[]byte) -> Record, err {
+	at, found := index_get(&plugin.records, form_id)
+	if not found do return Record{header = Record_Header{0}, data = plugin.data[0:0]}, No_Such_Record
+	return record_at(plugin, at, scratch)
+}
+
+// A record's first field of a kind, and false when it has none.
+find_field :: fun(data: []byte, kind: []utf8) -> []byte, bool {
+	fields := Fields{data = data, at = 0, broken = false}
+	for field in next_field(&fields) {
+		// The same bytes as field.data, but sliced from data itself: Mara
+		// counts field.data as a view of the local `fields`, which can't
+		// be returned.
+		if field.kind[:] == kind do return data[fields.at - field.data.len : fields.at], true
+	}
+	return data[0:0], false
+}
+
+// A field's text: up to its 0 (the plugins end their text with one).
+field_text :: fun(field: []byte) -> []utf8 {
+	text : []utf8 = field
+	for c, i in text {
+		if c == utf8(0) do return text[0 : i]
+	}
+	return text
+}
+
+// A record's editor id (EDID), or empty.
+editor_id :: fun(data: []byte) -> []utf8 {
+	field, found := find_field(data, "EDID")
+	if not found do return field_text(data[0:0])
+	return field_text(field)
+}
+
+// ---- cells and what's in them ------------------------------------------------
+
+// The interior cell whose editor id is name (any letter case): its form id.
+find_interior_cell :: fun(plugin: ^Plugin, name: []utf8, scratch: ^[]byte) -> u32, err {
+	at := plugin.interior_cells_at
+	for at < plugin.interior_cells_end {
+		header : Record_Header = plugin.data[at]
+		if header.kind[:] == "GRUP" {
+			at += HEADER_SIZE
+			continue
+		}
+		if header.kind[:] == "CELL" {
+			record := record_at(plugin, at, scratch)?
+			if compare_folded(editor_id(record.data), name) == 0 do return header.form_id
+		}
+		at += HEADER_SIZE + i64(header.size)
+	}
+	return 0, No_Such_Cell
+}
+
+// An object placed in a cell: what it is, where, turned how, how big.
+Reference :: struct {
+	form_id: u32
+	base: u32          // the record of what's placed: a STAT, DOOR, LIGH…
+	position: Vec3
+	rotation: Vec3     // radians about x, y and z, each clockwise; turned about z first, x last
+	scale: f32
+	flags: u32         // RECORD_*: disabled, persistent…
+}
+
+// The references in a cell (REFR records; actors aren't yet), into
+// references.
+cell_references :: fun(plugin: ^Plugin, cell: u32, references: ^[]Reference) -> err {
+	group_at, found := index_get(&plugin.cell_children, cell)
+	if not found do return
+	group_header : Group_Header = plugin.data[group_at]
+	end := group_at + i64(group_header.size)
+	at := group_at + HEADER_SIZE
+	for at < end {
+		header : Record_Header = plugin.data[at]
+		if header.kind[:] == "GRUP" {
+			at += HEADER_SIZE   // the persistent, temporary and distant groups: into them
+			continue
+		}
+		next_at := at + HEADER_SIZE + i64(header.size)
+		if header.kind[:] == "REFR" and references.len < references.cap {
+			body := plugin.data[at + HEADER_SIZE : next_at]
+			references + read_reference(header, body)
+		}
+		at = next_at
+	}
+}
+
+// A REFR record's fields: NAME the base, DATA where and how turned, XSCL
+// its scale.
+read_reference :: fun(header: Record_Header, data: []byte) -> Reference {
+	reference := Reference{
+		form_id = header.form_id,
+		base = 0,
+		position = Vec3{0, 0, 0},
+		rotation = Vec3{0, 0, 0},
+		scale = 1,
+		flags = header.flags}
+	fields := Fields{data = data, at = 0, broken = false}
+	for field in next_field(&fields) {
+		kind := field.kind[:]
+		if kind == "NAME" and field.data.len >= 4 {
+			reference.base = field.data[0]
+		elif kind == "DATA" and field.data.len >= 24
+			reference.position = field.data[0]
+			reference.rotation = field.data[12]
+		elif kind == "XSCL" and field.data.len >= 4
+			reference.scale = field.data[0]
+		}
+	}
+	return reference
+}
+
+// The mesh a base object's record names (MODL), as an archive path:
+// meshes\…, lower case. Empty when it names none.
+model_path :: fun(record: Record) -> [256]utf8 {
+	path : [256]utf8
+	field, found := find_field(record.data, "MODL")
+	if not found do return path
+	name := field_text(field)
+	if name.len == 0 do return path
+	&path + "meshes\\"
+	for c in name {
+		if path.len == path.cap do break
+		if c == '/' do &path + '\\'
+		else do &path + lower(c)
+	}
+	return path
+}
+
+// A reference's place in the world as a matrix: scaled, turned (about z
+// first, then y, then x, each clockwise, as OpenMW does it), moved.
+reference_transform :: fun(reference: Reference) -> Mat4 {
+	turn_x := clockwise(reference.rotation.x, 0)
+	turn_y := clockwise(reference.rotation.y, 1)
+	turn_z := clockwise(reference.rotation.z, 2)
+	turned := mat4_mul(turn_x, mat4_mul(turn_y, turn_z))
+	scaled := mat4_mul(turned, mat4_scale(Vec3{reference.scale, reference.scale, reference.scale}))
+	return mat4_mul(mat4_translate(reference.position), scaled)
+}
+
+// A turn by angle clockwise about an axis (0 x, 1 y, 2 z), looking down
+// the axis toward the origin.
+clockwise :: fun(angle: f32, axis: i64) -> Mat4 {
+	c := cos_f32(angle)
+	s := sin_f32(angle)
+	m := mat4_identity()
+	// The other two axes, in order: (y, z) for x, (z, x) for y, (x, y) for z.
+	a := (axis + 1) % 3
+	b := (axis + 2) % 3
+	m[a][a] = c
+	m[a][b] = -s
+	m[b][a] = s
+	m[b][b] = c
+	return m
+}

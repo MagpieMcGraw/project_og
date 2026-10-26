@@ -1,0 +1,106 @@
+// What's drawn: the models a cell needs, each loaded once, and the
+// instances of them placed by the cell's references.
+module scene
+
+use mara.core
+use mara.math
+use mara.string
+use mara.memory
+use bsa
+use nif
+use model
+use render
+use world
+use esm
+
+// A mesh path the scene has loaded, or tried to.
+Loaded_Path :: struct {
+	path: [256]utf8
+	model: i64     // in the scene's models; -1 when it couldn't be loaded
+}
+
+// The models on the card and their instances.
+Scene :: struct {
+	models: [1024]Gpu_Model
+	paths: [1024]Loaded_Path
+	instances: [16384]Instance
+	failed_paths: i64
+}
+
+// The rooms loading uses: for a mesh's file, its blocks, its model, and
+// for reading and decoding textures.
+Load_Room :: struct {
+	file: []byte
+	blocks: []byte
+	model: []byte
+	texture: []byte
+	// The NIF reader, kept here: a mesh's blocks view its data, and Mara
+	// counts those as views of the reader, so it must live as long as
+	// the blocks' room.
+	reader: Nif_Reader
+}
+
+// The scene's model for a mesh path: loaded the first time it's asked
+// for. -1 when it can't be.
+scene_model :: fun(scene: ^Scene, renderer: ^Renderer, meshes: ^Archive, textures: ^Archive, path: []utf8, room: ^Load_Room) -> i64 {
+	for loaded in scene.paths {
+		if loaded.path[:] == path do return loaded.model
+	}
+	model_index := load_model(scene, renderer, meshes, textures, path, room)
+	if model_index < 0 do scene.failed_paths += 1
+	if scene.paths.len < scene.paths.cap {
+		entry := next(&scene.paths)
+		entry.path.len = 0
+		&entry.path + path
+		entry.model = model_index
+	}
+	return model_index
+}
+
+// Reads a mesh, makes its model and puts it on the card: its index in the
+// scene's models, or -1.
+load_model :: fun(scene: ^Scene, renderer: ^Renderer, meshes: ^Archive, textures: ^Archive, path: []utf8, room: ^Load_Room) -> i64 {
+	if scene.models.len == scene.models.cap do return -1
+	index, found := find_file(meshes, path)
+	if not found do return -1
+	room.file.len = 0
+	data, read_error := read_file(meshes, index, &room.file)
+	if read_error do return -1
+
+	room.blocks.len = 0
+	room.reader = nif_reader(data)
+	failure := Nif_Failure{block = 0, type_name = room.file[0:0]}
+	mesh, nif_error := read_nif(&room.reader, &room.blocks, &failure)
+	if nif_error do return -1
+	room.model.len = 0
+	built, model_error := build_model(&mesh, &room.model)
+	if model_error do return -1
+
+	gpu := next(&scene.models)
+	upload_model(renderer, built, textures, &room.texture, gpu)
+	return scene.models.len - 1
+}
+
+// Whether a mesh is an editor's marker, not drawn in the game: the
+// markers' meshes are in meshes\ itself, named marker….
+is_marker :: fun(path: []utf8) -> bool {
+	return starts_with(path, "meshes\\marker")
+}
+
+// Places a cell's references in the scene, loading the models they need.
+add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, renderer: ^Renderer, meshes: ^Archive, textures: ^Archive, room: ^Load_Room) -> err {
+	references : [8192]Reference
+	cell_references(plugin, cell, &references)?
+	scratch : [4 * MB]byte
+	for reference in references {
+		if reference.flags & RECORD_DISABLED != 0 do continue
+		scratch.len = 0
+		base, base_error := find_record(plugin, reference.base, &scratch)
+		if base_error do continue
+		path := model_path(base)
+		if path.len == 0 or is_marker(path[:]) do continue
+		model_index := scene_model(scene, renderer, meshes, textures, path[:], room)
+		if model_index < 0 or scene.instances.len == scene.instances.cap do continue
+		next(&scene.instances)^ = Instance{model = model_index, world = reference_transform(reference)}
+	}
+}
