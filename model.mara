@@ -26,6 +26,8 @@ Model_Part :: struct {
 	indices: []u16          // three for each triangle
 	texture: [160]utf8      // the base texture's path in the archives: textures\…
 	glow_texture: [160]utf8 // the glow map's, or empty
+	clamp_mode: u32         // how the base texture's edges go: 0 clamped both ways, 1 clamped across
+	                        // and repeating up, 2 repeating across and clamped up, 3 repeating both
 	alpha_blend: bool       // blended with what's behind it
 	alpha_test: bool        // pixels whose alpha is below the threshold are left out
 	alpha_threshold: f32    // 0 to 1
@@ -190,6 +192,7 @@ add_shape :: fun(mesh: ^Nif, geometry: Geometry, transform: Mat4, properties: In
 		indices = indices,
 		texture = [],
 		glow_texture = [],
+		clamp_mode = 3,
 		alpha_blend = false,
 		alpha_test = false,
 		alpha_threshold = 0,
@@ -229,6 +232,7 @@ apply_properties :: fun(mesh: ^Nif, properties: Inherited, part: ^Model_Part) {
 		match mesh.blocks[properties.texturing] {
 		Texturing texturing
 			texture_path(mesh, texturing.slots[SLOT_BASE], &part.texture)
+			if texturing.slots[SLOT_BASE].used do part.clamp_mode = texturing.slots[SLOT_BASE].clamp_mode
 			texture_path(mesh, texturing.slots[SLOT_GLOW], &part.glow_texture)
 		else
 		}

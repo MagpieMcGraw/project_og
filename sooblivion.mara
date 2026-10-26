@@ -441,8 +441,8 @@ command_model :: fun(what: []utf8, name: []utf8) {
 			}
 		}
 		if part.vertices.len > 0 do print("  texture coordinates from % to %; first vertex %", low_uv, high_uv, part.vertices[0])
-		print("  % vertices, % triangles, texture % % % %",
-			part.vertices.len, part.indices.len / 3, part.texture,
+		print("  % vertices, % triangles, texture % (clamp mode %) % % %",
+			part.vertices.len, part.indices.len / 3, part.texture, part.clamp_mode,
 			if part.alpha_blend do "blended" else "",
 			if part.alpha_test do "alpha-tested" else "",
 			if part.two_sided do "two-sided" else "")
@@ -1193,7 +1193,7 @@ command_grass :: fun(name: []utf8, x: i64, y: i64) {
 	}
 	water_height, has_water := cell_water(&plugin, cell, &scratch)
 	if not has_water do water_height = -1000000
-	blades : [4096]render.Placed_Grass   // render.GRASS_PER_CELL (a module's constant can't size an array yet)
+	blades : [render.GRASS_PER_CELL]render.Placed_Grass
 	start := time_now()
 	place_grass(&cell_land, x, y, water_height, textures[:], &kinds, &blades)
 	print("% blades in % us; water at %", blades.len, (time_now() - start) / 1000, if has_water do water_height else 0)

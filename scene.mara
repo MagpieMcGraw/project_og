@@ -345,7 +345,8 @@ tree_kind :: fun(scene: ^Scene, plugin: ^Plugin, base: u32, loader: Loader) -> i
 	if not record_error and scene.kinds.len < scene.kinds.cap {
 		look, is_tree := tree_look(record)
 		if is_tree {
-			texture := texture_for(loader.renderer, loader.textures, look.billboard[:], &loader.room.texture)
+			// (The picture fills its texture: clamped, its edges don't pick up the far side.)
+			texture := texture_for(loader.renderer, loader.textures, look.billboard[:], &loader.room.texture, CLAMP_BOTH)
 			if texture != 0 {
 				&scene.kinds + Tree_Kind{look = look, texture = texture}
 				kind_index = scene.kinds.len - 1

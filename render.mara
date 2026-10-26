@@ -90,6 +90,13 @@ GRASS_WIND_MOST :: 125
 // are a bit each, HIDDEN_SIDE x HIDDEN_SIDE of them around the camera's.
 HIDDEN_SIDE :: 16
 
+// How a texture's edges go, as a NIF's texturing says: past them across
+// (s) and up (t), the picture clamped at its edge or repeated.
+CLAMP_BOTH :: 0
+CLAMP_ACROSS :: 1     // clamped across, repeating up
+CLAMP_UP :: 2         // repeating across, clamped up
+REPEAT_BOTH :: 3
+
 // How sharp textures stay seen at a slant: anisotropic filtering, at most.
 MOST_ANISOTROPY :: 16
 
@@ -2010,14 +2017,17 @@ setup_land_buffers :: fun(renderer: ^Renderer) {
 // The slot of the texture at path in the archive (an index into the
 // renderer's textures), loaded onto the card the first time it's asked
 // for; the white texture's (0) when it can't be read. scratch is room for
-// reading and decoding it.
-texture_for :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratch: ^[]byte) -> i64 {
+// reading and decoding it. clamp_mode is how its edges go, as a NIF says
+// (CLAMP_* : repeating both ways unless asked); a texture asked for with
+// two is loaded twice, as a texture's handle keeps its edges for good.
+texture_for :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratch: ^[]byte, clamp_mode: u32 = REPEAT_BOTH) -> i64 {
 	if path.len == 0 do return 0
 	key := text_hash(path)
+	if clamp_mode != REPEAT_BOTH do key = (key ~ (u64(clamp_mode + 1) *% 0x9E3779B97F4A7C15)) | 1
 	known, found := index_get(&renderer.texture_index, key)
 	if found do return known
 	if renderer.textures.len == renderer.textures.cap do return 0
-	id := load_texture(renderer, archive, path, scratch)
+	id := load_texture(renderer, archive, path, scratch, clamp_mode)
 	slot : i64 = 0
 	if id != 0 {
 		slot = renderer.textures.len
@@ -2044,7 +2054,7 @@ text_hash :: fun(text: []utf8) -> u64 {
 // Reads a texture from the archive onto the card: block compressed ones as
 // they are, the rest decoded to plain pixels; its mipmaps as many as it
 // has, sharp at a slant. 0 when it can't be read.
-load_texture :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratch: ^[]byte) -> u32 {
+load_texture :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratch: ^[]byte, clamp_mode: u32) -> u32 {
 	texture, read_error := read_archive_texture(archive, path, scratch)
 	if read_error do return 0
 
@@ -2075,8 +2085,9 @@ load_texture :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratc
 	TexParameteri(TEXTURE_2D, TEXTURE_MAX_LEVEL, i32(levels - 1))
 	TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(LINEAR_MIPMAP_LINEAR))
 	TexParameteri(TEXTURE_2D, TEXTURE_MAG_FILTER, i32(LINEAR))
-	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_S, i32(REPEAT))
-	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_T, i32(REPEAT))
+	// Past its edges: the picture again, or its edge's pixels drawn on.
+	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_S, i32(if clamp_mode & 2 != 0 do REPEAT else CLAMP_TO_EDGE))
+	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_T, i32(if clamp_mode & 1 != 0 do REPEAT else CLAMP_TO_EDGE))
 	if renderer.anisotropy > 1 do TexParameterf(TEXTURE_2D, TEXTURE_MAX_ANISOTROPY, renderer.anisotropy)
 	return id
 }
@@ -2130,7 +2141,7 @@ upload_model :: fun(renderer: ^Renderer, built: Model, archive: ^Archive, scratc
 			first_index = u32(renderer.indices_used),
 			index_count = u32(part.indices.len),
 			base_vertex = i32(renderer.vertices_used),
-			texture_slot = texture_for(renderer, archive, part.texture[:], scratch),
+			texture_slot = texture_for(renderer, archive, part.texture[:], scratch, part.clamp_mode),
 			alpha_blend = part.alpha_blend,
 			two_sided = part.two_sided,
 			alpha_threshold = threshold,

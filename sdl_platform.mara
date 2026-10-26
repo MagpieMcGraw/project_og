@@ -45,16 +45,6 @@ Platform :: struct {
 	vsync: bool       // frames wait for the display's refresh
 }
 
-// A GL function's address by its name, for gl_load. Its names are views
-// of C's text (c_text) with no room past them for the 0 SDL's call needs,
-// so each is copied into room that has one. (Until c_text's views keep
-// their 0: then gl_load(GL_GetProcAddress) does.)
-gl_function :: fun(name: []utf8) -> ^byte {
-	ended : [256]utf8
-	&ended + name
-	return GL_GetProcAddress(ended)
-}
-
 // Opens a window of the size given, with an OpenGL 4.5 core context.
 // Failing, the platform given back is all zeros: not to be used.
 platform_open :: fun(title: []utf8, width: i64, height: i64) -> Platform, err {
@@ -76,7 +66,7 @@ platform_open :: fun(title: []utf8, width: i64, height: i64) -> Platform, err {
 	// Without vsync: with it, the frames the driver queues ahead hold back
 	// what the mouse does (set_vsync turns it on).
 	_ = sdl.GL_SetSwapInterval(0)
-	gl_load(gl_function)
+	gl_load(GL_GetProcAddress)
 
 	platform := Platform{window = window, context = context, width = width, height = height, mouse_look = false, vsync = false}
 	update_size(&platform)
