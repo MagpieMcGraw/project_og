@@ -2321,7 +2321,7 @@ sphere_in_view :: fun(planes: ^View_Planes, center: Vec3, radius: f32) -> bool {
 // Draws a frame width by height pixels from the camera: the land in view,
 // then the instances in view — opaque parts, then blended — lit by the
 // lighting and the lights set with set_scene_lights. Tells what it drew.
-draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, grounds: ^[]Gpu_Land,
+draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, distant_instances: ^[]Instance, grounds: ^[]Gpu_Land,
 	waters: ^[]Water_Cell, tree_cells: ^[]Gpu_Trees, grass_cells: ^[]Gpu_Grass, look: ^Sky_Look, lighting: Cell_Lighting,
 	camera: Camera, width: i64, height: i64) -> Frame_Stats
 {
@@ -2355,12 +2355,20 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 		far_view_projection := mat4_mul(far_projection, view_matrix(camera))
 		far_planes := view_planes(far_view_projection)
 		draw_distant_land(renderer, grounds, &far_planes, far_view_projection, lighting, sun, camera, &stats)
+		// What's seen from afar, but in the cells drawn in full (there, its
+		// own references are).
+		if distant_instances.len > 0 {
+			gather_meshes(renderer, models, distant_instances, &far_planes, &near_cells, &stats)
+			draw_mesh_runs(renderer, far_view_projection, lighting, sun, camera, false, &stats)
+		}
 		if tree_cells.len > 0 do draw_trees(renderer, tree_cells, &near_cells, false, &far_planes, far_view_projection, lighting, sun, camera, &stats)
 		draw_far_water(renderer, waters, look, far_view_projection, lighting, camera, &stats)
+		if distant_instances.len > 0 do draw_mesh_runs(renderer, far_view_projection, lighting, sun, camera, true, &stats)
 		Clear(DEPTH_BUFFER_BIT)
 	}
 	if grounds.len > 0 do draw_land(renderer, grounds, &planes, view_projection, lighting, sun, camera, &stats)
-	gather_meshes(renderer, models, instances, &planes, &stats)
+	nothing_left_out := hidden_around(camera.position)
+	gather_meshes(renderer, models, instances, &planes, &nothing_left_out, &stats)
 	draw_mesh_runs(renderer, view_projection, lighting, sun, camera, false, &stats)
 	if look.outside and tree_cells.len > 0 do draw_trees(renderer, tree_cells, &near_cells, true, &planes, view_projection, lighting, sun, camera, &stats)
 	if look.outside and grass_cells.len > 0 {
@@ -2601,15 +2609,20 @@ part_key :: fun(part: Mesh_Part, part_index: i64, bindless: bool) -> i64 {
 // instances together, the parts of one state (and, without bindless, one
 // texture) together — into the records and the commands, both put on the
 // card. draw_mesh_runs draws them, a call for each gathering.
-gather_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, planes: ^View_Planes, stats: ^Frame_Stats) {
+gather_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, planes: ^View_Planes,
+	left_out: ^Hidden_Cells, stats: ^Frame_Stats)
+{
 	bindless := renderer.use_bindless
 
-	// The instances in view, and how many of each part they draw.
+	// The instances in view (but in the cells left out), and how many of
+	// each part they draw.
 	renderer.visible.len = 0
 	renderer.touched.len = 0
 	record_count : i64 = 0
 	for &instance, index in instances {
 		if not sphere_in_view(planes, instance.center, instance.radius) do continue
+		x, y := grid_of(Vec3{instance.world[3][0], instance.world[3][1], 0})
+		if hidden_cell_at(left_out, x, y) do continue
 		placed_model := models[instance.model]
 		if record_count + placed_model.part_count > MAX_DRAWN do break
 		&renderer.visible + index

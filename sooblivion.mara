@@ -1213,6 +1213,119 @@ command_grass :: fun(name: []utf8, x: i64, y: i64) {
 	}
 }
 
+// The world's references seen from afar: how many, of how many bases,
+// how many of those have a far mesh (their mesh's name with _far); and the
+// game's distantlod file for the cell at x, y, its kinds' records.
+survey_distant_objects :: fun(plugin: ^Plugin, world_id: u32, x: i64, y: i64, meshes: ^Archive) {
+	references : [4096]Reference
+	bases : [8192]u32
+	total : i64 = 0
+	most : i64 = 0
+	cells_with : i64 = 0
+	scratch : [1 * MB]byte
+	for key in plugin.exterior_cells.keys {
+		if key == 0 or u32(key >> 32) != world_id do continue
+		cell_x := i64(i16(u16((key >> 16) & 0xFFFF)))
+		cell_y := i64(i16(u16(key & 0xFFFF)))
+		cell := exterior_cell(plugin, world_id, cell_x, cell_y)
+		references.len = 0
+		cell_distant_references(plugin, cell, &references)
+		if references.len == 0 do continue
+		cells_with += 1
+		total += references.len
+		if references.len > most do most = references.len
+		for reference in references {
+			known := false
+			for base in bases {
+				if base == reference.base do known = true
+			}
+			if not known and bases.len < bases.cap do &bases + reference.base
+		}
+	}
+	far_meshes : i64 = 0
+	kinds : [16]Kind_Count
+	for base in bases {
+		scratch.len = 0
+		record, record_error := find_record(plugin, base, &scratch)
+		if record_error do continue
+		counted := false
+		for &kind_count in kinds {
+			if kind_count.kind == record.header.kind {
+				kind_count.count += 1
+				counted = true
+			}
+		}
+		if not counted and kinds.len < kinds.cap do &kinds + Kind_Count{kind = record.header.kind, count = 1}
+		path := model_path(record)
+		if path.len < 4 do continue
+		far : [256]utf8
+		&far + path[0 : path.len - 4]
+		&far + "_far.nif"
+		_, found := find_file(meshes, far[:])
+		if found do far_meshes += 1
+		if record.header.kind != "TREE" do print("    % %: % (far mesh: %)", record.header.kind, editor_id(record.data), path, found)
+	}
+	print("% references seen from afar in % cells (the most in a cell %), of % bases, % with a far mesh",
+		total, cells_with, most, bases.len, far_meshes)
+	// What the viewer places of them: all but trees and the disabled.
+	placed : i64 = 0
+	for key in plugin.exterior_cells.keys {
+		if key == 0 or u32(key >> 32) != world_id do continue
+		cell := exterior_cell(plugin, world_id, i64(i16(u16((key >> 16) & 0xFFFF))), i64(i16(u16(key & 0xFFFF))))
+		references.len = 0
+		cell_distant_references(plugin, cell, &references)
+		for reference in references {
+			if reference.flags & RECORD_DISABLED != 0 do continue
+			scratch.len = 0
+			record, record_error := find_record(plugin, reference.base, &scratch)
+			if record_error or record.header.kind == "TREE" or model_path(record).len == 0 do continue
+			placed += 1
+		}
+	}
+	print("% of them placed by the viewer (not trees, not disabled, with a mesh)", placed)
+	for &kind_count in kinds do print("  % bases of kind %", kind_count.count, kind_count.kind)
+
+	// The game's list for the cell.
+	world_name := editor_id_of(plugin, world_id)
+	path : [256]utf8
+	&path + "distantlod\\"
+	for c in world_name do &path + lower(c)
+	&path + "_"
+	&path + int_text(x)[:]
+	&path + "_"
+	&path + int_text(y)[:]
+	&path + ".lod"
+	index, found := find_file(meshes, path[:])
+	if not found {
+		print("no % in the archive", path)
+		return
+	}
+	file_storage : [1 * MB]byte
+	data, read_error := read_file(meshes, index, &file_storage)
+	if read_error do return
+	kind_total : u32 = data[0]
+	at : i64 = 4
+	print("% has % kinds:", path, kind_total)
+	for k in 0:i64(kind_total) {
+		form_id : u32 = data[at]
+		count : u32 = data[at + 4]
+		at += 8 + i64(count) * 28
+		scratch.len = 0
+		record, record_error := find_record(plugin, form_id, &scratch)
+		if record_error {
+			print("  % (unknown): %", form_id, count)
+			continue
+		}
+		print("  % % %: %", form_id, record.header.kind, editor_id(record.data), count)
+	}
+}
+
+// A record kind and how many of it.
+Kind_Count :: struct {
+	kind: [4!]utf8
+	count: i64
+}
+
 command_lod :: fun(name: []utf8, x: i64, y: i64) {
 	data_storage : [400 * MB]byte
 	index_storage : [96 * MB]byte
@@ -1270,6 +1383,7 @@ command_lod :: fun(name: []utf8, x: i64, y: i64) {
 	corner_y := lod_corner(y)
 	piece := lod_name(world_id, corner_x, corner_y)
 	print("cell % % is in piece %", x, y, piece)
+	survey_distant_objects(&plugin, world_id, x, y, &meshes)
 	path : [256]utf8
 	&path + "textures\\landscapelod\\generated\\"
 	&path + piece[:]

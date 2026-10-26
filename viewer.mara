@@ -281,7 +281,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		set_scene_lights(&viewer.renderer, &shown.lights)
 		shown.lights_changed = false
 	}
-	viewer.drawn = draw_frame(&viewer.renderer, &shown.models, &shown.instances, &shown.grounds, &shown.waters,
+	viewer.drawn = draw_frame(&viewer.renderer, &shown.models, &shown.instances, &shown.distant_instances, &shown.grounds, &shown.waters,
 		&shown.tree_cells, &shown.grass_cells, &viewer.look, shown.lighting, camera^, platform.width, platform.height)
 	card_start := time_now()
 	viewer.drawing_time = card_start - drawing_start
@@ -768,6 +768,16 @@ go_outside :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32, place: Vec3) 
 		note(&viewer.journal, viewer.renderer.distant_vertices_used)
 		note(&viewer.journal, " vertices, in ")
 		note(&viewer.journal, elapsed_ms(distant_start))
+		note(&viewer.journal, " ms")
+		note_end(&viewer.journal)
+	}
+	if viewer.shown.distant_world != world_id {
+		objects_start := time_now()
+		objects := load_distant_objects(&viewer.shown, plugin, world_id, viewer_loader(viewer))
+		note(&viewer.journal, "seen from afar: ")
+		note(&viewer.journal, objects)
+		note(&viewer.journal, " references placed, in ")
+		note(&viewer.journal, elapsed_ms(objects_start))
 		note(&viewer.journal, " ms")
 		note_end(&viewer.journal)
 	}

@@ -251,6 +251,34 @@ cell_references :: fun(plugin: ^Plugin, cell: u32, references: ^[]Reference) -> 
 	}
 }
 
+// The references of a cell that are seen from afar (its visible-distant
+// group: the game draws them past the cells loaded), into references.
+cell_distant_references :: fun(plugin: ^Plugin, cell: u32, references: ^[]Reference) {
+	group_at, found := index_get(&plugin.cell_children, u64(cell))
+	if not found do return
+	group_header : Group_Header = plugin.data[group_at]
+	end := group_at + i64(group_header.size)
+	at := group_at + HEADER_SIZE
+	for at < end {
+		// The cell's groups: only the visible-distant one is read.
+		inner : Group_Header = plugin.data[at]
+		if inner.kind != "GRUP" do return
+		inner_end := at + i64(inner.size)
+		if inner.group_type == GROUP_CELL_VISIBLE_DISTANT {
+			place := at + HEADER_SIZE
+			for place < inner_end {
+				header : Record_Header = plugin.data[place]
+				next_place := place + HEADER_SIZE + i64(header.size)
+				if header.kind == "REFR" and references.len < references.cap {
+					references + read_reference(header, plugin.data[place + HEADER_SIZE : next_place])
+				}
+				place = next_place
+			}
+		}
+		at = inner_end
+	}
+}
+
 // A REFR record's fields: NAME the base, DATA where and how turned, XSCL
 // its scale.
 read_reference :: fun(header: Record_Header, data: []byte) -> Reference {

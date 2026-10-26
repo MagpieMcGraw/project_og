@@ -87,6 +87,13 @@ Scene :: struct {
 	center_x: i64                // the cell the exterior was loaded around
 	center_y: i64
 	grounds: [LAND_SLOTS]Gpu_Land
+
+	// What's seen from afar outside: the world's references seen from afar
+	// (but its trees, billboards: tree_cells), each with its far mesh;
+	// drawn past the cells drawn in full. All of a world's at once: Tamriel
+	// has about 840.
+	distant_instances: [4096]Instance
+	distant_world: u32
 	grass_cells: [LAND_SLOTS]Gpu_Grass   // each land's grass, in its land's slot
 	waters: [WATER_SLOTS]Water_Cell
 	waters_changed: bool         // since the renderer was last given them (upload_waters)
@@ -158,6 +165,8 @@ scene_clear :: fun(scene: ^Scene, storage: ^[]byte) {
 	scene.texture_grass_index = key_index(1 << 11, storage)
 	scene.texture_grasses.len = 0
 	scene.grass_cells.len = 0
+	scene.distant_instances.len = 0
+	scene.distant_world = 0
 	drop_trees(scene, NOWHERE)
 	scene.trees_world = 0
 	scene_clear_cell(scene)
@@ -584,6 +593,42 @@ load_land :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64, load
 	build_land_mesh(plugin, &cell_land, x, y, &mesh)
 	&scene.grounds + upload_land(loader.renderer, &mesh, x, y, slot, loader.textures, &room.texture)
 	load_grass(scene, plugin, cell, x, y, &cell_land, slot, loader)
+}
+
+// ---- seen from afar ---------------------------------------------------------------
+
+// Places a world's references seen from afar, in place of the last
+// world's: each with its far mesh (its mesh's name with _far: a few
+// hundred triangles), or its mesh where there's none. Trees are left to
+// their billboards. How many were placed.
+load_distant_objects :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, loader: Loader) -> i64 {
+	scene.distant_instances.len = 0
+	scene.distant_world = world_id
+	references : [1024]Reference
+	scratch : [64 * KB]byte
+	for key in plugin.exterior_cells.keys {
+		if key == 0 or u32(key >> 32) != world_id do continue
+		cell := exterior_cell(plugin, world_id, i64(i16(u16((key >> 16) & 0xFFFF))), i64(i16(u16(key & 0xFFFF))))
+		references.len = 0
+		cell_distant_references(plugin, cell, &references)
+		for reference in references {
+			if reference.flags & RECORD_DISABLED != 0 do continue
+			if scene.distant_instances.len == scene.distant_instances.cap do return scene.distant_instances.len
+			scratch.len = 0
+			base, base_error := find_record(plugin, reference.base, &scratch)
+			if base_error or base.header.kind == "TREE" do continue
+			path := model_path(base)
+			if path.len < 4 or is_marker(path[:]) do continue
+			far : [256]utf8
+			&far + path[0 : path.len - 4]
+			&far + "_far.nif"
+			_, has_far := find_file(loader.meshes, far[:])
+			model_index := scene_model(scene, loader, if has_far do far[:] else path[:])
+			if model_index < 0 do continue
+			&scene.distant_instances + place_instance(scene.models[model_index], model_index, reference_transform(reference))
+		}
+	}
+	return scene.distant_instances.len
 }
 
 // ---- grass ----------------------------------------------------------------------
