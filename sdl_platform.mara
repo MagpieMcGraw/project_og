@@ -49,7 +49,9 @@ platform_open :: fun(platform: ^Platform, title: []utf8, width: i64, height: i64
 	title_text : str256
 	&title_text + title
 	platform.window = sdl.CreateWindow(cstring(title_text), i32(width), i32(height), OpenGL | Resizable)
+	if platform.window == void do return Window_Failed
 	platform.context = sdl.GL_CreateContext(platform.window)
+	if platform.context == void do return Context_Failed
 	if not sdl.GL_MakeCurrent(platform.window, platform.context) do return Context_Failed
 	_ = sdl.GL_SetSwapInterval(1)
 	gl_load(GL_GetProcAddress)
