@@ -52,7 +52,7 @@ View_Event :: union {
 viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^[]byte) -> err {
 	viewer.meshes = open_archive(data_path("Oblivion - Meshes.bsa"), directory_storage)?
 	viewer.textures = open_archive(data_path("Oblivion - Textures - Compressed.bsa"), directory_storage)?
-	platform_open(&viewer.platform, "sooblivion", 1280, 720)?
+	viewer.platform = platform_open("sooblivion", 1280, 720)?
 	renderer_init(&viewer.renderer)?
 	scene_clear(&viewer.shown, table_storage)
 	viewer.camera = render.Camera(){position = Vec3{0, 0, 0}, yaw = 0, pitch = 0}

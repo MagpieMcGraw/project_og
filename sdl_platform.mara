@@ -37,10 +37,10 @@ Platform :: struct {
 	mouse_look: bool  // the mouse turns the camera, held in the window
 }
 
-// Opens a window of the size given, with an OpenGL 4.5 core context, into
-// platform (declared and not yet set).
-platform_open :: fun(platform: ^Platform, title: []utf8, width: i64, height: i64) -> err {
-	if not sdl.Init(Video) do return Init_Failed
+// Opens a window of the size given, with an OpenGL 4.5 core context.
+// Failing, the platform given back is all zeros: not to be used.
+platform_open :: fun(title: []utf8, width: i64, height: i64) -> Platform, err {
+	if not sdl.Init(Video) do return Platform{0}, Init_Failed
 	_ = sdl.GL_SetAttribute(ContextProfileMask, i32(GLprofile.Core))
 	_ = sdl.GL_SetAttribute(ContextMajorVersion, 4)
 	_ = sdl.GL_SetAttribute(ContextMinorVersion, 5)
@@ -48,15 +48,17 @@ platform_open :: fun(platform: ^Platform, title: []utf8, width: i64, height: i64
 
 	title_text : str256
 	&title_text + title
-	platform.window = sdl.CreateWindow(cstring(title_text), i32(width), i32(height), OpenGL | Resizable)
-	if platform.window == void do return Window_Failed
-	platform.context = sdl.GL_CreateContext(platform.window)
-	if platform.context == void do return Context_Failed
-	if not sdl.GL_MakeCurrent(platform.window, platform.context) do return Context_Failed
+	window := sdl.CreateWindow(cstring(title_text), i32(width), i32(height), OpenGL | Resizable)
+	if window == void do return Platform{0}, Window_Failed
+	context := sdl.GL_CreateContext(window)
+	if context == void do return Platform{0}, Context_Failed
+	if not sdl.GL_MakeCurrent(window, context) do return Platform{0}, Context_Failed
 	_ = sdl.GL_SetSwapInterval(1)
 	gl_load(GL_GetProcAddress)
-	platform.mouse_look = false
-	update_size(platform)
+
+	platform := Platform{window = window, context = context, width = width, height = height, mouse_look = false}
+	update_size(&platform)
+	return platform
 }
 
 platform_close :: fun(platform: ^Platform) {

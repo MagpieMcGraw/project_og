@@ -271,19 +271,19 @@ exterior_lighting :: fun() -> Cell_Lighting {
 // Shows a world's cells around the one at x, y: their land and references,
 // and the world's persistent references among them. Land loaded before
 // and still in the area is kept.
-show_exterior :: fun(scene: ^Scene, plugin: ^Plugin, world: u32, x: i64, y: i64, renderer: ^Renderer, meshes: ^Archive, textures: ^Archive, room: ^Load_Room) -> err {
+show_exterior :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, x: i64, y: i64, renderer: ^Renderer, meshes: ^Archive, textures: ^Archive, room: ^Load_Room) -> err {
 	area := area_around(x, y)
-	if scene.world != world do drop_terrain(scene, area, true)
+	if scene.world != world_id do drop_terrain(scene, area, true)
 	else do drop_terrain(scene, area, false)
 	scene_clear_cell(scene)
-	scene.world = world
+	scene.world = world_id
 	scene.center_x = x
 	scene.center_y = y
 	scene.lighting = exterior_lighting()
 
 	for cell_y in area.low_y..area.high_y {
 		for cell_x in area.low_x..area.high_x {
-			cell := exterior_cell(plugin, world, cell_x, cell_y)
+			cell := exterior_cell(plugin, world_id, cell_x, cell_y)
 			if cell == 0 do continue
 			ground := terrain_model(scene, plugin, cell, cell_x, cell_y, renderer, textures, room)
 			if ground >= 0 and scene.instances.len < scene.instances.cap {
@@ -292,6 +292,6 @@ show_exterior :: fun(scene: ^Scene, plugin: ^Plugin, world: u32, x: i64, y: i64,
 			add_cell(scene, plugin, cell, EVERYWHERE, renderer, meshes, textures, room)?
 		}
 	}
-	persistent := persistent_cell(plugin, world)
+	persistent := persistent_cell(plugin, world_id)
 	if persistent != 0 do add_cell(scene, plugin, persistent, area, renderer, meshes, textures, room)?
 }

@@ -70,12 +70,12 @@ local_transform :: fun(object: Av_Object) -> Mat4 {
 }
 
 // The properties in effect for an object: its parent's, with its own put over them.
-inherit :: fun(nif: ^Nif, parent: Inherited, properties: Refs) -> Inherited {
+inherit :: fun(mesh: ^Nif, parent: Inherited, properties: Refs) -> Inherited {
 	result := parent
 	for k in 0:properties.count {
 		index := properties.at(k)
 		if index < 0 do continue
-		match nif.blocks[index] {
+		match mesh.blocks[index] {
 		Texturing
 			result.texturing = index
 		Material
@@ -92,10 +92,10 @@ inherit :: fun(nif: ^Nif, parent: Inherited, properties: Refs) -> Inherited {
 
 // Makes a model of a NIF: its parts' vertices and indexes, and the parts
 // themselves, carved from storage.
-build_model :: fun(nif: ^Nif, storage: ^[]byte) -> Model, err {
+build_model :: fun(mesh: ^Nif, storage: ^[]byte) -> Model, err {
 	// One part for each shape at most.
 	shape_count : i64 = 0
-	for block in nif.blocks {
+	for block in mesh.blocks {
 		match block {
 		Shape
 			shape_count += 1
@@ -107,33 +107,33 @@ build_model :: fun(nif: ^Nif, storage: ^[]byte) -> Model, err {
 		bounds_min = Vec3{1000000, 1000000, 1000000},
 		bounds_max = Vec3{-1000000, -1000000, -1000000}}
 	none := Inherited{texturing = -1, material = -1, alpha = -1, stencil = -1}
-	for k in 0:nif.roots.count {
-		root := nif.roots.at(k)
-		if root >= 0 do add_object(nif, root, mat4_identity(), none, &model, storage)?
+	for k in 0:mesh.roots.count {
+		root := mesh.roots.at(k)
+		if root >= 0 do add_object(mesh, root, mat4_identity(), none, &model, storage)?
 	}
 	return model
 }
 
 // Adds an object of the tree to the model: a node's children, or a shape.
-add_object :: fun(nif: ^Nif, index: i64, parent: Mat4, inherited: Inherited, model: ^Model, storage: ^[]byte) -> err {
-	match nif.blocks[index] {
+add_object :: fun(mesh: ^Nif, index: i64, parent: Mat4, inherited: Inherited, model: ^Model, storage: ^[]byte) -> err {
+	match mesh.blocks[index] {
 	Node node
 		if node.object.flags & 1 != 0 do return   // hidden
 		if node.object.name == "EditorMarker" do return
 		transform := mat4_mul(parent, local_transform(node.object))
-		properties := inherit(nif, inherited, node.object.properties)
+		properties := inherit(mesh, inherited, node.object.properties)
 		for k in 0:node.children.count {
 			child := node.children.at(k)
-			if child >= 0 do add_object(nif, child, transform, properties, model, storage)?
+			if child >= 0 do add_object(mesh, child, transform, properties, model, storage)?
 		}
 	Shape shape
 		if shape.object.flags & 1 != 0 do return
 		if shape.data < 0 do return
 		transform := mat4_mul(parent, local_transform(shape.object))
-		properties := inherit(nif, inherited, shape.object.properties)
-		match nif.blocks[shape.data] {
+		properties := inherit(mesh, inherited, shape.object.properties)
+		match mesh.blocks[shape.data] {
 		Shape_Data data
-			add_shape(nif, data.geometry, transform, properties, model, storage)?
+			add_shape(mesh, data.geometry, transform, properties, model, storage)?
 		else
 		}
 	else
@@ -141,7 +141,7 @@ add_object :: fun(nif: ^Nif, index: i64, parent: Mat4, inherited: Inherited, mod
 }
 
 // Adds a shape's geometry to the model as a part.
-add_shape :: fun(nif: ^Nif, geometry: Geometry, transform: Mat4, properties: Inherited, model: ^Model, storage: ^[]byte) -> err {
+add_shape :: fun(mesh: ^Nif, geometry: Geometry, transform: Mat4, properties: Inherited, model: ^Model, storage: ^[]byte) -> err {
 	count := geometry.vertex_count
 	if count == 0 or geometry.vertices.len == 0 do return
 	if model.parts.len == model.parts.cap do return Too_Many_Parts
@@ -197,7 +197,7 @@ add_shape :: fun(nif: ^Nif, geometry: Geometry, transform: Mat4, properties: Inh
 		diffuse = Vec3{1, 1, 1},
 		emissive = Vec3{0, 0, 0},
 		alpha = 1}
-	apply_properties(nif, properties, part)
+	apply_properties(mesh, properties, part)
 }
 
 // Adds a strip's triangles: each vertex after the first two makes one with
@@ -224,17 +224,17 @@ add_strip :: fun(strip: []byte, indices: ^[]u16) {
 }
 
 // Sets how a part is drawn from the properties in effect for it.
-apply_properties :: fun(nif: ^Nif, properties: Inherited, part: ^Model_Part) {
+apply_properties :: fun(mesh: ^Nif, properties: Inherited, part: ^Model_Part) {
 	if properties.texturing >= 0 {
-		match nif.blocks[properties.texturing] {
+		match mesh.blocks[properties.texturing] {
 		Texturing texturing
-			texture_path(nif, texturing.slots[SLOT_BASE], &part.texture)
-			texture_path(nif, texturing.slots[SLOT_GLOW], &part.glow_texture)
+			texture_path(mesh, texturing.slots[SLOT_BASE], &part.texture)
+			texture_path(mesh, texturing.slots[SLOT_GLOW], &part.glow_texture)
 		else
 		}
 	}
 	if properties.material >= 0 {
-		match nif.blocks[properties.material] {
+		match mesh.blocks[properties.material] {
 		Material material
 			part.diffuse = material.diffuse
 			part.emissive = material.emissive
@@ -243,7 +243,7 @@ apply_properties :: fun(nif: ^Nif, properties: Inherited, part: ^Model_Part) {
 		}
 	}
 	if properties.alpha >= 0 {
-		match nif.blocks[properties.alpha] {
+		match mesh.blocks[properties.alpha] {
 		Alpha alpha
 			part.alpha_blend = alpha.flags & 1 != 0
 			part.alpha_test = alpha.flags & 0x200 != 0
@@ -252,7 +252,7 @@ apply_properties :: fun(nif: ^Nif, properties: Inherited, part: ^Model_Part) {
 		}
 	}
 	if properties.stencil >= 0 {
-		match nif.blocks[properties.stencil] {
+		match mesh.blocks[properties.stencil] {
 		Stencil stencil
 			part.two_sided = stencil.draw_mode == 3
 		else
@@ -262,10 +262,10 @@ apply_properties :: fun(nif: ^Nif, properties: Inherited, part: ^Model_Part) {
 
 // The archive path of a slot's texture, into path: lower case, '\' between
 // its parts, under textures\ (the files write it with or without that).
-texture_path :: fun(nif: ^Nif, slot: Texture_Slot, path: ^[160]utf8) {
+texture_path :: fun(mesh: ^Nif, slot: Texture_Slot, path: ^[160]utf8) {
 	path.len = 0
 	if not slot.used or slot.source < 0 do return
-	match nif.blocks[slot.source] {
+	match mesh.blocks[slot.source] {
 	Source_Texture source
 		name := source.file_name
 		clean : [160]utf8
