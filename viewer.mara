@@ -26,8 +26,9 @@ render :: use render
 EYE_HEIGHT :: 120
 // How near a door must be to go through it.
 DOOR_REACH :: 300
-// Without vsync, frames are kept to this many a second at most.
-MOST_FRAMES_A_SECOND :: 240
+// Without vsync, frames are kept to this many a second at most: the game
+// has to feel good at 60.
+MOST_FRAMES_A_SECOND :: 60
 // How long a frame may spend loading what's waiting, in nanoseconds.
 LOAD_BUDGET :: 6000000
 
