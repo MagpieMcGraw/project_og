@@ -109,6 +109,25 @@ Door_Kind :: struct {
 	open_stop: f32
 	close_start: f32
 	close_stop: f32
+	// The sounds its Open and Close sequences make, at their times.
+	open_cues: [DOOR_CUES]Door_Cue
+	close_cues: [DOOR_CUES]Door_Cue
+}
+
+// The sounds a door's sequence makes, at most.
+DOOR_CUES :: 4
+
+// A sound a door's animation makes (a text key "Sound: <editor id>"): when,
+// in its sequence's time, and which (in the scene's sound kinds).
+Door_Cue :: struct {
+	time: f32
+	sound: i64
+}
+
+// A sound a door makes now: which (in the scene's sound kinds), and where.
+Door_Noise :: struct {
+	sound: i64
+	position: Vec3
 }
 
 // A door placed that opens in place: its reference, its kind, where it's
@@ -170,6 +189,8 @@ Scene :: struct {
 	// each door's opening and closing sounds.
 	sound_kinds: [1024]Sound_Kind
 	sound_kind_index: Key_Index
+	sound_names: Key_Index       // each SOUN's form id (+1), by its editor id's hash (any case)
+	sound_names_read: bool       // whether sound_names has been made
 	sounds: [1024]Placed_Sound
 	door_sounds: [2048]Door_Sounds
 	lighting: Cell_Lighting
@@ -258,6 +279,8 @@ scene_clear :: fun(scene: ^Scene, storage: ^[]byte) {
 	scene.paths = key_index(1 << 13, storage)
 	scene.sound_kinds.len = 0
 	scene.sound_kind_index = key_index(1 << 11, storage)
+	scene.sound_names = key_index(1 << 12, storage)
+	scene.sound_names_read = false
 	scene.failures = 0
 	scene.grounds.len = 0
 	scene.world = 0
@@ -363,12 +386,63 @@ door_sound :: fun(scene: ^Scene, reference: u32, opening: bool) -> i64, Vec3 {
 	return -1, Vec3{0, 0, 0}
 }
 
-// Whether a door that opens in place is open now (or opening).
-door_open :: fun(scene: ^Scene, reference: u32) -> bool {
-	for &door in scene.swinging {
-		if door.reference == reference do return if door.moving do door.opening else door.open
+// The sounds a door's sequence makes, from its text keys "Sound: <editor
+// id>" (any case), into cues.
+read_door_cues :: fun(scene: ^Scene, plugin: ^Plugin, mesh: ^Nif, sequence: i64, cues: ^[]Door_Cue) {
+	cues.len = 0
+	match mesh.blocks[sequence] {
+	Sequence played
+		if played.text_keys < 0 or played.text_keys >= mesh.blocks.len do return
+		match mesh.blocks[played.text_keys] {
+		Text_Keys text_keys
+			at : i64 = 0
+			for k in 0:text_keys.count {
+				seconds, text, next_at := next_text_key(text_keys.keys, at)
+				at = next_at
+				if text.len < 6 or compare_folded(text[0:6], "sound:") != 0 do continue
+				name := text[6 : text.len]
+				for name.len > 0 and name[0] == ' ' do name = name[1 : name.len]
+				sound := named_sound_kind(scene, plugin, name)
+				if sound >= 0 and cues.len < cues.cap do cues + Door_Cue{time = seconds, sound = sound}
+			}
+		else
+		}
+	else
 	}
-	return false
+}
+
+// The kind of sound a SOUN record makes, found by its editor id (any
+// case): its index in the scene's sound kinds; -1 when there's none. The
+// sounds' editor ids are read the first time.
+named_sound_kind :: fun(scene: ^Scene, plugin: ^Plugin, name: []utf8) -> i64 {
+	if not scene.sound_names_read {
+		scratch : [64 * KB]byte
+		for key, slot in plugin.records.keys {
+			if key == 0 do continue
+			header : Record_Header = plugin.data[i64(plugin.records.values[slot])]
+			if header.kind != "SOUN" do continue
+			scratch.len = 0
+			record, record_error := record_at(plugin, i64(plugin.records.values[slot]), &scratch)
+			if record_error {
+				note_failure(scene, "a sound's record", record_error)
+				continue
+			}
+			// (A full table only leaves some sounds unfound by name.)
+			_ = index_put(&scene.sound_names, folded_hash(editor_id(record.data)), i64(key) + 1)
+		}
+		scene.sound_names_read = true
+	}
+	form_id, found := index_get(&scene.sound_names, folded_hash(name))
+	if not found do return -1
+	return scene_sound_kind(scene, plugin, u32(form_id - 1))
+}
+
+// A hash of a text in lower case, never 0: an editor id's key, any case.
+folded_hash :: fun(text: []utf8) -> u64 {
+	hash : u64 = 0xCBF29CE484222325
+	for c in text do hash = (hash ~ u64(lower(c))) *% 0x100000001B3
+	if hash == 0 do hash = 1
+	return hash
 }
 
 // Notes that something couldn't be loaded (and is left out): counted, the
@@ -524,7 +598,7 @@ load_waiting :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, budget: u64)
 		place := Vec3{item.world[3][0], item.world[3][1], item.world[3][2]}
 		if scene.world != 0 and not area_holds(shown_area(scene), place) do continue
 		if item.door {
-			kind_index := door_kind(scene, loader, item.path[:])
+			kind_index := door_kind(scene, plugin, loader, item.path[:])
 			if kind_index >= 0 {
 				place_door(scene, kind_index, item.world, item.reference)
 				continue
@@ -744,14 +818,14 @@ area_around :: fun(x: i64, y: i64) -> Grid_Area {
 		high_x = x + EXTERIOR_RADIUS, high_y = y + EXTERIOR_RADIUS}
 }
 
-// Lets go of the land outside an area (all of it, when all): its slots
-// free for other land.
-drop_land :: fun(scene: ^Scene, area: Grid_Area, all: bool) {
+// Lets go of the land outside an area (all of it, when everything): its
+// slots free for other land.
+drop_land :: fun(scene: ^Scene, area: Grid_Area, everything: bool) {
 	k : i64 = 0
 	for k < scene.grounds.len {
 		ground := scene.grounds[k]
 		inside := ground.x >= area.low_x and ground.x <= area.high_x and ground.y >= area.low_y and ground.y <= area.high_y
-		if all or not inside {
+		if everything or not inside {
 			scene.grounds[k] = scene.grounds[scene.grounds.len - 1]
 			scene.grounds.len -= 1
 		else
@@ -763,7 +837,7 @@ drop_land :: fun(scene: ^Scene, area: Grid_Area, all: bool) {
 	for k < scene.grass_cells.len {
 		cell := &scene.grass_cells[k]
 		inside := cell.x >= area.low_x and cell.x <= area.high_x and cell.y >= area.low_y and cell.y <= area.high_y
-		if all or not inside {
+		if everything or not inside {
 			scene.grass_cells[k] = scene.grass_cells[scene.grass_cells.len - 1]
 			scene.grass_cells.len -= 1
 		else
@@ -864,11 +938,11 @@ next_chance :: fun(seed: ^u64) -> f32 {
 
 // The kind of door a mesh is, if it opens in place: its index in the
 // scene's door kinds, loaded the first time; -1 when it doesn't.
-door_kind :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64 {
+door_kind :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, path: []utf8) -> i64 {
 	key := text_hash(path)
 	known, found := index_get(&scene.door_kind_index, key)
 	if found do return known - 1
-	kind_index, load_error := load_door_kind(scene, loader, path)
+	kind_index, load_error := load_door_kind(scene, plugin, loader, path)
 	if load_error {
 		note_failure(scene, path, load_error)
 		kind_index = -1
@@ -881,7 +955,7 @@ door_kind :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64 {
 // frame and those nodes' pieces are each put on the card as a model (with
 // its collision), and the tracks kept. -1 when they move nothing (no
 // error: a door that doesn't open in place).
-load_door_kind :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64, err {
+load_door_kind :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, path: []utf8) -> i64, err {
 	if scene.door_kinds.len == scene.door_kinds.cap do return -1
 	room := loader.room
 	index, found := find_file(loader.meshes, path)
@@ -924,6 +998,8 @@ load_door_kind :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64, err {
 	kind := next(&scene.door_kinds)
 	kind.open_start, kind.open_stop = sequence_span(&mesh, open)
 	kind.close_start, kind.close_stop = sequence_span(&mesh, close)
+	read_door_cues(scene, plugin, &mesh, open, &kind.open_cues)
+	read_door_cues(scene, plugin, &mesh, close, &kind.close_cues)
 	// (The frame may be nothing: a door that moves all of itself.)
 	frame, frame_error := add_door_model(scene, loader, &mesh, -1, moving[:])
 	kind.frame = if frame_error do -1 else frame
@@ -1015,20 +1091,35 @@ swings :: fun(scene: ^Scene, reference: u32) -> bool {
 
 // Moves the doors that are opening or closing on by a frame: their
 // pieces' instances posed as their tracks say, until they're done. The
-// doors that shut in this frame (closing, now closed) go into shut.
-swing_doors :: fun(scene: ^Scene, seconds: f32, shut: ^[]u32) {
+// sounds they make in this frame go into noises: their sequence's cues as
+// it passes them; for a sequence with none, the door's own — opening as it
+// starts, closing as it shuts.
+swing_doors :: fun(scene: ^Scene, seconds: f32, noises: ^[]Door_Noise) {
 	for &door in scene.swinging {
 		if not door.moving do continue
 		kind := &scene.door_kinds[door.kind]
+		before := door.time
 		door.time += seconds
 		start := if door.opening do kind.open_start else kind.close_start
 		stop := if door.opening do kind.open_stop else kind.close_stop
 		at := start + door.time
+		shut := false
 		if at >= stop {
 			at = stop
 			door.moving = false
 			door.open = door.opening
-			if not door.opening and shut.len < shut.cap do shut + door.reference
+			shut = not door.opening
+		}
+		place := Vec3{door.placement[3][0], door.placement[3][1], door.placement[3][2]}
+		cues := if door.opening do kind.open_cues else kind.close_cues
+		if cues.len > 0 {
+			for cue in cues {
+				due := cue.time <= at and (before == 0 or cue.time > start + before)
+				if due and noises.len < noises.cap do noises + Door_Noise{sound = cue.sound, position = place}
+			}
+		elif (door.opening and before == 0) or shut
+			sound, _ := door_sound(scene, door.reference, door.opening)
+			if sound >= 0 and noises.len < noises.cap do noises + Door_Noise{sound = sound, position = place}
 		}
 		for &piece in kind.pieces {
 			track := if door.opening do &piece.opening else &piece.closing

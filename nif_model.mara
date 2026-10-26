@@ -479,6 +479,14 @@ Block :: union {
 		blocks: []byte       // as Oblivion's files have them: CONTROLLED_BLOCK_SIZE bytes each
 		start_time: f32
 		stop_time: f32
+		text_keys: i64       // its text keys (a Text_Keys block), -1 for none
+	}
+	// NiTextKeyExtraData: texts at times in an animation ("start", "end",
+	// "Sound: DRSMetalOpen01"…): how many, and the keys as the file has them
+	// (each a time, then its text's length and text: next_text_key).
+	Text_Keys {
+		count: i64
+		keys: []byte
 	}
 	// NiStringPalette: names, each ended by a 0, that sequences point into.
 	String_Palette {

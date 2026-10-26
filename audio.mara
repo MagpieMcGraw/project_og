@@ -12,31 +12,9 @@ module audio
 use mara.core
 use mara.math
 use mara.string
+use mara.sdl
 use bsa
 use world
-
-// SDL3's audio, bound here: Mara's SDL bindings have none yet (MARA_ISSUES.md).
-foreign static_lib "SDL3" {
-	fun SDL_InitSubSystem(flags: u32) -> bool
-	fun SDL_OpenAudioDeviceStream(device: u32, spec: ^Audio_Spec, callback: u64, userdata: u64) -> Audio_Stream
-	fun SDL_ResumeAudioStreamDevice(stream: Audio_Stream) -> bool
-	fun SDL_PutAudioStreamData(stream: Audio_Stream, data: ^f32, length: i32) -> bool
-	fun SDL_GetAudioStreamQueued(stream: Audio_Stream) -> i32
-	fun SDL_DestroyAudioStream(stream: Audio_Stream)
-}
-
-Audio_Stream :: ^byte
-
-// What SDL is handed: its sample format (SDL_AUDIO_*), channels, rate.
-Audio_Spec :: struct {
-	format: u32
-	channels: i32
-	frequency: i32
-}
-
-SDL_INIT_AUDIO :: 0x10
-SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK :: 0xFFFFFFFF
-SDL_AUDIO_F32 :: 0x8120   // 32-bit floats, little-endian
 
 // The mix: its rate, and how far ahead of what's heard it's kept (frames:
 // what a slow frame of the game can take before the sound stops).
@@ -95,8 +73,8 @@ Voice :: struct {
 // their paths' hashes) and the room they're in, the voices, the mix, and
 // what couldn't be played since the journal last told (how many, the
 // first's path and why).
-Audio :: struct {
-	stream: Audio_Stream
+Mixer :: struct {
+	stream: sdl.AudioStream
 	open: bool
 	clips: [MAX_CLIPS]Clip
 	clip_index: Key_Index
@@ -111,7 +89,7 @@ Audio :: struct {
 
 // Sets the audio up, closed: no clips, no voices; the clips' room (room_size
 // bytes) and index carved from storage.
-audio_init :: fun(audio: ^Audio, room_size: i64, storage: ^[]byte) {
+audio_init :: fun(audio: ^Mixer, room_size: i64, storage: ^[]byte) {
 	audio.open = false
 	audio.clips.len = 0
 	audio.voices.len = 0
@@ -124,17 +102,16 @@ audio_init :: fun(audio: ^Audio, room_size: i64, storage: ^[]byte) {
 
 // Starts SDL's audio and opens the default device for a stereo mix.
 // Failing, the audio stays closed (and silent): what's played is let go.
-audio_open :: fun(audio: ^Audio) -> err {
-	if not SDL_InitSubSystem(SDL_INIT_AUDIO) do return No_Audio
-	spec := Audio_Spec{format = SDL_AUDIO_F32, channels = 2, frequency = MIX_RATE}
-	audio.stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, 0, 0)
+audio_open :: fun(audio: ^Mixer) -> err {
+	if not sdl.InitSubSystem(sdl.Init_Flags.Audio) do return No_Audio
+	audio.stream = sdl.OpenAudioDeviceStream(sdl.AUDIO_DEVICE_DEFAULT_PLAYBACK, sdl.AudioSpec{format = .F32, channels = 2, freq = MIX_RATE})
 	if audio.stream == void do return No_Device
-	_ = SDL_ResumeAudioStreamDevice(audio.stream)
+	_ = sdl.ResumeAudioStreamDevice(audio.stream)
 	audio.open = true
 }
 
-audio_close :: fun(audio: ^Audio) {
-	if audio.open do SDL_DestroyAudioStream(audio.stream)
+audio_close :: fun(audio: ^Mixer) {
+	if audio.open do sdl.DestroyAudioStream(audio.stream)
 	audio.open = false
 }
 
@@ -176,7 +153,7 @@ read_wave :: fun(data: []byte) -> Clip, err {
 
 // The clip for a sound (its index in the clips): its file's, loaded from
 // the archive the first time; a folder's, one of its files at random.
-clip_for :: fun(audio: ^Audio, archive: ^Archive, kind: ^Sound_Kind) -> i64, err {
+clip_for :: fun(audio: ^Mixer, archive: ^Archive, kind: ^Sound_Kind) -> i64, err {
 	path : [256]utf8
 	if kind.folder {
 		folder_path := kind.path[:]
@@ -231,7 +208,7 @@ random_share :: fun(seed: ^u64) -> f32 {
 
 // Remembers a sound that couldn't be played: how many, the first's path
 // and why (for the journal: take_failures).
-note_sound_failure :: fun(audio: ^Audio, kind: ^Sound_Kind, reason: err) {
+note_sound_failure :: fun(audio: ^Mixer, kind: ^Sound_Kind, reason: err) {
 	audio.failures += 1
 	if audio.failures == 1 {
 		audio.first_failure.len = 0
@@ -286,7 +263,7 @@ plays_at_hour :: fun(kind: ^Sound_Kind, hour: f32) -> bool {
 // Starts a voice playing a sound's clip, its gains starting at gains (a
 // looping one from a place in its clip at random, so loops of one sound
 // don't play in step): its index, -1 when no voice is free.
-start_voice :: fun(audio: ^Audio, kind: ^Sound_Kind, clip_index: i64, source: u64, gains: [2!]f32, looping: bool) -> i64 {
+start_voice :: fun(audio: ^Mixer, kind: ^Sound_Kind, clip_index: i64, source: u64, gains: [2!]f32, looping: bool) -> i64 {
 	if audio.voices.len == audio.voices.cap do return -1
 	clip := audio.clips[clip_index]
 	if clip.frames == 0 do return -1
@@ -308,7 +285,7 @@ start_voice :: fun(audio: ^Audio, kind: ^Sound_Kind, clip_index: i64, source: u6
 
 // Plays a sound once at a place (a door opening, say), heard from where the
 // listener is now.
-play_once :: fun(audio: ^Audio, archive: ^Archive, kind: ^Sound_Kind, position: Vec3, listener: Listener) {
+play_once :: fun(audio: ^Mixer, archive: ^Archive, kind: ^Sound_Kind, position: Vec3, listener: Listener) {
 	if not audio.open do return
 	clip_index, clip_error := clip_for(audio, archive, kind)
 	if clip_error {
@@ -333,7 +310,7 @@ Placed_Sound :: struct {
 // in hearing range (and the others when their pause is over), moves the
 // playing ones' gains to where they are now, and fades out the voices whose
 // sound is gone or out of range. The time is the mix's, in seconds.
-hear :: fun(audio: ^Audio, archive: ^Archive, sounds: ^[]Placed_Sound, listener: Listener, hour: f32, now: f64) {
+hear :: fun(audio: ^Mixer, archive: ^Archive, sounds: ^[]Placed_Sound, listener: Listener, hour: f32, now: f64) {
 	if not audio.open do return
 	for &voice in audio.voices do voice.wanted = voice.source == 0
 	for &sound in sounds {
@@ -375,16 +352,16 @@ hear :: fun(audio: ^Audio, archive: ^Archive, sounds: ^[]Placed_Sound, listener:
 
 // Mixes as much as keeps the stream AHEAD frames ahead of what's heard,
 // and hands it to SDL; voices that ended (or faded out, unwanted) are let go.
-mix_ahead :: fun(audio: ^Audio) {
+mix_ahead :: fun(audio: ^Mixer) {
 	if not audio.open do return
-	queued := i64(SDL_GetAudioStreamQueued(audio.stream)) / 8
+	queued := i64(sdl.GetAudioStreamQueued(audio.stream)) / 8
 	frames := AHEAD - queued
 	if frames <= 0 do return
 	audio.mix.len = frames * 2
 	for k in 0:audio.mix.len do audio.mix[k] = 0
 	for &voice in audio.voices do mix_voice(audio, voice, frames)
 	for k in 0:audio.mix.len do audio.mix[k] = max(-1, min(1, audio.mix[k] * MASTER_VOLUME))
-	_ = SDL_PutAudioStreamData(audio.stream, &audio.mix[0], i32(audio.mix.len * 4))
+	_ = sdl.PutAudioStreamData(audio.stream, audio.mix[:])
 
 	// Let go of the voices done: ended, or faded out and not wanted.
 	kept : i64 = 0
@@ -400,7 +377,7 @@ mix_ahead :: fun(audio: ^Audio) {
 
 // Adds a voice's next frames to the mix: its clip resampled (between two
 // of its frames, in a line), its gains moving to their targets across them.
-mix_voice :: fun(audio: ^Audio, voice: ^Voice, frames: i64) {
+mix_voice :: fun(audio: ^Mixer, voice: ^Voice, frames: i64) {
 	if voice.ended do return
 	clip := audio.clips[voice.clip]
 	samples := clip.samples

@@ -1158,7 +1158,7 @@ command_sound :: fun(name: []utf8) {
 		kind.start_hour, kind.stop_hour)
 
 	room : [32 * MB]byte
-	mixer : Audio
+	mixer : Mixer
 	audio_init(&mixer, 24 * MB, &room)
 	clip_index, clip_error := clip_for(&mixer, &sounds, &kind)
 	if clip_error {
@@ -1512,6 +1512,22 @@ command_door :: fun(what: []utf8) {
 		tracks : [8]Track
 		read_tracks(&mesh, sequence, &tracks)
 		print("%: from % to % s, % tracks", name, start, stop, tracks.len)
+		match mesh.blocks[sequence] {
+		Sequence played
+			if played.text_keys >= 0 and played.text_keys < mesh.blocks.len {
+				match mesh.blocks[played.text_keys] {
+				Text_Keys text_keys
+					at : i64 = 0
+					for k in 0:text_keys.count {
+						seconds, text, next_at := next_text_key(text_keys.keys, at)
+						print("  at % s: %", seconds, text)
+						at = next_at
+					}
+				else
+				}
+			}
+		else
+		}
 		for &track in tracks {
 			node := find_node(&mesh, track.node_name[:])
 			if node >= 0 {

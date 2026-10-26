@@ -305,10 +305,10 @@ read_controller_sequence :: fun(reader: ^Nif_Reader) -> Block {
 	for b in 0:block_count do skip_controlled_block(reader)
 	blocks := reader.data[blocks_start : reader.at]
 	if blocks.len != block_count * CONTROLLED_BLOCK_SIZE do blocks = reader.data[0:0]
-	if reader.version <= VERSION_10_1_0_103 do return Sequence{name = name, block_count = block_count, blocks = blocks, start_time = 0, stop_time = 0}
+	if reader.version <= VERSION_10_1_0_103 do return Sequence{name = name, block_count = block_count, blocks = blocks, start_time = 0, stop_time = 0, text_keys = -1}
 
 	skip(reader, 4)           // weight
-	_ = read_ref(reader)      // text keys
+	text_keys := read_ref(reader)
 	skip(reader, 4)           // cycle type
 	skip(reader, 4)           // frequency
 	if reader.version <= VERSION_10_4_0_1 do skip(reader, 4)     // phase
@@ -318,7 +318,8 @@ read_controller_sequence :: fun(reader: ^Nif_Reader) -> Block {
 	_ = read_ref(reader)      // manager
 	_ = read_string(reader)   // accumulation root's name
 	if reader.version >= VERSION_10_1_0_113 and reader.version <= VERSION_20_1_0_0 do _ = read_ref(reader)   // string palette
-	return Sequence{name = name, block_count = block_count, blocks = blocks, start_time = start_time, stop_time = stop_time}
+	return Sequence{name = name, block_count = block_count, blocks = blocks, start_time = start_time, stop_time = stop_time,
+		text_keys = text_keys}
 }
 
 // NiGeomMorpherController: blends a mesh between its morph shapes.

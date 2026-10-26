@@ -7,34 +7,7 @@ against Mara at the time written. When one is fixed, move it to Fixed
 
 ## Open
 
-- A parameter (or variable) named `all` is accepted, but then `if x or all {`
-  reads `all {` as the start of a broadcast, and the errors land on the
-  next line, about its tokens:
-
-  ```
-  show :: fun(count: i64, all: bool) {
-  	if count < 25 or all {
-  		print("shown %", count)
-  	}
-  }
-  ```
-
-  gives `[7:8] Parse error: unexpected token Left_Paren "(" (expected
-  statement)` and three more like it, all on the `print` line; nothing
-  names `all`. Expected: either `all` refused as a name where it's
-  declared ("`all` is a keyword"), or `all` read as the variable where a
-  broadcast can't start (after `or`). sooblivion renamed its parameter
-  (`every_one`, sooblivion.mara command_cell).
-
-- mara.sdl has no audio: only the `Audio` init flag and the device events.
-  sooblivion needs SDL3's audio stream: `SDL_InitSubSystem`,
-  `SDL_OpenAudioDeviceStream` (with `SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK`,
-  an `SDL_AudioSpec`, no callback), `SDL_ResumeAudioStreamDevice`,
-  `SDL_PutAudioStreamData`, `SDL_GetAudioStreamQueued`,
-  `SDL_DestroyAudioStream`, and the `SDL_AUDIO_*` formats (F32 at least).
-  Stopgap: sooblivion's audio.mara has its own foreign block for these
-  (the callback and user data passed as `u64` 0, for C's NULL); it can go
-  when mara.sdl wraps them.
+None.
 
 ## Answered (not issues)
 
@@ -45,6 +18,12 @@ against Mara at the time written. When one is fixed, move it to Fixed
 
 ## Fixed
 
+- A variable named `all` was accepted, then `if x or all {` read `all {`
+  as a broadcast, the errors landing on the next line — b3661d1: `all` is
+  a keyword (declaring it is an error), and a condition's `{` is never a
+  broadcast's. sooblivion renamed its two (`every_one`, `everything`).
+- mara.sdl had no audio — 8336222 (SDL3's audio streams). sooblivion's
+  audio.mara uses it; its stopgap foreign block is gone.
 - An err couldn't be had as text (the journal's log could say what failed,
   not why) — b6926f2 (`e.text()`) and eb25281 (`e.where()`: where it was
   made, carried by `?`). sooblivion's journal writes both (note_error).

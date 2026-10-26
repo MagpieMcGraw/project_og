@@ -440,11 +440,23 @@ read_string_extra :: fun(reader: ^Nif_Reader) -> Block {
 read_text_key_extra :: fun(reader: ^Nif_Reader) -> Block {
 	_ = read_extra_name(reader)
 	key_count := i64(read_u32(reader))
+	start := reader.at
 	for k in 0:key_count {
 		skip(reader, 4)   // time
 		_ = read_string(reader)
 	}
-	return .Other
+	return Text_Keys{count = key_count, keys = reader.data[start : reader.at]}
+}
+
+// A text key of a Text_Keys block's keys, starting at a place in them: its
+// time, its text, and where the next starts.
+next_text_key :: fun(keys: []byte, at: i64) -> f32, []utf8, i64 {
+	if at + 8 > keys.len do return 0, keys[0:0], keys.len
+	seconds : f32 = keys[at]
+	text_length : u32 = keys[at + 4]
+	end := min(at + 8 + i64(text_length), keys.len)
+	text : []utf8 = keys[at + 8 : end]
+	return seconds, text, end
 }
 
 // BSBound: a box around a creature: its center and half its size.
