@@ -224,6 +224,23 @@ add_shape :: fun(mesh: ^Nif, geometry: Geometry, transform: Mat4, properties: In
 		emissive = Vec3{0, 0, 0},
 		alpha = 1}
 	apply_properties(mesh, properties, part)
+
+	// The material's color, where the mesh has no colors of its own (they
+	// take its place, as Oblivion's meshes mean them to), and its opacity,
+	// into the vertices' colors: a black backing behind a sewer's gate
+	// stays black.
+	no_colors := geometry.colors.len == 0
+	white := part.diffuse.x == 1 and part.diffuse.y == 1 and part.diffuse.z == 1
+	if (no_colors and not white) or part.alpha != 1 {
+		for &vertex in part.vertices {
+			if no_colors {
+				vertex.color[0] *= part.diffuse.x
+				vertex.color[1] *= part.diffuse.y
+				vertex.color[2] *= part.diffuse.z
+			}
+			vertex.color[3] *= part.alpha
+		}
+	}
 }
 
 // Adds a strip's triangles: each vertex after the first two makes one with

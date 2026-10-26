@@ -67,6 +67,15 @@ A negative constant without an exponent is fine (`B :: -3.4`). The
 module-level message doesn't point at the cause. sooblivion writes the
 number out (UNSET_BEYOND in nif_animation.mara).
 
+## Questions (maybe meant so)
+
+### Struct values can't be compared
+
+Found 2026-10-26. `part.diffuse != Vec3{1, 1, 1}` is
+`cannot compare Vec3 with Vec3 using '!='`. If comparing structs (or just
+the math vectors) is left out on purpose, ignore this; sooblivion
+compares the components (model.mara, add_shape).
+
 ## Fixed
 
 - A loop over a literal array of arrays (`for point in [[4, 4], [16, 16]]`)
