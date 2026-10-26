@@ -27,6 +27,9 @@ use land
 
 // How many cells around the camera's are loaded outside: 2 is 5 by 5.
 EXTERIOR_RADIUS :: 2
+// How many cells around the camera's have their trees drawn: as far as
+// the game drew them (uGridDistantTreeRange).
+TREE_RADIUS :: 15
 
 // A part of the world the grid's cells x and y go from low to high in.
 Grid_Area :: struct {
@@ -86,11 +89,30 @@ Scene :: struct {
 	waters: [WATER_SLOTS]Water_Cell
 	waters_changed: bool         // since the renderer was last given them (upload_waters)
 
+	// Trees: the cells' whose trees are on the card (and which slots they
+	// take), the world and cell they're around, each kind of tree's look
+	// (by its TREE's form id: its index + 1), and the cells waiting.
+	tree_cells: [TREE_CELLS]Gpu_Trees
+	tree_slots_taken: [TREE_CELLS!]bool
+	trees_world: u32
+	trees_x: i64
+	trees_y: i64
+	tree_kinds: Key_Index
+	kinds: [1024]Tree_Kind
+	waiting_trees: [TREE_CELLS]Waiting_Land
+	waiting_trees_next: i64
+
 	// What's still to load, in order, and how far along that is.
 	waiting: [16384]Waiting_Instance
 	waiting_next: i64
 	waiting_land: [64]Waiting_Land
 	waiting_land_next: i64
+}
+
+// A kind of tree: its look, its billboard's texture slot.
+Tree_Kind :: struct {
+	look: Tree_Look
+	texture: i64
 }
 
 // Where the scene's models come from: the archives, and the renderer that
@@ -119,6 +141,10 @@ scene_clear :: fun(scene: ^Scene, storage: ^[]byte) {
 	scene.failed_paths = 0
 	scene.grounds.len = 0
 	scene.world = 0
+	scene.tree_kinds = key_index(1 << 11, storage)
+	scene.kinds.len = 0
+	drop_trees(scene, NOWHERE)
+	scene.trees_world = 0
 	scene_clear_cell(scene)
 }
 
@@ -135,6 +161,8 @@ scene_clear_cell :: fun(scene: ^Scene) {
 	scene.waiting_next = 0
 	scene.waiting_land.len = 0
 	scene.waiting_land_next = 0
+	scene.waiting_trees.len = 0
+	scene.waiting_trees_next = 0
 }
 
 // ---- models ---------------------------------------------------------------------
@@ -230,6 +258,8 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, plac
 			if leads do &scene.doors + Scene_Door{reference = reference.form_id, position = reference.position}
 		}
 
+		// (Trees are drawn as billboards, each cell's at once: load_trees.)
+		if base.header.kind == "TREE" do continue
 		path := model_path(base)
 		if path.len == 0 or is_marker(path[:]) do continue
 		model_index, known := known_model(scene, path[:])
@@ -266,6 +296,16 @@ load_waiting :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, budget: u64)
 		model_index := scene_model(scene, loader, item.path[:])
 		if model_index >= 0 do add_instance(scene, model_index, item.world)
 	}
+	for scene.waiting_trees_next < scene.waiting_trees.len {
+		if time_now() - start > budget do return false
+		item := scene.waiting_trees[scene.waiting_trees_next]
+		scene.waiting_trees_next += 1
+		area := area_around_by(scene.trees_x, scene.trees_y, TREE_RADIUS)
+		inside := item.x >= area.low_x and item.x <= area.high_x and item.y >= area.low_y and item.y <= area.high_y
+		if inside do load_trees(scene, plugin, item.cell, item.x, item.y, loader)
+	}
+	scene.waiting_trees.len = 0
+	scene.waiting_trees_next = 0
 	scene.waiting.len = 0
 	scene.waiting_next = 0
 	scene.waiting_land.len = 0
@@ -273,9 +313,131 @@ load_waiting :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, budget: u64)
 	return true
 }
 
+// ---- trees ------------------------------------------------------------------------
+
+// The kind of tree a base record is: its index in the scene's kinds, its
+// billboard loaded the first time; -1 when it isn't a tree.
+tree_kind :: fun(scene: ^Scene, plugin: ^Plugin, base: u32, loader: Loader) -> i64 {
+	header_at, found := index_get(&plugin.records, u64(base))
+	if not found do return -1
+	header : Record_Header = plugin.data[header_at]
+	if header.kind != "TREE" do return -1
+	known, seen := index_get(&scene.tree_kinds, u64(base))
+	if seen do return known - 1
+	kind_index : i64 = -1
+	scratch : [64 * KB]byte
+	record, record_error := record_at(plugin, header_at, &scratch)
+	if not record_error and scene.kinds.len < scene.kinds.cap {
+		look, is_tree := tree_look(record)
+		if is_tree {
+			texture := texture_for(loader.renderer, loader.textures, look.billboard[:], &loader.room.texture)
+			if texture != 0 {
+				&scene.kinds + Tree_Kind{look = look, texture = texture}
+				kind_index = scene.kinds.len - 1
+			}
+		}
+	}
+	_ = index_put(&scene.tree_kinds, u64(base), kind_index + 1)
+	return kind_index
+}
+
+// Puts a cell's trees on the card, unless they're there: in a free slot,
+// even when it has none (so it's known to be done).
+load_trees :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64, loader: Loader) {
+	for &placed in scene.tree_cells {
+		if placed.x == x and placed.y == y do return
+	}
+	slot : i64 = -1
+	for k in 0:TREE_CELLS {
+		if not scene.tree_slots_taken[k] {
+			slot = k
+			break
+		}
+	}
+	if slot < 0 or scene.tree_cells.len == scene.tree_cells.cap do return
+	references : [16384]Reference
+	_ = cell_references(plugin, cell, &references)
+	trees : [TREES_PER_CELL]Placed_Tree
+	for reference in references {
+		if trees.len == trees.cap do break
+		if reference.flags & RECORD_DISABLED != 0 do continue
+		kind_index := tree_kind(scene, plugin, reference.base, loader)
+		if kind_index < 0 do continue
+		kind := &scene.kinds[kind_index]
+		// A little brighter or darker, the same each time.
+		shade := f32((reference.form_id *% 2654435761) >> 24) / 255
+		&trees + Placed_Tree{position = reference.position, width = kind.look.width * reference.scale,
+			height = kind.look.height * reference.scale, brightness = 0.88 + 0.2 * shade, texture = kind.texture}
+	}
+	scene.tree_slots_taken[slot] = true
+	&scene.tree_cells + upload_trees(loader.renderer, &trees, x, y, slot)
+}
+
+// Lets go of the trees of the cells outside an area.
+drop_trees :: fun(scene: ^Scene, area: Grid_Area) {
+	kept : i64 = 0
+	for k in 0:scene.tree_cells.len {
+		cell := &scene.tree_cells[k]
+		inside := cell.x >= area.low_x and cell.x <= area.high_x and cell.y >= area.low_y and cell.y <= area.high_y
+		if inside {
+			if kept != k do scene.tree_cells[kept] = scene.tree_cells[k]
+			kept += 1
+		else
+			scene.tree_slots_taken[cell.slot] = false
+		}
+	}
+	scene.tree_cells.len = kept
+	if kept == 0 {
+		for k in 0:TREE_CELLS do scene.tree_slots_taken[k] = false
+	}
+}
+
+// Shows the trees of a world's cells around the one at x, y: those it
+// had already that are still near kept, the new ones' cells waiting to be
+// loaded, the nearest first.
+show_trees :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, x: i64, y: i64) {
+	area := area_around_by(x, y, TREE_RADIUS)
+	placed := NOWHERE
+	if scene.trees_world == world_id {
+		placed = area_around_by(scene.trees_x, scene.trees_y, TREE_RADIUS)
+		drop_trees(scene, area)
+	else
+		drop_trees(scene, NOWHERE)
+	}
+	scene.trees_world = world_id
+	scene.trees_x = x
+	scene.trees_y = y
+	// What still waits and is still near waits on; the new cells after it.
+	kept : i64 = 0
+	for k in scene.waiting_trees_next:scene.waiting_trees.len {
+		item := scene.waiting_trees[k]
+		inside := item.x >= area.low_x and item.x <= area.high_x and item.y >= area.low_y and item.y <= area.high_y
+		if inside and scene.trees_world == world_id {
+			scene.waiting_trees[kept] = item
+			kept += 1
+		}
+	}
+	scene.waiting_trees.len = kept
+	scene.waiting_trees_next = 0
+	for ring in 0..TREE_RADIUS {
+		for cell_y in y - ring..y + ring {
+			for cell_x in x - ring..x + ring {
+				on_ring := cell_x == x - ring or cell_x == x + ring or cell_y == y - ring or cell_y == y + ring
+				if not on_ring do continue
+				already := cell_x >= placed.low_x and cell_x <= placed.high_x and cell_y >= placed.low_y and cell_y <= placed.high_y
+				if already do continue
+				cell := exterior_cell(plugin, world_id, cell_x, cell_y)
+				if cell == 0 or scene.waiting_trees.len == scene.waiting_trees.cap do continue
+				&scene.waiting_trees + Waiting_Land{cell = cell, x = cell_x, y = cell_y}
+			}
+		}
+	}
+}
+
 // Whether anything is waiting to be loaded.
 anything_waiting :: fun(scene: ^Scene) -> bool {
-	return scene.waiting_next < scene.waiting.len or scene.waiting_land_next < scene.waiting_land.len
+	return scene.waiting_next < scene.waiting.len or scene.waiting_land_next < scene.waiting_land.len or
+		scene.waiting_trees_next < scene.waiting_trees.len
 }
 
 // Where one arrives in the scene's cell through one of its doors: the
@@ -328,6 +490,11 @@ show_interior :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, loader: Loader) 
 }
 
 // ---- outside ------------------------------------------------------------------------
+
+// The cells within radius of the one at x, y.
+area_around_by :: fun(x: i64, y: i64, radius: i64) -> Grid_Area {
+	return Grid_Area{everywhere = false, low_x = x - radius, low_y = y - radius, high_x = x + radius, high_y = y + radius}
+}
 
 // The area of cells loaded around a cell.
 area_around :: fun(x: i64, y: i64) -> Grid_Area {
@@ -444,6 +611,7 @@ show_exterior :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, x: i64, y: i
 			}
 		}
 	}
+	show_trees(scene, plugin, world_id, x, y)
 	persistent := persistent_cell(plugin, world_id)
 	if persistent != 0 do add_cell(scene, plugin, persistent, area, placed)?
 	choose_all_lights(scene)

@@ -600,10 +600,31 @@ command_map :: fun(name: []utf8) {
 	// The water's heights, and how many cells have each.
 	water_heights : [64]f32
 	water_counts : [64]i64
+	// The trees placed, and the cell with the most.
+	trees : i64 = 0
+	most_trees : i64 = 0
+	most_trees_x : i64 = 0
+	most_trees_y : i64 = 0
 	for cell_y in low_y..high_y {
 		for cell_x in low_x..high_x {
 			cell := exterior_cell(&plugin, world_id, cell_x, cell_y)
 			if cell == 0 do continue
+			// Its trees.
+			references : [16384]Reference
+			_ = cell_references(&plugin, cell, &references)
+			cell_trees : i64 = 0
+			for reference in references {
+				header_at, known := index_get(&plugin.records, u64(reference.base))
+				if not known do continue
+				header : Record_Header = plugin.data[header_at]
+				if header.kind == "TREE" do cell_trees += 1
+			}
+			trees += cell_trees
+			if cell_trees > most_trees {
+				most_trees = cell_trees
+				most_trees_x = cell_x
+				most_trees_y = cell_y
+			}
 			water_height, has_water := cell_water(&plugin, cell, &scratch)
 			if has_water {
 				known := -1
@@ -656,6 +677,7 @@ command_map :: fun(name: []utf8) {
 	if write_error do print("couldn't write map.png: %", write_error)
 	else do print("wrote map.png: % x %, % cells with land", width, height, lands)
 	for height, k in water_heights do print("  water at %: % cells", height, water_counts[k])
+	print("% trees; the most in a cell: % in % %", trees, most_trees, most_trees_x, most_trees_y)
 }
 
 // `sooblivion area <world> <x> <y>`: what the viewer would load around a
@@ -881,9 +903,10 @@ command_walk :: fun(name: []utf8, x: i64, y: i64, steps: i64) {
 			// (On the card it'd be in a slot; here it's only remembered.)
 			&walked.grounds + Gpu_Land{x = item.x, y = item.y, slot = free_land_slot(&walked), center = land_mesh.center, radius = land_mesh.radius}
 		}
-		print("step to % %: placing % ms (% instances ready, % waiting); % new meshes % ms; % new textures % ms; % land cells % ms; % stretches of water",
+		print("step to % %: placing % ms (% instances ready, % waiting); % new meshes % ms; % new textures % ms; % land cells % ms; % stretches of water; % cells' trees waiting",
 			cell_x, y, place_ms, walked.instances.len, walked.waiting.len, mesh_count, mesh_ms,
-			texture_count, i64(texture_ns / 1000000), walked.waiting_land.len, elapsed_ms(land_start), walked.waters.len)
+			texture_count, i64(texture_ns / 1000000), walked.waiting_land.len, elapsed_ms(land_start), walked.waters.len,
+			walked.waiting_trees.len - walked.waiting_trees_next)
 		walked.waiting.len = 0
 		walked.waiting_land.len = 0
 	}
@@ -891,6 +914,74 @@ command_walk :: fun(name: []utf8, x: i64, y: i64, steps: i64) {
 
 // `sooblivion record <editor id or form id>`: a record's fields, each read three ways
 // — as text, as u32s, as f32s — for working out what's in them.
+// `sooblivion records <kind>`: the records of a kind (GRAS, TREE…), by
+// editor id and form id.
+command_records :: fun(kind: []utf8) {
+	data_storage : [400 * MB]byte
+	index_storage : [96 * MB]byte
+	plugin, load_error := load_oblivion(&data_storage, &index_storage)
+	if load_error {
+		print("couldn't load the plugin: %", load_error)
+		return
+	}
+	scratch : [1 * MB]byte
+	line : str1024
+	count : i64 = 0
+	for key, slot in plugin.records.keys {
+		if key == 0 do continue
+		header : Record_Header = plugin.data[i64(plugin.records.values[slot])]
+		if header.kind != kind do continue
+		scratch.len = 0
+		record, record_error := record_at(&plugin, i64(plugin.records.values[slot]), &scratch)
+		if record_error do continue
+		entry : str256
+		&entry + editor_id(record.data)
+		&entry + " ("
+		&entry + int_text(i64(key))[:]
+		&entry + ")  "
+		if line.len + entry.len > 120 {
+			print(line)
+			line.len = 0
+		}
+		&line + entry[:]
+		count += 1
+	}
+	print(line)
+	print("% records", count)
+	if kind == "TREE" do check_tree_billboards(&plugin)
+}
+
+// Whether each tree's billboard is in the archive: how many are, and the
+// trees whose aren't.
+check_tree_billboards :: fun(plugin: ^Plugin) {
+	directory_storage : [64 * MB]byte
+	textures, open_error := open_archive(data_path("Oblivion - Textures - Compressed.bsa"), &directory_storage)
+	if open_error {
+		print("couldn't open the textures: %", open_error)
+		return
+	}
+	defer close_archive(&textures)
+	scratch : [1 * MB]byte
+	found_count : i64 = 0
+	for key, slot in plugin.records.keys {
+		if key == 0 do continue
+		header : Record_Header = plugin.data[i64(plugin.records.values[slot])]
+		if header.kind != "TREE" do continue
+		scratch.len = 0
+		record, record_error := record_at(plugin, i64(plugin.records.values[slot]), &scratch)
+		if record_error do continue
+		look, is_tree := tree_look(record)
+		if not is_tree {
+			print("  % has no size", editor_id(record.data))
+			continue
+		}
+		_, found := find_file(&textures, look.billboard[:])
+		if found do found_count += 1
+		else do print("  % has no billboard: %", editor_id(record.data), look.billboard)
+	}
+	print("% trees' billboards found", found_count)
+}
+
 command_record :: fun(name: []utf8) {
 	data_storage : [400 * MB]byte
 	index_storage : [96 * MB]byte
@@ -1212,6 +1303,8 @@ main :: (args: [][]utf8) {
 		name : []utf8 = args[0][0:0]
 		if args.len > 2 do name = args[2]
 		command_shader(name, if args.len > 3 do args[3] else "shaderpackage019.sdp")
+	elif command == "records" and args.len > 2
+		command_records(args[2])
 	elif command == "record" and args.len > 2
 		command_record(args[2])
 	elif command == "cell" and args.len > 2

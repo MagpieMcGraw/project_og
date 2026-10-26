@@ -539,3 +539,38 @@ world_water :: fun(plugin: ^Plugin, world_id: u32, scratch: ^[]byte) -> Water_Ty
 	water.reflection = byte_color(data, 52)
 	return water
 }
+
+// How a tree (TREE) is drawn: as its billboard — the picture of it the
+// editor made for seeing it from afar, textures\trees\billboards\ and its
+// SpeedTree file's name — this wide and tall (BNAM) at a scale of 1.
+// (The SpeedTree files hold how to grow the tree, not its shape.)
+Tree_Look :: struct {
+	billboard: [160]utf8
+	width: f32
+	height: f32
+}
+
+// A TREE record's look; false for other records, or a tree without a size.
+tree_look :: fun(base: Record) -> Tree_Look, bool {
+	look := Tree_Look{billboard = [], width = 0, height = 0}
+	if base.header.kind != "TREE" do return look, false
+	model, has_model := find_field(base.data, "MODL")
+	size, has_size := find_field(base.data, "BNAM")
+	if not has_model or not has_size or size.len < 8 do return look, false
+	look.width = size[0]
+	look.height = size[4]
+	// The file's name without its folders or its extension.
+	name := field_text(model)
+	start : i64 = 0
+	end := name.len
+	for c, k in name {
+		if c == '\\' or c == '/' do start = k + 1
+	}
+	for k in start:name.len {
+		if name[k] == '.' do end = k
+	}
+	&look.billboard + "textures\\trees\\billboards\\"
+	for k in start:end do &look.billboard + lower(name[k])
+	&look.billboard + ".dds"
+	return look, true
+}

@@ -68,6 +68,12 @@ DISTANT_VERTEX_ROOM :: 1048576
 DISTANT_INDEX_ROOM :: 4194304
 DISTANT_NEAR :: 256
 
+// Trees: cells whose trees are on the card at once, the trees a cell can
+// have (Tamriel's most is 54), the kinds of tree in a cell.
+TREE_CELLS :: 1024
+TREES_PER_CELL :: 128
+TREE_RUNS :: 16
+
 // The cells left out of the far land and water — those drawn in full —
 // are a bit each, HIDDEN_SIDE x HIDDEN_SIDE of them around the camera's.
 HIDDEN_SIDE :: 16
@@ -339,6 +345,76 @@ void main() {
 		color = mix(color, fog_color, fog);
 	}
 	fragment_color = vec4(color, 1.0);
+}
+"
+
+// Trees: each its billboard, a picture standing on the tree's place and
+// turned about z to face the camera; its pixels clear of the tree left
+// out. Each corner of the picture is a vertex (0 to 3), the tree an
+// instance.
+TREE_VERTEX_SHADER :: "
+layout(location = 0) in vec3 tree_position;
+layout(location = 1) in vec3 tree_size;     // width, height, and how bright it is
+layout(location = 2) in uvec2 tree_texture;
+uniform mat4 view_projection;
+uniform vec3 camera_position;
+out vec3 world_position;
+out vec2 texture_uv;
+out float brightness;
+flat out uvec2 texture_handle;
+void main() {
+	// The corners: 0 bottom left, 1 bottom right, 2 top right, 3 top left,
+	// seen from the camera.
+	int corner = gl_VertexID;
+	vec2 toward = camera_position.xy - tree_position.xy;
+	float away = length(toward);
+	vec2 right = away > 0.001 ? vec2(-toward.y, toward.x) / away : vec2(1.0, 0.0);
+	float across = (corner == 1 || corner == 2) ? 0.5 : -0.5;
+	float up = corner >= 2 ? 1.0 : 0.0;
+	world_position = tree_position + vec3(right * across * tree_size.x, up * tree_size.y);
+	texture_uv = vec2(across + 0.5, 1.0 - up);
+	brightness = tree_size.z;
+	texture_handle = tree_texture;
+	gl_Position = view_projection * vec4(world_position, 1.0);
+}
+"
+
+TREE_FRAGMENT_SHADER :: "
+in vec3 world_position;
+in vec2 texture_uv;
+in float brightness;
+flat in uvec2 texture_handle;
+
+// The game's fLODTreeMipMapLODBias: sharper than the distance asks, so
+// far trees keep their leaves.
+const float mipmap_bias = -0.75;
+#ifdef BINDLESS
+vec4 picture() { return texture(sampler2D(texture_handle), texture_uv, mipmap_bias); }
+#else
+uniform sampler2D picture_texture;
+vec4 picture() { return texture(picture_texture, texture_uv, mipmap_bias); }
+#endif
+
+uniform vec3 sun_direction;
+uniform vec3 sun_color;
+uniform vec3 ambient_color;
+uniform vec3 camera_position;
+uniform vec3 fog_color;
+uniform float fog_near;
+uniform float fog_far;
+
+out vec4 fragment_color;
+
+void main() {
+	vec4 color = picture();
+	if (color.a < 0.5) discard;
+	// The picture is shaded already: lit as a whole, more as the sun's higher.
+	vec3 lit = color.rgb * brightness * (ambient_color + sun_color * (0.35 + 0.4 * max(sun_direction.z, 0.0)));
+	if (fog_far > fog_near) {
+		float fog = clamp((length(world_position - camera_position) - fog_near) / (fog_far - fog_near), 0.0, 1.0);
+		lit = mix(lit, fog_color, fog);
+	}
+	fragment_color = vec4(lit, 1.0);
 }
 "
 
@@ -649,6 +725,49 @@ Distant_Piece :: struct {
 	normal_texture: i64
 }
 
+// A tree placed, before it's on the card: where it stands, its size, how
+// bright it is (trees vary a little), its billboard's texture slot.
+Placed_Tree :: struct {
+	position: Vec3
+	width: f32
+	height: f32
+	brightness: f32
+	texture: i64
+}
+
+// A tree as the tree program reads it: 32 bytes.
+Tree_Instance :: struct {
+	position: Vec3
+	width: f32
+	height: f32
+	brightness: f32
+	handle: u64          // its billboard's (bindless)
+}
+
+// A run of a cell's trees with one texture: drawn in one go.
+Tree_Run :: struct {
+	first: u32           // its first tree in the cell's slot
+	count: u32
+	texture: i64
+}
+
+// A cell's trees on the card: in a slot of the tree buffer, in runs by
+// texture, inside a sphere.
+Gpu_Trees :: struct {
+	x: i64
+	y: i64
+	slot: i64
+	center: Vec3
+	radius: f32
+	runs: [TREE_RUNS]Tree_Run
+}
+
+// A tree program, and where its uniforms are.
+Tree_Program :: struct {
+	program: u32
+	shared: Shared_Uniforms
+}
+
 // A distant land program, and where its uniforms are.
 Distant_Program :: struct {
 	program: u32
@@ -754,6 +873,7 @@ Renderer :: struct {
 	mesh_programs: [2!]Mesh_Program
 	land_programs: [2!]Land_Program
 	distant_programs: [2!]Distant_Program
+	tree_programs: [2!]Tree_Program
 	sky_program: Sky_Program
 	water_program: Water_Program
 	anisotropy: f32
@@ -785,6 +905,14 @@ Renderer :: struct {
 	distant_vertices_used: i64
 	distant_indices_used: i64
 	flat_normal_texture: i64
+
+	// Trees: their buffer (a slot of TREES_PER_CELL for each cell), the
+	// indexes of a picture's two triangles, and a frame's commands.
+	tree_vertex_array: u32
+	tree_instance_buffer: u32
+	tree_index_buffer: u32
+	tree_indirect_buffer: u32
+	tree_commands: [8192]Draw_Command
 
 	// The shared mesh buffers, and how much of them is used.
 	mesh_vertex_array: u32
@@ -840,7 +968,9 @@ renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
 	make_sky_program(&renderer.sky_program)?
 	make_water_program(&renderer.water_program)?
 	make_distant_program(&renderer.distant_programs[0], false)?
+	make_tree_program(&renderer.tree_programs[0], false)?
 	if renderer.bindless_available {
+		make_tree_program(&renderer.tree_programs[1], true)?
 		make_mesh_program(&renderer.mesh_programs[1], true)?
 		make_land_program(&renderer.land_programs[1], true)?
 		make_distant_program(&renderer.distant_programs[1], true)?
@@ -850,6 +980,7 @@ renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
 	setup_land_buffers(renderer)
 	setup_water_buffers(renderer)
 	setup_distant_buffers(renderer)
+	setup_tree_buffers(renderer)
 
 	renderer.parts.len = 0
 	// Every part's count and start, by its index: all there, all 0.
@@ -990,6 +1121,13 @@ make_distant_program :: fun(made: ^Distant_Program, bindless: bool) -> err {
 		Uniform1i(GetUniformLocation(made.program, "color_texture"), 0)
 		Uniform1i(GetUniformLocation(made.program, "normal_texture"), 1)
 	}
+}
+
+make_tree_program :: fun(made: ^Tree_Program, bindless: bool) -> err {
+	made.program = compile_program(TREE_VERTEX_SHADER, TREE_FRAGMENT_SHADER, bindless)?
+	made.shared = find_shared_uniforms(made.program)
+	UseProgram(made.program)
+	if not bindless do Uniform1i(GetUniformLocation(made.program, "picture_texture"), 0)
 }
 
 make_water_program :: fun(made: ^Water_Program) -> err {
@@ -1248,6 +1386,130 @@ upload_distant_piece :: fun(renderer: ^Renderer, part: ^Model_Part, color_textur
 	return true
 }
 
+// ---- trees ------------------------------------------------------------------------
+
+// The trees' buffers: their instances, a slot for each cell's, and the
+// indexes of a picture's two triangles, counter-clockwise from the camera.
+setup_tree_buffers :: fun(renderer: ^Renderer) {
+	GenVertexArrays(1, &renderer.tree_vertex_array)
+	BindVertexArray(renderer.tree_vertex_array)
+	GenBuffers(1, &renderer.tree_instance_buffer)
+	BindBuffer(ARRAY_BUFFER, renderer.tree_instance_buffer)
+	BufferData(ARRAY_BUFFER, TREE_CELLS * TREES_PER_CELL * size_of(Tree_Instance), void, STATIC_DRAW)
+	stride := i32(size_of(Tree_Instance))
+	EnableVertexAttribArray(0)
+	VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)            // position
+	VertexAttribDivisor(0, 1)
+	EnableVertexAttribArray(1)
+	VertexAttribPointer(1, 3, FLOAT, 0, stride, 12)           // width, height, brightness
+	VertexAttribDivisor(1, 1)
+	EnableVertexAttribArray(2)
+	VertexAttribIPointer(2, 2, UNSIGNED_INT, stride, 24)      // texture handle
+	VertexAttribDivisor(2, 1)
+	corners : [6!]u16 = [0, 1, 2, 0, 2, 3]
+	GenBuffers(1, &renderer.tree_index_buffer)
+	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.tree_index_buffer)
+	BufferData(ELEMENT_ARRAY_BUFFER, 12, &corners[0], STATIC_DRAW)
+	BindVertexArray(0)
+	GenBuffers(1, &renderer.tree_indirect_buffer)
+}
+
+// Puts a cell's trees on the card in a slot: grouped by texture, each
+// group a run. Trees past the slot's room, or of kinds past TREE_RUNS,
+// are left out.
+upload_trees :: fun(renderer: ^Renderer, trees: ^[]Placed_Tree, x: i64, y: i64, slot: i64) -> Gpu_Trees {
+	placed := Gpu_Trees{x = x, y = y, slot = slot, center = Vec3{0, 0, 0}, radius = 0, runs = []}
+	if trees.len == 0 do return placed
+	instances : [TREES_PER_CELL]Tree_Instance
+	low := trees[0].position
+	high := low
+	// Run by run: each texture's trees, in the order the textures first come.
+	for k in 0:trees.len {
+		texture := trees[k].texture
+		seen := false
+		for run in placed.runs {
+			if run.texture == texture do seen = true
+		}
+		if seen or placed.runs.len == placed.runs.cap do continue
+		run := next(&placed.runs)
+		run.first = u32(instances.len)
+		run.count = 0
+		run.texture = texture
+		for tree in trees[k : trees.len] {
+			if tree.texture != texture or instances.len == instances.cap do continue
+			&instances + Tree_Instance{position = tree.position, width = tree.width, height = tree.height,
+				brightness = tree.brightness, handle = renderer.textures[texture].handle}
+			run.count += 1
+			top := tree.position + Vec3{0, 0, tree.height}
+			for axis in 0:3 {
+				if tree.position[axis] < low[axis] do low[axis] = tree.position[axis]
+				if top[axis] > high[axis] do high[axis] = top[axis]
+			}
+		}
+	}
+	// The sphere around them all, wide enough for the widest's pictures.
+	widest : f32 = 0
+	for tree in trees {
+		if tree.width > widest do widest = tree.width
+	}
+	placed.center = (low + high) * 0.5
+	placed.radius = vec3_length(high - low) * 0.5 + widest * 0.5
+	if instances.len > 0 {
+		BindBuffer(ARRAY_BUFFER, renderer.tree_instance_buffer)
+		BufferSubData(ARRAY_BUFFER, isize(slot * TREES_PER_CELL * size_of(Tree_Instance)),
+			isize(instances.len * size_of(Tree_Instance)), &instances[0])
+	}
+	return placed
+}
+
+// Draws the trees in view: near, those of the cells hidden from the far
+// pass (drawn in full); else the rest. Bindless, in one call; else a call
+// for each run, its texture bound.
+draw_trees :: fun(renderer: ^Renderer, tree_cells: ^[]Gpu_Trees, hidden: ^Hidden_Cells, near: bool, planes: ^View_Planes,
+	view_projection: Mat4, lighting: Cell_Lighting, sun: Vec3, camera: Camera, stats: ^Frame_Stats)
+{
+	renderer.tree_commands.len = 0
+	for &cell in tree_cells {
+		if cell.runs.len == 0 do continue
+		if hidden_cell_at(hidden, cell.x, cell.y) != near do continue
+		if not sphere_in_view(planes, cell.center, cell.radius) do continue
+		for run in cell.runs {
+			if renderer.tree_commands.len == renderer.tree_commands.cap do break
+			&renderer.tree_commands + Draw_Command{count = 6, instance_count = run.count, first_index = 0,
+				base_vertex = 0, base_instance = u32(cell.slot * TREES_PER_CELL) + run.first}
+		}
+	}
+	if renderer.tree_commands.len == 0 do return
+
+	bindless := renderer.use_bindless
+	made := &renderer.tree_programs[which_program(renderer)]
+	UseProgram(made.program)
+	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
+	BindVertexArray(renderer.tree_vertex_array)
+	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.tree_indirect_buffer)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.tree_commands.len * size_of(Draw_Command)), &renderer.tree_commands[0], STREAM_DRAW)
+	Disable(CULL_FACE)
+	if bindless {
+		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, 0, i32(renderer.tree_commands.len), 0)
+		stats.draw_calls += 1
+	else
+		// The commands' runs, in the order they were made: each with its texture.
+		k : i64 = 0
+		for &cell in tree_cells {
+			if cell.runs.len == 0 or hidden_cell_at(hidden, cell.x, cell.y) != near do continue
+			if not sphere_in_view(planes, cell.center, cell.radius) do continue
+			for run in cell.runs {
+				if k == renderer.tree_commands.len do break
+				BindTexture(TEXTURE_2D, renderer.textures[run.texture].id)
+				MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, usize(k * size_of(Draw_Command)), 1, 0)
+				stats.draw_calls += 1
+				k += 1
+			}
+		}
+	}
+	Enable(CULL_FACE)
+}
+
 // ---- the cells drawn in full ------------------------------------------------------
 
 // No cells hidden yet, around the cell a place is in.
@@ -1264,6 +1526,14 @@ hide_cell :: fun(hidden: ^Hidden_Cells, x: i64, y: i64) {
 	row := y - hidden.y
 	if column < 0 or column >= HIDDEN_SIDE or row < 0 or row >= HIDDEN_SIDE do return
 	hidden.rows[row] = hidden.rows[row] | i32(1 << column)
+}
+
+// Whether a cell is hidden.
+hidden_cell_at :: fun(hidden: ^Hidden_Cells, x: i64, y: i64) -> bool {
+	column := x - hidden.x
+	row := y - hidden.y
+	if column < 0 or column >= HIDDEN_SIDE or row < 0 or row >= HIDDEN_SIDE do return false
+	return hidden.rows[row] & i32(1 << column) != 0
 }
 
 find_hidden_uniforms :: fun(program: u32) -> Hidden_At {
@@ -1695,7 +1965,7 @@ sphere_in_view :: fun(planes: ^View_Planes, center: Vec3, radius: f32) -> bool {
 // then the instances in view — opaque parts, then blended — lit by the
 // lighting and the lights set with set_scene_lights. Tells what it drew.
 draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, grounds: ^[]Gpu_Land,
-	waters: ^[]Water_Cell, look: ^Sky_Look, lighting: Cell_Lighting, camera: Camera, width: i64, height: i64) -> Frame_Stats
+	waters: ^[]Water_Cell, tree_cells: ^[]Gpu_Trees, look: ^Sky_Look, lighting: Cell_Lighting, camera: Camera, width: i64, height: i64) -> Frame_Stats
 {
 	stats := Frame_Stats{instances = instances.len, visible = 0, drawn_parts = 0, draw_calls = 0, land_cells = 0}
 	Viewport(0, 0, i32(width), i32(height))
@@ -1715,6 +1985,9 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 	sun := vec3_normalize(lighting.direction)
 
 	if look.outside do draw_sky(renderer, look, view_projection, lighting, camera, &stats)
+	// The cells drawn in full: what the far pass leaves out.
+	near_cells := hidden_around(camera.position)
+	for ground in grounds do hide_cell(&near_cells, ground.x, ground.y)
 	if look.outside and renderer.distant_pieces.len > 0 {
 		// The far pass: out to where the fog ends, then the depth cleared
 		// for the near.
@@ -1724,12 +1997,14 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 		far_view_projection := mat4_mul(far_projection, view_matrix(camera))
 		far_planes := view_planes(far_view_projection)
 		draw_distant_land(renderer, grounds, &far_planes, far_view_projection, lighting, sun, camera, &stats)
+		if tree_cells.len > 0 do draw_trees(renderer, tree_cells, &near_cells, false, &far_planes, far_view_projection, lighting, sun, camera, &stats)
 		draw_far_water(renderer, waters, look, far_view_projection, lighting, camera, &stats)
 		Clear(DEPTH_BUFFER_BIT)
 	}
 	if grounds.len > 0 do draw_land(renderer, grounds, &planes, view_projection, lighting, sun, camera, &stats)
 	gather_meshes(renderer, models, instances, &planes, &stats)
 	draw_mesh_runs(renderer, view_projection, lighting, sun, camera, false, &stats)
+	if look.outside and tree_cells.len > 0 do draw_trees(renderer, tree_cells, &near_cells, true, &planes, view_projection, lighting, sun, camera, &stats)
 	if waters.len > 0 do draw_water(renderer, waters, &planes, look, view_projection, lighting, camera, &stats)
 	draw_mesh_runs(renderer, view_projection, lighting, sun, camera, true, &stats)
 
