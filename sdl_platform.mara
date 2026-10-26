@@ -1,0 +1,126 @@
+// The window the game draws in, its OpenGL context, and the keyboard and
+// mouse: what SDL gives the engine.
+module sdl_platform
+
+use mara.core
+use mara.sdl
+use mara.open_gl
+
+// What opening the window can fail with.
+Platform_Error :: error {
+	Init_Failed
+	Window_Failed
+	Context_Failed
+}
+
+// The keyboard and mouse as of the last events read.
+Input :: struct {
+	quit: bool                      // the window was closed
+	pressed: [512 Scancode]bool     // keys that went down since the last read
+	held: [512 Scancode]bool        // keys down now
+	mouse_pressed: [6!]bool         // buttons by SDL's numbers: 1 left, 2 middle, 3 right
+	mouse_held: [6!]bool
+	mouse_x: f32                    // where the mouse is, in window pixels
+	mouse_y: f32
+	mouse_moved_x: f32              // how far it moved since the last read
+	mouse_moved_y: f32
+	wheel: f32
+	focused: bool
+}
+
+// The window and its OpenGL context.
+Platform :: struct {
+	window: Window
+	context: GLContext
+	width: i64        // the window's size in pixels
+	height: i64
+	mouse_look: bool  // the mouse turns the camera, held in the window
+}
+
+// Opens a window of the size given, with an OpenGL 4.5 core context, into
+// platform (declared and not yet set).
+platform_open :: fun(platform: ^Platform, title: []utf8, width: i64, height: i64) -> err {
+	if not sdl.Init(Video) do return Init_Failed
+	_ = sdl.GL_SetAttribute(ContextProfileMask, i32(GLprofile.Core))
+	_ = sdl.GL_SetAttribute(ContextMajorVersion, 4)
+	_ = sdl.GL_SetAttribute(ContextMinorVersion, 5)
+	_ = sdl.GL_SetAttribute(DepthSize, 24)
+
+	title_text : str256
+	&title_text + title
+	platform.window = sdl.CreateWindow(cstring(title_text), i32(width), i32(height), OpenGL | Resizable)
+	platform.context = sdl.GL_CreateContext(platform.window)
+	if not sdl.GL_MakeCurrent(platform.window, platform.context) do return Context_Failed
+	_ = sdl.GL_SetSwapInterval(1)
+	gl_load(GL_GetProcAddress)
+	platform.mouse_look = false
+	update_size(platform)
+}
+
+platform_close :: fun(platform: ^Platform) {
+	sdl.DestroyWindow(platform.window)
+	sdl.Quit()
+}
+
+// The window's size now, in pixels.
+update_size :: fun(platform: ^Platform) {
+	width : i32 = 0
+	height : i32 = 0
+	_ = sdl.GetWindowSizeInPixels(platform.window, &width, &height)
+	platform.width = i64(width)
+	platform.height = i64(height)
+}
+
+// Turns mouse look on or off: on, the cursor is hidden and held in the
+// window, and its moves turn the camera however far it goes.
+set_mouse_look :: fun(platform: ^Platform, on: bool) {
+	platform.mouse_look = on
+	_ = sdl.SetWindowRelativeMouseMode(platform.window, on)
+}
+
+// Reads the events that came since the last read into input.
+read_input :: fun(platform: ^Platform, input: ^Input) {
+	input.quit = false
+	for k in 0:512 do input.pressed[k] = false
+	for b in 0:6 do input.mouse_pressed[b] = false
+	input.mouse_moved_x = 0
+	input.mouse_moved_y = 0
+	input.wheel = 0
+
+	event: Event
+	for PollEvent(&event) {
+		match event {
+		Quit
+			input.quit = true
+		KeyDown key
+			input.pressed[key.scancode] = true
+			input.held[key.scancode] = true
+		KeyUp key
+			input.held[key.scancode] = false
+		MouseMotion
+			input.mouse_moved_x += event.xrel
+			input.mouse_moved_y += event.yrel
+			input.mouse_x = event.x
+			input.mouse_y = event.y
+		MouseButtonDown
+			input.mouse_pressed[i64(event.button)] = true
+			input.mouse_held[i64(event.button)] = true
+		MouseButtonUp
+			input.mouse_held[i64(event.button)] = false
+		MouseWheel
+			input.wheel += event.y
+		WindowFocusGained
+			input.focused = true
+		WindowFocusLost
+			input.focused = false
+		WindowPixelSizeChanged
+			update_size(platform)
+		else
+		}
+	}
+}
+
+// Shows what was drawn this frame.
+present :: fun(platform: ^Platform) {
+	_ = GL_SwapWindow(platform.window)
+}
