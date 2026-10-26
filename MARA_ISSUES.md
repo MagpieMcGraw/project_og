@@ -7,7 +7,17 @@ against Mara at the time written. When one is fixed, move it to Fixed
 
 ## Open
 
-None.
+### 1. An err can't be had as text
+
+Found 2026-10-26. `print` shows an err (`Parse_Error.Not_A_Digit`), but
+nothing gives its name as text to keep: `name : []utf8 = e` is "cannot
+assign err", `e.name` "cannot access field", and there's no format into a
+buffer. So sooblivion's journal, which writes a log file, can say what
+failed but not why: the why goes to the console with `print` beside it
+(viewer.mara, note_failures and its neighbors).
+
+Wanted: an err's name as text (`e.text()`, say, or a print into a
+buffer), so it can go in a file or a window's title.
 
 ## Answered (not issues)
 

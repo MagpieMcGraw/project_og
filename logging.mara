@@ -20,9 +20,14 @@ Journal :: struct {
 	line: str1024      // the line being written
 }
 
-// A journal writing to a new file at path (over the one there).
+// A journal writing to a new file at path (over the one there); when the
+// file can't be made, to the console only (and it says so there).
 journal_open :: fun(path: []utf8) -> Journal {
-	file, _ := file_open_write(path)   // (failing, it's NO_FILE: no file, the console still)
+	file, open_error := file_open_write(path)
+	if open_error {
+		print("the journal can't be written to %: %; the console only", path, open_error)
+		file = NO_FILE
+	}
 	return Journal{file = file, started = time_now(), line = []}
 }
 
@@ -62,6 +67,14 @@ note_end :: fun(journal: ^Journal) {
 	if journal.line.len <= room do &stamped + journal.line[:]
 	else do &stamped + journal.line[0 : room]
 	&stamped + "\n"
-	_ = file_write_text(journal.file, stamped[:])
+	if journal.file != NO_FILE {
+		write_error := file_write_text(journal.file, stamped[:])
+		if write_error {
+			// Said once, on the console; the journal goes on there only.
+			print("the journal's file can't be written to: %; the console only from here", write_error)
+			file_close(journal.file)
+			journal.file = NO_FILE
+		}
+	}
 	journal.line.len = 0
 }

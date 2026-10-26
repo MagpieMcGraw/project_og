@@ -58,23 +58,30 @@ lod_name :: fun(world_id: u32, x: i64, y: i64) -> str64 {
 
 // Puts a world's distant land on the card in place of what's there: every
 // piece of it the archives have (Tamriel has 36), then the far water under
-// all of it. A piece whose mesh can't be read is left out; one whose
-// normals are missing is lit as if flat. How many pieces went on.
-load_distant_land :: fun(renderer: ^Renderer, world_id: u32, loader: Loader) -> i64 {
+// all of it. A piece whose mesh can't be read is left out, and the first
+// such failure given back with how many pieces went on; one whose normals
+// are missing is lit as if flat.
+load_distant_land :: fun(renderer: ^Renderer, world_id: u32, loader: Loader) -> i64, err {
 	clear_distant_land(renderer)
 	renderer.distant_world = world_id
 	room := loader.room
 	low := Vec3{1000000000, 1000000000, 0}
 	high := Vec3{-1000000000, -1000000000, 0}
 	pieces : i64 = 0
+	first_failure : err
 	steps := LOD_REACH * 2 / LOD_CELLS
 	for row in 0:steps {
 		for column in 0:steps {
 			x := column * LOD_CELLS - LOD_REACH
 			y := row * LOD_CELLS - LOD_REACH
 			name := lod_name(world_id, x, y)
-			built, found := read_lod_mesh(loader.meshes, room, name[:])
+			index, found := find_file(loader.meshes, lod_mesh_path(name[:])[:])
 			if not found do continue
+			built, read_error := read_lod_mesh(loader.meshes, room, index)
+			if read_error {
+				if not first_failure do first_failure = read_error
+				continue
+			}
 
 			path : [256]utf8
 			&path + "textures\\landscapelod\\generated\\"
@@ -96,27 +103,25 @@ load_distant_land :: fun(renderer: ^Renderer, world_id: u32, loader: Loader) -> 
 		}
 	}
 	if pieces > 0 do set_far_water(renderer, low.x, low.y, high.x, high.y, 0)
-	return pieces
+	return pieces, first_failure
 }
 
-// A piece's mesh, by its name, as a model (made in room); false when
-// there's none, or it can't be read.
-read_lod_mesh :: fun(meshes: ^Archive, room: ^Load_Room, name: []utf8) -> Model, bool {
+// A piece's mesh's archive path, by the piece's name.
+lod_mesh_path :: fun(name: []utf8) -> [256]utf8 {
 	path : [256]utf8
 	&path + "meshes\\landscape\\lod\\"
 	&path + name
 	&path + ".nif"
-	index, found := find_file(meshes, path[:])
-	if not found do return Model{0}, false
+	return path
+}
+
+// A piece's mesh (the archive's file at index) as a model, made in room.
+read_lod_mesh :: fun(meshes: ^Archive, room: ^Load_Room, index: i64) -> Model, err {
 	room.file.len = 0
-	data, read_error := read_file(meshes, index, &room.file)
-	if read_error do return Model{0}, false
+	data := read_file(meshes, index, &room.file)?
 	room.blocks.len = 0
 	failure := Nif_Failure{block = 0, type_name = room.file[0:0]}
-	mesh, nif_error := read_nif(data, &room.blocks, &failure)
-	if nif_error do return Model{0}, false
+	mesh := read_nif(data, &room.blocks, &failure)?
 	room.model.len = 0
-	built, model_error := build_model(&mesh, &room.model)
-	if model_error do return Model{0}, false
-	return built, true
+	return build_model(&mesh, &room.model)
 }

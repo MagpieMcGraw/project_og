@@ -146,9 +146,12 @@ command_bsa :: fun(name: []utf8, what: []utf8) {
 			if not file.packed or file.size <= 8 do continue
 			storage.len = 0
 			packed := storage[storage.cap - file.size : storage.cap]
-			_ = file_seek(archive.file, file.offset, SEEK_SET)
+			_, seek_error := file_seek(archive.file, file.offset, SEEK_SET)
 			read_error := read_exactly(archive.file, packed)
-			if read_error do continue
+			if seek_error or read_error {
+				print("  couldn't read %: % %", file_name(&archive, file), seek_error, read_error)
+				continue
+			}
 			unpacked_size : u32 = packed[0]
 			stream := packed[4 : packed.len]
 			for quarter in 1..3 {
@@ -581,7 +584,8 @@ command_cell :: fun(name: []utf8) {
 		return
 	}
 	references : [8192]Reference
-	_ = cell_references(&plugin, cell, &references)
+	references_error := cell_references(&plugin, cell, &references)
+	if references_error do print("couldn't read all of the cell's references: %", references_error)
 	print("cell % holds % references", name, references.len)
 	with_model : i64 = 0
 	for reference, i in references {
@@ -596,7 +600,8 @@ command_cell :: fun(name: []utf8) {
 	}
 	print("% of them have a mesh", with_model)
 
-	lighting := cell_lighting(&plugin, cell, &scratch)
+	lighting, lighting_error := cell_lighting(&plugin, cell, &scratch)
+	if lighting_error do print("couldn't read the cell's lighting: %", lighting_error)
 	print("lighting: ambient %, directional % from %, fog % from % to %", lighting.ambient,
 		lighting.directional, lighting.direction, lighting.fog_color, lighting.fog_near, lighting.fog_far)
 	light_count : i64 = 0
@@ -609,8 +614,9 @@ command_cell :: fun(name: []utf8) {
 			if light_count <= 3 do print("  light % at %, radius %, color %", editor_id(base.data), light.position, light.radius, light.color)
 		}
 		if base.header.kind != "DOOR" do continue
-		there, leads := door_destination(&plugin, reference.form_id, &scratch)
-		if not leads do continue
+		there, leads, door_error := door_destination(&plugin, reference.form_id, &scratch)
+		if door_error do print("  couldn't read door %: %", reference.form_id, door_error)
+		if door_error or not leads do continue
 		target := cell_of_reference(&plugin, there.door)
 		target_name : str256
 		target_record, target_error := find_record(&plugin, target, &scratch)
@@ -717,7 +723,8 @@ command_map :: fun(name: []utf8) {
 			if cell == 0 do continue
 			// Its trees.
 			references : [16384]Reference
-			_ = cell_references(&plugin, cell, &references)
+			references_error := cell_references(&plugin, cell, &references)
+			if references_error do print("  couldn't read all of cell % %'s references: %", cell_x, cell_y, references_error)
 			cell_trees : i64 = 0
 			for reference in references {
 				header_at, known := index_get(&plugin.records, u64(reference.base))
@@ -731,7 +738,8 @@ command_map :: fun(name: []utf8) {
 				most_trees_x = cell_x
 				most_trees_y = cell_y
 			}
-			water_height, has_water := cell_water(&plugin, cell, &scratch)
+			water_height, has_water, water_error := cell_water(&plugin, cell, &scratch)
+			if water_error do print("  couldn't read cell % %'s water: %", cell_x, cell_y, water_error)
 			if has_water {
 				known := -1
 				for known_height, k in water_heights {
@@ -819,7 +827,8 @@ command_area :: fun(name: []utf8, x: i64, y: i64) {
 		for cell_x in area.low_x..area.high_x {
 			cell := exterior_cell(&plugin, world_id, cell_x, cell_y)
 			if cell == 0 do continue
-			_ = cell_references(&plugin, cell, &references)
+			references_error := cell_references(&plugin, cell, &references)
+			if references_error do print("  couldn't read all of cell % %'s references: %", cell_x, cell_y, references_error)
 			land_at, found := find_land(&plugin, cell)
 			if not found do continue
 			scratch.len = 0
@@ -900,7 +909,8 @@ command_area :: fun(name: []utf8, x: i64, y: i64) {
 	}
 	persistent := persistent_cell(&plugin, world_id)
 	references.len = 0
-	_ = cell_references(&plugin, persistent, &references)
+	persistent_error := cell_references(&plugin, persistent, &references)
+	if persistent_error do print("couldn't read all of the world's persistent references: %", persistent_error)
 	nearby : i64 = 0
 	for reference in references {
 		if area_holds(area, reference.position) do nearby += 1
@@ -949,7 +959,8 @@ command_walk :: fun(name: []utf8, x: i64, y: i64, steps: i64) {
 	for step in 0..steps {
 		cell_x := x + step
 		place_start := time_now()
-		_ = show_exterior(&walked, &plugin, world_id, cell_x, y)
+		show_error := show_exterior(&walked, &plugin, world_id, cell_x, y)
+		if show_error do print("  placing the cells around % % stopped early: %", cell_x, y, show_error)
 		place_ms := elapsed_ms(place_start)
 
 		// What's waiting, read as loading would: the meshes and their
@@ -1168,13 +1179,22 @@ command_sky :: fun(name: []utf8) {
 		print("no world %", name)
 		return
 	}
-	climate := world_climate(&plugin, world_id, &scratch)
-	weather := read_weather(&plugin, climate.weather, &scratch)
+	climate, climate_error := world_climate(&plugin, world_id, &scratch)
+	if climate_error {
+		print("couldn't read the climate: %", climate_error)
+		return
+	}
+	weather, weather_error := read_weather(&plugin, climate.weather, &scratch)
+	if weather_error {
+		print("couldn't read the weather: %", weather_error)
+		return
+	}
 	print("weather %, sunrise % to %, sunset % to %, clouds % and %, sun %", climate.weather,
 		climate.sunrise_begin, climate.sunrise_end, climate.sunset_begin, climate.sunset_end,
 		weather.cloud_lower, weather.cloud_upper, climate.sun_texture)
-	water := world_water(&plugin, world_id, &scratch)
-	print("water: %", water)
+	water, water_error := world_water(&plugin, world_id, &scratch)
+	if water_error do print("couldn't read the water: %", water_error)
+	else do print("water: %", water)
 	for hour in [0, 5, 7, 8, 9, 12, 16, 17, 18, 19, 21] {
 		state := sky_at(climate, &weather, f32(hour), 10240)
 		print("  %:00  daylight %  sky % / % / %  sun % toward %  ambient %  sunlight %  fog % % to %", hour, state.daylight,
@@ -1206,12 +1226,17 @@ command_doors :: fun() {
 	for key in plugin.cell_children.keys {
 		if key == 0 do continue
 		references.len = 0
-		_ = cell_references(&plugin, u32(key), &references)
+		references_error := cell_references(&plugin, u32(key), &references)
+		if references_error do print("  couldn't read all of cell %'s references: %", key, references_error)
 		for reference in references {
 			scratch.len = 0
 			base, base_error := find_record(&plugin, reference.base, &scratch)
 			if base_error or base.header.kind != "DOOR" do continue
-			_, leads := door_destination(&plugin, reference.form_id, &scratch)
+			_, leads, door_error := door_destination(&plugin, reference.form_id, &scratch)
+			if door_error {
+				print("  couldn't read door %: %", reference.form_id, door_error)
+				continue
+			}
 			if leads {
 				leading += 1
 				continue
@@ -1338,7 +1363,8 @@ command_find :: fun(name: []utf8) {
 	for key in plugin.cell_children.keys {
 		if key == 0 do continue
 		references.len = 0
-		_ = cell_references(&plugin, u32(key), &references)
+		references_error := cell_references(&plugin, u32(key), &references)
+		if references_error do print("  couldn't read all of cell %'s references: %", key, references_error)
 		for reference in references {
 			if reference.base != base_id do continue
 			found += 1
@@ -1556,7 +1582,8 @@ command_grass :: fun(name: []utf8, x: i64, y: i64) {
 			&textures + grasses
 		}
 	}
-	water_height, has_water := cell_water(&plugin, cell, &scratch)
+	water_height, has_water, water_error := cell_water(&plugin, cell, &scratch)
+	if water_error do print("couldn't read the cell's water: %", water_error)
 	if not has_water do water_height = -1000000
 	blades : [render.GRASS_PER_CELL]render.Placed_Grass
 	start := time_now()
@@ -1733,8 +1760,13 @@ command_lod :: fun(name: []utf8, x: i64, y: i64) {
 	for row in 0:steps {
 		for column in 0:steps {
 			piece_name := lod_name(world_id, column * LOD_CELLS - LOD_REACH, row * LOD_CELLS - LOD_REACH)
-			built, found := read_lod_mesh(&meshes, &room, piece_name[:])
+			index, found := find_file(&meshes, lod_mesh_path(piece_name[:])[:])
 			if not found do continue
+			built, read_error := read_lod_mesh(&meshes, &room, index)
+			if read_error {
+				print("  couldn't read piece %: %", piece_name, read_error)
+				continue
+			}
 			pieces += 1
 			for part in built.parts {
 				vertices += part.vertices.len

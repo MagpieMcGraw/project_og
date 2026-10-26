@@ -16,6 +16,7 @@ World_Error :: error {
 	No_Such_Cell
 	No_Such_Record
 	Index_Full
+	Broken_Group     // a record in a cell's group runs past the group's end
 }
 
 // ---- finding records ---------------------------------------------------------
@@ -243,6 +244,7 @@ cell_references :: fun(plugin: ^Plugin, cell: u32, references: ^[]Reference) -> 
 			continue
 		}
 		next_at := at + HEADER_SIZE + i64(header.size)
+		if next_at > end do return Broken_Group
 		if header.kind == "REFR" and references.len < references.cap {
 			body := plugin.data[at + HEADER_SIZE : next_at]
 			references + read_reference(header, body)
@@ -380,9 +382,8 @@ byte_color :: fun(data: []byte, at: i64) -> Vec3 {
 }
 
 // A cell's lighting: its XCLL, or daylight when it has none.
-cell_lighting :: fun(plugin: ^Plugin, cell: u32, scratch: ^[]byte) -> Cell_Lighting {
-	record, record_error := find_record(plugin, cell, scratch)
-	if record_error do return DAYLIGHT
+cell_lighting :: fun(plugin: ^Plugin, cell: u32, scratch: ^[]byte) -> Cell_Lighting, err {
+	record := find_record(plugin, cell, scratch)?
 	field, found := find_field(record.data, "XCLL")
 	if not found or field.len < 36 do return DAYLIGHT
 	fog_near : f32 = field[12]
@@ -465,10 +466,9 @@ Door_Destination :: struct {
 }
 
 // A reference's destination, and false when it leads nowhere.
-door_destination :: fun(plugin: ^Plugin, reference: u32, scratch: ^[]byte) -> Door_Destination, bool {
+door_destination :: fun(plugin: ^Plugin, reference: u32, scratch: ^[]byte) -> Door_Destination, bool, err {
 	none := Door_Destination{door = 0, position = Vec3{0, 0, 0}, rotation = Vec3{0, 0, 0}}
-	record, record_error := find_record(plugin, reference, scratch)
-	if record_error do return none, false
+	record := find_record(plugin, reference, scratch)?
 	field, found := find_field(record.data, "XTEL")
 	if not found or field.len < 28 do return none, false
 	door : u32 = field[0]
@@ -540,9 +540,8 @@ CELL_HAS_WATER :: 0x2
 
 // Whether a cell has water, and its height: its XCLW, else (outside) the
 // sea's, 0.
-cell_water :: fun(plugin: ^Plugin, cell: u32, scratch: ^[]byte) -> f32, bool {
-	record, record_error := find_record(plugin, cell, scratch)
-	if record_error do return 0, false
+cell_water :: fun(plugin: ^Plugin, cell: u32, scratch: ^[]byte) -> f32, bool, err {
+	record := find_record(plugin, cell, scratch)?
 	flags_field, has_flags := find_field(record.data, "DATA")
 	if not has_flags or flags_field.len < 1 do return 0, false
 	flags : u8 = flags_field[0]
@@ -575,15 +574,13 @@ DEFAULT_WATER :: Water_Type{sun_power = 15, reflectivity = 0.9, fresnel = 0.15, 
 // direction, wave amplitude and frequency, sun power, reflectivity,
 // fresnel, scroll speeds, fog near and far (floats), then its shallow,
 // deep and reflection colors (bytes).
-world_water :: fun(plugin: ^Plugin, world_id: u32, scratch: ^[]byte) -> Water_Type {
+world_water :: fun(plugin: ^Plugin, world_id: u32, scratch: ^[]byte) -> Water_Type, err {
 	water := DEFAULT_WATER
-	record, record_error := find_record(plugin, world_id, scratch)
-	if record_error do return water
+	record := find_record(plugin, world_id, scratch)?
 	water_field, has_water := find_field(record.data, "NAM2")
 	if not has_water or water_field.len < 4 do return water
 	water_id : u32 = water_field[0]
-	water_record, water_error := find_record(plugin, water_id, scratch)
-	if water_error do return water
+	water_record := find_record(plugin, water_id, scratch)?
 	data, has_data := find_field(water_record.data, "DATA")
 	if not has_data or data.len < 56 do return water
 	water.sun_power = data[16]

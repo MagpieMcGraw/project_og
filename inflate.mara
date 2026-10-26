@@ -199,15 +199,15 @@ decode :: fun(bits: ^Bits, code: ^Huffman) -> i64, err {
 }
 
 // The codes of a block packed with the fixed codes deflate defines.
-fixed_codes :: fun(literals: ^Huffman, distances: ^Huffman) {
+fixed_codes :: fun(literals: ^Huffman, distances: ^Huffman) -> err {
 	lengths : [288!]u8
 	for i in 0:144 do lengths[i] = 8
 	for i in 144:256 do lengths[i] = 9
 	for i in 256:280 do lengths[i] = 7
 	for i in 280:288 do lengths[i] = 8
-	_ = build(literals, lengths[:])
+	build(literals, lengths[:])?
 	for i in 0:30 do lengths[i] = 5
-	_ = build(distances, lengths[0:30])
+	build(distances, lengths[0:30])?
 }
 
 // The codes a dynamic block starts with: their code lengths, themselves
@@ -318,7 +318,7 @@ packed_block :: fun(bits: ^Bits, output: ^[]byte, literals: ^Huffman, distances:
 read_block :: fun(bits: ^Bits, kind: i64, output: ^[]byte, literals: ^Huffman, distances: ^Huffman) -> err {
 	if kind == 0 do return stored_block(bits, output)
 	if kind == 1 {
-		fixed_codes(literals, distances)
+		fixed_codes(literals, distances)?
 	elif kind == 2
 		read_codes(bits, literals, distances)?
 	else

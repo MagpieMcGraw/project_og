@@ -1162,6 +1162,11 @@ Renderer :: struct {
 	// Textures, found by their paths' hashes.
 	textures: [MAX_TEXTURES]Cached_Texture
 	texture_index: Key_Index
+	// The textures that couldn't be loaded since the journal last told of
+	// them: how many, and the first's path and why. (Each is drawn white.)
+	texture_failures: i64
+	first_texture_failure: [160]utf8
+	first_texture_reason: err
 
 	// A frame's work.
 	visible: [MAX_DRAWN]i64        // instances in view
@@ -1176,6 +1181,7 @@ Renderer :: struct {
 // What setting up the renderer can fail with.
 Render_Error :: error {
 	Shader_Failed
+	Empty_Texture    // a texture with no image the card could take
 }
 
 // ---- setting up ------------------------------------------------------------------
@@ -2068,9 +2074,16 @@ texture_for :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratch
 	known, found := index_get(&renderer.texture_index, key)
 	if found do return known
 	if renderer.textures.len == renderer.textures.cap do return 0
-	id := load_texture(renderer, archive, path, scratch, clamp_mode)
+	id, load_error := load_texture(renderer, archive, path, scratch, clamp_mode)
 	slot : i64 = 0
-	if id != 0 {
+	if load_error {
+		renderer.texture_failures += 1
+		if renderer.texture_failures == 1 {
+			renderer.first_texture_failure.len = 0
+			&renderer.first_texture_failure + path[0 : min(path.len, renderer.first_texture_failure.cap)]
+			renderer.first_texture_reason = load_error
+		}
+	else
 		slot = renderer.textures.len
 		entry := next(&renderer.textures)
 		entry.path.len = 0
@@ -2094,10 +2107,9 @@ text_hash :: fun(text: []utf8) -> u64 {
 
 // Reads a texture from the archive onto the card: block compressed ones as
 // they are, the rest decoded to plain pixels; its mipmaps as many as it
-// has, sharp at a slant. 0 when it can't be read.
-load_texture :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratch: ^[]byte, clamp_mode: u32) -> u32 {
-	texture, read_error := read_archive_texture(archive, path, scratch)
-	if read_error do return 0
+// has, sharp at a slant.
+load_texture :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratch: ^[]byte, clamp_mode: u32) -> u32, err {
+	texture := read_archive_texture(archive, path, scratch)?
 
 	id : u32 = 0
 	GenTextures(1, &id)
@@ -2121,7 +2133,7 @@ load_texture :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratc
 		}
 		levels += 1
 	}
-	if levels == 0 do return 0
+	if levels == 0 do return 0, Empty_Texture
 	// Its mipmaps, as many as it has (many stop short of 1 pixel).
 	TexParameteri(TEXTURE_2D, TEXTURE_MAX_LEVEL, i32(levels - 1))
 	TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(LINEAR_MIPMAP_LINEAR))

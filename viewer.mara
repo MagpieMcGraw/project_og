@@ -549,9 +549,20 @@ take_sky :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32) {
 	if viewer.sky_world == world_id do return
 	viewer.sky_world = world_id
 	scratch : [4 * MB]byte
-	viewer.climate = world_climate(plugin, world_id, &scratch)
-	viewer.weather = read_weather(plugin, viewer.climate.weather, &scratch)
-	viewer.water = world_water(plugin, world_id, &scratch)
+	// What can't be read is told of, and the defaults go in its place.
+	climate, climate_error := world_climate(plugin, world_id, &scratch)
+	viewer.climate = if climate_error do default_climate() else climate
+	weather, weather_error := read_weather(plugin, viewer.climate.weather, &scratch)
+	viewer.weather = if weather_error do default_weather() else weather
+	water, water_error := world_water(plugin, world_id, &scratch)
+	viewer.water = if water_error do DEFAULT_WATER else water
+	for sky_error in [climate_error, weather_error, water_error] {
+		if not sky_error do continue
+		note(&viewer.journal, "couldn't read the world's climate, weather or water: the defaults instead")
+		note_end(&viewer.journal)
+		print("    why: %", sky_error)
+		break
+	}
 	room := &viewer.room
 	look := &viewer.look
 	look.cloud_lower = texture_for(&viewer.renderer, &viewer.textures, viewer.weather.cloud_lower[:], &room.texture)
@@ -569,6 +580,34 @@ take_sky :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32) {
 	note(journal, " to ")
 	note(journal, i64(viewer.climate.sunset_end))
 	note_end(journal)
+}
+
+// Tells the journal what loading couldn't do since it last did: what the
+// scene left out and the textures drawn white, how many, and the first's
+// name. (Why is printed on the console: an err can't be put in the log's
+// text yet.)
+note_failures :: fun(viewer: ^Viewer) {
+	shown := &viewer.shown
+	renderer := &viewer.renderer
+	journal := &viewer.journal
+	if shown.failures > 0 {
+		note(journal, "  couldn't load ")
+		note(journal, shown.failures)
+		note(journal, ", left out; the first: ")
+		note(journal, shown.first_failure[:])
+		note_end(journal)
+		print("    why: %", shown.first_failure_reason)
+		shown.failures = 0
+	}
+	if renderer.texture_failures > 0 {
+		note(journal, "  couldn't load ")
+		note(journal, renderer.texture_failures)
+		note(journal, " textures, drawn white; the first: ")
+		note(journal, renderer.first_texture_failure[:])
+		note_end(journal)
+		print("    why: %", renderer.first_texture_reason)
+		renderer.texture_failures = 0
+	}
 }
 
 // A record's editor id, as text kept by value.
@@ -609,10 +648,9 @@ load_some :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 		note(journal, viewer.loading_frames)
 		note(journal, " frames: ")
 		note(journal, shown.models.len)
-		note(journal, " models loaded (")
-		note(journal, shown.failed_paths)
-		note(journal, " meshes failed)")
+		note(journal, " models loaded")
 		note_end(journal)
+		note_failures(viewer)
 	}
 }
 
@@ -655,7 +693,7 @@ command_view :: fun(what: []utf8) {
 	shown := &viewer.shown
 	model_index := scene_model(shown, viewer_loader(&viewer), what)
 	if model_index < 0 {
-		print("couldn't load %", what)
+		print("couldn't load %: %", what, shown.first_failure_reason)
 		return
 	}
 	add_instance(shown, model_index, mat4_identity())
@@ -777,7 +815,13 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 			viewer.crossing_time = time_now() - start
 		door
 			scratch.len = 0
-			there, leads := door_destination(plugin, viewer.shown.doors[viewer.chosen_door].reference, &scratch)
+			there, leads, door_error := door_destination(plugin, viewer.shown.doors[viewer.chosen_door].reference, &scratch)
+			if door_error {
+				note(journal, "that door's record couldn't be read")
+				note_end(journal)
+				print("    why: %", door_error)
+				continue
+			}
 			if not leads do continue
 			target := cell_of_reference(plugin, there.door)
 			if target == 0 {
@@ -817,13 +861,13 @@ go_inside :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
 	note(journal, shown.doors.len)
 	note(journal, " doors; ")
 	note(journal, shown.models.len)
-	note(journal, " models loaded (")
-	note(journal, shown.failed_paths)
-	note(journal, " meshes failed), in ")
+	note(journal, " models loaded, in ")
 	note(journal, elapsed_ms(start))
 	note(journal, " ms")
 	if show_error do note(journal, " (reading the cell stopped early)")
 	note_end(journal)
+	if show_error do print("    why: %", show_error)
+	note_failures(viewer)
 	viewer.frame_start = time_now()
 }
 
@@ -835,7 +879,7 @@ go_outside :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32, place: Vec3) 
 	take_sky(viewer, plugin, world_id)
 	if viewer.renderer.distant_world != world_id {
 		distant_start := time_now()
-		pieces := load_distant_land(&viewer.renderer, world_id, viewer_loader(viewer))
+		pieces, distant_error := load_distant_land(&viewer.renderer, world_id, viewer_loader(viewer))
 		note(&viewer.journal, "distant land: ")
 		note(&viewer.journal, pieces)
 		note(&viewer.journal, " pieces, ")
@@ -843,7 +887,9 @@ go_outside :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32, place: Vec3) 
 		note(&viewer.journal, " vertices, in ")
 		note(&viewer.journal, elapsed_ms(distant_start))
 		note(&viewer.journal, " ms")
+		if distant_error do note(&viewer.journal, " (some pieces couldn't be read)")
 		note_end(&viewer.journal)
+		if distant_error do print("    why: %", distant_error)
 	}
 	if viewer.shown.distant_world != world_id {
 		objects_start := time_now()
@@ -878,13 +924,13 @@ go_outside :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32, place: Vec3) 
 	note(journal, shown.grounds.len)
 	note(journal, " land cells; ")
 	note(journal, shown.models.len)
-	note(journal, " models loaded (")
-	note(journal, shown.failed_paths)
-	note(journal, " meshes failed), in ")
+	note(journal, " models loaded, in ")
 	note(journal, elapsed_ms(start))
 	note(journal, " ms")
 	if show_error do note(journal, " (placing the cells stopped early)")
 	note_end(journal)
+	if show_error do print("    why: %", show_error)
+	note_failures(viewer)
 	viewer.frame_start = time_now()
 }
 

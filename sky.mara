@@ -72,20 +72,17 @@ Sky_State :: struct {
 }
 
 // The climate of a world: its CNAM's, or TamrielClimate, or DefaultClimate.
-world_climate :: fun(plugin: ^Plugin, world_id: u32, scratch: ^[]byte) -> Climate {
-	climate := Climate{weather = 0, sunrise_begin = 6, sunrise_end = 10, sunset_begin = 16, sunset_end = 20, sun_texture = []}
+world_climate :: fun(plugin: ^Plugin, world_id: u32, scratch: ^[]byte) -> Climate, err {
+	climate := default_climate()
 	climate_id : u32 = 0
-	record, record_error := find_record(plugin, world_id, scratch)
-	if not record_error {
-		field, found := find_field(record.data, "CNAM")
-		if found and field.len >= 4 do climate_id = field[0]
-	}
+	record := find_record(plugin, world_id, scratch)?
+	field, found := find_field(record.data, "CNAM")
+	if found and field.len >= 4 do climate_id = field[0]
 	if climate_id == 0 do climate_id = find_by_editor_id(plugin, "CLMT", "TamrielClimate", scratch)
 	if climate_id == 0 do climate_id = find_by_editor_id(plugin, "CLMT", "DefaultClimate", scratch)
 	if climate_id == 0 do return climate
 
-	climate_record, climate_error := find_record(plugin, climate_id, scratch)
-	if climate_error do return climate
+	climate_record := find_record(plugin, climate_id, scratch)?
 	// The likeliest weather: WLST is (weather, chance) pairs.
 	weathers, has_weathers := find_field(climate_record.data, "WLST")
 	if has_weathers {
@@ -117,6 +114,22 @@ world_climate :: fun(plugin: ^Plugin, world_id: u32, scratch: ^[]byte) -> Climat
 	return climate
 }
 
+// A climate for a world that has none: no weather (the default one), the
+// sun up from 6 to 20.
+default_climate :: fun() -> Climate {
+	return Climate{weather = 0, sunrise_begin = 6, sunrise_end = 10, sunset_begin = 16, sunset_end = 20, sun_texture = []}
+}
+
+// A weather for when there's none to read: a pale blue sky all day, fog far.
+default_weather :: fun() -> Weather {
+	weather := Weather{colors = [], fog_day_near = 4096, fog_day_far = 40000, fog_night_near = 2048, fog_night_far = 20000,
+		cloud_lower = [], cloud_upper = [], cloud_speed_lower = 0, cloud_speed_upper = 0, wind_speed = 0.1}
+	for c in 0:WEATHER_COLORS {
+		for t in 0:4 do weather.colors[c][t] = Vec3{0.5, 0.6, 0.8}
+	}
+	return weather
+}
+
 // The form id of the record of a kind with an editor id; 0 when there's none.
 find_by_editor_id :: fun(plugin: ^Plugin, kind: []utf8, name: []utf8, scratch: ^[]byte) -> u32 {
 	for key, slot in plugin.records.keys {
@@ -145,14 +158,10 @@ texture_path_of :: fun(name: []utf8, path: ^[160]utf8) {
 
 // Reads a weather record. Its colors, as NAM0 has them: for each color, at
 // each time of day, red, green, blue and a byte unused.
-read_weather :: fun(plugin: ^Plugin, weather_id: u32, scratch: ^[]byte) -> Weather {
-	weather := Weather{colors = [], fog_day_near = 4096, fog_day_far = 40000, fog_night_near = 2048, fog_night_far = 20000,
-		cloud_lower = [], cloud_upper = [], cloud_speed_lower = 0, cloud_speed_upper = 0, wind_speed = 0.1}
-	for c in 0:WEATHER_COLORS {
-		for t in 0:4 do weather.colors[c][t] = Vec3{0.5, 0.6, 0.8}
-	}
-	record, record_error := find_record(plugin, weather_id, scratch)
-	if record_error do return weather
+read_weather :: fun(plugin: ^Plugin, weather_id: u32, scratch: ^[]byte) -> Weather, err {
+	weather := default_weather()
+	if weather_id == 0 do return weather   // (a climate without weathers: the defaults)
+	record := find_record(plugin, weather_id, scratch)?
 	colors, has_colors := find_field(record.data, "NAM0")
 	if has_colors and colors.len >= WEATHER_COLORS * 16 {
 		for c in 0:WEATHER_COLORS {

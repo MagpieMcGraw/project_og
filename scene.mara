@@ -114,6 +114,13 @@ Swinging_Door :: struct {
 	time: f32
 }
 
+// What loading a model can fail with, beyond reading its file.
+Load_Error :: error {
+	Not_In_Archive     // no file of that path in the archive
+	No_Room_For_Models // the scene's models are all taken
+	No_Parts           // a part of a mesh with nothing to draw
+}
+
 // A model's collision: its points in the scene's collision, three a triangle.
 Collision_Range :: struct {
 	first: i64
@@ -137,7 +144,11 @@ Scene :: struct {
 	model_collision: [4096]Collision_Range
 	collision_points: [COLLISION_POINTS]Vec3
 	paths: Key_Index             // each mesh's model (+1; 0 when it couldn't be loaded), by the path's hash
-	failed_paths: i64
+	// What loading couldn't do since the journal last told of it: how many
+	// things failed (each left out), and the first's name and why.
+	failures: i64
+	first_failure: [256]utf8
+	first_failure_reason: err
 	instances: [32768]Instance
 	lights: [4096]Point_Light
 	lights_changed: bool         // since the renderer was last given them (set_scene_lights)
@@ -227,7 +238,7 @@ scene_clear :: fun(scene: ^Scene, storage: ^[]byte) {
 	scene.door_kinds.len = 0
 	scene.door_kind_index = key_index(1 << 9, storage)
 	scene.paths = key_index(1 << 13, storage)
-	scene.failed_paths = 0
+	scene.failures = 0
 	scene.grounds.len = 0
 	scene.world = 0
 	scene.tree_kinds = key_index(1 << 11, storage)
@@ -270,10 +281,23 @@ scene_model :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64 {
 	key := text_hash(path)
 	known, found := index_get(&scene.paths, key)
 	if found do return known - 1
-	model_index := load_model(scene, loader, path)
-	if model_index < 0 do scene.failed_paths += 1
+	model_index, load_error := load_model(scene, loader, path)
+	if load_error {
+		note_failure(scene, path, load_error)
+		model_index = -1
+	}
 	_ = index_put(&scene.paths, key, model_index + 1)
 	return model_index
+}
+
+// Notes that something couldn't be loaded (and is left out): counted, the
+// first's name and reason kept, for the journal.
+note_failure :: fun(scene: ^Scene, what: []utf8, reason: err) {
+	scene.failures += 1
+	if scene.failures > 1 do return
+	scene.first_failure.len = 0
+	&scene.first_failure + what[0 : min(what.len, scene.first_failure.cap)]
+	scene.first_failure_reason = reason
 }
 
 // Whether a mesh path's model has been asked for before: its index (-1
@@ -284,26 +308,21 @@ known_model :: fun(scene: ^Scene, path: []utf8) -> i64, bool {
 }
 
 // Reads a mesh, makes its model and puts it on the card: its index in the
-// scene's models, or -1.
-load_model :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64 {
-	if scene.models.len == scene.models.cap do return -1
+// scene's models.
+load_model :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64, err {
+	if scene.models.len == scene.models.cap do return -1, No_Room_For_Models
 	room := loader.room
 	index, found := find_file(loader.meshes, path)
-	if not found do return -1
+	if not found do return -1, Not_In_Archive
 	room.file.len = 0
-	data, read_error := read_file(loader.meshes, index, &room.file)
-	if read_error do return -1
+	data := read_file(loader.meshes, index, &room.file)?
 
 	room.blocks.len = 0
 	failure := Nif_Failure{block = 0, type_name = room.file[0:0]}
-	mesh, nif_error := read_nif(data, &room.blocks, &failure)
-	if nif_error do return -1
+	mesh := read_nif(data, &room.blocks, &failure)?
 	room.model.len = 0
-	built, model_error := build_model(&mesh, &room.model)
-	if model_error do return -1
-
-	gpu, upload_error := upload_model(loader.renderer, built, loader.textures, &room.texture)
-	if upload_error do return -1
+	built := build_model(&mesh, &room.model)?
+	gpu := upload_model(loader.renderer, built, loader.textures, &room.texture)?
 	// What it collides as (from its blocks, still in their room).
 	collision_start := scene.collision_points.len
 	add_collision(&mesh, &scene.collision_points)
@@ -356,7 +375,7 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, plac
 		}
 		in_place := false
 		if base.header.kind == "DOOR" {
-			_, leads := door_destination(plugin, reference.form_id, &scratch)
+			_, leads := door_destination(plugin, reference.form_id, &scratch)?
 			if leads and scene.doors.len < scene.doors.cap do &scene.doors + Scene_Door{reference = reference.form_id, position = reference.position}
 			in_place = not leads
 		}
@@ -456,6 +475,7 @@ tree_kind :: fun(scene: ^Scene, plugin: ^Plugin, base: u32, loader: Loader) -> i
 	kind_index : i64 = -1
 	scratch : [64 * KB]byte
 	record, record_error := record_at(plugin, header_at, &scratch)
+	if record_error do note_failure(scene, "a tree's record", record_error)
 	if not record_error and scene.kinds.len < scene.kinds.cap {
 		look, is_tree := tree_look(record)
 		if is_tree {
@@ -486,7 +506,8 @@ load_trees :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64, loa
 	}
 	if slot < 0 or scene.tree_cells.len == scene.tree_cells.cap do return
 	references : [16384]Reference
-	_ = cell_references(plugin, cell, &references)
+	references_error := cell_references(plugin, cell, &references)
+	if references_error do note_failure(scene, "a cell's references, for its trees", references_error)
 	trees : [TREES_PER_CELL]Placed_Tree
 	for reference in references {
 		if trees.len == trees.cap do break
@@ -577,10 +598,11 @@ scene_entrance :: fun(scene: ^Scene, plugin: ^Plugin) -> Door_Destination, bool 
 	scratch : [4 * MB]byte
 	for door in scene.doors {
 		scratch.len = 0
-		there, leads := door_destination(plugin, door.reference, &scratch)
-		if not leads do continue
-		back, leads_back := door_destination(plugin, there.door, &scratch)
-		if leads_back and back.door == door.reference do return back, true
+		// (A door whose record can't be read is passed over, as one that leads nowhere.)
+		there, leads, there_error := door_destination(plugin, door.reference, &scratch)
+		if there_error or not leads do continue
+		back, leads_back, back_error := door_destination(plugin, there.door, &scratch)
+		if not back_error and leads_back and back.door == door.reference do return back, true
 	}
 	return Door_Destination{door = 0, position = Vec3{0, 0, 0}, rotation = Vec3{0, 0, 0}}, false
 }
@@ -592,13 +614,13 @@ show_interior :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, loader: Loader) 
 	scene_clear_cell(scene)
 	scene.world = 0
 	scratch : [1 * MB]byte
-	scene.lighting = cell_lighting(plugin, cell, &scratch)
+	scene.lighting = cell_lighting(plugin, cell, &scratch)?
 	add_cell(scene, plugin, cell, EVERYWHERE, NOWHERE)?
 	_ = load_waiting(scene, plugin, loader, 0xFFFFFFFFFFFFFFFF)
 	choose_all_lights(scene)
 
 	// Water inside (sewers, caves): a plane under all that's placed.
-	height, has_water := cell_water(plugin, cell, &scratch)
+	height, has_water := cell_water(plugin, cell, &scratch)?
 	if has_water and scene.instances.len > 0 {
 		low := Vec3{1000000, 1000000, 0}
 		high := Vec3{-1000000, -1000000, 0}
@@ -691,7 +713,10 @@ load_land :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64, load
 	room := loader.room
 	room.file.len = 0
 	record, record_error := record_at(plugin, land_at, &room.file)
-	if record_error do return
+	if record_error {
+		note_failure(scene, "a cell's land", record_error)
+		return
+	}
 	cell_land : Land
 	read_land(record.data, &cell_land)
 	mesh : Land_Mesh
@@ -754,26 +779,29 @@ door_kind :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64 {
 	key := text_hash(path)
 	known, found := index_get(&scene.door_kind_index, key)
 	if found do return known - 1
-	kind_index := load_door_kind(scene, loader, path)
+	kind_index, load_error := load_door_kind(scene, loader, path)
+	if load_error {
+		note_failure(scene, path, load_error)
+		kind_index = -1
+	}
 	_ = index_put(&scene.door_kind_index, key, kind_index + 1)
 	return kind_index
 }
 
 // Reads a door's mesh: if its Open and Close sequences move nodes, its
 // frame and those nodes' pieces are each put on the card as a model (with
-// its collision), and the tracks kept. -1 when they move nothing.
-load_door_kind :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64 {
+// its collision), and the tracks kept. -1 when they move nothing (no
+// error: a door that doesn't open in place).
+load_door_kind :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64, err {
 	if scene.door_kinds.len == scene.door_kinds.cap do return -1
 	room := loader.room
 	index, found := find_file(loader.meshes, path)
-	if not found do return -1
+	if not found do return -1, Not_In_Archive
 	room.file.len = 0
-	data, read_error := read_file(loader.meshes, index, &room.file)
-	if read_error do return -1
+	data := read_file(loader.meshes, index, &room.file)?
 	room.blocks.len = 0
 	failure := Nif_Failure{block = 0, type_name = room.file[0:0]}
-	mesh, nif_error := read_nif(data, &room.blocks, &failure)
-	if nif_error do return -1
+	mesh := read_nif(data, &room.blocks, &failure)?
 	open := find_sequence(&mesh, "Open")
 	close := find_sequence(&mesh, "Close")
 	if open < 0 or close < 0 do return -1
@@ -807,7 +835,9 @@ load_door_kind :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64 {
 	kind := next(&scene.door_kinds)
 	kind.open_start, kind.open_stop = sequence_span(&mesh, open)
 	kind.close_start, kind.close_stop = sequence_span(&mesh, close)
-	kind.frame = add_door_model(scene, loader, &mesh, -1, moving[:])
+	// (The frame may be nothing: a door that moves all of itself.)
+	frame, frame_error := add_door_model(scene, loader, &mesh, -1, moving[:])
+	kind.frame = if frame_error do -1 else frame
 	kind.pieces.len = 0
 	for k in 0:moving.len {
 		// (A moving node under another is its own piece, not part of that one's.)
@@ -816,7 +846,12 @@ load_door_kind :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64 {
 			if other != moving[k] do &others + other
 		}
 		piece := next(&kind.pieces)
-		piece.model = add_door_model(scene, loader, &mesh, moving[k], others[:])
+		piece_model, piece_error := add_door_model(scene, loader, &mesh, moving[k], others[:])
+		if piece_error {
+			scene.door_kinds.len -= 1
+			return -1, piece_error
+		}
+		piece.model = piece_model
 		piece.parent, _ = parent_transform(&mesh, moving[k])
 		piece.opening = opening[k]
 		// Its Close track: the one for its node; else its Open one, run back.
@@ -824,26 +859,20 @@ load_door_kind :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64 {
 		for &track in closing {
 			if track.node_name[:] == opening[k].node_name[:] do piece.closing = track^
 		}
-		if piece.model < 0 {
-			scene.door_kinds.len -= 1
-			return -1
-		}
 	}
 	return scene.door_kinds.len - 1
 }
 
 // Puts part of a door's mesh on the card as a model, with its collision:
 // what's under a node, in its space (node -1: all but what's under the
-// nodes left out). Its index in the scene's models; -1 when it has no
-// parts or there's no room.
-add_door_model :: fun(scene: ^Scene, loader: Loader, mesh: ^Nif, node: i64, left_out: []i64) -> i64 {
-	if scene.models.len == scene.models.cap do return -1
+// nodes left out). Its index in the scene's models.
+add_door_model :: fun(scene: ^Scene, loader: Loader, mesh: ^Nif, node: i64, left_out: []i64) -> i64, err {
+	if scene.models.len == scene.models.cap do return -1, No_Room_For_Models
 	room := loader.room
 	room.model.len = 0
-	built, model_error := build_model_part(mesh, node, left_out, &room.model)
-	if model_error or built.parts.len == 0 do return -1
-	gpu, upload_error := upload_model(loader.renderer, built, loader.textures, &room.texture)
-	if upload_error do return -1
+	built := build_model_part(mesh, node, left_out, &room.model)?
+	if built.parts.len == 0 do return -1, No_Parts
+	gpu := upload_model(loader.renderer, built, loader.textures, &room.texture)?
 	collision_start := scene.collision_points.len
 	add_collision_part(mesh, node, left_out, &scene.collision_points)
 	&scene.model_collision + Collision_Range{first = collision_start, count = scene.collision_points.len - collision_start}
@@ -974,7 +1003,8 @@ load_grass :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64, cel
 		for &layer in quadrant.layers do add_texture_grasses(scene, plugin, layer.texture, &textures, loader)
 	}
 	scratch : [64 * KB]byte
-	water_height, has_water := cell_water(plugin, cell, &scratch)
+	water_height, has_water, water_error := cell_water(plugin, cell, &scratch)
+	if water_error do note_failure(scene, "a cell's water, for its grass", water_error)
 	if not has_water do water_height = -1000000
 	blades : [GRASS_PER_CELL]Placed_Grass
 	place_grass(cell_land, x, y, water_height, textures[:], &scene.grass_kinds, &blades)
@@ -998,6 +1028,7 @@ texture_grasses_of :: fun(scene: ^Scene, plugin: ^Plugin, texture: u32, loader: 
 	grasses := Texture_Grasses{texture = texture, kinds = [-1, -1]}
 	scratch : [64 * KB]byte
 	record, record_error := find_record(plugin, texture, &scratch)
+	if record_error do note_failure(scene, "a land texture's record", record_error)
 	if not record_error {
 		count : i64 = 0
 		fields := Fields{data = record.data, at = 0, broken = false}
@@ -1023,6 +1054,7 @@ grass_kind :: fun(scene: ^Scene, plugin: ^Plugin, grass_id: u32, loader: Loader)
 	kind_index : i64 = -1
 	scratch : [64 * KB]byte
 	record, record_error := find_record(plugin, grass_id, &scratch)
+	if record_error do note_failure(scene, "a grass's record", record_error)
 	if not record_error and scene.grass_kinds.len < scene.grass_kinds.cap {
 		look, readable := read_grass_look(record)
 		if readable {
@@ -1150,7 +1182,8 @@ drop_outside :: fun(scene: ^Scene, area: Grid_Area) {
 // land: over the cell, its depth at each of the land's points.
 add_cell_water :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64) {
 	scratch : [256 * KB]byte
-	height, has_water := cell_water(plugin, cell, &scratch)
+	height, has_water, water_error := cell_water(plugin, cell, &scratch)
+	if water_error do note_failure(scene, "a cell's water", water_error)
 	if not has_water or scene.waters.len == scene.waters.cap do return
 	// Deep where there's no land under it to know.
 	depths : [WATER_VERTICES!]f32
@@ -1159,7 +1192,10 @@ add_cell_water :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64)
 	if has_land {
 		scratch.len = 0
 		record, record_error := record_at(plugin, land_at, &scratch)
-		if record_error do return
+		if record_error {
+			note_failure(scene, "a cell's land, under its water", record_error)
+			return
+		}
 		cell_land : Land
 		read_land(record.data, &cell_land)
 		// All of the land above the water: none to draw.
