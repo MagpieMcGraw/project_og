@@ -55,7 +55,7 @@ lightning) and the regions' sounds (birds, insects, wind).
 
 | What | Data | Notes |
 |---|---|---|
-| 3D trees | 113 SpeedTree `.spt`; `textures	reesranches` 90, `leaves` 78 | near trees are billboards now |
+| 3D trees | 113 SpeedTree `.spt`; `textures\trees\branches` 90, `leaves` 78 | near trees are billboards now |
 | Sunbeams | `sunbeam01–03.nif` | |
 | HDR (eye adapting, bloom) | WTHR HNAM | |
 | Water reflections | — | framebuffers are in now; left for later earlier |
