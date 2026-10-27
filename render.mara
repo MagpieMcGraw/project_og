@@ -859,6 +859,34 @@ uniform sampler2D cloud_upper_texture;
 uniform sampler2D cloud_lower_last_texture;   // the last weather's, going out
 uniform sampler2D cloud_upper_last_texture;
 uniform float weather_share;                  // how far the coming weather has come in
+// The night sky: its stars and nebula (turned as the night goes), in the
+// stars' color; the moons, each where it is and how big, in their phases'
+// pictures, as much as it's night; the sun's glare, as much as the weather
+// has it.
+uniform sampler2D stars_texture;
+uniform sampler2D nebula_texture;
+uniform vec3 stars_color;
+uniform float stars_turn;
+uniform sampler2D masser_texture;
+uniform sampler2D secunda_texture;
+uniform vec3 masser;                          // toward it
+uniform float masser_size;                    // how big (0: none)
+uniform vec3 secunda;
+uniform float secunda_size;
+uniform float night;
+uniform sampler2D sun_glare_texture;
+uniform float sun_glare;
+
+// A picture on a patch of sky about a direction, size across: its color
+// where the way looked is on it, else nothing.
+vec4 sky_patch(sampler2D picture, vec3 direction, vec3 center, float size) {
+	if (size <= 0.0 || dot(direction, center) <= 0.0) return vec4(0.0);
+	vec3 side = normalize(cross(center, vec3(0.0, 0.0, 1.0)));
+	vec3 up = cross(side, center);
+	vec2 at = vec2(dot(direction, side), dot(direction, up)) / size + 0.5;
+	if (any(lessThan(at, vec2(0.0))) || any(greaterThan(at, vec2(1.0)))) return vec4(0.0);
+	return texture(picture, vec2(at.x, 1.0 - at.y));
+}
 uniform sampler2D sun_texture;
 out vec4 fragment_color;
 
@@ -866,6 +894,21 @@ void main() {
 	vec4 far = inverse_view_projection * vec4(screen, 1.0, 1.0);
 	vec3 direction = normalize(far.xyz / far.w - camera_position);
 	vec3 color = sky_color(direction);
+
+	// The stars, on the dome above (seen from below its middle), turning.
+	if (direction.z > 0.0 && night > 0.0) {
+		float c = cos(stars_turn);
+		float s = sin(stars_turn);
+		vec3 turned = vec3(c * direction.x - s * direction.y, s * direction.x + c * direction.y, direction.z);
+		vec2 on_dome = turned.xy / (1.0 + turned.z);
+		vec3 stars = texture(stars_texture, on_dome * 1.5).rgb + texture(nebula_texture, on_dome * 0.7 + 0.5).rgb * 0.6;
+		color += stars * stars_color * night * smoothstep(0.0, 0.25, direction.z);
+	}
+	// The moons, over the stars.
+	vec4 moon = sky_patch(masser_texture, direction, masser, masser_size);
+	color = mix(color, moon.rgb, moon.a * night);
+	moon = sky_patch(secunda_texture, direction, secunda, secunda_size);
+	color = mix(color, moon.rgb, moon.a * night);
 
 	// The sun: its texture on a patch of sky around its direction.
 	vec3 side = normalize(cross(sun_direction, vec3(0.0, 0.0, 1.0)));
@@ -877,6 +920,8 @@ void main() {
 			color += sun_color * sun.rgb * sun.a;
 		}
 	}
+	// Its glare, as the weather has it.
+	if (sun_glare > 0.0) color += sun_color * sky_patch(sun_glare_texture, direction, sun_direction, 0.6).rgb * sun_glare;
 
 	// The clouds: two layers on a plane above, faded toward the horizon.
 	if (direction.z > 0.0) {
@@ -1186,6 +1231,20 @@ Sky_Look :: struct {
 	cloud_upper_last: i64
 	weather_share: f32
 	sun: i64
+	// The night sky: the stars' and nebula's textures and how far they've
+	// turned; the moons' phases' textures, where they are and how big (0:
+	// none); the sun's glare's texture and how strong it is now.
+	stars: i64
+	nebula: i64
+	stars_turn: f32
+	masser: i64
+	secunda: i64
+	masser_direction: Vec3
+	secunda_direction: Vec3
+	masser_size: f32
+	secunda_size: f32
+	sun_glare: i64
+	sun_glare_strength: f32
 	// The coming weather's rain or snow, and the last one's, going.
 	precipitation: [PRECIPITATION_LAYERS]Precipitation_Layer
 	last_precipitation: [PRECIPITATION_LAYERS]Precipitation_Layer
@@ -1213,6 +1272,14 @@ Sky_Program :: struct {
 	cloud_lower_offset_at: i32
 	cloud_upper_offset_at: i32
 	weather_share_at: i32
+	stars_color_at: i32
+	stars_turn_at: i32
+	masser_at: i32
+	masser_size_at: i32
+	secunda_at: i32
+	secunda_size_at: i32
+	night_at: i32
+	sun_glare_at: i32
 }
 
 // The cells left out of the far land or water, around the cell at x, y:
@@ -1805,7 +1872,20 @@ make_sky_program :: fun(made: ^Sky_Program) -> err {
 	Uniform1i(GetUniformLocation(program, "sun_texture"), 2)
 	Uniform1i(GetUniformLocation(program, "cloud_lower_last_texture"), 3)
 	Uniform1i(GetUniformLocation(program, "cloud_upper_last_texture"), 4)
+	Uniform1i(GetUniformLocation(program, "stars_texture"), 5)
+	Uniform1i(GetUniformLocation(program, "nebula_texture"), 6)
+	Uniform1i(GetUniformLocation(program, "masser_texture"), 7)
+	Uniform1i(GetUniformLocation(program, "secunda_texture"), 8)
+	Uniform1i(GetUniformLocation(program, "sun_glare_texture"), 9)
 	made.weather_share_at = GetUniformLocation(program, "weather_share")
+	made.stars_color_at = GetUniformLocation(program, "stars_color")
+	made.stars_turn_at = GetUniformLocation(program, "stars_turn")
+	made.masser_at = GetUniformLocation(program, "masser")
+	made.masser_size_at = GetUniformLocation(program, "masser_size")
+	made.secunda_at = GetUniformLocation(program, "secunda")
+	made.secunda_size_at = GetUniformLocation(program, "secunda_size")
+	made.night_at = GetUniformLocation(program, "night")
+	made.sun_glare_at = GetUniformLocation(program, "sun_glare")
 }
 
 make_distant_program :: fun(made: ^Distant_Program, bindless: bool) -> err {
@@ -3190,8 +3270,22 @@ draw_sky :: fun(renderer: ^Renderer, look: ^Sky_Look, view_projection: Mat4, lig
 	BindTexture(TEXTURE_2D, renderer.textures[look.cloud_lower_last].id)
 	ActiveTexture(TEXTURE4)
 	BindTexture(TEXTURE_2D, renderer.textures[look.cloud_upper_last].id)
+	sky_textures : [5!]i64 = [look.stars, look.nebula, look.masser, look.secunda, look.sun_glare]
+	sky_units : [5!]GL_Texture_Unit = [TEXTURE5, TEXTURE6, TEXTURE7, TEXTURE8, TEXTURE9]
+	for k in 0:5 {
+		ActiveTexture(sky_units[k])
+		BindTexture(TEXTURE_2D, renderer.textures[sky_textures[k]].id)
+	}
 	ActiveTexture(TEXTURE0)
 	Uniform1f(made.weather_share_at, look.weather_share)
+	Uniform3f(made.stars_color_at, state.stars_color.x, state.stars_color.y, state.stars_color.z)
+	Uniform1f(made.stars_turn_at, look.stars_turn)
+	Uniform3f(made.masser_at, look.masser_direction.x, look.masser_direction.y, look.masser_direction.z)
+	Uniform1f(made.masser_size_at, look.masser_size)
+	Uniform3f(made.secunda_at, look.secunda_direction.x, look.secunda_direction.y, look.secunda_direction.z)
+	Uniform1f(made.secunda_size_at, look.secunda_size)
+	Uniform1f(made.night_at, 1 - state.daylight)
+	Uniform1f(made.sun_glare_at, look.sun_glare_strength)
 	Disable(DEPTH_TEST)
 	DepthMask(0)
 	BindVertexArray(renderer.empty_vertex_array)

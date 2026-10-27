@@ -69,6 +69,12 @@ HURRIED_TIME_SCALE :: 2000
 // The room the sounds' clips are loaded into.
 SOUND_ROOM :: 64 * MB
 
+// The moons' sizes on the sky (across, as a share of the way to the
+// horizon); the days the stars take to turn round.
+MASSER_SIZE :: 0.3
+SECUNDA_SIZE :: 0.12
+STARS_TURN_DAYS :: 2
+
 // How long a weather stays before the next is chosen, in the game's hours.
 WEATHER_LEAST_HOURS :: 4
 WEATHER_MOST_HOURS :: 8
@@ -108,6 +114,8 @@ Viewer :: struct {
 	weathers_here: [16]Weather_Chance
 	weather_due: bool
 	weather_seed: u64
+	day: i64            // the game's days gone, for the moons' phases
+	moon_phase: i64     // the phase whose pictures are on the card (-1: none yet)
 	sky_world: u32      // the world they're of, 0 for none yet
 	hour: f32
 	look: Sky_Look
@@ -199,8 +207,12 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.weathers_here.len = 0
 	viewer.weather_due = false
 	viewer.weather_seed = time_now() | 1
+	viewer.day = 0
+	viewer.moon_phase = -1
 	viewer.look = Sky_Look{state = Sky_State{0}, cloud_lower = 0, cloud_upper = 0, cloud_lower_last = 0, cloud_upper_last = 0,
 		weather_share = 1, sun = 0, precipitation = [], last_precipitation = [],
+		stars = 0, nebula = 0, stars_turn = 0, masser = 0, secunda = 0, masser_direction = Vec3{0, 0, -1},
+		secunda_direction = Vec3{0, 0, -1}, masser_size = 0, secunda_size = 0, sun_glare = 0, sun_glare_strength = 0,
 		cloud_lower_offset = 0, cloud_upper_offset = 0, outside = false, time = 0, water = DEFAULT_WATER, wind = 0}
 	viewer.water = DEFAULT_WATER
 	viewer.frame_start = time_now()
@@ -570,7 +582,10 @@ pass_time :: fun(viewer: ^Viewer, seconds: f32, hurried: bool) {
 	scale : f32 = if hurried do HURRIED_TIME_SCALE else TIME_SCALE
 	hours := seconds * scale / 3600
 	viewer.hour += hours
-	if viewer.hour >= 24 do viewer.hour -= 24
+	if viewer.hour >= 24 {
+		viewer.hour -= 24
+		viewer.day += 1
+	}
 	look := &viewer.look
 	look.time += seconds
 	shown := &viewer.shown
@@ -580,7 +595,7 @@ pass_time :: fun(viewer: ^Viewer, seconds: f32, hurried: bool) {
 		lighting := shown.lighting
 		look.state = Sky_State{upper = lighting.ambient, lower = lighting.fog_color, horizon = lighting.fog_color,
 			cloud_lower_color = lighting.ambient, cloud_upper_color = lighting.ambient, sun_color = Vec3{0, 0, 0},
-			sun_direction = Vec3{0, 0, 1}, daylight = 0, lighting = lighting}
+			stars_color = Vec3{0, 0, 0}, sun_direction = Vec3{0, 0, 1}, daylight = 0, lighting = lighting}
 		look.water = lit_water(viewer.water, lighting.ambient * 2)
 		return
 	}
@@ -598,6 +613,72 @@ pass_time :: fun(viewer: ^Viewer, seconds: f32, hurried: bool) {
 	look.cloud_upper_offset += seconds * scale / TIME_SCALE * viewer.weather.cloud_speed_upper
 	shown.lighting = look.state.lighting
 	look.water = lit_water(viewer.water, look.state.lighting.ambient + look.state.lighting.directional * 0.6)
+	move_night_sky(viewer)
+}
+
+// The moons' phases, in turn, by their pictures' names.
+MOON_PHASES :: ["full", "three_wan", "half_wan", "one_wan", "new", "one_wax", "half_wax", "three_wax"]
+
+// The night sky at the hour: the stars turned with it; the moons across
+// it, from dusk to the next morning (Secunda a little ahead and faster),
+// each in its phase by the days gone (a phase lasting the climate's days);
+// the sun's glare, as much as the weather and the sun's height have it.
+move_night_sky :: fun(viewer: ^Viewer) {
+	look := &viewer.look
+	climate := &viewer.climate
+	days := f32(viewer.day) + viewer.hour / 24
+	look.stars_turn = days * 6.2831853 / STARS_TURN_DAYS
+	dusk := climate.sunset_begin
+	since_dusk := viewer.hour - dusk
+	if since_dusk < 0 do since_dusk += 24
+	night_hours := climate.sunrise_end + 24 - dusk
+	along := since_dusk / night_hours * 3.14159265
+	look.masser_direction = vec3_normalize(Vec3{cos_f32(along), 0.45, sin_f32(along)})
+	ahead := along * 1.15 + 0.35
+	look.secunda_direction = vec3_normalize(Vec3{cos_f32(ahead), 0.2, sin_f32(ahead)})
+	look.masser_size = if climate.masser do MASSER_SIZE else 0
+	look.secunda_size = if climate.secunda do SECUNDA_SIZE else 0
+	phase := i64(days / max(climate.phase_days, 1)) % 8
+	if phase != viewer.moon_phase {
+		viewer.moon_phase = phase
+		room := &viewer.room
+		for moon in ["masser", "secunda"] {
+			path : [160]utf8
+			&path + "textures\\sky\\"
+			&path + moon
+			&path + "_"
+			&path + MOON_PHASES[phase]
+			&path + ".dds"
+			slot := texture_for(&viewer.renderer, &viewer.textures, path[:], &room.texture, CLAMP_BOTH)
+			if moon == "masser" do look.masser = slot
+			else do look.secunda = slot
+		}
+	}
+	glare := mix_number(viewer.last_weather.sun_glare, viewer.weather.sun_glare, viewer.weather_share)
+	look.sun_glare_strength = glare * look.state.daylight * min(1, max(0, look.state.sun_direction.z * 4))
+}
+
+// The night sky's textures: its stars' and nebula's (the climate's night
+// sky mesh's first two parts'), and the sun's glare's.
+night_sky_textures :: fun(viewer: ^Viewer) -> err {
+	look := &viewer.look
+	room := &viewer.room
+	look.sun_glare = texture_for(&viewer.renderer, &viewer.textures, viewer.climate.sun_glare_texture[:], &room.texture, CLAMP_BOTH)
+	look.stars = 0
+	look.nebula = 0
+	viewer.moon_phase = -1
+	if viewer.climate.stars.len == 0 do return
+	index, found := find_file(&viewer.meshes, viewer.climate.stars[:])
+	if not found do return Not_In_Archive
+	room.file.len = 0
+	data := read_file(&viewer.meshes, index, &room.file)?
+	room.blocks.len = 0
+	failure := Nif_Failure{block = 0, type_name = room.file[0:0]}
+	mesh := read_nif(data, &room.blocks, &failure)?
+	room.model.len = 0
+	built := build_model(&mesh, &room.model)?
+	if built.parts.len > 0 do look.stars = texture_for(&viewer.renderer, &viewer.textures, built.parts[0].texture[:], &room.texture)
+	if built.parts.len > 1 do look.nebula = texture_for(&viewer.renderer, &viewer.textures, built.parts[1].texture[:], &room.texture)
 }
 
 // Water whose colors are lit by a light: dim at night, its own by day.
@@ -635,6 +716,12 @@ take_sky :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32) {
 	}
 	look := &viewer.look
 	look.sun = texture_for(&viewer.renderer, &viewer.textures, viewer.climate.sun_texture[:], &viewer.room.texture)
+	night_error := night_sky_textures(viewer)
+	if night_error {
+		note(&viewer.journal, "couldn't read the night sky: ")
+		note_error(&viewer.journal, night_error)
+		note_end(&viewer.journal)
+	}
 	journal := &viewer.journal
 	note(journal, "the sky: sunrise ")
 	note(journal, i64(viewer.climate.sunrise_begin))

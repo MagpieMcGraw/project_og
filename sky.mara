@@ -114,6 +114,7 @@ Sky_State :: struct {
 	cloud_lower_color: Vec3
 	cloud_upper_color: Vec3
 	sun_color: Vec3            // the sun's disc
+	stars_color: Vec3          // the stars' (dark by day)
 	sun_direction: Vec3        // toward the sun (below the horizon at night)
 	daylight: f32              // 0 at night, 1 by day
 	lighting: Cell_Lighting
@@ -407,6 +408,7 @@ changing_sky_at :: fun(climate: ^Climate, last: ^Weather, coming: ^Weather, shar
 	mixed.cloud_lower_color = mix_vec3(from.cloud_lower_color, to.cloud_lower_color, share)
 	mixed.cloud_upper_color = mix_vec3(from.cloud_upper_color, to.cloud_upper_color, share)
 	mixed.sun_color = mix_vec3(from.sun_color, to.sun_color, share)
+	mixed.stars_color = mix_vec3(from.stars_color, to.stars_color, share)
 	mixed.lighting.ambient = mix_vec3(from.lighting.ambient, to.lighting.ambient, share)
 	mixed.lighting.directional = mix_vec3(from.lighting.directional, to.lighting.directional, share)
 	mixed.lighting.fog_color = mix_vec3(from.lighting.fog_color, to.lighting.fog_color, share)
@@ -450,6 +452,7 @@ sky_at :: fun(climate: Climate, weather: ^Weather, hour: f32, most_fog: f32) -> 
 		cloud_lower_color = mixed_color(weather, CLOUDS_LOWER, weights),
 		cloud_upper_color = mixed_color(weather, CLOUDS_UPPER, weights),
 		sun_color = mixed_color(weather, SUN, weights),
+		stars_color = mixed_color(weather, STARS, weights),
 		sun_direction = sun_direction,
 		daylight = daylight,
 		lighting = Cell_Lighting{

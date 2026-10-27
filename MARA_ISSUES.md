@@ -22,6 +22,12 @@ against Mara at the time written. When one is fixed, move it to Fixed
   type. sooblivion writes the two prints apart (sooblivion.mara,
   command_sky).
 
+- mara.open_gl has Uniform1f, Uniform2f and Uniform3f but no Uniform4f
+  (nor glUniform4f in its foreign block, and GL's functions come through
+  gl_load, so a program can't declare its own). sooblivion passes a
+  moon's direction and size as a vec3 and a float (render.mara, the sky
+  program).
+
 ## Answered (not issues)
 
 - Struct values can't be compared (`part.diffuse != Vec3{1, 1, 1}`): not
