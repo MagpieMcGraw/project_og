@@ -32,9 +32,40 @@ MAX_TREE_LEVELS :: 8
 MAX_TREE_LEAVES :: 8
 MAX_CURVE_POINTS :: 8
 
-// Of the places the branch levels give for leaves, the share that get one
-// (the rest would make the crown far thicker than the game's billboards).
-LEAF_SHARE :: 0.25
+// How thickly leaves cover a crown: the opaque part of their cards (as
+// much of each as its leaf texture is: Tree_Fit's leaf_fill), this many
+// times the crown's area (seen from the side, an ellipse). The places the
+// branch levels give for leaves are thinned to it; where there are too
+// few, each gets more cards round it, up to LEAF_MOST_PER_PLACE.
+LEAF_COVERAGE :: 1.6
+LEAF_MOST_PER_PLACE :: 4
+
+// Whether a level's curves go along the part of its parent its branches
+// grow from (first_child to last_child), or along the whole parent. (The
+// whole: the white pine's branches are longest where its trunk's first
+// grow, 0.3 along it, where their length's curve is highest.)
+CURVES_ACROSS_SPAN :: false
+
+// How far a grown tree is stretched or squeezed sideways, at most, to be
+// as wide as its billboard (Tree_Fit).
+LEAST_SIDEWAYS :: 0.6
+MOST_SIDEWAYS :: 1.8
+
+// A tree's size in its billboard, in units: its silhouette's (where the
+// picture's alpha is at least a half). A grown tree is fitted to it: as
+// tall, and stretched sideways to be as wide (LEAST_SIDEWAYS to
+// MOST_SIDEWAYS), so it looks like the game's and its billboard takes its
+// place unchanged. Zero: grown as it grows.
+Tree_Fit :: struct {
+	width: f32
+	height: f32
+	leaf_fill: f32   // how much of its leaf texture is opaque (LEAF_ALPHA_TEST); 0: not known
+}
+
+// Leaves are cut out where their texture's alpha is below this. (Their
+// alpha is soft: needles' edges are grey. The mesh program makes up for
+// what the smaller mipmaps lose.)
+LEAF_ALPHA_TEST :: 0.3
 
 // How many vertices a tree's bark or leaves can have (a part's indexes
 // are 16-bit).
@@ -181,6 +212,15 @@ read_speed_tree :: fun(data: []byte, tree: ^Speed_Tree) -> err {
 		}
 	}
 	if first do return Not_A_Speed_Tree
+	// A tree whose leaf texture is one picture (8 of them) gives no
+	// rectangles: each leaf has all of it.
+	for &leaf in tree.leaves {
+		unplaced := true
+		for corner in leaf.corners {
+			if corner != 0 do unplaced = false
+		}
+		if unplaced do leaf.corners = [1, 1, 0, 1, 0, 0, 1, 0]
+	}
 }
 
 // One of a branch level's values.
@@ -383,7 +423,15 @@ roll :: fun(dice: ^u64) -> f32 {
 // for stored in the storage the lists are carved from. MARA_ISSUES.md.)
 Growth :: struct {
 	dice: u64
+	leaf_dice: u64            // the leaves' own: they're thinned without the branches changing
 	units: f32                // the tree's size, scaled: what lengths are shares of
+	counting: bool            // the first time: leaves counted (leaf_area, crown_low and high), not made
+	leaf_area: f32
+	leaf_places: i64
+	crown_low: Vec3
+	crown_high: Vec3
+	leaf_share: f32           // the share of leaf places given a card
+	leaf_cards: i64           // how many cards each leaf place given one gets
 	bark_vertices: []Vertex
 	bark_indices: []u16
 	leaf_vertices: []Vertex
@@ -397,29 +445,51 @@ Growth :: struct {
 // tree's own, or one of its TREE record's: each grows a different one):
 // its bark, round its trunk and branches (textures\trees\branches\), and
 // its leaves, cards that face the camera (leaf_texture), made in storage.
-grow_tree :: fun(tree: ^Speed_Tree, seed: i64, leaf_texture: []utf8, storage: ^[]byte) -> Model, Growth_Report, err {
+// Fitted to its billboard's size (Tree_Fit), where that's given.
+grow_tree :: fun(tree: ^Speed_Tree, seed: i64, leaf_texture: []utf8, fit: Tree_Fit, storage: ^[]byte) -> Model, Growth_Report, err {
 	report := Growth_Report{branches = 0, leaves = 0, left_out = 0}
 	if tree.levels.len == 0 do return Model{0}, report, Not_A_Speed_Tree
 	growth := Growth{
-		dice = u64(seed) *% 0x2545F4914F6CDD1D +% 1,
+		dice = 0, leaf_dice = 0,
 		units = tree.size * tree.scale / 100,
+		counting = true, leaf_area = 0, leaf_places = 0,
+		crown_low = Vec3{1000000, 1000000, 1000000}, crown_high = Vec3{-1000000, -1000000, -1000000},
+		leaf_share = 1, leaf_cards = 1,
 		bark_vertices = slice([:TREE_PART_VERTICES]Vertex, storage),
 		bark_indices = slice([:TREE_PART_VERTICES * 6]u16, storage),
 		leaf_vertices = slice([:TREE_PART_VERTICES]Vertex, storage),
 		leaf_indices = slice([:TREE_PART_VERTICES * 3 / 2]u16, storage),
 		branches = 0, leaves = 0, left_out = 0}
 
-	// The trunk: up, leaning a little (its start angle's variance) to a
-	// side at random.
-	trunk := &tree.levels[0]
-	lean := (curve_value(&trunk.start_angle, 0, &growth.dice) + 90) * PI / 180
-	side := roll(&growth.dice) * 2 * PI
-	lean_axis := Vec3{cos_f32(side), sin_f32(side), 0}
-	trunk_way := turned_about(Vec3{0, 0, 1}, lean_axis, lean)
-	trunk_length := curve_value(&trunk.length, 0, &growth.dice) * growth.units
-	trunk_radius := curve_value(&trunk.radius, 0, &growth.dice) * trunk_length
-	grow_branch(&growth, tree, 0, Vec3{0, 0, 0}, trunk_way, trunk_length, trunk_radius, 0)
+	// Grown twice: first to count the places for leaves and see the crown,
+	// then again (the same, the dice started again) with as many leaves as
+	// cover it (LEAF_COVERAGE).
+	grow_from_seed(&growth, tree, seed)
+	// Its size as grown: the crown its leaves' places make (as far round
+	// as the average leaf reaches), the top of that or of its trunk.
+	upward : f32 = 1
+	sideways : f32 = 1
+	if growth.leaf_places > 0 {
+		leaf_side := sqrt_f32(growth.leaf_area / f32(growth.leaf_places))
+		crown := growth.crown_high - growth.crown_low
+		crown_width := max(crown.x, crown.y) + leaf_side
+		top := growth.crown_high.z + leaf_side / 2
+		for &vertex in growth.bark_vertices do top = max(top, vertex.position.z)
+		if fit.height > 0 and top > 0 do upward = fit.height / top
+		if fit.width > 0 do sideways = min(max(fit.width / upward / crown_width, LEAST_SIDEWAYS), MOST_SIDEWAYS)
+		fill := if fit.leaf_fill > 0 do fit.leaf_fill else 0.5
+		wanted := LEAF_COVERAGE * PI / 4 * crown_width * sideways * (crown.z + leaf_side) / max(fill, 0.1)
+		growth.leaf_share = min(wanted / growth.leaf_area, 1)
+		if wanted > growth.leaf_area do growth.leaf_cards = min(i64(ceil_f32(wanted / growth.leaf_area)), LEAF_MOST_PER_PLACE)
+	}
+	growth.counting = false
+	growth.bark_vertices.len = 0
+	growth.bark_indices.len = 0
+	growth.branches = 0
+	growth.left_out = 0
+	grow_from_seed(&growth, tree, seed)
 	shade_leaves(&growth)
+	fit_growth(&growth, upward, sideways)
 
 	parts := slice([:2]Model_Part, storage)
 	low := Vec3{1000000, 1000000, 1000000}
@@ -434,6 +504,22 @@ grow_tree :: fun(tree: ^Speed_Tree, seed: i64, leaf_texture: []utf8, storage: ^[
 	if growth.leaf_indices.len > 0 do &parts + tree_part(&growth, true, leaf_texture)
 	report = Growth_Report{branches = growth.branches, leaves = growth.leaves, left_out = growth.left_out}
 	return Model{parts = parts[:], flips = [], particles = [], motions = [], bounds_min = low, bounds_max = high}, report
+}
+
+// Grows the tree from its trunk, the dice started from the seed.
+grow_from_seed :: fun(growth: ^Growth, tree: ^Speed_Tree, seed: i64) {
+	growth.dice = u64(seed) *% 0x2545F4914F6CDD1D +% 1
+	growth.leaf_dice = growth.dice ~ 0x5DEECE66D
+	// The trunk: up, leaning a little (its start angle's variance) to a
+	// side at random.
+	trunk := &tree.levels[0]
+	lean := (curve_value(&trunk.start_angle, 0, &growth.dice) + 90) * PI / 180
+	side := roll(&growth.dice) * 2 * PI
+	lean_axis := Vec3{cos_f32(side), sin_f32(side), 0}
+	trunk_way := turned_about(Vec3{0, 0, 1}, lean_axis, lean)
+	trunk_length := curve_value(&trunk.length, 0, &growth.dice) * growth.units
+	trunk_radius := curve_value(&trunk.radius, 0, &growth.dice) * trunk_length
+	grow_branch(growth, tree, 0, Vec3{0, 0, 0}, trunk_way, trunk_length, trunk_radius, 0)
 }
 
 // What growing a tree made: how many branches (the trunk one) and leaves,
@@ -494,17 +580,29 @@ grow_branch :: fun(growth: ^Growth, tree: ^Speed_Tree, level_index: i64, start: 
 		t := first + (last - first) * (f32(c) + roll(&growth.dice)) / f32(count)
 		// The child level's curves go across the part this one's children
 		// grow from: 0 where they start, 1 where they stop.
-		span : f32 = if last > first do (t - first) / (last - first) else 0
+		span : f32 = t
+		if CURVES_ACROSS_SPAN do span = if last > first do (t - first) / (last - first) else 0
 		at, parent_way := spine_at(spine[:], t)
 		turn_round += 137.5 * PI / 180 + (2 * roll(&growth.dice) - 1) * 0.3
 		out := turned_about(square_to(parent_way), parent_way, turn_round)
 		angle := curve_value(&child_level.start_angle, span, &growth.dice) * PI / 180
 		child_way := vec3_normalize(turned_about(parent_way, vec3_normalize(cross(parent_way, out)), angle))
 		if leaves_next {
-			if roll(&growth.dice) > LEAF_SHARE do continue
 			// A leaf where the leaf level's stem would end.
-			stem := curve_value(&child_level.length, span, &growth.dice) * growth.units
-			add_leaf(growth, tree, at + child_way * stem)
+			stem := curve_value(&child_level.length, span, &growth.leaf_dice) * growth.units
+			place := at + child_way * stem
+			if growth.counting {
+				count_leaf(growth, tree, place)
+			elif roll(&growth.leaf_dice) <= growth.leaf_share
+				add_leaf(growth, tree, place)
+				// More round it, where the places are too few: up to half a
+				// leaf away.
+				for extra in 1:growth.leaf_cards {
+					reach := sqrt_f32(growth.leaf_area / f32(growth.leaf_places)) * 0.5
+					away := Vec3{2 * roll(&growth.leaf_dice) - 1, 2 * roll(&growth.leaf_dice) - 1, 2 * roll(&growth.leaf_dice) - 1}
+					add_leaf(growth, tree, place + away * reach)
+				}
+			}
 			continue
 		}
 		child_length := curve_value(&child_level.length, span, &growth.dice) * growth.units
@@ -569,6 +667,17 @@ add_tube :: fun(growth: ^Growth, level: ^Branch_Level, spine: []Vec3, radius: f3
 	}
 }
 
+// A place for a leaf counted: the crown widened to take it in, and the
+// average leaf picture's area added.
+count_leaf :: fun(growth: ^Growth, tree: ^Speed_Tree, place: Vec3) {
+	if tree.leaves.len == 0 do return
+	area : f32 = 0
+	for &picture in tree.leaves do area += picture.size[0] * picture.size[1]
+	growth.leaf_area += area / f32(tree.leaves.len) * growth.units * growth.units
+	growth.leaf_places += 1
+	widen(&growth.crown_low, &growth.crown_high, place, 0)
+}
+
 // A leaf card at a place: one of the tree's leaf pictures at random, its
 // size and its corners. A card's corners all sit at its place; each keeps
 // how far it's set off across and up from there (its tangent's first two),
@@ -580,11 +689,11 @@ add_leaf :: fun(growth: ^Growth, tree: ^Speed_Tree, place: Vec3) {
 		return
 	}
 	growth.leaves += 1
-	picture := &tree.leaves[min(i64(roll(&growth.dice) * f32(tree.leaves.len)), tree.leaves.len - 1)]
+	picture := &tree.leaves[min(i64(roll(&growth.leaf_dice) * f32(tree.leaves.len)), tree.leaves.len - 1)]
 	width := picture.size[0] * growth.units
 	height := picture.size[1] * growth.units
 	// A little darker or lighter, the same all over.
-	shade := 0.8 + 0.2 * roll(&growth.dice)
+	shade := 0.8 + 0.2 * roll(&growth.leaf_dice)
 	first_vertex := growth.leaf_vertices.len
 	// The corners as the leaf's rectangle has them: right top, left top,
 	// left bottom, right bottom.
@@ -600,6 +709,52 @@ add_leaf :: fun(growth: ^Growth, tree: ^Speed_Tree, place: Vec3) {
 			tangent = [(across[c] - picture.pivot[0]) * width, (up[c] - picture.pivot[1]) * height, 0, 1]}
 	}
 	for k in [0, 1, 2, 0, 2, 3] do &growth.leaf_indices + u16(first_vertex + k)
+}
+
+// Scales a grown tree (Tree_Fit): all of it upward times, and its places
+// across (not its leaf cards) sideways times more.
+fit_growth :: fun(growth: ^Growth, upward: f32, sideways: f32) {
+	stretch := Vec3{upward * sideways, upward * sideways, upward}
+	for &vertex in growth.bark_vertices do vertex.position = vertex.position * stretch
+	for &vertex in growth.leaf_vertices {
+		vertex.position = vertex.position * stretch
+		vertex.tangent[0] *= upward
+		vertex.tangent[1] *= upward
+	}
+}
+
+// A tree's size in its billboard (Tree_Fit), from the picture's pixels
+// (red, green, blue, alpha; columns by rows, from the top), the picture
+// being width by height units: the columns its silhouette spans, and how
+// far down from the top it starts (its foot is at the bottom).
+billboard_fit :: fun(pixels: []byte, columns: i64, rows: i64, width: f32, height: f32) -> Tree_Fit {
+	none := Tree_Fit{width = 0, height = 0, leaf_fill = 0}
+	left := columns
+	right : i64 = -1
+	top := rows
+	for y in 0:rows {
+		for x in 0:columns {
+			alpha := u8(pixels[4 * (y * columns + x) + 3])
+			if alpha < 128 do continue
+			left = min(left, x)
+			right = max(right, x)
+			top = min(top, y)
+		}
+	}
+	if right < left do return none
+	return Tree_Fit{width = f32(right - left + 1) / f32(columns) * width, height = f32(rows - top) / f32(rows) * height, leaf_fill = 0}
+}
+
+// How much of a leaf texture (its pixels, as billboard_fit's) is opaque
+// enough to be drawn (LEAF_ALPHA_TEST).
+leaf_fill :: fun(pixels: []byte) -> f32 {
+	opaque : i64 = 0
+	count := pixels.len / 4
+	for k in 0:count {
+		alpha := u8(pixels[4 * k + 3])
+		if f32(alpha) / 255 >= LEAF_ALPHA_TEST do opaque += 1
+	}
+	return if count > 0 do f32(opaque) / f32(count) else 0
 }
 
 // The leaves' normals: out from the middle of the crown (and a little up),
@@ -632,7 +787,7 @@ tree_part :: fun(growth: ^Growth, leaves: bool, texture: []utf8) -> Model_Part {
 		alpha_blend = false,
 		depth_write = true,
 		alpha_test = leaves,
-		alpha_threshold = if leaves do 0.5 else 0,
+		alpha_threshold = if leaves do LEAF_ALPHA_TEST else 0,
 		two_sided = leaves,
 		diffuse = Vec3{1, 1, 1},
 		emissive = Vec3{0, 0, 0},

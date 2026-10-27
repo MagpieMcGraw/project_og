@@ -2507,6 +2507,8 @@ usage :: fun() {
 	print("sooblivion plugins                 the plugins loaded, in order, and the archives")
 	print("sooblivion tree <name.spt | -all> [seed]")
 	print("                                   a SpeedTree file read and grown (every one: -all)")
+	print("sooblivion tree-picture <TREE editor id> <out.png> [seed]")
+	print("                                   a tree grown and drawn by hand beside its billboard")
 	print("sooblivion overlaps <world> <x> <y> <z> [radius]")
 	print("                                   drawn shapes lying on one another near a point (flicker)")
 	print("sooblivion mp3 <file> [raw]        decodes an MP3 (into raw floats, if given)")
@@ -2735,7 +2737,7 @@ command_tree :: fun(name: []utf8, seed_text: []utf8) {
 					continue
 				}
 				model_storage.len = 0
-				grown, report, grow_error := grow_tree(&tree, tree.seed, "", &model_storage)
+				grown, report, grow_error := grow_tree(&tree, tree.seed, "", Tree_Fit{width = 0, height = 0, leaf_fill = 0}, &model_storage)
 				if grow_error {
 					failed += 1
 					print("  % couldn't be grown: %", file_path, grow_error)
@@ -2788,7 +2790,7 @@ command_tree :: fun(name: []utf8, seed_text: []utf8) {
 		number, is_number := parse_number(seed_text)
 		if is_number do seed = i64(number)
 	}
-	grown, report, grow_error := grow_tree(&tree, seed, "", &model_storage)
+	grown, report, grow_error := grow_tree(&tree, seed, "", Tree_Fit{width = 0, height = 0, leaf_fill = 0}, &model_storage)
 	if grow_error {
 		print("couldn't grow it: %", grow_error)
 		return
@@ -3166,6 +3168,8 @@ main :: (args: [][]utf8) {
 		command_plugins()
 	elif command == "tree" and args.len > 2
 		command_tree(args[2], if args.len > 3 do args[3] else "")
+	elif command == "tree-picture" and args.len > 3
+		command_tree_picture(args[2], args[3], if args.len > 4 do args[4] else "")
 	elif command == "overlaps" and args.len > 5
 		x, x_ok := parse_number(args[3])
 		y, y_ok := parse_number(args[4])

@@ -29,6 +29,7 @@ use audio
 use collision
 use animation
 use speedtree
+use dds
 
 // Room for the models' collision: points, three a triangle. (Tamriel's
 // meshes have 1.8 million triangles in all; a scene's models, a few hundred
@@ -290,6 +291,7 @@ Scene :: struct {
 Tree_Kind :: struct {
 	look: Tree_Look
 	texture: i64
+	fit: Tree_Fit          // its size in its billboard: what it's grown to
 }
 
 // Where the scene's models come from: the game's archives, and the renderer
@@ -747,13 +749,42 @@ tree_kind :: fun(scene: ^Scene, plugin: ^Plugin, base: u32, loader: Loader) -> i
 			// (The picture fills its texture: clamped, its edges don't pick up the far side.)
 			texture := texture_for(loader.renderer, loader.archives, look.billboard[:], &loader.room.texture, CLAMP_BOTH)
 			if texture != 0 {
-				&scene.kinds + Tree_Kind{look = look, texture = texture}
+				fit, fit_error := read_billboard_fit(loader, &look)
+				if fit_error do note_failure(scene, look.billboard[:], fit_error)
+				&scene.kinds + Tree_Kind{look = look, texture = texture, fit = fit}
 				kind_index = scene.kinds.len - 1
 			}
 		}
 	}
 	_ = index_put(&scene.tree_kinds, u64(base), kind_index + 1)
 	return kind_index
+}
+
+// A tree's size in its billboard and how opaque its leaves are (Tree_Fit:
+// grown trees are fitted to it), from the pictures' smallest mipmaps at
+// least 64 wide.
+read_billboard_fit :: fun(loader: Loader, look: ^Tree_Look) -> Tree_Fit, err {
+	columns, rows := small_picture(loader, look.billboard[:])?
+	fit := billboard_fit(loader.room.model, columns, rows, look.width, look.height)
+	small_picture(loader, look.leaves[:])?
+	fit.leaf_fill = leaf_fill(loader.room.model)
+	return fit
+}
+
+// A texture's smallest mipmap at least 64 wide, decoded into the room's
+// model room (red, green, blue, alpha, rows from the top): how many columns
+// and rows.
+small_picture :: fun(loader: Loader, path: []utf8) -> i64, i64, err {
+	found, in_archives := find_archived(loader.archives, path)
+	if not in_archives do return 0, 0, Not_In_Archive
+	loader.room.file.len = 0
+	data := read_archived(loader.archives, found, &loader.room.file)?
+	texture := read_texture(data)?
+	mip : i64 = 0
+	for mip + 1 < texture.mips.len and texture.mips[mip + 1].width >= 64 do mip += 1
+	loader.room.model.len = 0
+	decode_rgba(texture, mip, &loader.room.model)?
+	return texture.mips[mip].width, texture.mips[mip].height
 }
 
 // Puts a cell's trees on the card, unless they're there: in a free slot,
@@ -799,13 +830,14 @@ TREE_MODEL_KEY :: 0x4000000000000000
 tree_model :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, base: u32, reference: u32) -> i64 {
 	kind_index := tree_kind(scene, plugin, base, loader)
 	if kind_index < 0 do return -1
-	look := &scene.kinds[kind_index].look
+	kind := &scene.kinds[kind_index]
+	look := &kind.look
 	seed_index : i64 = 0
 	if look.seeds.len > 0 do seed_index = i64(reference % u32(look.seeds.len))
 	key := TREE_MODEL_KEY | (u64(base) << 8) | u64(seed_index)
 	known, found := index_get(&scene.paths, key)
 	if found do return known - 1
-	model_index, grow_error := grow_tree_model(scene, loader, look, seed_index)
+	model_index, grow_error := grow_tree_model(scene, loader, kind, seed_index)
 	if grow_error {
 		note_failure(scene, look.model[:], grow_error)
 		model_index = -1
@@ -814,10 +846,11 @@ tree_model :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, base: u32, ref
 	return model_index
 }
 
-// Grows a tree after its look's SpeedTree file, with its seed_index-th seed
-// (the file's own where the record names none), and puts it on the card:
-// its model's index.
-grow_tree_model :: fun(scene: ^Scene, loader: Loader, look: ^Tree_Look, seed_index: i64) -> i64, err {
+// Grows a tree after its kind's SpeedTree file, with its seed_index-th seed
+// (the file's own where the record names none), fitted to its billboard,
+// and puts it on the card: its model's index.
+grow_tree_model :: fun(scene: ^Scene, loader: Loader, kind: ^Tree_Kind, seed_index: i64) -> i64, err {
+	look := &kind.look
 	if scene.models.len == scene.models.cap do return -1, No_Room_For_Models
 	found, in_archives := find_archived(loader.archives, look.model[:])
 	if not in_archives do return -1, Not_In_Archive
@@ -827,7 +860,7 @@ grow_tree_model :: fun(scene: ^Scene, loader: Loader, look: ^Tree_Look, seed_ind
 	read_speed_tree(data, &tree)?
 	seed := if look.seeds.len > 0 do look.seeds[seed_index] else tree.seed
 	loader.room.model.len = 0
-	grown, _ := grow_tree(&tree, seed, look.leaves[:], &loader.room.model)?
+	grown, _ := grow_tree(&tree, seed, look.leaves[:], kind.fit, &loader.room.model)?
 	gpu := upload_model(loader.renderer, &grown, loader.archives, &loader.room.texture)?
 	// (No collision yet: walking goes through trees.)
 	&scene.model_collision + Collision_Range{first = scene.collision_points.len, count = 0}

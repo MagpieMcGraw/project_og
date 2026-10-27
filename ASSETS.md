@@ -192,10 +192,12 @@ guesses for now.
 - Trees, grown here as SpeedTree's library isn't to be had (see
   speedtree.mara): lengths as shares of the file's size times its scale
   (2006, in percent: what makes young trees small); the children's curves
-  read across the span they grow from; a branch's count its frequency
-  times its length's share of the size, and a quarter of the leaf places
-  given a card; gravity bending each segment down by how far it reaches
-  sideways. Which of a record's seeds a reference grows (its form id
+  read along their parent's whole length; a branch's count its frequency
+  times its length's share of the size; gravity bending each segment down
+  by how far it reaches sideways. Then fitted to the billboard: as tall
+  as its silhouette and stretched sideways (0.6 to 1.8 times) to be as
+  wide, with as many leaf cards as cover the crown 1.6 times over in
+  their opaque parts. Which of a record's seeds a reference grows (its form id
   picks one here), and how far away the game turns trees to billboards
   (4096 units here).
 - Music: what an interior cell of the default type plays (Explore here);

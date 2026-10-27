@@ -168,6 +168,7 @@ flat out uvec2 part_glow;
 flat out uvec2 part_normal;
 flat out vec4 part_shine;   // its specular color, its glossiness
 flat out vec4 part_motion;
+flat out uint part_flags;
 
 void main() {
 	mat4 world = mat4(world_x, world_y, world_z, world_w);
@@ -194,6 +195,7 @@ void main() {
 	part_normal = normal_map.xy;
 	part_shine = vec4(specular.rgb, uintBitsToFloat(normal_map.z));
 	part_motion = motion;
+	part_flags = normal_map.w;
 }
 "
 
@@ -212,6 +214,10 @@ flat in uvec2 part_glow;
 flat in uvec2 part_normal;
 flat in vec4 part_shine;
 flat in vec4 part_motion;
+flat in uint part_flags;
+
+// An instance's flags (Drawn_Instance's, as PART_*).
+const uint LEAF_CARDS = 1u;
 
 #ifdef BINDLESS
 #define BASE_TEXTURE sampler2D(part_texture)
@@ -275,6 +281,12 @@ void main() {
 	// Its texture where its motion has moved it to now, as opaque as it is now.
 	vec4 base = texture(BASE_TEXTURE, texture_uv + part_motion.xy) * vertex_color;
 	base.a *= part_motion.z;
+	if ((part_flags & LEAF_CARDS) != 0u) {
+		// Leaves' alpha is soft (needles' edges grey) and thins out in the
+		// smaller mipmaps, till the test leaves specks: made up for, a
+		// quarter more opaque for each level down.
+		base.a *= 1.0 + max(textureQueryLod(BASE_TEXTURE, texture_uv).x, 0.0) * 0.25;
+	}
 	if (base.a < part_material.x) discard;
 	// The surface's way, as its normal map turns it (its red along the
 	// texture's x, green along y); how much it shines, the map's alpha.
@@ -299,7 +311,9 @@ void main() {
 	vec3 emitted = part_material.yzw;
 	if (part_glow != uvec2(0u)) emitted *= texture(GLOW_TEXTURE, texture_uv).rgb;
 	float sun_facing = dot(normal, sun_direction);
-	vec3 light = ambient_color + emitted + sun_color * max(sun_facing, 0.0);
+	// (Leaves let the sun through: lit half from behind.)
+	float sun_lit = (part_flags & LEAF_CARDS) != 0u ? 0.5 + 0.5 * sun_facing : max(sun_facing, 0.0);
+	vec3 light = ambient_color + emitted + sun_color * sun_lit;
 	vec3 shine = sun_color * shine_toward(normal, sun_direction, to_eye, sun_facing);
 	// Its lights, nearest first, till the first none.
 	for (int k = 0; k < 16; k++) {
