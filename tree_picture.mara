@@ -1,8 +1,9 @@
-// `sooblivion tree-picture <TREE editor id> <out.png> [seed]`: a tree
+// `sooblivion tree-picture <TREE editor id> <out.png> [seed | bare]`: a tree
 // grown as the viewer grows it, drawn by hand (no window) from the front,
 // lit by a sun from the front left, beside the game's billboard of it at
 // the same scale: to see how near the grown trees come to the game's
-// without starting the game.
+// without starting the game. Bare: without its leaves, to see its
+// branches.
 module sooblivion
 
 use mara.core
@@ -36,7 +37,9 @@ Painted_Texture :: struct {
 	height: i64
 }
 
-command_tree_picture :: fun(name: []utf8, out_path: []utf8, seed_text: []utf8) {
+command_tree_picture :: fun(name: []utf8, out_path: []utf8, seed_or_bare: []utf8) {
+	bare := seed_or_bare == "bare"
+	seed_text := if bare do out_path[0:0] else seed_or_bare
 	data_storage : [400 * MB]byte
 	index_storage : [96 * MB]byte
 	plugin, load_error := load_oblivion(&data_storage, &index_storage)
@@ -128,6 +131,7 @@ command_tree_picture :: fun(name: []utf8, out_path: []utf8, seed_text: []utf8) {
 	texture_storage : [64 * MB]byte
 	pixel_storage : [64 * MB]byte
 	for &part in grown.parts {
+		if bare and part.leaf_cards do continue
 		file_storage.len = 0
 		texture_storage.len = 0
 		painted, texture_error := paint_texture(&archives, part.texture[:], 0, &file_storage, &texture_storage)

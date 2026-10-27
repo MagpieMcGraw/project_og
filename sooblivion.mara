@@ -2507,7 +2507,7 @@ usage :: fun() {
 	print("sooblivion plugins                 the plugins loaded, in order, and the archives")
 	print("sooblivion tree <name.spt | -all> [seed]")
 	print("                                   a SpeedTree file read and grown (every one: -all)")
-	print("sooblivion tree-picture <TREE editor id> <out.png> [seed]")
+	print("sooblivion tree-picture <TREE editor id> <out.png> [seed | bare]")
 	print("                                   a tree grown and drawn by hand beside its billboard")
 	print("sooblivion overlaps <world> <x> <y> <z> [radius]")
 	print("                                   drawn shapes lying on one another near a point (flicker)")

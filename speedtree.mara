@@ -46,6 +46,12 @@ LEAF_MOST_PER_PLACE :: 4
 // grow, 0.3 along it, where their length's curve is highest.)
 CURVES_ACROSS_SPAN :: false
 
+// A branch's radius, at least and at most, as a share of its length: the
+// files' range from the white pine's hairs (0.05%) to the grey poplar's
+// cones (20%).
+BRANCH_LEAST_RADIUS :: 0.02
+BRANCH_MOST_RADIUS :: 0.05
+
 // How far a grown tree is stretched or squeezed sideways, at most, to be
 // as wide as its billboard (Tree_Fit).
 LEAST_SIDEWAYS :: 0.6
@@ -425,6 +431,7 @@ Growth :: struct {
 	dice: u64
 	leaf_dice: u64            // the leaves' own: they're thinned without the branches changing
 	units: f32                // the tree's size, scaled: what lengths are shares of
+	trunk_way: Vec3           // which way its trunk grows from its foot
 	counting: bool            // the first time: leaves counted (leaf_area, crown_low and high), not made
 	leaf_area: f32
 	leaf_places: i64
@@ -452,6 +459,7 @@ grow_tree :: fun(tree: ^Speed_Tree, seed: i64, leaf_texture: []utf8, fit: Tree_F
 	growth := Growth{
 		dice = 0, leaf_dice = 0,
 		units = tree.size * tree.scale / 100,
+		trunk_way = Vec3{0, 0, 1},
 		counting = true, leaf_area = 0, leaf_places = 0,
 		crown_low = Vec3{1000000, 1000000, 1000000}, crown_high = Vec3{-1000000, -1000000, -1000000},
 		leaf_share = 1, leaf_cards = 1,
@@ -517,6 +525,7 @@ grow_from_seed :: fun(growth: ^Growth, tree: ^Speed_Tree, seed: i64) {
 	side := roll(&growth.dice) * 2 * PI
 	lean_axis := Vec3{cos_f32(side), sin_f32(side), 0}
 	trunk_way := turned_about(Vec3{0, 0, 1}, lean_axis, lean)
+	growth.trunk_way = trunk_way
 	trunk_length := curve_value(&trunk.length, 0, &growth.dice) * growth.units
 	trunk_radius := curve_value(&trunk.radius, 0, &growth.dice) * trunk_length
 	grow_branch(growth, tree, 0, Vec3{0, 0, 0}, trunk_way, trunk_length, trunk_radius, 0)
@@ -608,6 +617,10 @@ grow_branch :: fun(growth: ^Growth, tree: ^Speed_Tree, level_index: i64, start: 
 		child_length := curve_value(&child_level.length, span, &growth.dice) * growth.units
 		if child_length <= 0 do continue
 		child_radius := curve_value(&child_level.radius, span, &growth.dice) * child_length
+		// Kept branch-shaped (BRANCH_LEAST_RADIUS to BRANCH_MOST_RADIUS),
+		// and thinner than where it grows from.
+		child_radius = min(max(child_radius, BRANCH_LEAST_RADIUS * child_length), BRANCH_MOST_RADIUS * child_length)
+		child_radius = min(child_radius, 0.85 * radius * curve_height(&level.taper, t))
 		bend := curve_value(&child_level.gravity, span, &growth.dice)
 		grow_branch(growth, tree, level_index + 1, at, child_way, child_length, child_radius, bend)
 	}
@@ -712,15 +725,23 @@ add_leaf :: fun(growth: ^Growth, tree: ^Speed_Tree, place: Vec3) {
 }
 
 // Scales a grown tree (Tree_Fit): all of it upward times, and its places
-// across (not its leaf cards) sideways times more.
+// across (not its leaf cards) sideways times more, out from its trunk's
+// line (so the trunk leans no more than it grew).
 fit_growth :: fun(growth: ^Growth, upward: f32, sideways: f32) {
-	stretch := Vec3{upward * sideways, upward * sideways, upward}
-	for &vertex in growth.bark_vertices do vertex.position = vertex.position * stretch
+	for &vertex in growth.bark_vertices do vertex.position = fitted(growth.trunk_way, vertex.position, upward, sideways)
 	for &vertex in growth.leaf_vertices {
-		vertex.position = vertex.position * stretch
+		vertex.position = fitted(growth.trunk_way, vertex.position, upward, sideways)
 		vertex.tangent[0] *= upward
 		vertex.tangent[1] *= upward
 	}
+}
+
+// A place of a tree fitted (fit_growth): its way across from the trunk's
+// line at its height stretched sideways times, then all of it upward times.
+fitted :: fun(trunk_way: Vec3, place: Vec3, upward: f32, sideways: f32) -> Vec3 {
+	along := trunk_way * (place.z / max(trunk_way.z, 0.1))
+	across := place - along
+	return (along + Vec3{across.x * sideways, across.y * sideways, across.z}) * upward
 }
 
 // A tree's size in its billboard (Tree_Fit), from the picture's pixels
