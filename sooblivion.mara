@@ -546,7 +546,8 @@ command_model :: fun(what: []utf8, name: []utf8) {
 			}
 		}
 		if part.vertices.len > 0 do print("  texture coordinates from % to %; first vertex %", low_uv, high_uv, part.vertices[0])
-		print("  material: diffuse %, emissive %, alpha %; glow map %", part.diffuse, part.emissive, part.alpha, part.glow_texture)
+		print("  material: diffuse %, emissive %, specular % (glossiness %), alpha %; glow map %", part.diffuse, part.emissive,
+			part.specular, part.glossiness, part.alpha, part.glow_texture)
 		if part.billboard_mode >= 0 do print("  under a billboard node, mode %, at %", part.billboard_mode, part.billboard_node[3])
 		if part.flip >= 0 {
 			flip := &built.flips[part.flip]

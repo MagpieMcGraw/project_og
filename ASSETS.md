@@ -18,8 +18,9 @@ Oblivion.esm and the base game's archives; sizes are as stored.
   layers, the sun.
 - **Water:** WATR colors, ripples and scroll, cell water heights.
 - **Meshes:** NIF geometry, base and glow textures, normal maps (`_n`,
-  with their tangent space) and specular (the normal map's alpha, the
-  material's specular color and glossiness), alpha, stencil and z-buffer
+  with their tangent space) and specular (the normal map's alpha, where it
+  has an alpha channel; the material's specular color and glossiness),
+  alpha, stencil and z-buffer
   properties, billboard nodes, flipbook textures, particle systems (box,
   cylinder and sphere emitters), Havok collision for walking, door
   Open/Close sequences and their sound keys.

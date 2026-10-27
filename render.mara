@@ -1233,6 +1233,7 @@ Cached_Texture :: struct {
 	path: [160]utf8
 	id: u32
 	handle: u64            // its bindless handle, resident; 0 without bindless
+	has_alpha: bool        // its file keeps an alpha channel (DXT3, DXT5, 32-bit): a normal map's gloss
 }
 
 // What an instance of a mesh part is drawn with, as the mesh shader reads
@@ -1508,6 +1509,7 @@ one_pixel_texture :: fun(renderer: ^Renderer, pixel: [4!]u8) -> i64 {
 	entry.path.len = 0
 	entry.id = id
 	entry.handle = resident_handle(renderer, id)
+	entry.has_alpha = true
 	return renderer.textures.len - 1
 }
 
@@ -2437,7 +2439,7 @@ texture_for :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratch
 	known, found := index_get(&renderer.texture_index, key)
 	if found do return known
 	if renderer.textures.len == renderer.textures.cap do return 0
-	id, load_error := load_texture(renderer, archive, path, scratch, clamp_mode)
+	id, has_alpha, load_error := load_texture(renderer, archive, path, scratch, clamp_mode)
 	slot : i64 = 0
 	if load_error {
 		renderer.texture_failures += 1
@@ -2453,6 +2455,7 @@ texture_for :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratch
 		&entry.path + path
 		entry.id = id
 		entry.handle = resident_handle(renderer, id)
+		entry.has_alpha = has_alpha
 	}
 	_ = index_put(&renderer.texture_index, key, slot)
 	return slot
@@ -2471,8 +2474,9 @@ text_hash :: fun(text: []utf8) -> u64 {
 // Reads a texture from the archive onto the card: block compressed ones as
 // they are, the rest decoded to plain pixels; its mipmaps as many as it
 // has, sharp at a slant.
-load_texture :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratch: ^[]byte, clamp_mode: u32) -> u32, err {
+load_texture :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratch: ^[]byte, clamp_mode: u32) -> u32, bool, err {
 	texture := read_archive_texture(archive, path, scratch)?
+	has_alpha := texture.format == .dxt3 or texture.format == .dxt5 or texture.format == .bgra8 or texture.format == .bgra4
 
 	id : u32 = 0
 	GenTextures(1, &id)
@@ -2496,7 +2500,7 @@ load_texture :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratc
 		}
 		levels += 1
 	}
-	if levels == 0 do return 0, Empty_Texture
+	if levels == 0 do return 0, false, Empty_Texture
 	// Its mipmaps, as many as it has (many stop short of 1 pixel).
 	TexParameteri(TEXTURE_2D, TEXTURE_MAX_LEVEL, i32(levels - 1))
 	TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(LINEAR_MIPMAP_LINEAR))
@@ -2505,7 +2509,7 @@ load_texture :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratc
 	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_S, i32(if clamp_mode & 2 != 0 do REPEAT else CLAMP_TO_EDGE))
 	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_T, i32(if clamp_mode & 1 != 0 do REPEAT else CLAMP_TO_EDGE))
 	if renderer.anisotropy > 1 do TexParameterf(TEXTURE_2D, TEXTURE_MAX_ANISOTROPY, renderer.anisotropy)
-	return id
+	return id, has_alpha
 }
 
 // A texture from the archive, its header read: into scratch (len set to 0).
@@ -2596,6 +2600,10 @@ upload_model :: fun(renderer: ^Renderer, built: ^Model, archive: ^Archive, scrat
 
 		threshold : f32 = 0
 		if part.alpha_test do threshold = part.alpha_threshold
+		// It shines where its normal map's alpha says: one without an alpha
+		// channel (DXT1, as the game's matte stone and wood have) not at all.
+		normal_slot := normal_map_for(renderer, archive, &part, scratch)
+		shines := normal_slot >= 0 and renderer.textures[normal_slot].has_alpha
 		flip : i64 = -1
 		if part.flip >= 0 do flip = first_flip + part.flip
 		billboard : i64 = -1
@@ -2612,8 +2620,8 @@ upload_model :: fun(renderer: ^Renderer, built: ^Model, archive: ^Archive, scrat
 			base_vertex = i32(renderer.vertices_used),
 			texture_slot = texture_for(renderer, archive, part.texture[:], scratch, part.clamp_mode),
 			glow_slot = glow_map_for(renderer, archive, &part, scratch),
-			normal_slot = normal_map_for(renderer, archive, &part, scratch),
-			specular = part.specular,
+			normal_slot = normal_slot,
+			specular = if shines do part.specular else Vec3{0, 0, 0},
 			glossiness = part.glossiness,
 			alpha_blend = part.alpha_blend,
 			depth_write = part.depth_write,
