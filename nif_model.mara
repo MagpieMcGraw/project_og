@@ -196,6 +196,26 @@ Keys :: struct {
 	}
 }
 
+// A controller of a property's value over time — NiTextureTransformController
+// (a texture's place: its operation, TT_*, of a texturing's slot),
+// NiMaterialColorController (a material's color: its operation, COLOR_*),
+// NiAlphaController (a material's opacity) — by its interpolator, played
+// as a time controller is: its time at a frequency from a phase, between a
+// start and stop; its flags' bit 3 when it's running, bits 1 and 2 past
+// the stop (CYCLE_*).
+Property_Controller :: struct {
+	kind: i64            // VALUE_TEXTURE, VALUE_COLOR or VALUE_ALPHA
+	next: i64
+	flags: u16
+	frequency: f32
+	phase: f32
+	start_time: f32
+	stop_time: f32
+	interpolator: i64
+	slot: u32
+	operation: u32
+}
+
 // What every object in the scene tree has: a name, its place relative to
 // its parent, and the properties it's drawn with.
 Av_Object :: struct {
@@ -281,6 +301,7 @@ Block :: union {
 		emissive: Vec3
 		glossiness: f32
 		alpha: f32
+		controller: i64      // its first controller (a color or alpha controller), -1 for none
 	}
 	Alpha {
 		flags: u16       // bit 0 blending, bits 1-4 and 5-8 its factors, bit 9 testing
@@ -394,6 +415,16 @@ Block :: union {
 	Float_Interpolator {
 		value: f32
 		data: i64
+	}
+	// NiPoint3Interpolator: a point or a color, as its keys say over time
+	// (or its value).
+	Point_Interpolator {
+		value: Vec3
+		data: i64
+	}
+	// NiTextureTransformController, NiMaterialColorController, NiAlphaController.
+	Value_Controller {
+		controller: Property_Controller
 	}
 	// NiBoolInterpolator: on or off, as its keys say over time (or its value).
 	Bool_Interpolator {
@@ -712,7 +743,7 @@ read_block :: fun(reader: ^Nif_Reader, block_type: Block_Type) -> Block {
 	NiVisController
 		return read_data_controller(reader)
 	NiAlphaController
-		return read_data_controller(reader)
+		return read_alpha_controller(reader)
 	NiMaterialColorController
 		return read_material_color_controller(reader)
 	NiFlipController

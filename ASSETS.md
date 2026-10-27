@@ -27,6 +27,8 @@ Oblivion.esm and the base game's archives; sizes are as stored.
 - **Land normal maps:** each layer's `_n`, blended as its colors are.
 - **Sound:** WAV files, SOUN records, placed sounds, light and activator
   sounds, door sounds.
+- **Animation:** Idle sequences' movement, scrolling textures, glow and
+  opacity changes (see below for what's left).
 
 ## Not used yet
 
@@ -58,13 +60,20 @@ Oblivion.esm and the base game's archives; sizes are as stored.
 
 ### Animation on objects
 
+Played now: Idle and SpecialIdle sequences' node movement (hanging
+corpses, ship sails, sigil stones…), and controllers moving a base
+texture across or up (waterfalls, light beams), changing a material's
+glow or opacity — their own, or an Idle's.
+
 | What | Data | Notes |
 |---|---|---|
-| Objects that move | NiControllerManager in 423 meshes (doors done); NiTransformController 164; ANIO 34 | windmills, waterwheels, traps, banners |
-| Scrolling textures | NiTextureTransformController in 42 meshes | lava, waterfalls, Oblivion gates |
-| Color and fade changes | NiMaterialColorController 127, NiAlphaController 21, NiVisController 35 | |
-| Morphs | NiGeomMorpherController in 62 meshes | |
-| Moving along paths | NiPathInterpolator in 9 | |
+| Sequences started by use or by scripts | Forward/Backward (130/66), Open/Close of activators, Equip/Unequip | traps, platforms, levers |
+| Visibility over time | NiVisController in 35 meshes | Oblivion gates' meteors |
+| Particle controllers in sequences | emitter on/off and speed keys in SpecialIdles | Oblivion gates |
+| Textures turned or scaled | NiTextureTransformController's rotate and scale | sigil stones |
+| Material diffuse and other colors | NiMaterialColorController's non-emissive targets | |
+| Morphs | NiGeomMorpherController in 62 meshes | mostly creatures |
+| Moving along paths | NiPathInterpolator in 9 | butterflies, moths, spell effects |
 
 ### Materials
 

@@ -330,7 +330,7 @@ command_nifs :: fun(name: []utf8) {
 		nif_count, block_total, failed, with_trailing, elapsed_ms(start))
 	print("models: % parts, % triangles, % parts without a texture, % failed",
 		part_total, triangle_total, untextured, model_failures)
-	print("a vertex is % bytes, an instance drawn % (the mesh program reads 64 and 160)", size_of(Vertex), size_of(Drawn_Instance))
+	print("a vertex is % bytes, an instance drawn % (the mesh program reads 64 and 176)", size_of(Vertex), size_of(Drawn_Instance))
 	line : str1024
 	for &entry in sequence_names {
 		if entry.count < 3 do continue
@@ -588,6 +588,11 @@ command_model :: fun(what: []utf8, name: []utf8) {
 			if part.depth_write do "" else "no depth written",
 			if part.alpha_test do "alpha-tested" else "",
 			if part.two_sided do "two-sided" else "")
+	}
+	for &motion in built.motions {
+		print("part % changes (%) over % to % s, cycle %, frequency %, phase %: keys at % = %; value %", motion.part, motion.what,
+			motion.start_time, motion.stop_time, motion.cycle, motion.frequency, motion.phase, motion.key_times, motion.key_values,
+			motion.value)
 	}
 	for &system in built.particles {
 		emitter := system.emitter
@@ -1374,6 +1379,13 @@ command_anim :: fun(what: []utf8) {
 		type_name := mesh.header.type_names[i64(mesh.header.block_types[b])]
 		if ends_with(type_name, "Controller") and type_name != "NiControllerManager" {
 			print("controller %: %", b, type_name)
+		}
+		match block^ {
+		Value_Controller value
+			made := value.controller
+			print("  kind %, flags %, % to % s at % times from %, interpolator %, slot %, operation %", made.kind, made.flags,
+				made.start_time, made.stop_time, made.frequency, made.phase, made.interpolator, made.slot, made.operation)
+		else
 		}
 	}
 	// What moves by itself: the Idle's moving tracks, each node's pose at

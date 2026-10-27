@@ -296,7 +296,7 @@ read_fog_property :: fun(reader: ^Nif_Reader) -> Block {
 
 // NiMaterialProperty: a surface's colors and shine.
 read_material_property :: fun(reader: ^Nif_Reader) -> Block {
-	_ = read_object_net(reader)
+	net := read_object_net(reader)
 	if reader.version <= VERSION_10_0_1_2 do skip(reader, 2)   // flags
 	ambient := read_vec3(reader)
 	diffuse := read_vec3(reader)
@@ -310,7 +310,8 @@ read_material_property :: fun(reader: ^Nif_Reader) -> Block {
 		specular = specular,
 		emissive = emissive,
 		glossiness = glossiness,
-		alpha = alpha}
+		alpha = alpha,
+		controller = net.controller}
 }
 
 // NiSpecularProperty: whether the material's specular color shows.

@@ -53,8 +53,37 @@ Model :: struct {
 	parts: []Model_Part
 	flips: []Model_Flip    // the parts' flipbooks (Model_Part.flip), and the particles'
 	particles: []Model_Particles
+	motions: []Model_Motion
 	bounds_min: Vec3
 	bounds_max: Vec3
+}
+
+// The keys a part's changing value holds, at most.
+MOTION_KEYS :: 64
+
+// What of a part changes over time: its texture moved across (u) or up
+// (v), its glow (its material's emissive color), its opacity.
+MOTION_TEXTURE_U :: 0
+MOTION_TEXTURE_V :: 1
+MOTION_GLOW      :: 2
+MOTION_ALPHA     :: 3
+
+// One of a part's values changing over time, as a controller says: which
+// part and what (MOTION_*); its keys (each a time and a value — a color's
+// three, else the first), or with none its value; played as its controller
+// (or the Idle sequence driving it) has it — its time at a frequency from
+// a phase, kept between a start and stop by its cycle (CYCLE_*).
+Model_Motion :: struct {
+	part: i64
+	what: i64
+	start_time: f32
+	stop_time: f32
+	frequency: f32
+	phase: f32
+	cycle: i64
+	key_times: [MOTION_KEYS]f32
+	key_values: [MOTION_KEYS]Vec3
+	value: Vec3
 }
 
 // The keys of a particle system's changing values, at most.
@@ -195,12 +224,15 @@ build_model_part :: fun(mesh: ^Nif, node: i64, left_out: []i64, storage: ^[]byte
 	// for each one.
 	flip_count : i64 = 0
 	system_count : i64 = 0
+	motion_count : i64 = 0
 	for block in mesh.blocks {
 		match block {
 		Flip_Controller
 			flip_count += 1
 		Particle_System
 			system_count += 1
+		Value_Controller
+			motion_count += 1
 		else
 		}
 	}
@@ -208,6 +240,7 @@ build_model_part :: fun(mesh: ^Nif, node: i64, left_out: []i64, storage: ^[]byte
 		parts = slice([:shape_count]Model_Part, storage),
 		flips = slice([:flip_count]Model_Flip, storage),
 		particles = slice([:system_count]Model_Particles, storage),
+		motions = slice([:motion_count]Model_Motion, storage),
 		bounds_min = Vec3{1000000, 1000000, 1000000},
 		bounds_max = Vec3{-1000000, -1000000, -1000000}}
 	none := Inherited{texturing = -1, material = -1, alpha = -1, stencil = -1, z_buffer = -1, vertex_color = -1, billboard_mode = -1, billboard_node = mat4_identity()}
@@ -321,6 +354,7 @@ add_shape :: fun(mesh: ^Nif, geometry: Geometry, extra_data: Refs, transform: Ma
 	part^ = part_look(mesh, properties, model)
 	part.vertices = vertices
 	part.indices = indices
+	add_motions(mesh, properties, model, model.parts.len - 1)
 
 	// The material's color, where the mesh has no colors of its own (they
 	// take its place, as Oblivion's meshes mean them to), and its opacity,
@@ -338,6 +372,169 @@ add_shape :: fun(mesh: ^Nif, geometry: Geometry, extra_data: Refs, transform: Ma
 			vertex.color[3] *= part.alpha
 		}
 	}
+}
+
+// A part's values that change over time: its texturing's controllers that
+// move its base texture, its material's that change its glow or opacity.
+add_motions :: fun(mesh: ^Nif, properties: Inherited, model: ^Model, part: i64) {
+	if properties.texturing >= 0 {
+		match mesh.blocks[properties.texturing] {
+		Texturing texturing
+			add_controller_motions(mesh, texturing.controller, model, part)
+		else
+		}
+	}
+	if properties.material >= 0 {
+		match mesh.blocks[properties.material] {
+		Material material
+			add_controller_motions(mesh, material.controller, model, part)
+		else
+		}
+	}
+}
+
+// The motions of a chain of controllers (from the first): each value
+// controller's that a part's look can follow.
+add_controller_motions :: fun(mesh: ^Nif, first: i64, model: ^Model, part: i64) {
+	at := first
+	for at >= 0 and at < mesh.blocks.len {
+		match mesh.blocks[at] {
+		Value_Controller value
+			made := value.controller
+			what : i64 = -1
+			if made.kind == VALUE_TEXTURE and made.slot == SLOT_BASE {
+				if made.operation == TT_TRANSLATE_U do what = MOTION_TEXTURE_U
+				if made.operation == TT_TRANSLATE_V do what = MOTION_TEXTURE_V
+			}
+			if made.kind == VALUE_COLOR and made.operation == COLOR_EMISSIVE do what = MOTION_GLOW
+			if made.kind == VALUE_ALPHA do what = MOTION_ALPHA
+			if what >= 0 and model.motions.len < model.motions.cap do add_motion(mesh, at, made, what, model, part)
+			at = made.next
+		Flip_Controller flip
+			at = flip.next
+		else
+			return
+		}
+	}
+}
+
+// A controller's motion of a part: its own interpolator and timing, or
+// where it has no interpolator, the one an Idle (or SpecialIdle) sequence
+// drives it with, and the sequence's timing. None when neither has one.
+add_motion :: fun(mesh: ^Nif, controller_index: i64, controller: Property_Controller, what: i64, model: ^Model, part: i64) {
+	interpolator := controller.interpolator
+	start_time := controller.start_time
+	stop_time := controller.stop_time
+	frequency := controller.frequency
+	phase := controller.phase
+	cycle := i64(controller.flags >> 1) & 3
+	if interpolator < 0 {
+		for name in ["Idle", "SpecialIdle"] {
+			sequence_index := find_sequence_named(mesh, name)
+			if sequence_index < 0 do continue
+			match mesh.blocks[sequence_index] {
+			Sequence sequence
+				for k in 0:sequence.block_count {
+					if sequence.blocks.len < (k + 1) * CONTROLLED_BLOCK_SIZE do break
+					driven : i32 = sequence.blocks[k * CONTROLLED_BLOCK_SIZE + 4]
+					if i64(driven) != controller_index do continue
+					driver : i32 = sequence.blocks[k * CONTROLLED_BLOCK_SIZE]
+					interpolator = i64(driver)
+					start_time = sequence.start_time
+					stop_time = sequence.stop_time
+					frequency = sequence.frequency
+					phase = 0
+					cycle = i64(sequence.cycle)
+				}
+			else
+			}
+			if interpolator >= 0 do break
+		}
+	}
+	if interpolator < 0 or interpolator >= mesh.blocks.len do return
+	motion := next(&model.motions)
+	motion.part = part
+	motion.what = what
+	motion.start_time = start_time
+	motion.stop_time = stop_time
+	motion.frequency = frequency
+	motion.phase = phase
+	motion.cycle = cycle
+	motion.key_times.len = 0
+	motion.key_values.len = 0
+	motion.value = Vec3{0, 0, 0}
+	data : i64 = -1
+	match mesh.blocks[interpolator] {
+	Float_Interpolator float_interpolator
+		motion.value = Vec3{float_interpolator.value, 0, 0}
+		data = float_interpolator.data
+	Point_Interpolator point_interpolator
+		motion.value = point_interpolator.value
+		data = point_interpolator.data
+	else
+	}
+	if data < 0 or data >= mesh.blocks.len do return
+	match mesh.blocks[data] {
+	Key_Data key_data
+		keys := key_data.keys
+		for k in 0:keys.count {
+			if motion.key_times.len == motion.key_times.cap do break
+			value := Vec3{0, 0, 0}
+			if keys.value_size == 12 {
+				point : Vec3 = keys.data[keys.value_at(k)]
+				value = point
+			elif keys.value_size == 4
+				number : f32 = keys.data[keys.value_at(k)]
+				value = Vec3{number, 0, 0}
+			}
+			&motion.key_times + keys.time(k)
+			&motion.key_values + value
+		}
+	else
+	}
+	// (One that never changes is the part's look as it is: none.)
+	if motion.key_times.len < 2 do model.motions.len -= 1
+}
+
+// A motion's value at a time of the scene's (seconds): its controller's
+// time played at its frequency from its phase, kept between its start and
+// stop by its cycle; between its keys there, in a line.
+motion_value :: fun(motion: ^Model_Motion, seconds: f32) -> Vec3 {
+	at := seconds * motion.frequency + motion.phase
+	span := motion.stop_time - motion.start_time
+	if span <= 0 {
+		at = motion.start_time
+	elif motion.cycle == CYCLE_CLAMP
+		at = max(motion.start_time, min(motion.stop_time, at))
+	else
+		laps := floor_f32((at - motion.start_time) / span)
+		inside := at - motion.start_time - laps * span
+		if motion.cycle == CYCLE_REVERSE and i64(laps) % 2 != 0 do inside = span - inside
+		at = motion.start_time + inside
+	}
+	keys := motion.key_times.len
+	if keys == 0 do return motion.value
+	if at <= motion.key_times[0] do return motion.key_values[0]
+	for k in 1:keys {
+		if at < motion.key_times[k] {
+			before := motion.key_times[k - 1]
+			share := (at - before) / (motion.key_times[k] - before)
+			return motion.key_values[k - 1] + (motion.key_values[k] - motion.key_values[k - 1]) * share
+		}
+	}
+	return motion.key_values[keys - 1]
+}
+
+// A sequence by its name (any case): its block's index; -1 for none.
+find_sequence_named :: fun(mesh: ^Nif, name: []utf8) -> i64 {
+	for &block, index in mesh.blocks {
+		match block^ {
+		Sequence sequence
+			if compare_folded(sequence.name, name) == 0 do return index
+		else
+		}
+	}
+	return -1
 }
 
 // The vertices' tangents (where the texture's x and y run on them, for

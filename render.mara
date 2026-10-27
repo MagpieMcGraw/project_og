@@ -56,6 +56,7 @@ MESH_INDEX_ROOM :: 33554432
 // Mesh parts on the card, textures loaded, instances drawn in a frame.
 MAX_PARTS :: 65536
 MAX_FLIPS :: 1024
+MAX_MOTIONS :: 2048
 MAX_PARTICLE_KINDS :: 1024
 MAX_PARTICLE_SQUARES :: 16384   // a frame's
 MAX_PARTICLE_RUNS :: 1024
@@ -141,6 +142,7 @@ layout(location = 10) in vec4 material;     // alpha threshold, emissive color
 layout(location = 11) in uvec4 handles;     // its texture's, its glow map's (0 for none; bound: 1 for one)
 layout(location = 12) in uvec4 normal_map;  // its normal map's handle (as the glow map's), its glossiness's bits
 layout(location = 13) in vec4 specular;     // the color it shines
+layout(location = 14) in vec4 motion;       // its texture moved across and up, its opacity (as they change)
 
 uniform mat4 view_projection;
 
@@ -157,6 +159,7 @@ flat out uvec2 part_texture;
 flat out uvec2 part_glow;
 flat out uvec2 part_normal;
 flat out vec4 part_shine;   // its specular color, its glossiness
+flat out vec4 part_motion;
 
 void main() {
 	mat4 world = mat4(world_x, world_y, world_z, world_w);
@@ -175,6 +178,7 @@ void main() {
 	part_glow = handles.zw;
 	part_normal = normal_map.xy;
 	part_shine = vec4(specular.rgb, uintBitsToFloat(normal_map.z));
+	part_motion = motion;
 }
 "
 
@@ -192,6 +196,7 @@ flat in uvec2 part_texture;
 flat in uvec2 part_glow;
 flat in uvec2 part_normal;
 flat in vec4 part_shine;
+flat in vec4 part_motion;
 
 #ifdef BINDLESS
 #define BASE_TEXTURE sampler2D(part_texture)
@@ -252,7 +257,9 @@ float shine_toward(vec3 normal, vec3 to_light, vec3 to_eye, float facing) {
 }
 
 void main() {
-	vec4 base = texture(BASE_TEXTURE, texture_uv) * vertex_color;
+	// Its texture where its motion has moved it to now, as opaque as it is now.
+	vec4 base = texture(BASE_TEXTURE, texture_uv + part_motion.xy) * vertex_color;
+	base.a *= part_motion.z;
 	if (base.a < part_material.x) discard;
 	// The surface's way, as its normal map turns it (its red along the
 	// texture's x, green along y); how much it shines, the map's alpha.
@@ -916,6 +923,8 @@ Mesh_Part :: struct {
 	alpha_threshold: f32   // pixels less opaque are left out; 0 for none
 	emissive: Vec3
 	normal_slot: i64       // its normal map's texture slot, -1 for none
+	first_motion: i64      // its values that change over time (in the renderer's motions)
+	motion_count: i64
 	specular: Vec3         // the color it shines (black: not at all)
 	glossiness: f32
 	additive: bool         // blended by adding its light to what's behind (fire)
@@ -1242,8 +1251,8 @@ Cached_Texture :: struct {
 }
 
 // What an instance of a mesh part is drawn with, as the mesh shader reads
-// it: its matrix, its lights, the part's material, textures and shine —
-// 160 bytes.
+// it: its matrix, its lights, the part's material, textures, shine and
+// motion — 176 bytes.
 Drawn_Instance :: struct {
 	world: Mat4
 	lights: [LIGHTS_PER_OBJECT!]u16
@@ -1254,6 +1263,7 @@ Drawn_Instance :: struct {
 	glossiness: f32
 	flags: u32             // (none yet)
 	specular: [4!]f32      // the color it shines, red, green, blue; the last unused
+	motion: [4!]f32        // its texture moved across and up, its opacity; the last unused
 }
 
 // One draw of MultiDrawElementsIndirect, as OpenGL reads it: 20 bytes.
@@ -1376,6 +1386,12 @@ Renderer :: struct {
 	// slots; the billboard nodes parts are under.
 	flips: [MAX_FLIPS]Gpu_Flip
 	flip_frames: [MAX_FLIP_FRAMES]i64
+	// The parts' values that change over time, and where they are this
+	// frame (each part's: its texture moved across and up, its opacity; its
+	// glow when that changes, else its own).
+	motions: [MAX_MOTIONS]Model_Motion
+	part_motions: [MAX_PARTS][4!]f32
+	part_glows: [MAX_PARTS]Vec3
 	billboards: [MAX_BILLBOARDS]Gpu_Billboard
 
 	// Particles: the models' systems; a frame's squares (made again each
@@ -2384,6 +2400,9 @@ setup_mesh_buffers :: fun(renderer: ^Renderer) {
 	EnableVertexAttribArray(13)
 	VertexAttribPointer(13, 4, FLOAT, 0, instance_stride, 144)         // specular color
 	VertexAttribDivisor(13, 1)
+	EnableVertexAttribArray(14)
+	VertexAttribPointer(14, 4, FLOAT, 0, instance_stride, 160)         // motion
+	VertexAttribDivisor(14, 1)
 	BindVertexArray(0)
 
 	GenBuffers(1, &renderer.indirect_buffer)
@@ -2548,6 +2567,7 @@ upload_model :: fun(renderer: ^Renderer, built: ^Model, archive: ^Archive, scrat
 	if renderer.parts.len + built.parts.len > renderer.parts.cap do return Gpu_Model{0}, No_Room_On_Card
 	if renderer.billboards.len + built.parts.len > renderer.billboards.cap do return Gpu_Model{0}, No_Room_On_Card
 	if renderer.particle_kinds.len + built.particles.len > renderer.particle_kinds.cap do return Gpu_Model{0}, No_Room_On_Card
+	if renderer.motions.len + built.motions.len > renderer.motions.cap do return Gpu_Model{0}, No_Room_On_Card
 	frame_total : i64 = 0
 	for &flip in built.flips do frame_total += flip.frames.len
 	if renderer.flips.len + built.flips.len > renderer.flips.cap or renderer.flip_frames.len + frame_total > renderer.flip_frames.cap {
@@ -2596,7 +2616,7 @@ upload_model :: fun(renderer: ^Renderer, built: ^Model, archive: ^Archive, scrat
 		particles_count = built.particles.len,
 		center = (built.bounds_min + built.bounds_max) * 0.5,
 		radius = vec3_length(built.bounds_max - built.bounds_min) * 0.5}
-	for part in built.parts {
+	for part, part_index in built.parts {
 		if part.indices.len == 0 or part.vertices.len == 0 do continue
 		BindBuffer(ARRAY_BUFFER, renderer.mesh_vertex_buffer)
 		BufferSubData(ARRAY_BUFFER, isize(renderer.vertices_used * size_of(Vertex)), part.vertices)
@@ -2609,6 +2629,11 @@ upload_model :: fun(renderer: ^Renderer, built: ^Model, archive: ^Archive, scrat
 		// channel (DXT1, as the game's matte stone and wood have) not at all.
 		normal_slot := normal_map_for(renderer, archive, &part, scratch)
 		shines := normal_slot >= 0 and renderer.textures[normal_slot].has_alpha
+		// Its values that change over time.
+		first_motion := renderer.motions.len
+		for &motion in built.motions {
+			if motion.part == part_index do &renderer.motions + motion^
+		}
 		flip : i64 = -1
 		if part.flip >= 0 do flip = first_flip + part.flip
 		billboard : i64 = -1
@@ -2626,6 +2651,8 @@ upload_model :: fun(renderer: ^Renderer, built: ^Model, archive: ^Archive, scrat
 			texture_slot = texture_for(renderer, archive, part.texture[:], scratch, part.clamp_mode),
 			glow_slot = glow_map_for(renderer, archive, &part, scratch),
 			normal_slot = normal_slot,
+			first_motion = first_motion,
+			motion_count = renderer.motions.len - first_motion,
 			specular = if shines do part.specular else Vec3{0, 0, 0},
 			glossiness = part.glossiness,
 			alpha_blend = part.alpha_blend,
@@ -3327,6 +3354,22 @@ gather_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]In
 	sort_keys(&renderer.visible)
 	for k in 0:renderer.visible.len do renderer.visible[k] = renderer.visible[k] & 0xFFFFFF
 
+	// The parts that change over time: where their motions are now.
+	for key in renderer.touched {
+		p := key & 0xFFFFF
+		renderer.part_motions[p] = [0, 0, 1, 0]
+		part := renderer.parts[p]
+		renderer.part_glows[p] = part.emissive
+		for m in part.first_motion:part.first_motion + part.motion_count {
+			motion := &renderer.motions[m]
+			value := motion_value(motion, time)
+			if motion.what == MOTION_TEXTURE_U do renderer.part_motions[p][0] = value.x
+			if motion.what == MOTION_TEXTURE_V do renderer.part_motions[p][1] = value.x
+			if motion.what == MOTION_ALPHA do renderer.part_motions[p][2] = value.x
+			if motion.what == MOTION_GLOW do renderer.part_glows[p] = value
+		}
+	}
+
 	// The parts in drawing order; each one's instances' place in the records.
 	sort_keys(&renderer.touched)
 	renderer.commands.len = 0
@@ -3363,7 +3406,9 @@ gather_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]In
 				record.world = billboard_world(&renderer.billboards[part.billboard], instance.world, camera_right, camera_up, camera.position)
 			}
 			record.lights = instance.lights
-			record.material = [part.alpha_threshold, part.emissive.x, part.emissive.y, part.emissive.z]
+			glow := renderer.part_glows[p]
+			record.material = [part.alpha_threshold, glow.x, glow.y, glow.z]
+			record.motion = renderer.part_motions[p]
 			record.texture = renderer.textures[shown_texture(renderer, part)].handle
 			record.glow = 0
 			if part.glow_slot >= 0 do record.glow = if bindless do renderer.textures[part.glow_slot].handle else 1

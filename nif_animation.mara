@@ -127,6 +127,11 @@ read_value_interpolator :: fun(reader: ^Nif_Reader, value_size: i64) -> Block {
 		data := read_ref(reader)
 		return Bool_Interpolator{value = on, data = data}
 	}
+	if value_size == 12 {
+		value := read_vec3(reader)
+		data := read_ref(reader)
+		return Point_Interpolator{value = value, data = data}
+	}
 	skip(reader, value_size)
 	_ = read_ref(reader)   // data
 	return .Other
@@ -342,10 +347,54 @@ read_geom_morpher_controller :: fun(reader: ^Nif_Reader) -> Block {
 
 // NiMaterialColorController: changes one of a material's colors.
 read_material_color_controller :: fun(reader: ^Nif_Reader) -> Block {
-	skip_single_interp_controller(reader)
-	if reader.version >= VERSION_10_1_0_0 do skip(reader, 2)   // which color
+	made := read_value_controller(reader, VALUE_COLOR)
+	if reader.version >= VERSION_10_1_0_0 do made.operation = u32(read_u16(reader))   // which color
 	if reader.version <= VERSION_10_1_0_103 do _ = read_ref(reader)   // data
-	return .Other
+	return Value_Controller{controller = made}
+}
+
+// NiAlphaController: a material's opacity over time.
+read_alpha_controller :: fun(reader: ^Nif_Reader) -> Block {
+	made := read_value_controller(reader, VALUE_ALPHA)
+	if reader.version <= VERSION_10_1_0_103 do _ = read_ref(reader)   // data
+	return Value_Controller{controller = made}
+}
+
+// What's controlled by a value controller.
+VALUE_TEXTURE :: 0
+VALUE_COLOR   :: 1
+VALUE_ALPHA   :: 2
+
+// A texture transform's operation: its place moved across (u) or up (v),
+// turned, or scaled across or up.
+TT_TRANSLATE_U :: 0
+TT_TRANSLATE_V :: 1
+TT_ROTATE      :: 2
+TT_SCALE_U     :: 3
+TT_SCALE_V     :: 4
+
+// A material color controller's color.
+COLOR_AMBIENT  :: 0
+COLOR_DIFFUSE  :: 1
+COLOR_SPECULAR :: 2
+COLOR_EMISSIVE :: 3
+
+// A single-interpolator controller's fields — its time controller's, then
+// its interpolator — as a value controller of a kind (slot and operation
+// still to read).
+read_value_controller :: fun(reader: ^Nif_Reader, kind: i64) -> Property_Controller {
+	next_controller := read_ref(reader)
+	flags := read_u16(reader)
+	frequency := read_f32(reader)
+	phase := read_f32(reader)
+	start_time := read_f32(reader)
+	stop_time := read_f32(reader)
+	_ = read_ref(reader)   // target
+	if reader.version >= VERSION_10_1_0_104 and reader.version <= VERSION_10_1_0_108 do skip(reader, 1)
+	interpolator : i64 = -1
+	if reader.version >= VERSION_10_1_0_104 do interpolator = read_ref(reader)
+	return Property_Controller{kind = kind, next = next_controller, flags = flags, frequency = frequency, phase = phase,
+		start_time = start_time, stop_time = stop_time, interpolator = interpolator, slot = 0, operation = 0}
 }
 
 // NiFlipController: steps a texture slot through a list of textures.
@@ -370,12 +419,12 @@ read_flip_controller :: fun(reader: ^Nif_Reader) -> Block {
 
 // NiTextureTransformController: slides or turns a texture.
 read_texture_transform_controller :: fun(reader: ^Nif_Reader) -> Block {
-	skip_single_interp_controller(reader)
+	made := read_value_controller(reader, VALUE_TEXTURE)
 	skip(reader, 1)   // shader map
-	skip(reader, 4)   // texture slot
-	skip(reader, 4)   // which part of the transform
+	made.slot = read_u32(reader)
+	made.operation = read_u32(reader)
 	if reader.version <= VERSION_10_1_0_103 do _ = read_ref(reader)   // data
-	return .Other
+	return Value_Controller{controller = made}
 }
 
 // NiBSBoneLODController: which bones a skeleton uses at each distance.
