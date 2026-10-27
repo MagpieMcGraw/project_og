@@ -18,6 +18,8 @@ Vertex :: struct {
 	normal: Vec3
 	uv: [2!]f32
 	color: [4!]f32   // red, green, blue, alpha: the mesh's vertex colors, else white
+	tangent: [4!]f32 // where the texture's x (u) runs, across the normal; its last: 1 when
+	                 // y (v) runs along the normal × it, -1 when the other way (mirrored)
 }
 
 // A part of a model: one shape's triangles, and how they're drawn.
@@ -39,6 +41,8 @@ Model_Part :: struct {
 	two_sided: bool
 	diffuse: Vec3
 	emissive: Vec3
+	specular: Vec3          // the color its shine is (black: none); how much shines, its normal map's alpha says
+	glossiness: f32         // how tight the shine is (the power its highlights are raised to)
 	alpha: f32
 	vertex_mode: u32        // what its vertex colors stand for: 0 nothing, 1 its own light, 2 its color
 	lighting_mode: u32      // 0 lit by its own light only, 1 by the scene's lights too
@@ -253,7 +257,7 @@ add_object :: fun(mesh: ^Nif, index: i64, parent: Mat4, inherited: Inherited, mo
 		properties := inherit(mesh, inherited, shape.object.properties)
 		match mesh.blocks[shape.data] {
 		Shape_Data data
-			add_shape(mesh, data.geometry, transform, properties, model, storage)?
+			add_shape(mesh, data.geometry, shape.object.extra_data, transform, properties, model, storage)?
 		else
 		}
 	Particle_System system
@@ -265,7 +269,9 @@ add_object :: fun(mesh: ^Nif, index: i64, parent: Mat4, inherited: Inherited, mo
 }
 
 // Adds a shape's geometry to the model as a part.
-add_shape :: fun(mesh: ^Nif, geometry: Geometry, transform: Mat4, properties: Inherited, model: ^Model, storage: ^[]byte) -> err {
+add_shape :: fun(mesh: ^Nif, geometry: Geometry, extra_data: Refs, transform: Mat4, properties: Inherited, model: ^Model,
+	storage: ^[]byte) -> err
+{
 	count := geometry.vertex_count
 	if count == 0 or geometry.vertices.len == 0 do return
 	if model.parts.len == model.parts.cap do return Too_Many_Parts
@@ -280,7 +286,8 @@ add_shape :: fun(mesh: ^Nif, geometry: Geometry, transform: Mat4, properties: In
 			position = Vec3{position.x, position.y, position.z},
 			normal = Vec3{0, 0, 1},
 			uv = [0, 0],
-			color = [1, 1, 1, 1]}
+			color = [1, 1, 1, 1],
+			tangent = [1, 0, 0, 1]}
 		if geometry.normals.len != 0 {
 			local_normal : Vec3 = geometry.normals[i * 12]
 			turned := mat4_mul_vec4(transform, Vec4{local_normal.x, local_normal.y, local_normal.z, 0})
@@ -308,6 +315,8 @@ add_shape :: fun(mesh: ^Nif, geometry: Geometry, transform: Mat4, properties: In
 		}
 	}
 
+	add_tangents(mesh, extra_data, transform, &vertices, indices)
+
 	part := next(&model.parts)
 	part^ = part_look(mesh, properties, model)
 	part.vertices = vertices
@@ -329,6 +338,75 @@ add_shape :: fun(mesh: ^Nif, geometry: Geometry, transform: Mat4, properties: In
 			vertex.color[3] *= part.alpha
 		}
 	}
+}
+
+// The vertices' tangents (where the texture's x and y run on them, for
+// normal maps): as the shape's file keeps them (TANGENT_SPACE: y's for each
+// vertex, then x's), turned into the model's space; else worked out from
+// the triangles' texture coordinates.
+add_tangents :: fun(mesh: ^Nif, extra_data: Refs, transform: Mat4, vertices: ^[]Vertex, indices: []u16) {
+	count := vertices.len
+	for k in 0:extra_data.count {
+		extra := extra_data.at(k)
+		if extra < 0 or extra >= mesh.blocks.len do continue
+		match mesh.blocks[extra] {
+		Binary_Extra binary
+			if binary.name != TANGENT_SPACE or binary.data.len < count * 24 do continue
+			for i in 0:count {
+				along_v : Vec3 = binary.data[i * 12]
+				along_u : Vec3 = binary.data[count * 12 + i * 12]
+				turned_u := mat4_mul_vec4(transform, Vec4{along_u.x, along_u.y, along_u.z, 0})
+				turned_v := mat4_mul_vec4(transform, Vec4{along_v.x, along_v.y, along_v.z, 0})
+				set_tangent(&vertices[i], Vec3{turned_u.x, turned_u.y, turned_u.z}, Vec3{turned_v.x, turned_v.y, turned_v.z})
+			}
+			return
+		else
+		}
+	}
+
+	// Worked out: each triangle's directions of x and y, weighed by its size,
+	// summed at its corners.
+	along_us : [65536]Vec3
+	along_vs : [65536]Vec3
+	for i in 0:count {
+		&along_us + Vec3{0, 0, 0}
+		&along_vs + Vec3{0, 0, 0}
+	}
+	for t in 0:indices.len / 3 {
+		a := i64(indices[t * 3])
+		b := i64(indices[t * 3 + 1])
+		c := i64(indices[t * 3 + 2])
+		edge_one := vertices[b].position - vertices[a].position
+		edge_two := vertices[c].position - vertices[a].position
+		du_one := vertices[b].uv[0] - vertices[a].uv[0]
+		dv_one := vertices[b].uv[1] - vertices[a].uv[1]
+		du_two := vertices[c].uv[0] - vertices[a].uv[0]
+		dv_two := vertices[c].uv[1] - vertices[a].uv[1]
+		area := du_one * dv_two - du_two * dv_one
+		if abs(area) < 0.0000001 do continue
+		along_u := (edge_one * dv_two - edge_two * dv_one) * (1 / area)
+		along_v := (edge_two * du_one - edge_one * du_two) * (1 / area)
+		for corner in [a, b, c] {
+			along_us[corner] = along_us[corner] + along_u
+			along_vs[corner] = along_vs[corner] + along_v
+		}
+	}
+	for i in 0:count do set_tangent(&vertices[i], along_us[i], along_vs[i])
+}
+
+// A vertex's tangent from where the texture's x and y run on it: x's
+// direction across the normal, and which way y runs from there.
+set_tangent :: fun(vertex: ^Vertex, along_u: Vec3, along_v: Vec3) {
+	normal := vertex.normal
+	across := along_u - normal * dot(normal, along_u)
+	if vec3_length(across) < 0.000001 {
+		// No x here: any way across the normal will do.
+		across = cross(normal, if abs(normal.z) < 0.9 do Vec3{0, 0, 1} else Vec3{1, 0, 0})
+	}
+	across = vec3_normalize(across)
+	handedness : f32 = 1
+	if dot(cross(normal, across), along_v) < 0 do handedness = -1
+	vertex.tangent = [across.x, across.y, across.z, handedness]
 }
 
 // Adds a strip's triangles: each vertex after the first two makes one with
@@ -374,6 +452,8 @@ part_look :: fun(mesh: ^Nif, properties: Inherited, model: ^Model) -> Model_Part
 		two_sided = false,
 		diffuse = Vec3{1, 1, 1},
 		emissive = Vec3{0, 0, 0},
+		specular = Vec3{0, 0, 0},
+		glossiness = 10,
 		alpha = 1,
 		vertex_mode = 2,
 		lighting_mode = 1}
@@ -398,6 +478,8 @@ apply_properties :: fun(mesh: ^Nif, properties: Inherited, part: ^Model_Part, mo
 		Material material
 			part.diffuse = material.diffuse
 			part.emissive = material.emissive
+			part.specular = material.specular
+			part.glossiness = material.glossiness
 			part.alpha = material.alpha
 		else
 		}

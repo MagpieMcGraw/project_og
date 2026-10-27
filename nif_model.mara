@@ -304,6 +304,12 @@ Block :: union {
 		name: []utf8
 		value: []utf8
 	}
+	// NiBinaryExtraData: bytes with a name. Oblivion's meshes keep their
+	// tangent space so: TANGENT_SPACE.
+	Binary_Extra {
+		name: []utf8
+		data: []byte
+	}
 	Integer_Extra {
 		name: []utf8     // BSXFlags' is "BSX"
 		value: u32

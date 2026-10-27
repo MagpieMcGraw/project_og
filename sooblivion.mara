@@ -247,6 +247,12 @@ command_nifs :: fun(name: []utf8) {
 	untextured : i64 = 0
 	// The Havok blocks: how many of each type, in how many files.
 	havok_types : [64]Type_Count
+	// Specular properties on and off; the materials' glossiness.
+	specular_on : i64 = 0
+	specular_off : i64 = 0
+	glossiness_total : f64 = 0
+	materials : i64 = 0
+	black_specular : i64 = 0
 	start := time_now()
 
 	for file, i in archive.files {
@@ -280,6 +286,18 @@ command_nifs :: fun(name: []utf8) {
 					entry.count = 1
 				}
 			}
+			for &block in mesh.blocks {
+				match block^ {
+				Specular specular
+					if specular.enabled do specular_on += 1
+					else do specular_off += 1
+				Material material
+					glossiness_total += f64(material.glossiness)
+					materials += 1
+					if material.specular.x == 0 and material.specular.y == 0 and material.specular.z == 0 do black_specular += 1
+				else
+				}
+			}
 			if mesh.trailing_bytes > 0 do with_trailing += 1
 			model_storage.len = 0
 			built, model_error := build_model(&mesh, &model_storage)
@@ -307,6 +325,9 @@ command_nifs :: fun(name: []utf8) {
 		nif_count, block_total, failed, with_trailing, elapsed_ms(start))
 	print("models: % parts, % triangles, % parts without a texture, % failed",
 		part_total, triangle_total, untextured, model_failures)
+	print("a vertex is % bytes, an instance drawn % (the mesh program reads 64 and 160)", size_of(Vertex), size_of(Drawn_Instance))
+	print("specular properties: % on, % off; % materials, % with a black specular color, glossiness % on average", specular_on,
+		specular_off, materials, black_specular, if materials > 0 do glossiness_total / f64(materials) else 0)
 	for entry in failures {
 		print("  % files stopped at %: %   (first: %)", entry.files, entry.type_name, entry.reason, entry.example)
 	}
@@ -495,6 +516,22 @@ command_model :: fun(what: []utf8, name: []utf8) {
 			print("  string extra data % = %", extra.name, extra.value)
 		Node node
 			print("  node %: at %, flags %", node.object.name, node.object.translation, node.object.flags)
+		else
+		}
+	}
+	// Each shape's tangent space as kept, beside its first triangle's
+	// directions of u and v (in the shape's space).
+	shown_shapes : i64 = 0
+	for &block in mesh.blocks {
+		if shown_shapes == 4 do break
+		match block^ {
+		Shape shape
+			if shape.data < 0 do continue
+			match mesh.blocks[shape.data] {
+			Shape_Data data
+				if show_tangent_space(&mesh, shape.object.extra_data, data.geometry) do shown_shapes += 1
+			else
+			}
 		else
 		}
 	}
@@ -1182,6 +1219,70 @@ command_sound :: fun(name: []utf8) {
 		}
 	}
 	print("gains at its near distance, to the right: %; a second mixed peaks at % left, % right", gains, peak[0], peak[1])
+}
+
+// Prints a shape's tangent space as its file keeps it, for its first
+// triangle's first corner: both halves, each against the triangle's
+// directions of u and v (dot products), and the corner's normal. False
+// when it keeps none.
+show_tangent_space :: fun(mesh: ^Nif, extra_data: Refs, geometry: Geometry) -> bool {
+	if geometry.uv_set_count == 0 or geometry.vertex_count < 3 do return false
+	for k in 0:extra_data.count {
+		extra := extra_data.at(k)
+		if extra < 0 do continue
+		match mesh.blocks[extra] {
+		Binary_Extra binary
+			if binary.name != TANGENT_SPACE do continue
+		count := geometry.vertex_count
+		// The first triangle's corners.
+		corners : [3!]i64 = [0, 1, 2]
+		if geometry.triangles.len != 0 {
+			for c in 0:3 {
+				corner : u16 = geometry.triangles[c * 2]
+				corners[c] = i64(corner)
+			}
+		elif geometry.strips.len >= 6
+			for c in 0:3 {
+				corner : u16 = geometry.strips[c * 2]
+				corners[c] = i64(corner)
+			}
+		}
+		points : [3!]Vec3
+		uvs : [3!][2!]f32
+		for c in 0:3 {
+			point : Vec3 = geometry.vertices[corners[c] * 12]
+			uv : [2!]f32 = geometry.uvs[corners[c] * 8]
+			points[c] = point
+			uvs[c] = uv
+		}
+		along_u, along_v := uv_directions(points, uvs)
+		first : Vec3 = binary.data[corners[0] * 12]
+		second : Vec3 = binary.data[count * 12 + corners[0] * 12]
+		normal : Vec3 = geometry.normals[corners[0] * 12]
+		print("  tangent space (% bytes for % vertices): first half % · u % · v %; second half % · u % · v %; normal %",
+			binary.data.len, count, first, dot(first, along_u), dot(first, along_v), second, dot(second, along_u),
+			dot(second, along_v), normal)
+			return true
+		else
+		}
+	}
+	return false
+}
+
+// A triangle's directions of u and v across it (each a unit vector): where
+// its texture's x and y run.
+uv_directions :: fun(points: [3!]Vec3, uvs: [3!][2!]f32) -> Vec3, Vec3 {
+	edge_one := points[1] - points[0]
+	edge_two := points[2] - points[0]
+	du_one := uvs[1][0] - uvs[0][0]
+	dv_one := uvs[1][1] - uvs[0][1]
+	du_two := uvs[2][0] - uvs[0][0]
+	dv_two := uvs[2][1] - uvs[0][1]
+	area := du_one * dv_two - du_two * dv_one
+	if abs(area) < 0.0000001 do return Vec3{0, 0, 0}, Vec3{0, 0, 0}
+	along_u := (edge_one * dv_two - edge_two * dv_one) * (1 / area)
+	along_v := (edge_two * du_one - edge_one * du_two) * (1 / area)
+	return vec3_normalize(along_u), vec3_normalize(along_v)
 }
 
 // The record whose editor id is name (any letter case): its form id; false

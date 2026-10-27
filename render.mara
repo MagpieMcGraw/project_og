@@ -112,9 +112,12 @@ REPEAT_BOTH :: 3
 // How sharp textures stay seen at a slant: anisotropic filtering, at most.
 MOST_ANISOTROPY :: 16
 
-// The texture units a land quadrant's textures are bound to, without bindless.
+// The texture units a land quadrant's textures are bound to, without
+// bindless; their normal maps'.
 LAYER_UNITS :: [QUADRANT_TEXTURES!]GL_Texture_Unit{
 	TEXTURE0, TEXTURE1, TEXTURE2, TEXTURE3, TEXTURE4, TEXTURE5, TEXTURE6, TEXTURE7, TEXTURE8}
+LAYER_NORMAL_UNITS :: [QUADRANT_TEXTURES!]GL_Texture_Unit{
+	TEXTURE9, TEXTURE10, TEXTURE11, TEXTURE12, TEXTURE13, TEXTURE14, TEXTURE15, TEXTURE16, TEXTURE17}
 
 // ---- shaders ---------------------------------------------------------------------
 // Each is written once and compiled two ways: with `#define BINDLESS` (and
@@ -125,33 +128,35 @@ layout(location = 0) in vec3 position;
 layout(location = 1) in vec3 normal;
 layout(location = 2) in vec2 uv;
 layout(location = 3) in vec4 color;
-// Each instance's: its matrix's columns, its lights, its part's material,
-// its part's texture's handle.
+layout(location = 15) in vec4 tangent;      // where the texture's x runs; w: y's way from there (1 or -1)
+// Each instance's: its matrix's columns, its lights (16, two to a word), its
+// part's material, its textures' handles, how it shines.
 layout(location = 4) in vec4 world_x;
 layout(location = 5) in vec4 world_y;
 layout(location = 6) in vec4 world_z;
 layout(location = 7) in vec4 world_w;
-layout(location = 8) in uvec4 lights_first;
-layout(location = 9) in uvec4 lights_second;
-layout(location = 13) in uvec4 lights_third;
-layout(location = 14) in uvec4 lights_fourth;
-layout(location = 10) in vec4 material;    // alpha threshold, emissive color
-layout(location = 11) in uvec2 texture_handle;
-layout(location = 12) in uvec2 glow_handle;   // its glow map's (bindless; else 1 for one), 0 for none
+layout(location = 8) in uvec4 lights_low;
+layout(location = 9) in uvec4 lights_high;
+layout(location = 10) in vec4 material;     // alpha threshold, emissive color
+layout(location = 11) in uvec4 handles;     // its texture's, its glow map's (0 for none; bound: 1 for one)
+layout(location = 12) in uvec4 normal_map;  // its normal map's handle (as the glow map's), its glossiness's bits
+layout(location = 13) in vec4 specular;     // the color it shines
 
 uniform mat4 view_projection;
 
 out vec3 world_position;
 out vec3 world_normal;
+out vec3 world_tangent;
+out float tangent_way;
 out vec2 texture_uv;
 out vec4 vertex_color;
-flat out uvec4 light_set_first;
-flat out uvec4 light_set_second;
-flat out uvec4 light_set_third;
-flat out uvec4 light_set_fourth;
+flat out uvec4 light_words_low;
+flat out uvec4 light_words_high;
 flat out vec4 part_material;
 flat out uvec2 part_texture;
 flat out uvec2 part_glow;
+flat out uvec2 part_normal;
+flat out vec4 part_shine;   // its specular color, its glossiness
 
 void main() {
 	mat4 world = mat4(world_x, world_y, world_z, world_w);
@@ -159,39 +164,46 @@ void main() {
 	gl_Position = view_projection * placed;
 	world_position = placed.xyz;
 	world_normal = mat3(world) * normal;
+	world_tangent = mat3(world) * tangent.xyz;
+	tangent_way = tangent.w;
 	texture_uv = uv;
 	vertex_color = color;
-	light_set_first = lights_first;
-	light_set_second = lights_second;
-	light_set_third = lights_third;
-	light_set_fourth = lights_fourth;
+	light_words_low = lights_low;
+	light_words_high = lights_high;
 	part_material = material;
-	part_texture = texture_handle;
-	part_glow = glow_handle;
+	part_texture = handles.xy;
+	part_glow = handles.zw;
+	part_normal = normal_map.xy;
+	part_shine = vec4(specular.rgb, uintBitsToFloat(normal_map.z));
 }
 "
 
 MESH_FRAGMENT_SHADER :: "
 in vec3 world_position;
 in vec3 world_normal;
+in vec3 world_tangent;
+in float tangent_way;
 in vec2 texture_uv;
 in vec4 vertex_color;
-flat in uvec4 light_set_first;
-flat in uvec4 light_set_second;
-flat in uvec4 light_set_third;
-flat in uvec4 light_set_fourth;
+flat in uvec4 light_words_low;
+flat in uvec4 light_words_high;
 flat in vec4 part_material;
 flat in uvec2 part_texture;
 flat in uvec2 part_glow;
+flat in uvec2 part_normal;
+flat in vec4 part_shine;
 
 #ifdef BINDLESS
 #define BASE_TEXTURE sampler2D(part_texture)
 #define GLOW_TEXTURE sampler2D(part_glow)
+#define NORMAL_TEXTURE sampler2D(part_normal)
 #else
 uniform sampler2D base_texture;
 uniform sampler2D glow_texture;
+uniform sampler2D normal_texture;
 #define BASE_TEXTURE base_texture
 #define GLOW_TEXTURE glow_texture
+#define NORMAL_TEXTURE normal_texture
 #endif
 
 uniform vec3 sun_direction;       // where the light comes from
@@ -224,36 +236,65 @@ float eye_distance(float depth) {
 	return 2.0 * depth_range.x * depth_range.y / (depth_range.y + depth_range.x - z * (depth_range.y - depth_range.x));
 }
 
-vec3 point_light(uint index, vec3 normal) {
-	Scene_Light light = scene_lights[index];
-	vec3 to_light = light.place.xyz - world_position;
-	float distance = length(to_light);
-	float reach = clamp(1.0 - distance / light.place.w, 0.0, 1.0);
-	float facing = max(dot(normal, to_light / max(distance, 0.001)), 0.0);
-	return light.color.rgb * facing * reach * reach;
+// The k-th of the part's lights (in the scene's), 65535 after the last.
+uint light_index(int k) {
+	uint word = k < 8 ? light_words_low[k / 2] : light_words_high[(k - 8) / 2];
+	return (word >> (16u * uint(k & 1))) & 0xFFFFu;
+}
+
+// How much of a light shines off the surface toward the eye, as the
+// game's SLS2015.pso has it: the highlight raised to the glossiness; full
+// while the light faces the surface more than a little, fading as it turns
+// past.
+float shine_toward(vec3 normal, vec3 to_light, vec3 to_eye, float facing) {
+	float highlight = pow(max(dot(normal, normalize(to_light + to_eye)), 0.0), part_shine.w);
+	return facing > 0.2 ? highlight : highlight * max(facing + 0.5, 0.0);
 }
 
 void main() {
 	vec4 base = texture(BASE_TEXTURE, texture_uv) * vertex_color;
 	if (base.a < part_material.x) discard;
+	// The surface's way, as its normal map turns it (its red along the
+	// texture's x, green along y); how much it shines, the map's alpha.
 	vec3 normal = normalize(world_normal);
+	float gloss = 0.0;
+	if (part_normal != uvec2(0u)) {
+		vec4 mapped = texture(NORMAL_TEXTURE, texture_uv);
+		vec3 bump = normalize(mapped.xyz * 2.0 - 1.0);
+		vec3 across = world_tangent - normal * dot(normal, world_tangent);
+		if (dot(across, across) > 0.000001) {
+			across = normalize(across);
+			vec3 up = cross(normal, across) * tangent_way;
+			normal = normalize(across * bump.x + up * bump.y + normal * bump.z);
+		}
+		gloss = mapped.a;
+	}
 	if (!gl_FrontFacing) normal = -normal;   // a two-sided part's back
+	vec3 to_eye = normalize(camera_position - world_position);
 	// The material's own light: through its glow map where it has one (as
 	// the game's SLS2002.pso: emittance times the map, a light the
 	// texture is lit by), else all over it.
 	vec3 emitted = part_material.yzw;
 	if (part_glow != uvec2(0u)) emitted *= texture(GLOW_TEXTURE, texture_uv).rgb;
-	vec3 light = ambient_color + emitted + sun_color * max(dot(normal, sun_direction), 0.0);
-	// Its lights, nearest first, till the first none (65535).
-	uvec4 sets[4] = uvec4[4](light_set_first, light_set_second, light_set_third, light_set_fourth);
-	for (int s = 0; s < 4; s++) {
-		if (sets[s].x == 65535u) break;
-		for (int i = 0; i < 4; i++) {
-			if (sets[s][i] == 65535u) break;
-			light += point_light(sets[s][i], normal);
-		}
+	float sun_facing = dot(normal, sun_direction);
+	vec3 light = ambient_color + emitted + sun_color * max(sun_facing, 0.0);
+	vec3 shine = sun_color * shine_toward(normal, sun_direction, to_eye, sun_facing);
+	// Its lights, nearest first, till the first none.
+	for (int k = 0; k < 16; k++) {
+		uint index = light_index(k);
+		if (index == 65535u) break;
+		Scene_Light point = scene_lights[index];
+		vec3 to_light = point.place.xyz - world_position;
+		float distance = length(to_light);
+		to_light /= max(distance, 0.001);
+		float reach = clamp(1.0 - distance / point.place.w, 0.0, 1.0);
+		reach *= reach;
+		float facing = dot(normal, to_light);
+		light += point.color.rgb * max(facing, 0.0) * reach;
+		shine += point.color.rgb * reach * shine_toward(normal, to_light, to_eye, facing);
 	}
-	vec3 color = base.rgb * light;
+	// The shine is added over the lit texture, in the part's specular color.
+	vec3 color = base.rgb * light + shine * gloss * part_shine.rgb;
 	if (fog_far > fog_near) {
 		float fog = clamp((length(world_position - camera_position) - fog_near) / (fog_far - fog_near), 0.0, 1.0);
 		if (adding != 0) base.a *= 1.0 - fog;
@@ -368,17 +409,25 @@ in vec4 layer_weights_second;
 flat in uint quadrant;
 
 #ifdef BINDLESS
-// Each quadrant's 9 textures' handles: its base, then its layers.
+// Each quadrant's 9 textures' handles — its base, then its layers — then
+// their 9 normal maps'.
 layout(std430, binding = 1) readonly buffer Land_Textures {
 	uvec2 land_textures[];
 };
 vec3 layer_color(int layer) {
-	return texture(sampler2D(land_textures[quadrant * 9u + uint(layer)]), texture_uv).rgb;
+	return texture(sampler2D(land_textures[quadrant * 18u + uint(layer)]), texture_uv).rgb;
+}
+vec3 layer_bump(int layer) {
+	return texture(sampler2D(land_textures[quadrant * 18u + 9u + uint(layer)]), texture_uv).xyz;
 }
 #else
 uniform sampler2D layer_textures[9];
+uniform sampler2D layer_normals[9];
 vec3 layer_color(int layer) {
 	return texture(layer_textures[layer], texture_uv).rgb;
+}
+vec3 layer_bump(int layer) {
+	return texture(layer_normals[layer], texture_uv).xyz;
 }
 #endif
 
@@ -395,12 +444,23 @@ out vec4 fragment_color;
 void main() {
 	float weights[8] = float[8](layer_weights_first.x, layer_weights_first.y, layer_weights_first.z, layer_weights_first.w,
 		layer_weights_second.x, layer_weights_second.y, layer_weights_second.z, layer_weights_second.w);
+	// The layers' colors and normal maps, each over those below by its weight.
 	vec3 color = layer_color(0);
+	vec3 bump = layer_bump(0);
 	for (int i = 0; i < 8; i++) {
-		if (weights[i] > 0.0) color = mix(color, layer_color(i + 1), weights[i]);
+		if (weights[i] > 0.0) {
+			color = mix(color, layer_color(i + 1), weights[i]);
+			bump = mix(bump, layer_bump(i + 1), weights[i]);
+		}
 	}
 	color *= vertex_color;
+	// The ground's way, as the normal maps turn it: their red east along
+	// the ground (the textures' x), green north (y).
 	vec3 normal = normalize(world_normal);
+	vec3 east = normalize(vec3(1.0, 0.0, 0.0) - normal * normal.x);
+	vec3 north = cross(normal, east);
+	bump = normalize(bump * 2.0 - 1.0);
+	normal = normalize(east * bump.x + north * bump.y + normal * bump.z);
 	color *= ambient_color + sun_color * max(dot(normal, sun_direction), 0.0);
 	if (fog_far > fog_near) {
 		float fog = clamp((length(world_position - camera_position) - fog_near) / (fog_far - fog_near), 0.0, 1.0);
@@ -855,6 +915,9 @@ Mesh_Part :: struct {
 	two_sided: bool
 	alpha_threshold: f32   // pixels less opaque are left out; 0 for none
 	emissive: Vec3
+	normal_slot: i64       // its normal map's texture slot, -1 for none
+	specular: Vec3         // the color it shines (black: not at all)
+	glossiness: f32
 	additive: bool         // blended by adding its light to what's behind (fire)
 	flip: i64              // its texture's flipbook (in the renderer's flips), -1 for none
 	billboard: i64         // turned to face the camera: its billboard (in the renderer's), -1 for none
@@ -945,6 +1008,7 @@ Gpu_Land :: struct {
 // renderer's textures (the base's again where it has fewer layers).
 Quadrant_Slots :: struct {
 	textures: [QUADRANT_TEXTURES!]i64
+	normal_maps: [QUADRANT_TEXTURES!]i64   // each's normal map (the flat one where it has none)
 }
 
 // A stretch of water: a rectangle at a height, and the water's depth at
@@ -1172,13 +1236,18 @@ Cached_Texture :: struct {
 }
 
 // What an instance of a mesh part is drawn with, as the mesh shader reads
-// it: its matrix, its lights, the part's material and texture — 104 bytes.
+// it: its matrix, its lights, the part's material, textures and shine —
+// 160 bytes.
 Drawn_Instance :: struct {
 	world: Mat4
 	lights: [LIGHTS_PER_OBJECT!]u16
 	material: [4!]f32      // alpha threshold, emissive red, green, blue
 	texture: u64           // the bindless handle
 	glow: u64              // its glow map's bindless handle (without bindless, 1 when it has one); 0 for none
+	normal_map: u64        // its normal map's, as the glow map's
+	glossiness: f32
+	flags: u32             // (none yet)
+	specular: [4!]f32      // the color it shines, red, green, blue; the last unused
 }
 
 // One draw of MultiDrawElementsIndirect, as OpenGL reads it: 20 bytes.
@@ -1317,7 +1386,7 @@ Renderer :: struct {
 	land_vertex_buffer: u32
 	land_index_buffer: u32
 	land_indirect_buffer: u32
-	land_texture_buffer: u32                   // each quadrant's 9 handles (bindless)
+	land_texture_buffer: u32                   // each quadrant's 9 handles, then its normal maps' 9 (bindless)
 
 	// The scene's lights as the mesh programs read them (binding 3).
 	light_buffer: u32
@@ -1418,7 +1487,10 @@ renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
 	_ = one_pixel_texture(renderer, [255, 255, 255, 255])
 	renderer.flat_normal_texture = one_pixel_texture(renderer, [128, 128, 255, 255])
 	for q in 0:LAND_QUADRANTS {
-		for k in 0:QUADRANT_TEXTURES do renderer.land_quadrants[q].textures[k] = 0
+		for k in 0:QUADRANT_TEXTURES {
+			renderer.land_quadrants[q].textures[k] = 0
+			renderer.land_quadrants[q].normal_maps[k] = renderer.flat_normal_texture
+		}
 	}
 }
 
@@ -1502,7 +1574,10 @@ make_mesh_program :: fun(made: ^Mesh_Program, bindless: bool) -> err {
 	made.depth_range_at = GetUniformLocation(made.program, "depth_range")
 	UseProgram(made.program)
 	Uniform1i(GetUniformLocation(made.program, "scene_depth"), 2)
-	if not bindless do Uniform1i(GetUniformLocation(made.program, "glow_texture"), 1)
+	if not bindless {
+		Uniform1i(GetUniformLocation(made.program, "glow_texture"), 1)
+		Uniform1i(GetUniformLocation(made.program, "normal_texture"), 3)
+	}
 }
 
 make_particle_program :: fun(made: ^Particle_Program) -> err {
@@ -1522,7 +1597,10 @@ make_land_program :: fun(made: ^Land_Program, bindless: bool) -> err {
 	UseProgram(made.program)
 	for k in 0:QUADRANT_TEXTURES {
 		made.layer_texture_at[k] = array_uniform(made.program, "layer_textures[", k)
-		if not bindless do Uniform1i(made.layer_texture_at[k], i32(k))
+		if not bindless {
+			Uniform1i(made.layer_texture_at[k], i32(k))
+			Uniform1i(array_uniform(made.program, "layer_normals[", k), i32(QUADRANT_TEXTURES + k))
+		}
 	}
 }
 
@@ -2059,6 +2137,8 @@ setup_grass_buffers :: fun(renderer: ^Renderer) {
 	VertexAttribPointer(2, 2, FLOAT, 0, stride, 24)   // uv
 	EnableVertexAttribArray(3)
 	VertexAttribPointer(3, 4, FLOAT, 0, stride, 32)   // color
+	EnableVertexAttribArray(15)
+	VertexAttribPointer(15, 4, FLOAT, 0, stride, 48)  // tangent
 	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.mesh_index_buffer)
 
 	GenBuffers(1, &renderer.grass_instance_buffer)
@@ -2280,26 +2360,23 @@ setup_mesh_buffers :: fun(renderer: ^Renderer) {
 		VertexAttribDivisor(location, 1)
 	}
 	EnableVertexAttribArray(8)
-	VertexAttribIPointer(8, 4, UNSIGNED_SHORT, instance_stride, 64)    // lights 1 to 4
+	VertexAttribIPointer(8, 4, UNSIGNED_INT, instance_stride, 64)      // lights 1 to 8, two to a word
 	VertexAttribDivisor(8, 1)
 	EnableVertexAttribArray(9)
-	VertexAttribIPointer(9, 4, UNSIGNED_SHORT, instance_stride, 72)    // lights 5 to 8
+	VertexAttribIPointer(9, 4, UNSIGNED_INT, instance_stride, 80)      // lights 9 to 16
 	VertexAttribDivisor(9, 1)
-	EnableVertexAttribArray(13)
-	VertexAttribIPointer(13, 4, UNSIGNED_SHORT, instance_stride, 80)   // lights 9 to 12
-	VertexAttribDivisor(13, 1)
-	EnableVertexAttribArray(14)
-	VertexAttribIPointer(14, 4, UNSIGNED_SHORT, instance_stride, 88)   // lights 13 to 16
-	VertexAttribDivisor(14, 1)
 	EnableVertexAttribArray(10)
 	VertexAttribPointer(10, 4, FLOAT, 0, instance_stride, 96)          // material
 	VertexAttribDivisor(10, 1)
 	EnableVertexAttribArray(11)
-	VertexAttribIPointer(11, 2, UNSIGNED_INT, instance_stride, 112)    // texture handle
+	VertexAttribIPointer(11, 4, UNSIGNED_INT, instance_stride, 112)    // texture and glow map handles
 	VertexAttribDivisor(11, 1)
 	EnableVertexAttribArray(12)
-	VertexAttribIPointer(12, 2, UNSIGNED_INT, instance_stride, 120)    // glow map handle
+	VertexAttribIPointer(12, 4, UNSIGNED_INT, instance_stride, 128)    // normal map handle, glossiness, flags
 	VertexAttribDivisor(12, 1)
+	EnableVertexAttribArray(13)
+	VertexAttribPointer(13, 4, FLOAT, 0, instance_stride, 144)         // specular color
+	VertexAttribDivisor(13, 1)
 	BindVertexArray(0)
 
 	GenBuffers(1, &renderer.indirect_buffer)
@@ -2338,7 +2415,7 @@ setup_land_buffers :: fun(renderer: ^Renderer) {
 
 	GenBuffers(1, &renderer.land_texture_buffer)
 	BindBuffer(SHADER_STORAGE_BUFFER, renderer.land_texture_buffer)
-	BufferData(SHADER_STORAGE_BUFFER, LAND_QUADRANTS * QUADRANT_TEXTURES * 8, [], DYNAMIC_DRAW)
+	BufferData(SHADER_STORAGE_BUFFER, LAND_QUADRANTS * QUADRANT_TEXTURES * 2 * 8, [], DYNAMIC_DRAW)
 
 	GenBuffers(1, &renderer.light_buffer)
 	BindBuffer(SHADER_STORAGE_BUFFER, renderer.light_buffer)
@@ -2535,6 +2612,9 @@ upload_model :: fun(renderer: ^Renderer, built: ^Model, archive: ^Archive, scrat
 			base_vertex = i32(renderer.vertices_used),
 			texture_slot = texture_for(renderer, archive, part.texture[:], scratch, part.clamp_mode),
 			glow_slot = glow_map_for(renderer, archive, &part, scratch),
+			normal_slot = normal_map_for(renderer, archive, &part, scratch),
+			specular = part.specular,
+			glossiness = part.glossiness,
 			alpha_blend = part.alpha_blend,
 			depth_write = part.depth_write,
 			two_sided = part.two_sided,
@@ -2569,6 +2649,20 @@ glow_map_for :: fun(renderer: ^Renderer, archive: ^Archive, part: ^Model_Part, s
 	_, found := find_file(archive, path[:])
 	if not found do return -1
 	return texture_for(renderer, archive, path[:], scratch, part.clamp_mode)
+}
+
+// A part's normal map: its texture's with _n, as the game finds them
+// (doorlow.dds, doorlow_n.dds). Its texture slot; -1 for none, or when it
+// couldn't be loaded (the white texture would tip every pixel).
+normal_map_for :: fun(renderer: ^Renderer, archive: ^Archive, part: ^Model_Part, scratch: ^[]byte) -> i64 {
+	if part.texture.len <= 4 or not ends_with(part.texture[:], ".dds") do return -1
+	path : [160]utf8
+	&path + part.texture[0 : part.texture.len - 4]
+	&path + "_n.dds"
+	_, found := find_file(archive, path[:])
+	if not found do return -1
+	slot := texture_for(renderer, archive, path[:], scratch, part.clamp_mode)
+	return if slot == 0 do -1 else slot
 }
 
 // An instance of a model placed in the world: its sphere worked out, no
@@ -2639,28 +2733,47 @@ set_scene_lights :: fun(renderer: ^Renderer, lights: ^[]Point_Light) {
 // ---- land ---------------------------------------------------------------------------------
 
 // Puts the land of the cell at x, y on the card: its quadrants' textures
-// (loaded the first time each is asked for, their handles where the
-// quadrant's land reads them), its vertices into a slot (0 to LAND_SLOTS
-// - 1, one no other land is in).
+// and their normal maps (loaded the first time each is asked for, their
+// handles where the quadrant's land reads them), its vertices into a slot
+// (0 to LAND_SLOTS - 1, one no other land is in).
 upload_land :: fun(renderer: ^Renderer, mesh: ^Land_Mesh, x: i64, y: i64, slot: i64, archive: ^Archive, scratch: ^[]byte) -> Gpu_Land {
 	for q in 0:4 {
 		textures := &mesh.textures[q]
 		quadrant := &renderer.land_quadrants[slot * 4 + q]
-		handles : [QUADRANT_TEXTURES!]u64
+		handles : [QUADRANT_TEXTURES * 2!]u64
 		for k in 0:QUADRANT_TEXTURES {
 			texture_slot := quadrant.textures[0]
-			if k < textures.count do texture_slot = texture_for(renderer, archive, textures.paths[k][:], scratch)
+			normal_slot := quadrant.normal_maps[0]
+			if k < textures.count {
+				texture_slot = texture_for(renderer, archive, textures.paths[k][:], scratch)
+				normal_slot = land_normal_for(renderer, archive, textures.paths[k][:], scratch)
+			}
 			quadrant.textures[k] = texture_slot
+			quadrant.normal_maps[k] = normal_slot
 			handles[k] = renderer.textures[texture_slot].handle
+			handles[QUADRANT_TEXTURES + k] = renderer.textures[normal_slot].handle
 		}
 		if renderer.bindless_available {
 			BindBuffer(SHADER_STORAGE_BUFFER, renderer.land_texture_buffer)
-			BufferSubData(SHADER_STORAGE_BUFFER, isize((slot * 4 + q) * QUADRANT_TEXTURES * 8), handles[:])
+			BufferSubData(SHADER_STORAGE_BUFFER, isize((slot * 4 + q) * QUADRANT_TEXTURES * 2 * 8), handles[:])
 		}
 	}
 	BindBuffer(ARRAY_BUFFER, renderer.land_vertex_buffer)
 	BufferSubData(ARRAY_BUFFER, isize(slot * LAND_MESH_VERTICES * size_of(Land_Vertex)), mesh.vertices[:])
 	return Gpu_Land{x = x, y = y, slot = slot, center = mesh.center, radius = mesh.radius}
+}
+
+// A land texture's normal map (its path with _n): its texture slot; the
+// flat normal map's where it has none.
+land_normal_for :: fun(renderer: ^Renderer, archive: ^Archive, texture: []utf8, scratch: ^[]byte) -> i64 {
+	if texture.len <= 4 or not ends_with(texture, ".dds") do return renderer.flat_normal_texture
+	path : [160]utf8
+	&path + texture[0 : texture.len - 4]
+	&path + "_n.dds"
+	_, found := find_file(archive, path[:])
+	if not found do return renderer.flat_normal_texture
+	slot := texture_for(renderer, archive, path[:], scratch)
+	return if slot == 0 do renderer.flat_normal_texture else slot
 }
 
 // ---- the reticle ---------------------------------------------------------------------
@@ -3047,6 +3160,8 @@ draw_land :: fun(renderer: ^Renderer, grounds: ^[]Gpu_Land, planes: ^View_Planes
 		for unit in 0:QUADRANT_TEXTURES {
 			ActiveTexture(LAYER_UNITS[unit])
 			BindTexture(TEXTURE_2D, renderer.textures[quadrant.textures[unit]].id)
+			ActiveTexture(LAYER_NORMAL_UNITS[unit])
+			BindTexture(TEXTURE_2D, renderer.textures[quadrant.normal_maps[unit]].id)
 		}
 		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, usize(k * size_of(Draw_Command)), 1, 0)
 		stats.draw_calls += 1
@@ -3236,6 +3351,11 @@ gather_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]In
 			record.texture = renderer.textures[shown_texture(renderer, part)].handle
 			record.glow = 0
 			if part.glow_slot >= 0 do record.glow = if bindless do renderer.textures[part.glow_slot].handle else 1
+			record.normal_map = 0
+			if part.normal_slot >= 0 do record.normal_map = if bindless do renderer.textures[part.normal_slot].handle else 1
+			record.glossiness = max(part.glossiness, 1)
+			record.flags = 0
+			record.specular = [part.specular.x, part.specular.y, part.specular.z, 0]
 		}
 	}
 	for key in renderer.touched do renderer.part_counts[key & 0xFFFFF] = 0
@@ -3289,6 +3409,11 @@ draw_mesh_runs :: fun(renderer: ^Renderer, view_projection: Mat4, lighting: Cell
 			if first_part.glow_slot >= 0 {
 				ActiveTexture(TEXTURE1)
 				BindTexture(TEXTURE_2D, renderer.textures[first_part.glow_slot].id)
+				ActiveTexture(TEXTURE0)
+			}
+			if first_part.normal_slot >= 0 {
+				ActiveTexture(TEXTURE3)
+				BindTexture(TEXTURE_2D, renderer.textures[first_part.normal_slot].id)
 				ActiveTexture(TEXTURE0)
 			}
 		}

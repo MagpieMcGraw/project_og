@@ -410,11 +410,15 @@ read_extra_name :: fun(reader: ^Nif_Reader) -> []utf8 {
 }
 
 read_binary_extra :: fun(reader: ^Nif_Reader) -> Block {
-	_ = read_extra_name(reader)
+	name := read_extra_name(reader)
 	size := i64(read_u32(reader))
-	skip(reader, size)
-	return .Other
+	data := read_view(reader, size)
+	return Binary_Extra{name = name, data = data}
 }
+
+// The name of the binary extra data a shape's tangent space is kept in:
+// a Vec3 for each vertex, then another for each.
+TANGENT_SPACE :: "Tangent space (binormal & tangent vectors)"
 
 read_boolean_extra :: fun(reader: ^Nif_Reader) -> Block {
 	_ = read_extra_name(reader)
