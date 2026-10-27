@@ -1,11 +1,12 @@
-// The sky outside: a world's climate and its weather, and from them, for an
-// hour of the day, the sky's colors, the sun, the clouds, and the light
+// The sky outside: a world's climate and its weathers, and from them, for
+// an hour of the day, the sky's colors, the sun, the clouds, and the light
 // and fog everything outside is drawn with.
 //
 // A weather (WTHR) gives ten colors — sky, fog, clouds, ambient, sunlight,
 // sun, stars, horizon — at four times of day: sunrise, day, sunset, night.
-// A climate (CLMT) says which weathers come, and when the sun rises and
-// sets; between its times, the colors blend.
+// A climate (CLMT) says when the sun rises and sets (between its times, the
+// colors blend) and which weathers come; a place's regions (REGN, its
+// cell's XCLR) may say otherwise: their weathers, each with a chance.
 module sky
 
 use mara.core
@@ -33,8 +34,25 @@ DAY     :: 1
 SUNSET  :: 2
 NIGHT   :: 3
 
-// A weather: its colors at each time of day, its fog, its clouds.
+// What a weather is like (its classification): bits.
+WEATHER_PLEASANT :: 1
+WEATHER_CLOUDY   :: 2
+WEATHER_RAINY    :: 4
+WEATHER_SNOW     :: 8
+
+// What a weather's sound is for (its SNAM's role).
+WEATHER_SOUND_PRECIPITATION :: 1
+WEATHER_SOUND_WIND          :: 2
+WEATHER_SOUND_THUNDER       :: 3
+
+// A weather: its form id, its colors at each time of day, its fog, its
+// clouds; what it's like (WEATHER_*), how long it takes to come in (game
+// hours), its sun's glare (0 to 1); its rain or snow (the precipitation
+// mesh's archive path, or empty), coming in and going out over shares of
+// its coming in; its thunder (how often, 0 to 1) and lightning's color;
+// its sounds (form ids, with their roles).
 Weather :: struct {
+	form_id: u32
 	colors: [WEATHER_COLORS!][4!]Vec3
 	fog_day_near: f32
 	fog_day_far: f32
@@ -45,16 +63,46 @@ Weather :: struct {
 	cloud_speed_lower: f32     // how fast each layer drifts, in its texture's widths a second
 	cloud_speed_upper: f32
 	wind_speed: f32            // 0 to 1
+	classification: u32
+	transition: f32
+	sun_glare: f32
+	precipitation: [160]utf8
+	precipitation_in: f32
+	precipitation_out: f32
+	thunder: f32
+	lightning_color: Vec3
+	sounds: [8]Weather_Sound
 }
 
-// A climate: the weather it brings (its likeliest), and the sun's hours.
-Climate :: struct {
+// A sound of a weather's: the sound's form id, and what it's for
+// (WEATHER_SOUND_*).
+Weather_Sound :: struct {
+	sound: u32
+	role: u32
+}
+
+// A weather that may come: its form id, and how likely (out of its list's
+// chances in all).
+Weather_Chance :: struct {
 	weather: u32
+	chance: i64
+}
+
+// A climate: the weathers it brings, the sun's hours, the sun's and its
+// glare's textures, the night sky's mesh (its stars), and its moons:
+// which there are and how many days each phase lasts.
+Climate :: struct {
+	weathers: [16]Weather_Chance
 	sunrise_begin: f32         // hours, 0 to 24
 	sunrise_end: f32
 	sunset_begin: f32
 	sunset_end: f32
 	sun_texture: [160]utf8
+	sun_glare_texture: [160]utf8
+	stars: [160]utf8           // the night sky mesh's archive path
+	masser: bool
+	secunda: bool
+	phase_days: f32
 }
 
 // The sky at an hour: what the sky and water are drawn with, and the
@@ -83,21 +131,19 @@ world_climate :: fun(plugin: ^Plugin, world_id: u32, scratch: ^[]byte) -> Climat
 	if climate_id == 0 do return climate
 
 	climate_record := find_record(plugin, climate_id, scratch)?
-	// The likeliest weather: WLST is (weather, chance) pairs.
+	// Its weathers: WLST is (weather, chance) pairs.
 	weathers, has_weathers := find_field(climate_record.data, "WLST")
-	if has_weathers {
-		best : i32 = -1
-		for k in 0:weathers.len / 8 {
-			weather : u32 = weathers[k * 8]
-			chance : i32 = weathers[k * 8 + 4]
-			if chance > best {
-				best = chance
-				climate.weather = weather
-			}
-		}
-	}
-	// TNAM: sunrise's and sunset's beginnings and ends, in tens of minutes.
+	if has_weathers do add_weather_chances(weathers, &climate.weathers)
+	// TNAM: sunrise's and sunset's beginnings and ends, in tens of minutes;
+	// how changeable the weather is; the moons (bit 6 Masser, bit 7 Secunda)
+	// and how many days a phase lasts (the rest).
 	timing, has_timing := find_field(climate_record.data, "TNAM")
+	if has_timing and timing.len >= 6 {
+		moons : u8 = timing[5]
+		climate.masser = moons & 0x40 != 0
+		climate.secunda = moons & 0x80 != 0
+		climate.phase_days = f32(moons & 0x3F)
+	}
 	if has_timing and timing.len >= 4 {
 		hours : [4!]f32
 		for k in 0:4 {
@@ -111,19 +157,106 @@ world_climate :: fun(plugin: ^Plugin, world_id: u32, scratch: ^[]byte) -> Climat
 	}
 	sun, has_sun := find_field(climate_record.data, "FNAM")
 	if has_sun do texture_path_of(field_text(sun), &climate.sun_texture)
+	glare, has_glare := find_field(climate_record.data, "GNAM")
+	if has_glare do texture_path_of(field_text(glare), &climate.sun_glare_texture)
+	night_sky, has_night_sky := find_field(climate_record.data, "MODL")
+	if has_night_sky do mesh_path_of(field_text(night_sky), &climate.stars)
 	return climate
 }
 
-// A climate for a world that has none: no weather (the default one), the
+// A list of (weather, chance) pairs, as WLST and RDWT have them, into chances.
+add_weather_chances :: fun(pairs: []byte, chances: ^[]Weather_Chance) {
+	for k in 0:pairs.len / 8 {
+		if chances.len == chances.cap do return
+		weather : u32 = pairs[k * 8]
+		chance : i32 = pairs[k * 8 + 4]
+		if weather != 0 and chance > 0 do chances + Weather_Chance{weather = weather, chance = i64(chance)}
+	}
+}
+
+// The weathers that may come at an exterior cell (its grid place in a
+// world): its regions' (XCLR) — the region with weathers of the highest
+// priority — else none (the climate's then). Into chances.
+cell_weathers :: fun(plugin: ^Plugin, world_id: u32, x: i64, y: i64, chances: ^[]Weather_Chance, scratch: ^[]byte) -> err {
+	chances.len = 0
+	cell := exterior_cell(plugin, world_id, x, y)
+	if cell == 0 do return
+	cell_record := find_record(plugin, cell, scratch)?
+	regions, has_regions := find_field(cell_record.data, "XCLR")
+	if not has_regions do return
+	best_priority : i64 = -1
+	best_region : u32 = 0
+	for k in 0:regions.len / 4 {
+		region : u32 = regions[k * 4]
+		priority := region_weather_priority(plugin, region)?
+		if priority > best_priority {
+			best_priority = priority
+			best_region = region
+		}
+	}
+	if best_region == 0 do return
+	region_scratch : [65536]byte
+	record := find_record(plugin, best_region, &region_scratch)?
+	fields := Fields{data = record.data, at = 0, broken = false}
+	for field in next_field(&fields) {
+		if field.kind == "RDWT" do add_weather_chances(field.data, chances)
+	}
+}
+
+// A region's priority for its weathers (its RDAT of type 3, followed by
+// RDWT); -1 for a region without weathers.
+region_weather_priority :: fun(plugin: ^Plugin, region: u32) -> i64, err {
+	region_scratch : [65536]byte
+	record := find_record(plugin, region, &region_scratch)?
+	fields := Fields{data = record.data, at = 0, broken = false}
+	for field in next_field(&fields) {
+		if field.kind != "RDAT" or field.data.len < 6 do continue
+		kind : u32 = field.data[0]
+		priority : u8 = field.data[5]
+		if kind == 3 do return i64(priority)
+	}
+	return -1
+}
+
+// A mesh's archive path from a record's: meshes\…, lower case.
+mesh_path_of :: fun(name: []utf8, path: ^[160]utf8) {
+	path.len = 0
+	if name.len == 0 do return
+	path + "meshes\\"
+	for c in name {
+		if path.len == path.cap do break
+		if c == '/' do path + '\\'
+		else do path + lower(c)
+	}
+}
+
+// One of a list of weathers, at random by their chances: its form id; 0
+// for an empty list. pick is a number from 0 up to 1.
+pick_weather :: fun(chances: ^[]Weather_Chance, pick: f32) -> u32 {
+	total : i64 = 0
+	for chance in chances^ do total += chance.chance
+	if total == 0 do return 0
+	at := i64(pick * f32(total))
+	for chance in chances^ {
+		if at < chance.chance do return chance.weather
+		at -= chance.chance
+	}
+	return chances[chances.len - 1].weather
+}
+
+// A climate for a world that has none: no weathers (the default one), the
 // sun up from 6 to 20.
 default_climate :: fun() -> Climate {
-	return Climate{weather = 0, sunrise_begin = 6, sunrise_end = 10, sunset_begin = 16, sunset_end = 20, sun_texture = []}
+	return Climate{weathers = [], sunrise_begin = 6, sunrise_end = 10, sunset_begin = 16, sunset_end = 20, sun_texture = [],
+		sun_glare_texture = [], stars = [], masser = false, secunda = false, phase_days = 3}
 }
 
 // A weather for when there's none to read: a pale blue sky all day, fog far.
 default_weather :: fun() -> Weather {
-	weather := Weather{colors = [], fog_day_near = 4096, fog_day_far = 40000, fog_night_near = 2048, fog_night_far = 20000,
-		cloud_lower = [], cloud_upper = [], cloud_speed_lower = 0, cloud_speed_upper = 0, wind_speed = 0.1}
+	weather := Weather{form_id = 0, colors = [], fog_day_near = 4096, fog_day_far = 40000, fog_night_near = 2048, fog_night_far = 20000,
+		cloud_lower = [], cloud_upper = [], cloud_speed_lower = 0, cloud_speed_upper = 0, wind_speed = 0.1,
+		classification = WEATHER_PLEASANT, transition = 0.25, sun_glare = 1, precipitation = [], precipitation_in = 0,
+		precipitation_out = 0, thunder = 0, lightning_color = Vec3{1, 1, 1}, sounds = []}
 	for c in 0:WEATHER_COLORS {
 		for t in 0:4 do weather.colors[c][t] = Vec3{0.5, 0.6, 0.8}
 	}
@@ -162,6 +295,7 @@ read_weather :: fun(plugin: ^Plugin, weather_id: u32, scratch: ^[]byte) -> Weath
 	weather := default_weather()
 	if weather_id == 0 do return weather   // (a climate without weathers: the defaults)
 	record := find_record(plugin, weather_id, scratch)?
+	weather.form_id = weather_id
 	colors, has_colors := find_field(record.data, "NAM0")
 	if has_colors and colors.len >= WEATHER_COLORS * 16 {
 		for c in 0:WEATHER_COLORS {
@@ -179,8 +313,13 @@ read_weather :: fun(plugin: ^Plugin, weather_id: u32, scratch: ^[]byte) -> Weath
 	if has_lower do texture_path_of(field_text(lower_clouds), &weather.cloud_lower)
 	upper_clouds, has_upper := find_field(record.data, "DNAM")
 	if has_upper do texture_path_of(field_text(upper_clouds), &weather.cloud_upper)
+	precipitation, has_precipitation := find_field(record.data, "MODL")
+	if has_precipitation do mesh_path_of(field_text(precipitation), &weather.precipitation)
 	data, has_data := find_field(record.data, "DATA")
-	// DATA: the wind's speed, the clouds' speeds (lower, upper), …: bytes.
+	// DATA, bytes: the wind's speed, the clouds' speeds (lower, upper), how
+	// fast it comes in, the sun's glare, the sun's damage, its rain's coming
+	// in and going out, its thunder's coming in and going out and how often,
+	// what it's like, its lightning's color.
 	if has_data and data.len >= 3 {
 		wind_speed : u8 = data[0]
 		weather.wind_speed = f32(wind_speed) / 255
@@ -188,6 +327,30 @@ read_weather :: fun(plugin: ^Plugin, weather_id: u32, scratch: ^[]byte) -> Weath
 		upper_speed : u8 = data[2]
 		weather.cloud_speed_lower = f32(lower_speed) * 0.00004
 		weather.cloud_speed_upper = f32(upper_speed) * 0.00004
+	}
+	if has_data and data.len >= 15 {
+		delta : u8 = data[3]
+		glare : u8 = data[4]
+		rain_in : u8 = data[6]
+		rain_out : u8 = data[7]
+		thunder : u8 = data[10]
+		classification : u8 = data[11]
+		// (The faster it comes in, the shorter: from a quarter hour to an hour.)
+		weather.transition = 64 / (f32(delta) + 1)
+		if weather.transition > 1 do weather.transition = 1
+		weather.sun_glare = f32(glare) / 255
+		weather.precipitation_in = f32(rain_in) / 255
+		weather.precipitation_out = f32(rain_out) / 255
+		weather.thunder = if thunder == 255 do 0 else 1 - f32(thunder) / 255
+		weather.classification = u32(classification)
+		weather.lightning_color = byte_color(data, 12)
+	}
+	sounds := Fields{data = record.data, at = 0, broken = false}
+	for field in next_field(&sounds) {
+		if field.kind != "SNAM" or field.data.len < 8 or weather.sounds.len == weather.sounds.cap do continue
+		sound : u32 = field.data[0]
+		role : u32 = field.data[4]
+		&weather.sounds + Weather_Sound{sound = sound, role = role}
 	}
 	return weather
 }
@@ -229,6 +392,31 @@ mixed_color :: fun(weather: ^Weather, color: i64, weights: [4!]f32) -> Vec3 {
 	mixed := Vec3{0, 0, 0}
 	for t in 0:4 do mixed = mixed + weather.colors[color][t] * weights[t]
 	return mixed
+}
+
+// The sky at an hour of the day as one weather turns into another: the
+// last's sky and the coming one's, mixed by how far it has come (0 to 1).
+changing_sky_at :: fun(climate: ^Climate, last: ^Weather, coming: ^Weather, share: f32, hour: f32, most_fog: f32) -> Sky_State {
+	to := sky_at(climate^, coming, hour, most_fog)
+	if share >= 1 do return to
+	from := sky_at(climate^, last, hour, most_fog)
+	mixed := to
+	mixed.upper = mix_vec3(from.upper, to.upper, share)
+	mixed.lower = mix_vec3(from.lower, to.lower, share)
+	mixed.horizon = mix_vec3(from.horizon, to.horizon, share)
+	mixed.cloud_lower_color = mix_vec3(from.cloud_lower_color, to.cloud_lower_color, share)
+	mixed.cloud_upper_color = mix_vec3(from.cloud_upper_color, to.cloud_upper_color, share)
+	mixed.sun_color = mix_vec3(from.sun_color, to.sun_color, share)
+	mixed.lighting.ambient = mix_vec3(from.lighting.ambient, to.lighting.ambient, share)
+	mixed.lighting.directional = mix_vec3(from.lighting.directional, to.lighting.directional, share)
+	mixed.lighting.fog_color = mix_vec3(from.lighting.fog_color, to.lighting.fog_color, share)
+	mixed.lighting.fog_near = from.lighting.fog_near + (to.lighting.fog_near - from.lighting.fog_near) * share
+	mixed.lighting.fog_far = from.lighting.fog_far + (to.lighting.fog_far - from.lighting.fog_far) * share
+	return mixed
+}
+
+mix_vec3 :: fun(from: Vec3, to: Vec3, share: f32) -> Vec3 {
+	return from + (to - from) * share
 }
 
 // The sky at an hour of the day (0 to 24), with the fog no farther than

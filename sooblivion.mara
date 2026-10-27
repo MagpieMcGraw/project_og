@@ -1667,17 +1667,41 @@ command_sky :: fun(name: []utf8) {
 		print("couldn't read the climate: %", climate_error)
 		return
 	}
-	weather, weather_error := read_weather(&plugin, climate.weather, &scratch)
+	// The climate's likeliest weather.
+	likeliest : u32 = 0
+	best : i64 = -1
+	for chance in climate.weathers {
+		if chance.chance > best {
+			best = chance.chance
+			likeliest = chance.weather
+		}
+	}
+	weather, weather_error := read_weather(&plugin, likeliest, &scratch)
 	if weather_error {
 		print("couldn't read the weather: %", weather_error)
 		return
 	}
-	print("weather %, sunrise % to %, sunset % to %, clouds % and %, sun %", climate.weather,
+	print("weathers %; the likeliest %, sunrise % to %, sunset % to %, clouds % and %, sun %", climate.weathers, likeliest,
 		climate.sunrise_begin, climate.sunrise_end, climate.sunset_begin, climate.sunset_end,
 		weather.cloud_lower, weather.cloud_upper, climate.sun_texture)
 	water, water_error := world_water(&plugin, world_id, &scratch)
 	if water_error do print("couldn't read the water: %", water_error)
 	else do print("water: %", water)
+	// The weathers that may come at a few places: their regions'.
+	for place in [[-48, -9], [8, 30], [30, -30], [0, 0], [-20, 20]] {
+		chances : [16]Weather_Chance
+		region_error := cell_weathers(&plugin, world_id, place[0], place[1], &chances, &scratch)
+		line : str1024
+		for chance in chances {
+			&line + editor_id_of(&plugin, chance.weather)[:]
+			&line + " "
+			&line + int_text(chance.chance)[:]
+			&line + "  "
+		}
+		if region_error do print("  at %: couldn't read its regions: %", place, region_error)
+		elif chances.len == 0 do print("  at %: the climate's", place)
+		else do print("  at %: %", place, line)
+	}
 	for hour in [0, 5, 7, 8, 9, 12, 16, 17, 18, 19, 21] {
 		state := sky_at(climate, &weather, f32(hour), 10240)
 		print("  %:00  daylight %  sky % / % / %  sun % toward %  ambient %  sunlight %  fog % % to %", hour, state.daylight,

@@ -767,6 +767,9 @@ uniform vec2 cloud_lower_offset;
 uniform vec2 cloud_upper_offset;
 uniform sampler2D cloud_lower_texture;
 uniform sampler2D cloud_upper_texture;
+uniform sampler2D cloud_lower_last_texture;   // the last weather's, going out
+uniform sampler2D cloud_upper_last_texture;
+uniform float weather_share;                  // how far the coming weather has come in
 uniform sampler2D sun_texture;
 out vec4 fragment_color;
 
@@ -790,9 +793,11 @@ void main() {
 	if (direction.z > 0.0) {
 		vec2 on_plane = direction.xy / direction.z;
 		float fade = smoothstep(0.03, 0.3, direction.z);
-		vec4 upper = texture(cloud_upper_texture, on_plane * 0.3 + cloud_upper_offset);
+		vec4 upper = mix(texture(cloud_upper_last_texture, on_plane * 0.3 + cloud_upper_offset),
+			texture(cloud_upper_texture, on_plane * 0.3 + cloud_upper_offset), weather_share);
 		color = mix(color, cloud_upper_color * upper.rgb, upper.a * fade);
-		vec4 lower = texture(cloud_lower_texture, on_plane * 0.45 + cloud_lower_offset);
+		vec4 lower = mix(texture(cloud_lower_last_texture, on_plane * 0.45 + cloud_lower_offset),
+			texture(cloud_lower_texture, on_plane * 0.45 + cloud_lower_offset), weather_share);
 		color = mix(color, cloud_lower_color * lower.rgb, lower.a * fade);
 	}
 
@@ -1049,6 +1054,11 @@ Sky_Look :: struct {
 	state: Sky_State
 	cloud_lower: i64
 	cloud_upper: i64
+	// The last weather's clouds, going out as the coming one's come in
+	// (weather_share 0 to 1).
+	cloud_lower_last: i64
+	cloud_upper_last: i64
+	weather_share: f32
 	sun: i64
 	cloud_lower_offset: f32
 	cloud_upper_offset: f32
@@ -1073,6 +1083,7 @@ Sky_Program :: struct {
 	cloud_upper_color_at: i32
 	cloud_lower_offset_at: i32
 	cloud_upper_offset_at: i32
+	weather_share_at: i32
 }
 
 // The cells left out of the far land or water, around the cell at x, y:
@@ -1641,11 +1652,15 @@ make_sky_program :: fun(made: ^Sky_Program) -> err {
 	made.cloud_lower_color_at = GetUniformLocation(program, "cloud_lower_color")
 	made.cloud_upper_color_at = GetUniformLocation(program, "cloud_upper_color")
 	made.cloud_lower_offset_at = GetUniformLocation(program, "cloud_lower_offset")
+	made.weather_share_at = -1
 	made.cloud_upper_offset_at = GetUniformLocation(program, "cloud_upper_offset")
 	UseProgram(program)
 	Uniform1i(GetUniformLocation(program, "cloud_lower_texture"), 0)
 	Uniform1i(GetUniformLocation(program, "cloud_upper_texture"), 1)
 	Uniform1i(GetUniformLocation(program, "sun_texture"), 2)
+	Uniform1i(GetUniformLocation(program, "cloud_lower_last_texture"), 3)
+	Uniform1i(GetUniformLocation(program, "cloud_upper_last_texture"), 4)
+	made.weather_share_at = GetUniformLocation(program, "weather_share")
 }
 
 make_distant_program :: fun(made: ^Distant_Program, bindless: bool) -> err {
@@ -3025,7 +3040,12 @@ draw_sky :: fun(renderer: ^Renderer, look: ^Sky_Look, view_projection: Mat4, lig
 	BindTexture(TEXTURE_2D, renderer.textures[look.cloud_upper].id)
 	ActiveTexture(TEXTURE2)
 	BindTexture(TEXTURE_2D, renderer.textures[look.sun].id)
+	ActiveTexture(TEXTURE3)
+	BindTexture(TEXTURE_2D, renderer.textures[look.cloud_lower_last].id)
+	ActiveTexture(TEXTURE4)
+	BindTexture(TEXTURE_2D, renderer.textures[look.cloud_upper_last].id)
 	ActiveTexture(TEXTURE0)
+	Uniform1f(made.weather_share_at, look.weather_share)
 	Disable(DEPTH_TEST)
 	DepthMask(0)
 	BindVertexArray(renderer.empty_vertex_array)

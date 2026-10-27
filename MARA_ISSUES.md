@@ -7,7 +7,20 @@ against Mara at the time written. When one is fixed, move it to Fixed
 
 ## Open
 
-None.
+- An if-expression choosing between a text literal and a longer slice
+  stops the program: its value seems to go into a list of room 64.
+
+  ```
+  line : str1024
+  &line + "one two three four five six seven eight nine ten eleven twelve thirteen"
+  print("%", if line.len == 0 do "none" else line[:])
+  ```
+
+  stops with `runtime error: 71 items into a list with room for 64` at
+  the print. Expected: the slice printed (the literal's room shouldn't
+  bound the other side's), or a build error if the two can't share a
+  type. sooblivion writes the two prints apart (sooblivion.mara,
+  command_sky).
 
 ## Answered (not issues)
 

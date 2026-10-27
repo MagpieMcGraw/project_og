@@ -68,6 +68,10 @@ HURRIED_TIME_SCALE :: 2000
 // The room the sounds' clips are loaded into.
 SOUND_ROOM :: 64 * MB
 
+// How long a weather stays before the next is chosen, in the game's hours.
+WEATHER_LEAST_HOURS :: 4
+WEATHER_MOST_HOURS :: 8
+
 // The hour the viewer starts at.
 START_HOUR :: 10
 
@@ -90,10 +94,19 @@ Viewer :: struct {
 	walker: Walker
 	eyes: f32           // how high the walker's eyes are: smoothed over steps
 
-	// The sky outside: the world's climate and weather, the hour of the
-	// game's day, and what the sky and water look like now.
+	// The sky outside: the world's climate; its weather — the one coming in,
+	// the last one going out, how far it has come in (0 to 1), the game's
+	// hours left before the next, the weathers that may come where the
+	// camera is, and whether it's time to choose the next (explore does);
+	// the hour of the game's day, and what the sky and water look like now.
 	climate: Climate
 	weather: Weather
+	last_weather: Weather
+	weather_share: f32
+	weather_hours_left: f32
+	weathers_here: [16]Weather_Chance
+	weather_due: bool
+	weather_seed: u64
 	sky_world: u32      // the world they're of, 0 for none yet
 	hour: f32
 	look: Sky_Look
@@ -178,7 +191,15 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.eyes = 0
 	viewer.sky_world = 0
 	viewer.hour = START_HOUR
-	viewer.look = Sky_Look{state = Sky_State{0}, cloud_lower = 0, cloud_upper = 0, sun = 0,
+	viewer.weather = default_weather()
+	viewer.last_weather = default_weather()
+	viewer.weather_share = 1
+	viewer.weather_hours_left = 0
+	viewer.weathers_here.len = 0
+	viewer.weather_due = false
+	viewer.weather_seed = time_now() | 1
+	viewer.look = Sky_Look{state = Sky_State{0}, cloud_lower = 0, cloud_upper = 0, cloud_lower_last = 0, cloud_upper_last = 0,
+		weather_share = 1, sun = 0,
 		cloud_lower_offset = 0, cloud_upper_offset = 0, outside = false, time = 0, water = DEFAULT_WATER, wind = 0}
 	viewer.water = DEFAULT_WATER
 	viewer.frame_start = time_now()
@@ -546,7 +567,8 @@ place_walker :: fun(viewer: ^Viewer) {
 // everything's drawn with.
 pass_time :: fun(viewer: ^Viewer, seconds: f32, hurried: bool) {
 	scale : f32 = if hurried do HURRIED_TIME_SCALE else TIME_SCALE
-	viewer.hour += seconds * scale / 3600
+	hours := seconds * scale / 3600
+	viewer.hour += hours
 	if viewer.hour >= 24 do viewer.hour -= 24
 	look := &viewer.look
 	look.time += seconds
@@ -564,8 +586,13 @@ pass_time :: fun(viewer: ^Viewer, seconds: f32, hurried: bool) {
 	// Without distant land, the fog ends where the loaded cells do.
 	most_fog : f32 = CELL_SIZE * (EXTERIOR_RADIUS + 0.5)
 	if has_distant_land(viewer) do most_fog = 1000000
-	look.state = sky_at(viewer.climate, &viewer.weather, viewer.hour, most_fog)
-	look.wind = viewer.weather.wind_speed
+	// The weather coming in, and the next one's time.
+	viewer.weather_share = min(1, viewer.weather_share + hours / max(viewer.weather.transition, 0.01))
+	viewer.weather_hours_left -= hours
+	if viewer.weather_hours_left <= 0 do viewer.weather_due = true
+	look.weather_share = viewer.weather_share
+	look.state = changing_sky_at(&viewer.climate, &viewer.last_weather, &viewer.weather, viewer.weather_share, viewer.hour, most_fog)
+	look.wind = mix_number(viewer.last_weather.wind_speed, viewer.weather.wind_speed, viewer.weather_share)
 	look.cloud_lower_offset += seconds * scale / TIME_SCALE * viewer.weather.cloud_speed_lower
 	look.cloud_upper_offset += seconds * scale / TIME_SCALE * viewer.weather.cloud_speed_upper
 	shown.lighting = look.state.lighting
@@ -581,8 +608,14 @@ lit_water :: fun(water: Water_Type, light: Vec3) -> Water_Type {
 	return lit
 }
 
-// Reads a world's climate and weather, and puts its sky's textures on the
-// card: the first time the viewer goes out into it.
+// A number between two, by a share (0: the first, 1: the second).
+mix_number :: fun(from: f32, to: f32, share: f32) -> f32 {
+	return from + (to - from) * share
+}
+
+// Reads a world's climate and water and puts its sun on the card, and
+// starts its weather where the camera is: when the viewer goes out into a
+// world it wasn't in.
 take_sky :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32) {
 	if viewer.sky_world == world_id do return
 	viewer.sky_world = world_id
@@ -590,26 +623,19 @@ take_sky :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32) {
 	// What can't be read is told of, and the defaults go in its place.
 	climate, climate_error := world_climate(plugin, world_id, &scratch)
 	viewer.climate = if climate_error do default_climate() else climate
-	weather, weather_error := read_weather(plugin, viewer.climate.weather, &scratch)
-	viewer.weather = if weather_error do default_weather() else weather
 	water, water_error := world_water(plugin, world_id, &scratch)
 	viewer.water = if water_error do DEFAULT_WATER else water
-	for sky_error in [climate_error, weather_error, water_error] {
+	for sky_error in [climate_error, water_error] {
 		if not sky_error do continue
-		note(&viewer.journal, "couldn't read the world's climate, weather or water: the defaults instead; ")
+		note(&viewer.journal, "couldn't read the world's climate or water: the defaults instead; ")
 		note_error(&viewer.journal, sky_error)
 		note_end(&viewer.journal)
 		break
 	}
-	room := &viewer.room
 	look := &viewer.look
-	look.cloud_lower = texture_for(&viewer.renderer, &viewer.textures, viewer.weather.cloud_lower[:], &room.texture)
-	look.cloud_upper = texture_for(&viewer.renderer, &viewer.textures, viewer.weather.cloud_upper[:], &room.texture)
-	look.sun = texture_for(&viewer.renderer, &viewer.textures, viewer.climate.sun_texture[:], &room.texture)
+	look.sun = texture_for(&viewer.renderer, &viewer.textures, viewer.climate.sun_texture[:], &viewer.room.texture)
 	journal := &viewer.journal
-	note(journal, "the sky: ")
-	note(journal, editor_id_of(plugin, viewer.climate.weather))
-	note(journal, " weather; sunrise ")
+	note(journal, "the sky: sunrise ")
 	note(journal, i64(viewer.climate.sunrise_begin))
 	note(journal, " to ")
 	note(journal, i64(viewer.climate.sunrise_end))
@@ -618,6 +644,66 @@ take_sky :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32) {
 	note(journal, " to ")
 	note(journal, i64(viewer.climate.sunset_end))
 	note_end(journal)
+	_ = weathers_at_camera(viewer, plugin)
+	change_weather(viewer, plugin, true)
+}
+
+// The weathers that may come where the camera is: its cell's regions', or
+// the climate's. True when they're not the ones that could before.
+weathers_at_camera :: fun(viewer: ^Viewer, plugin: ^Plugin) -> bool {
+	scratch : [256 * KB]byte
+	x, y := grid_of(viewer.camera.position)
+	found : [16]Weather_Chance
+	region_error := cell_weathers(plugin, viewer.shown.world, x, y, &found, &scratch)
+	if region_error {
+		note(&viewer.journal, "couldn't read the regions here: the climate's weathers instead; ")
+		note_error(&viewer.journal, region_error)
+		note_end(&viewer.journal)
+		found.len = 0
+	}
+	if found.len == 0 do found = viewer.climate.weathers
+	same := found.len == viewer.weathers_here.len
+	if same {
+		for chance, k in found {
+			if chance.weather != viewer.weathers_here[k].weather do same = false
+		}
+	}
+	viewer.weathers_here = found
+	return not same
+}
+
+// Brings in the next weather, chosen by its chance among those that may
+// come here: at once, or over its coming-in time. Its clouds go on the card.
+change_weather :: fun(viewer: ^Viewer, plugin: ^Plugin, at_once: bool) {
+	viewer.weather_due = false
+	viewer.weather_hours_left = WEATHER_LEAST_HOURS + (WEATHER_MOST_HOURS - WEATHER_LEAST_HOURS) * random_share(&viewer.weather_seed)
+	chosen := pick_weather(&viewer.weathers_here, random_share(&viewer.weather_seed))
+	if chosen == viewer.weather.form_id and not at_once do return
+	scratch : [256 * KB]byte
+	weather, weather_error := read_weather(plugin, chosen, &scratch)
+	if weather_error {
+		note(&viewer.journal, "couldn't read a weather: ")
+		note_error(&viewer.journal, weather_error)
+		note_end(&viewer.journal)
+		weather = default_weather()
+	}
+	look := &viewer.look
+	room := &viewer.room
+	viewer.last_weather = if at_once do weather else viewer.weather
+	look.cloud_lower_last = look.cloud_lower
+	look.cloud_upper_last = look.cloud_upper
+	viewer.weather = weather
+	viewer.weather_share = if at_once do 1 else 0
+	look.cloud_lower = texture_for(&viewer.renderer, &viewer.textures, weather.cloud_lower[:], &room.texture)
+	look.cloud_upper = texture_for(&viewer.renderer, &viewer.textures, weather.cloud_upper[:], &room.texture)
+	if at_once {
+		look.cloud_lower_last = look.cloud_lower
+		look.cloud_upper_last = look.cloud_upper
+	}
+	note(&viewer.journal, "the weather: ")
+	note(&viewer.journal, editor_id_of(plugin, chosen)[:])
+	note(&viewer.journal, if at_once do "" else ", coming in")
+	note_end(&viewer.journal)
 }
 
 // Where the camera hears from: its place, and its right.
@@ -854,6 +940,8 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 			x, y := grid_of(viewer.camera.position)
 			start := time_now()
 			show_error := show_exterior(&viewer.shown, plugin, viewer.shown.world, x, y)
+			// Into another region: its weather soon.
+			if weathers_at_camera(viewer, plugin) do viewer.weather_hours_left = min(viewer.weather_hours_left, 0.1)
 			note(journal, "into ")
 			note(journal, x)
 			note(journal, " ")
