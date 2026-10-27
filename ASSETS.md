@@ -126,6 +126,24 @@ glow or opacity — their own, or an Idle's.
 Loading these means plugins over the master: overriding records and new
 forms (load-order form ids), and their archives.
 
+### To check against the game (a decompile, later)
+
+How the engine uses data whose meaning the files don't give; sooblivion
+guesses for now.
+
+- The sun's arc from the climate's hours (on the horizon at 6:00 and
+  20:00 here), the moons' orbits and sizes, when the stars fade in (with
+  the sky's colors here: half in at 18:00, the sun still up).
+- How long a weather stays and comes in (4 to 8 hours here; its
+  transition byte mapped to a quarter to a whole hour).
+- The scale of a region sound's chance (ten-millionths of a try every
+  2 s here).
+- Which parts shine (specular only where a normal map has an alpha
+  channel here, the material's specular color tinting it).
+- Point lights' falloff (the game reads a lookup texture), and the mist
+  near ruin lamps looking brighter than remembered.
+- Placed sounds that don't loop (played again after 6 to 12 s here).
+
 ### Probably left alone (gameplay)
 
 Scripts (SCPT 2,393, by choice), quests (QUST 390), AI packages (PACK
