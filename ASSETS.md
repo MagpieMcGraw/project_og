@@ -156,6 +156,13 @@ guesses for now.
   2 s here).
 - Which parts shine (specular only where a normal map has an alpha
   channel here, the material's specular color tinting it).
+- A material's diffuse color: used here only on untextured parts
+  without vertex colors (the sewer gates' black backing); textured ones
+  without colors are white (the game's object shaders take MatAlpha and
+  MatEmit but no diffuse; a silver battleaxe's blade is black by its
+  material; the Skingrad-style bridges' SkingradBridgeEdge01 pieces lie
+  on a copy of their railing in SkingradBridgeMain01, gray 0.588 against
+  its white vertex colors, and flickered).
 - Point lights' falloff (the game reads a lookup texture), and the mist
   near ruin lamps looking brighter than remembered.
 - Placed sounds that don't loop (played again after 6 to 12 s here).

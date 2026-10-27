@@ -2505,6 +2505,8 @@ usage :: fun() {
 	print("sooblivion bsa <archive>           an archive's folders and files")
 	print("sooblivion bsa <archive> <file>    one file from an archive, unpacked")
 	print("sooblivion plugins                 the plugins loaded, in order, and the archives")
+	print("sooblivion overlaps <world> <x> <y> <z> [radius]")
+	print("                                   drawn shapes lying on one another near a point (flicker)")
 	print("sooblivion mp3 <file> [raw]        decodes an MP3 (into raw floats, if given)")
 	print("sooblivion music <kind> [raw]      a kind's first track through the mix, no sound device (explore, public, dungeon)")
 	print("sooblivion help                    this")
@@ -2693,6 +2695,207 @@ command_npc :: fun(name: []utf8) {
 	if report.failures > 0 do print("% parts left out; the first: %, %", report.failures, report.first, report.reason)
 }
 
+// A drawn triangle in the world, for command_overlaps: its corners, the
+// way it faces, the shape it's from (an index into the shapes).
+Placed_Triangle :: struct {
+	corners: [3!]Vec3
+	facing: Vec3
+	shape: i64
+}
+
+// A shape command_overlaps looks at: its mesh, its texture, the reference
+// that places it.
+Placed_Shape :: struct {
+	mesh: [256]utf8
+	texture: [160]utf8
+	reference: u32
+}
+
+// Two shapes found lying on one another: how many pairs of their
+// triangles do, and how far the second's corners are in front of the
+// first's plane in such a pair, at least and at most (behind: below 0).
+Overlapping_Shapes :: struct {
+	first: i64
+	second: i64
+	pairs: i64
+	lowest: f32
+	highest: f32
+}
+
+OVERLAP_GAP :: 0.5     // triangles closer than this to one plane count as on it
+OVERLAP_HAIR :: 0.05   // triangles reaching less than this into each other only touch
+
+// `sooblivion overlaps <world> <x> <y> <z> [radius]`: the drawn triangles
+// near a point (within radius, 500 when not given) that lie on one
+// another: on one plane, facing the same way, covering some of the same
+// place, from different shapes. Where the frame flickers between two
+// shapes, they show up here.
+command_overlaps :: fun(name: []utf8, point: Vec3, radius: f32) {
+	data_storage : [400 * MB]byte
+	index_storage : [96 * MB]byte
+	plugin, load_error := load_oblivion(&data_storage, &index_storage)
+	if load_error {
+		print("couldn't load the plugins: %", load_error)
+		return
+	}
+	scratch : [16 * MB]byte
+	world_id := find_world(&plugin, name, &scratch)
+	if world_id == 0 {
+		print("no world %", name)
+		return
+	}
+	directory_storage : [64 * MB]byte
+	archives : Archives
+	open_error := open_all_archives(&archives, &directory_storage)
+	if open_error {
+		print("couldn't open the archives: %", open_error)
+		return
+	}
+	defer close_archives(&archives)
+	file_room : [16 * MB]byte
+	block_room : [16 * MB]byte
+	model_room : [64 * MB]byte
+	shapes : [4096]Placed_Shape
+	triangles : [200000]Placed_Triangle
+	references : [16384]Reference
+
+	// The triangles near the point, from the cell it's in and those round it.
+	middle_x := i64(floor_f32(point.x / CELL_SIZE))
+	middle_y := i64(floor_f32(point.y / CELL_SIZE))
+	for cell_y in middle_y - 1 .. middle_y + 1 {
+		for cell_x in middle_x - 1 .. middle_x + 1 {
+			cell := exterior_cell(&plugin, world_id, cell_x, cell_y)
+			if cell == 0 do continue
+			references.len = 0
+			references_error := cell_references(&plugin, cell, &references)
+			if references_error do continue
+			for reference in references {
+				if reference.flags & RECORD_DISABLED != 0 do continue
+				scratch.len = 0
+				base, base_error := find_record(&plugin, reference.base, &scratch)
+				if base_error do continue
+				path := model_path(base)
+				if path.len == 0 or is_marker(path[:]) do continue
+				file_room.len = 0
+				block_room.len = 0
+				mesh, mesh_error := read_archived_nif(&archives, path[:], &file_room, &block_room)
+				if mesh_error do continue
+				model_room.len = 0
+				built, model_error := build_model(&mesh, &model_room)
+				if model_error do continue
+				place := reference_transform(reference)
+				for &part in built.parts {
+					if shapes.len == shapes.cap do break
+					kept := false
+					for t in 0:part.indices.len / 3 {
+						corners : [3!]Vec3
+						for k in 0:3 {
+							position := part.vertices[i64(part.indices[t * 3 + k])].position
+							placed := mat4_mul_vec4(place, Vec4{position.x, position.y, position.z, 1})
+							corners[k] = Vec3{placed[0], placed[1], placed[2]}
+						}
+						if not triangle_near(corners, point, radius) or triangles.len == triangles.cap do continue
+						facing := cross(vec3_sub(corners[1], corners[0]), vec3_sub(corners[2], corners[0]))
+						if vec3_length(facing) < 0.0001 do continue
+						&triangles + Placed_Triangle{corners = corners, facing = vec3_normalize(facing), shape = shapes.len}
+						kept = true
+					}
+					if kept do &shapes + Placed_Shape{mesh = path, texture = part.texture, reference = reference.form_id}
+				}
+			}
+		}
+	}
+
+	// Each pair of triangles from different shapes.
+	found : [256]Overlapping_Shapes
+	for i in 0:triangles.len {
+		a := &triangles[i]
+		for j in i + 1 : triangles.len {
+			b := &triangles[j]
+			if a.shape == b.shape or dot(a.facing, b.facing) < 0.995 do continue
+			lowest : f32 = 1000000
+			highest : f32 = -1000000
+			for k in 0:3 {
+				in_front := dot(vec3_sub(b.corners[k], a.corners[0]), a.facing)
+				lowest = min(lowest, in_front)
+				highest = max(highest, in_front)
+			}
+			if max(abs_f32(lowest), abs_f32(highest)) > OVERLAP_GAP or not triangles_cover(a, b) do continue
+			first := min(a.shape, b.shape)
+			second := max(a.shape, b.shape)
+			index : i64 = -1
+			for &pair, p in found {
+				if pair.first == first and pair.second == second do index = p
+			}
+			if index < 0 {
+				if found.len == found.cap do continue
+				&found + Overlapping_Shapes{first = first, second = second, pairs = 0, lowest = lowest, highest = highest}
+				index = found.len - 1
+			}
+			// (The triangles go in shape by shape, so a's shape is the first.)
+			found[index].pairs += 1
+			found[index].lowest = min(found[index].lowest, lowest)
+			found[index].highest = max(found[index].highest, highest)
+		}
+	}
+	print("% shapes, % triangles within % of %", shapes.len, triangles.len, radius, point)
+	for &pair in found {
+		first := &shapes[pair.first]
+		second := &shapes[pair.second]
+		print("  % pairs, the second % to % in front:", pair.pairs, pair.lowest, pair.highest)
+		print("    % % (reference %)", first.mesh, first.texture, first.reference)
+		print("    % % (reference %)", second.mesh, second.texture, second.reference)
+	}
+}
+
+// Whether a triangle comes within radius of a point (its box does).
+triangle_near :: fun(corners: [3!]Vec3, point: Vec3, radius: f32) -> bool {
+	closest := point
+	for axis in 0:3 {
+		low := min(corners[0][axis], min(corners[1][axis], corners[2][axis]))
+		high := max(corners[0][axis], max(corners[1][axis], corners[2][axis]))
+		closest[axis] = min(max(point[axis], low), high)
+	}
+	return vec3_length(vec3_sub(closest, point)) < radius
+}
+
+// Whether two triangles on one plane (a's) cover some of the same place:
+// seen flat, along the axis a faces most, no edge of either has all of the
+// other on its outer side.
+triangles_cover :: fun(a: ^Placed_Triangle, b: ^Placed_Triangle) -> bool {
+	dropped := 0
+	for axis in 1:3 {
+		if abs_f32(a.facing[axis]) > abs_f32(a.facing[dropped]) do dropped = axis
+	}
+	across := (dropped + 1) % 3
+	up := (dropped + 2) % 3
+	flat_a : [3!]Vec3
+	flat_b : [3!]Vec3
+	for k in 0:3 {
+		flat_a[k] = Vec3{a.corners[k][across], a.corners[k][up], 0}
+		flat_b[k] = Vec3{b.corners[k][across], b.corners[k][up], 0}
+	}
+	return not outside_an_edge(flat_a, flat_b) and not outside_an_edge(flat_b, flat_a)
+}
+
+// Whether all of second (flat: z 0) lies on the outer side of one of
+// first's edges, or reaches in less than a hair (OVERLAP_HAIR).
+outside_an_edge :: fun(first: [3!]Vec3, second: [3!]Vec3) -> bool {
+	for k in 0:3 {
+		start := first[k]
+		edge := vec3_sub(first[(k + 1) % 3], start)
+		// Square to the edge, pointing away from the third corner.
+		outward := vec3_normalize(Vec3{-edge.y, edge.x, 0})
+		if dot(outward, vec3_sub(first[(k + 2) % 3], start)) > 0 do outward = vec3_negate(outward)
+		reaching_in := false
+		for corner in second {
+			if dot(outward, vec3_sub(corner, start)) < -OVERLAP_HAIR do reaching_in = true
+		}
+		if not reaching_in do return true
+	}
+	return false
+}
+
 // `sooblivion plugins`: the plugins the game loads, in its order, and its
 // archives in the order a file is looked for in them.
 command_plugins :: fun() {
@@ -2856,6 +3059,13 @@ main :: (args: [][]utf8) {
 		command_sounds()
 	elif command == "plugins"
 		command_plugins()
+	elif command == "overlaps" and args.len > 5
+		x, x_ok := parse_number(args[3])
+		y, y_ok := parse_number(args[4])
+		z, z_ok := parse_number(args[5])
+		radius, radius_ok := parse_number(if args.len > 6 do args[6] else "500")
+		if x_ok and y_ok and z_ok and radius_ok do command_overlaps(args[2], Vec3{f32(x), f32(y), f32(z)}, f32(radius))
+		else do usage()
 	elif command == "npc" and args.len > 2
 		command_npc(args[2])
 	elif command == "skin" and args.len > 2

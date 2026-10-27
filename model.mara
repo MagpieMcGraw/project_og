@@ -378,11 +378,16 @@ add_shape :: fun(mesh: ^Nif, geometry: Geometry, extra_data: Refs, transform: Ma
 	part.indices = indices
 	add_motions(mesh, properties, model, model.parts.len - 1)
 
-	// The material's color, where the mesh has no colors of its own (they
-	// take its place, as Oblivion's meshes mean them to), and its opacity,
-	// into the vertices' colors: a black backing behind a sewer's gate
-	// stays black.
-	no_colors := geometry.colors.len == 0
+	// The material's color, where the mesh has neither colors of its own
+	// (they take its place, as Oblivion's meshes mean them to) nor a
+	// texture, and its opacity, into the vertices' colors: a black backing
+	// behind a sewer's gate stays black. A textured mesh without colors is
+	// white: the game's shaders for them take the material's opacity and
+	// glow but no color of it. (797 textured parts have a material that
+	// isn't white and no colors: a silver battleaxe's blade, black by its
+	// material; a bridge's railing whose white colors the exporter dropped,
+	// gray 0.588 by its material, lying on a copy that kept them.)
+	no_colors := geometry.colors.len == 0 and part.texture.len == 0
 	white := part.diffuse.x == 1 and part.diffuse.y == 1 and part.diffuse.z == 1
 	if (no_colors and not white) or part.alpha != 1 {
 		for &vertex in part.vertices {

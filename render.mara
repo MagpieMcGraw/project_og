@@ -3091,7 +3091,7 @@ Camera :: struct {
 	yaw: f32      // turned from looking north (+y), clockwise seen from above
 	pitch: f32    // up from level
 	field_of_view: f32 = 1.2   // vertical, in radians
-	near: f32 = 5
+	near: f32 = 10   // as the game's (Oblivion.ini fNearDistance)
 	far: f32 = 60000
 }
 
