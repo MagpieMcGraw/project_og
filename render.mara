@@ -920,8 +920,12 @@ void main() {
 			color += sun_color * sun.rgb * sun.a;
 		}
 	}
-	// Its glare, as the weather has it.
-	if (sun_glare > 0.0) color += sun_color * sky_patch(sun_glare_texture, direction, sun_direction, 0.6).rgb * sun_glare;
+	// Its glare, as the weather has it: the glare's color where its alpha
+	// shapes it.
+	if (sun_glare > 0.0) {
+		vec4 glare = sky_patch(sun_glare_texture, direction, sun_direction, 0.6);
+		color += sun_color * glare.rgb * glare.a * sun_glare;
+	}
 
 	// The clouds: two layers on a plane above, faded toward the horizon.
 	if (direction.z > 0.0) {
