@@ -2676,9 +2676,6 @@ command_npc :: fun(name: []utf8) {
 		print("couldn't pose its skeleton: %", pose_error)
 		return
 	}
-	for &bone in bones {
-		if compare_folded(bone.name[:], "Bip01 Head") == 0 do print("head bone at rest: x axis %, y axis %, z axis %, at %; posed at %", bone.rest.x, bone.rest.y, bone.rest.z, bone.rest.w, bone.place.w)
-	}
 	report := Npc_Report{failures = 0, first = [], reason = Not_In_Archive}
 	whole := assemble_npc(&archives, &room, &look, bones[:], &report)
 	print("% shapes, from % to %", whole.parts.len, whole.bounds_min, whole.bounds_max)

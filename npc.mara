@@ -67,17 +67,12 @@ NPC_MODEL_PARTS :: 128
 // it isn't skinned (empty: the one it names, Prn, else none), and a color
 // it's drawn tinted by (hair's grey textures take the NPC's hair color).
 // Hung from a bone, a part's coordinates are the bone's own axes (a shield
-// on the forearm), except from the head: there the model's axes moved to
-// the head (eyes, ears, hair, hats: hang_place) — but for the mouth, teeth
-// and tongue (in_bone_frame). Their files' coordinates say so (a helmet is
-// even in the model's x, the mouth's width runs along the head bone's z),
-// nothing else in them does; FaceGen's own files may explain it.
+// on the forearm), except from the head: see head_hang.
 Npc_Part :: struct {
 	mesh: [256]utf8
 	texture: [256]utf8
 	bone: [64]utf8
 	tint: Vec3
-	in_bone_frame: bool
 }
 
 // What an NPC is put together from: whether she's a woman, how tall (a
@@ -235,7 +230,6 @@ read_npc_look :: fun(plugin: ^Plugin, npc_id: u32, look: ^Npc_Look) -> err {
 		if head_meshes[k].len == 0 do continue
 		texture := if k >= 7 and eyes_texture.len > 0 do eyes_texture[:] else head_textures[k][:]
 		add_npc_part(look, head_meshes[k][:], texture, HEAD_BONE)
-		look.parts[look.parts.len - 1].in_bone_frame = k >= 3 and k <= 6
 	}
 	// Its hair, unless something worn covers it.
 	if hair_id != 0 and taken & SLOT_HAIR == 0 {
@@ -267,7 +261,6 @@ add_npc_part :: fun(look: ^Npc_Look, mesh: []utf8, texture: []utf8, bone: []utf8
 	part.texture.len = 0
 	part.bone.len = 0
 	part.tint = Vec3{1, 1, 1}
-	part.in_bone_frame = false
 	archive_path_under("meshes\\", mesh, &part.mesh)
 	if texture.len > 0 do archive_path_under("textures\\", texture, &part.texture)
 	&part.bone + bone
@@ -458,8 +451,7 @@ assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose
 			if parent.len > 0 do bone = parent
 			if bone.len > 0 {
 				place, posed := pose_place(pose, bone)
-				on_head := compare_folded(bone, HEAD_BONE) == 0
-				if on_head and not part.in_bone_frame do place, posed = hang_place(pose, bone)
+				if compare_folded(bone, HEAD_BONE) == 0 do place, posed = head_hang(&mesh, pose)
 				if posed do hang = place
 			}
 		}
@@ -506,6 +498,26 @@ note_npc_failure :: fun(report: ^Npc_Report, path: []utf8, reason: err) {
 		&report.first + path
 		report.reason = reason
 	}
+}
+
+// Where a part hung from the head goes: in the head's space (FaceGen's:
+// the model's axes at the head bone, hang_place), by its shapes' own
+// coordinates — its root node's transform undone. Some files turn their
+// root to sit under the head bone itself (the mouth, teeth and tongue; a
+// Khajiit's ears: a quarter turn, the bone's at rest, backward); their
+// vertices are the head's space's all the same, as their .tri (FaceGen's
+// copy of them) has them.
+head_hang :: fun(mesh: ^Nif, pose: []Pose_Bone) -> Mat4, bool {
+	place, posed := hang_place(pose, HEAD_BONE)
+	if not posed or mesh.roots.count == 0 do return place, posed
+	root_object := mesh.roots.at(0)
+	if root_object < 0 do return place, posed
+	match mesh.blocks[root_object] {
+	Node node
+		return mat4_mul(place, mat4_inverse(local_transform(node.object))), true
+	else
+	}
+	return place, posed
 }
 
 // Whether a NIF has a skinned shape.
