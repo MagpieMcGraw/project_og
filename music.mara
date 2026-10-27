@@ -163,14 +163,14 @@ next_music_frame :: fun(audio: ^Mixer) -> bool {
 start_track :: fun(music: ^Music, seed: ^u64) -> err {
 	stop_track(music)
 	folder : Path
-	&folder + music.folder[:]
+	&folder + music.folder
 	&folder + "\\"
 	kind_folder := music_folder_name(music.wanted)
-	&folder + kind_folder[:]
+	&folder + kind_folder
 	music.track.len = 0
-	&music.track + kind_folder[:]
+	&music.track + kind_folder
 	listing : [MUSIC_LISTING]byte
-	entries := dir_read(folder[:], &listing)?
+	entries := dir_read(folder, &listing)?
 	tracks : i64 = 0
 	for entry in entries {
 		if is_track(entry) do tracks += 1
@@ -179,18 +179,18 @@ start_track :: fun(music: ^Music, seed: ^u64) -> err {
 	pick := i64(next_random(seed) % u64(tracks))
 	for round in 0:2 {
 		chosen := nth_track(entries, pick)
-		if tracks == 1 or path_hash(chosen[:]) != music.track_hash do break
+		if tracks == 1 or path_hash(chosen) != music.track_hash do break
 		pick = (pick + 1) % tracks
 	}
 	name := nth_track(entries, pick)
 	path : Path
-	&path + folder[:]
+	&path + folder
 	&path + "\\"
-	&path + name[:]
+	&path + name
 	&music.track + "\\"
-	&music.track + name[:]
+	&music.track + name
 
-	music.file = file_open_read(path[:])?
+	music.file = file_open_read(path)?
 	music.file_open = true
 	music.file_ended = false
 	music.buffer.len = 0
@@ -201,13 +201,13 @@ start_track :: fun(music: ^Music, seed: ^u64) -> err {
 	music.kind = music.wanted
 	music.volume = 1
 	music.at = 0
-	music.track_hash = path_hash(name[:])
+	music.track_hash = path_hash(name)
 	music.tracks_started += 1
 }
 
 // Whether a folder's entry is a track: an MP3 file.
 is_track :: fun(entry: Dir_Entry) -> bool {
-	return not entry.dir and (ends_with(entry.name[:], ".mp3") or ends_with(entry.name[:], ".MP3"))
+	return not entry.dir and (ends_with(entry.name, ".mp3") or ends_with(entry.name, ".MP3"))
 }
 
 // The name of a listing's nth track.
@@ -217,7 +217,7 @@ nth_track :: fun(entries: []Dir_Entry, n: i64) -> [260]utf8 {
 	for entry in entries {
 		if not is_track(entry) do continue
 		if seen == n {
-			&name + entry.name[:]
+			&name + entry.name
 			break
 		}
 		seen += 1
@@ -262,7 +262,7 @@ note_music_failure :: fun(audio: ^Mixer, reason: err) {
 	if audio.failures == 1 {
 		audio.first_failure.len = 0
 		&audio.first_failure + "music "
-		&audio.first_failure + audio.music.track[:]
+		&audio.first_failure + audio.music.track
 		audio.first_failure_reason = reason
 	}
 }

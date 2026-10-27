@@ -46,7 +46,7 @@ note_text :: fun(journal: ^Journal, text: []utf8) {
 }
 
 note_number :: fun(journal: ^Journal, number: i64) {
-	note_text(journal, int_text(number)[:])
+	note_text(journal, int_text(number))
 }
 
 // An err in the line: its name, and where it was made ("Archive_Error.Not_Found
@@ -67,19 +67,19 @@ note_end :: fun(journal: ^Journal) {
 	milliseconds := i64((time_now() - journal.started) / 1000000)
 	stamped : str1024
 	&stamped + "["
-	&stamped + int_text(milliseconds / 1000)[:]
+	&stamped + int_text(milliseconds / 1000)
 	&stamped + "."
 	fraction := milliseconds % 1000
 	if fraction < 100 do &stamped + "0"
 	if fraction < 10 do &stamped + "0"
-	&stamped + int_text(fraction)[:]
+	&stamped + int_text(fraction)
 	&stamped + "] "
 	room := stamped.cap - stamped.len - 1
-	if journal.line.len <= room do &stamped + journal.line[:]
+	if journal.line.len <= room do &stamped + journal.line
 	else do &stamped + journal.line[0 : room]
 	&stamped + "\n"
 	if journal.file != NO_FILE {
-		write_error := file_write_text(journal.file, stamped[:])
+		write_error := file_write_text(journal.file, stamped)
 		if write_error {
 			// Said once, on the console; the journal goes on there only.
 			print("the journal's file can't be written to: %; the console only from here", write_error)

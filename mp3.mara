@@ -208,7 +208,7 @@ mp3_start :: fun(decoder: ^Mp3_Decoder, data: []byte) -> err {
 	main_at := decoder.at + 4 + side_info_size(header)
 	if main_at + 4 <= data.len {
 		tag : [4!]utf8 = data[main_at]
-		if tag[:] == "Xing" or tag[:] == "Info" do decoder.at += header.size
+		if tag == "Xing" or tag == "Info" do decoder.at += header.size
 	}
 
 	decoder.main_data.len = 0

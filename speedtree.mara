@@ -506,12 +506,12 @@ grow_tree :: fun(tree: ^Speed_Tree, seed: i64, leaf_texture: []utf8, fit: Tree_F
 	for &vertex in growth.leaf_vertices do widen(&low, &high, vertex.position, max(abs_f32(vertex.tangent[0]), abs_f32(vertex.tangent[1])))
 	bark_texture : [160]utf8
 	&bark_texture + "textures\\trees\\branches\\"
-	&bark_texture + tree.bark[:]
+	&bark_texture + tree.bark
 	&bark_texture + ".dds"
-	if growth.bark_indices.len > 0 do &parts + tree_part(&growth, false, bark_texture[:])
+	if growth.bark_indices.len > 0 do &parts + tree_part(&growth, false, bark_texture)
 	if growth.leaf_indices.len > 0 do &parts + tree_part(&growth, true, leaf_texture)
 	report = Growth_Report{branches = growth.branches, leaves = growth.leaves, left_out = growth.left_out}
-	return Model{parts = parts[:], flips = [], particles = [], motions = [], bounds_min = low, bounds_max = high}, report
+	return Model{parts = parts, flips = [], particles = [], motions = [], bounds_min = low, bounds_max = high}, report
 }
 
 // Grows the tree from its trunk, the dice started from the seed.
@@ -574,7 +574,7 @@ grow_branch :: fun(growth: ^Growth, tree: ^Speed_Tree, level_index: i64, start: 
 		}
 		&spine + (spine[spine.len - 1] + heading * step)
 	}
-	add_tube(growth, level, spine[:], radius)
+	add_tube(growth, level, spine, radius)
 
 	// The next level's branches, or the leaves.
 	if level_index + 1 >= tree.levels.len do return
@@ -591,7 +591,7 @@ grow_branch :: fun(growth: ^Growth, tree: ^Speed_Tree, level_index: i64, start: 
 		// grow from: 0 where they start, 1 where they stop.
 		span : f32 = t
 		if CURVES_ACROSS_SPAN do span = if last > first do (t - first) / (last - first) else 0
-		at, parent_way := spine_at(spine[:], t)
+		at, parent_way := spine_at(spine, t)
 		turn_round += 137.5 * PI / 180 + (2 * roll(&growth.dice) - 1) * 0.3
 		out := turned_about(square_to(parent_way), parent_way, turn_round)
 		angle := curve_value(&child_level.start_angle, span, &growth.dice) * PI / 180

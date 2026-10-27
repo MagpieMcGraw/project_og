@@ -129,7 +129,7 @@ read_wave :: fun(data: []byte) -> Clip, err {
 	if data.len < 12 do return clip, Not_Wave
 	riff : [4!]utf8 = data[0]
 	wave : [4!]utf8 = data[8]
-	if riff[:] != "RIFF" or wave[:] != "WAVE" do return clip, Not_Wave
+	if riff != "RIFF" or wave != "WAVE" do return clip, Not_Wave
 	at : i64 = 12
 	bits : i64 = 0
 	for at + 8 <= data.len {
@@ -137,7 +137,7 @@ read_wave :: fun(data: []byte) -> Clip, err {
 		size : u32 = data[at + 4]
 		body := at + 8
 		end := min(body + i64(size), data.len)
-		if chunk[:] == "fmt " and end - body >= 16 {
+		if chunk == "fmt " and end - body >= 16 {
 			format : u16 = data[body]
 			channels : u16 = data[body + 2]
 			rate : u32 = data[body + 4]
@@ -146,7 +146,7 @@ read_wave :: fun(data: []byte) -> Clip, err {
 			clip.channels = i64(channels)
 			clip.rate = i64(rate)
 			bits = i64(sample_bits)
-		elif chunk[:] == "data"
+		elif chunk == "data"
 			clip.samples = data[body : end]
 		}
 		at = body + i64(size) + i64(size & 1)
@@ -174,13 +174,13 @@ clip_for :: fun(audio: ^Mixer, archives: ^Archives, kind: ^Sound_Kind) -> i64, e
 		&path + "\\"
 		&path + file_name(archive, archive.files[pick])
 	else
-		&path + kind.path[:]
+		&path + kind.path
 	}
-	key := path_hash(path[:])
+	key := path_hash(path)
 	known, found := index_get(&audio.clip_index, key)
 	if found do return known
 	if audio.clips.len == audio.clips.cap do return -1, No_Room_For_Sound
-	sound_file, in_archive := find_archived(archives, path[:])
+	sound_file, in_archive := find_archived(archives, path)
 	if not in_archive do return -1, No_Sound_File
 	if archived_size(archives, sound_file) > audio.clip_room.cap - audio.clip_room.len do return -1, No_Room_For_Sound
 	data := read_archived(archives, sound_file, &audio.clip_room)?
@@ -219,7 +219,7 @@ note_sound_failure :: fun(audio: ^Mixer, kind: ^Sound_Kind, reason: err) {
 	audio.failures += 1
 	if audio.failures == 1 {
 		audio.first_failure.len = 0
-		&audio.first_failure + kind.path[:]
+		&audio.first_failure + kind.path
 		audio.first_failure_reason = reason
 	}
 }
@@ -380,7 +380,7 @@ mix_ahead :: fun(audio: ^Mixer) {
 	for &voice in audio.voices do mix_voice(audio, voice, frames)
 	mix_music(audio, frames)
 	for k in 0:audio.mix.len do audio.mix[k] = max(-1, min(1, audio.mix[k] * MASTER_VOLUME))
-	_ = sdl.PutAudioStreamData(audio.stream, audio.mix[:])
+	_ = sdl.PutAudioStreamData(audio.stream, audio.mix)
 
 	// Let go of the voices done: ended, or faded out and not wanted.
 	kept : i64 = 0

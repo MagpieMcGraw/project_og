@@ -205,7 +205,7 @@ fixed_codes :: fun(literals: ^Huffman, distances: ^Huffman) -> err {
 	for i in 144:256 do lengths[i] = 9
 	for i in 256:280 do lengths[i] = 7
 	for i in 280:288 do lengths[i] = 8
-	build(literals, lengths[:])?
+	build(literals, lengths)?
 	for i in 0:30 do lengths[i] = 5
 	build(distances, lengths[0:30])?
 }
@@ -221,7 +221,7 @@ read_codes :: fun(bits: ^Bits, literals: ^Huffman, distances: ^Huffman) -> err {
 	code_lengths : [19!]u8
 	for i in 0:length_count do code_lengths[CODE_LENGTH_ORDER[i]] = u8(take(bits, 3))
 	length_code : Huffman
-	build(&length_code, code_lengths[:])?
+	build(&length_code, code_lengths)?
 
 	// The literal and distance lengths, as one list. 16 repeats the length
 	// before 3 to 6 times; 17 is 3 to 10 zeros, 18 is 11 to 138.

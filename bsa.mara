@@ -246,7 +246,7 @@ archive_path :: fun(path: []utf8) -> [512]utf8 {
 // when there is none. Either '/' or '\' between the parts, any letter case.
 find_folder :: fun(archive: ^Archive, path: []utf8) -> i64, bool {
 	clean := archive_path(path)
-	return search_folders(archive.folders, name_hash(clean[:], ""))
+	return search_folders(archive.folders, name_hash(clean, ""))
 }
 
 // The file at path in the archive, as an index into its files; false when

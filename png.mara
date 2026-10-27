@@ -74,7 +74,7 @@ encode_png :: fun(pixels: []byte, width: i64, height: i64, out: ^[]byte, scratch
 	header[10] = u8(0)   // deflate
 	header[11] = u8(0)   // filtering by rows
 	header[12] = u8(0)   // not interlaced
-	add_chunk(out, &table, "IHDR", header[:])
+	add_chunk(out, &table, "IHDR", header)
 
 	// The rows, each after a 0: no filter.
 	scratch.len = 0

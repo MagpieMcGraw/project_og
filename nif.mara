@@ -277,7 +277,7 @@ version_text :: fun(version: u32) -> str64 {
 	for part in 0:4 {
 		if part > 0 do &text + '.'
 		number := i64((version >> u32(24 - part * 8)) & 255)
-		&text + int_text(number)[:]
+		&text + int_text(number)
 	}
 	return text
 }

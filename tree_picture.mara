@@ -71,7 +71,7 @@ command_tree_picture :: fun(name: []utf8, out_path: []utf8, seed_or_bare: []utf8
 	file_storage : [16 * MB]byte
 	model_storage : [32 * MB]byte
 	tree := Speed_Tree{0}
-	spt, spt_found := find_archived(&archives, look.model[:])
+	spt, spt_found := find_archived(&archives, look.model)
 	if not spt_found {
 		print("no % in the archives", look.model)
 		return
@@ -90,22 +90,22 @@ command_tree_picture :: fun(name: []utf8, out_path: []utf8, seed_or_bare: []utf8
 	// The billboard: its size fits the tree, and it's drawn beside it.
 	billboard_file : [4 * MB]byte
 	billboard_pixels : [8 * MB]byte
-	billboard, billboard_error := paint_texture(&archives, look.billboard[:], 0, &billboard_file, &billboard_pixels)
+	billboard, billboard_error := paint_texture(&archives, look.billboard, 0, &billboard_file, &billboard_pixels)
 	if billboard_error do print("couldn't read %: %", look.billboard, billboard_error)
 	// The fit as the scene finds it: from mipmaps at least 64 wide.
 	fit := Tree_Fit{width = 0, height = 0, leaf_fill = 0}
 	small_file : [4 * MB]byte
 	small_pixels : [1 * MB]byte
-	small_billboard, small_billboard_error := paint_texture(&archives, look.billboard[:], 64, &small_file, &small_pixels)
+	small_billboard, small_billboard_error := paint_texture(&archives, look.billboard, 64, &small_file, &small_pixels)
 	if not small_billboard_error {
 		fit = billboard_fit(small_billboard.pixels, small_billboard.width, small_billboard.height, look.width, look.height)
 	}
 	small_file.len = 0
 	small_pixels.len = 0
-	small_leaves, small_leaves_error := paint_texture(&archives, look.leaves[:], 64, &small_file, &small_pixels)
+	small_leaves, small_leaves_error := paint_texture(&archives, look.leaves, 64, &small_file, &small_pixels)
 	if small_leaves_error do print("couldn't read %: %", look.leaves, small_leaves_error)
 	else do fit.leaf_fill = leaf_fill(small_leaves.pixels)
-	grown, report, grow_error := grow_tree(&tree, seed, look.leaves[:], fit, &model_storage)
+	grown, report, grow_error := grow_tree(&tree, seed, look.leaves, fit, &model_storage)
 	if grow_error {
 		print("couldn't grow %: %", look.model, grow_error)
 		return
@@ -134,7 +134,7 @@ command_tree_picture :: fun(name: []utf8, out_path: []utf8, seed_or_bare: []utf8
 		if bare and part.leaf_cards do continue
 		file_storage.len = 0
 		texture_storage.len = 0
-		painted, texture_error := paint_texture(&archives, part.texture[:], 0, &file_storage, &texture_storage)
+		painted, texture_error := paint_texture(&archives, part.texture, 0, &file_storage, &texture_storage)
 		if texture_error {
 			print("couldn't read %: %", part.texture, texture_error)
 			continue
@@ -146,7 +146,7 @@ command_tree_picture :: fun(name: []utf8, out_path: []utf8, seed_or_bare: []utf8
 	png_storage : [16 * MB]byte
 	row_storage : [16 * MB]byte
 	encode_png(canvas.pixels, canvas.width, canvas.height, &png_storage, &row_storage)
-	write_error := write_entire_file(out_path, png_storage[:])
+	write_error := write_entire_file(out_path, png_storage)
 	if write_error {
 		print("couldn't write %: %", out_path, write_error)
 		return

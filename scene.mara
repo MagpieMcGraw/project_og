@@ -634,10 +634,10 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, plac
 			continue
 		}
 		path := model_path(base)
-		if path.len == 0 or is_marker(path[:]) do continue
+		if path.len == 0 or is_marker(path) do continue
 		// A door that opens in place, of a kind loaded: its pieces.
 		if in_place {
-			kind_index, kind_known := index_get(&scene.door_kind_index, text_hash(path[:]))
+			kind_index, kind_known := index_get(&scene.door_kind_index, text_hash(path))
 			if kind_known and kind_index > 0 {
 				place_door(scene, kind_index - 1, reference_transform(reference), reference.form_id)
 				continue
@@ -649,14 +649,14 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, plac
 				waiting.npc = 0
 				waiting.tree = 0
 				waiting.path.len = 0
-				&waiting.path + path[:]
+				&waiting.path + path
 				waiting.world = reference_transform(reference)
 				continue
 			}
 		}
-		model_index, known := known_model(scene, path[:])
+		model_index, known := known_model(scene, path)
 		if known {
-			if model_index >= 0 do place_model(scene, model_index, path[:], reference_transform(reference), reference.form_id)
+			if model_index >= 0 do place_model(scene, model_index, path, reference_transform(reference), reference.form_id)
 		elif scene.waiting.len < scene.waiting.cap
 			waiting := next(&scene.waiting)
 			waiting.reference = reference.form_id
@@ -664,7 +664,7 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, plac
 			waiting.npc = 0
 			waiting.tree = 0
 			waiting.path.len = 0
-			&waiting.path + path[:]
+			&waiting.path + path
 			waiting.world = reference_transform(reference)
 		}
 	}
@@ -690,7 +690,7 @@ load_waiting :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, budget: u64)
 		place := Vec3{item.world[3][0], item.world[3][1], item.world[3][2]}
 		if scene.world != 0 and not area_holds(shown_area(scene), place) do continue
 		if item.door {
-			kind_index := door_kind(scene, plugin, loader, item.path[:])
+			kind_index := door_kind(scene, plugin, loader, item.path)
 			if kind_index >= 0 {
 				place_door(scene, kind_index, item.world, item.reference)
 				continue
@@ -708,8 +708,8 @@ load_waiting :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, budget: u64)
 			if scene.instances.len > before do scene.instances[before].reach = TREE_NEAR
 			continue
 		}
-		model_index := scene_model(scene, loader, item.path[:])
-		if model_index >= 0 do place_model(scene, model_index, item.path[:], item.world, item.reference)
+		model_index := scene_model(scene, loader, item.path)
+		if model_index >= 0 do place_model(scene, model_index, item.path, item.world, item.reference)
 	}
 	for scene.waiting_trees_next < scene.waiting_trees.len {
 		if time_now() - start > budget do return false
@@ -747,10 +747,10 @@ tree_kind :: fun(scene: ^Scene, plugin: ^Plugin, base: u32, loader: Loader) -> i
 		look, is_tree := tree_look(record)
 		if is_tree {
 			// (The picture fills its texture: clamped, its edges don't pick up the far side.)
-			texture := texture_for(loader.renderer, loader.archives, look.billboard[:], &loader.room.texture, CLAMP_BOTH)
+			texture := texture_for(loader.renderer, loader.archives, look.billboard, &loader.room.texture, CLAMP_BOTH)
 			if texture != 0 {
 				fit, fit_error := read_billboard_fit(loader, &look)
-				if fit_error do note_failure(scene, look.billboard[:], fit_error)
+				if fit_error do note_failure(scene, look.billboard, fit_error)
 				&scene.kinds + Tree_Kind{look = look, texture = texture, fit = fit}
 				kind_index = scene.kinds.len - 1
 			}
@@ -764,9 +764,9 @@ tree_kind :: fun(scene: ^Scene, plugin: ^Plugin, base: u32, loader: Loader) -> i
 // grown trees are fitted to it), from the pictures' smallest mipmaps at
 // least 64 wide.
 read_billboard_fit :: fun(loader: Loader, look: ^Tree_Look) -> Tree_Fit, err {
-	columns, rows := small_picture(loader, look.billboard[:])?
+	columns, rows := small_picture(loader, look.billboard)?
 	fit := billboard_fit(loader.room.model, columns, rows, look.width, look.height)
-	small_picture(loader, look.leaves[:])?
+	small_picture(loader, look.leaves)?
 	fit.leaf_fill = leaf_fill(loader.room.model)
 	return fit
 }
@@ -839,7 +839,7 @@ tree_model :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, base: u32, ref
 	if found do return known - 1
 	model_index, grow_error := grow_tree_model(scene, loader, kind, seed_index)
 	if grow_error {
-		note_failure(scene, look.model[:], grow_error)
+		note_failure(scene, look.model, grow_error)
 		model_index = -1
 	}
 	_ = index_put(&scene.paths, key, model_index + 1)
@@ -852,7 +852,7 @@ tree_model :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, base: u32, ref
 grow_tree_model :: fun(scene: ^Scene, loader: Loader, kind: ^Tree_Kind, seed_index: i64) -> i64, err {
 	look := &kind.look
 	if scene.models.len == scene.models.cap do return -1, No_Room_For_Models
-	found, in_archives := find_archived(loader.archives, look.model[:])
+	found, in_archives := find_archived(loader.archives, look.model)
 	if not in_archives do return -1, Not_In_Archive
 	loader.room.file.len = 0
 	data := read_archived(loader.archives, found, &loader.room.file)?
@@ -860,7 +860,7 @@ grow_tree_model :: fun(scene: ^Scene, loader: Loader, kind: ^Tree_Kind, seed_ind
 	read_speed_tree(data, &tree)?
 	seed := if look.seeds.len > 0 do look.seeds[seed_index] else tree.seed
 	loader.room.model.len = 0
-	grown, _ := grow_tree(&tree, seed, look.leaves[:], kind.fit, &loader.room.model)?
+	grown, _ := grow_tree(&tree, seed, look.leaves, kind.fit, &loader.room.model)?
 	gpu := upload_model(loader.renderer, &grown, loader.archives, &loader.room.texture)?
 	// (No collision yet: walking goes through trees.)
 	&scene.model_collision + Collision_Range{first = scene.collision_points.len, count = 0}
@@ -1156,7 +1156,7 @@ load_door_kind :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, path: []ut
 	// The nodes they move, each found, its rest taken.
 	moving : [DOOR_PIECES]i64
 	for &track in opening {
-		node := find_node(&mesh, track.node_name[:])
+		node := find_node(&mesh, track.node_name)
 		if node < 0 do return -1
 		match mesh.blocks[node] {
 		Node moved
@@ -1167,7 +1167,7 @@ load_door_kind :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, path: []ut
 	}
 	if moving.len == 0 do return -1
 	for &track in closing {
-		node := find_node(&mesh, track.node_name[:])
+		node := find_node(&mesh, track.node_name)
 		if node < 0 do continue
 		match mesh.blocks[node] {
 		Node moved
@@ -1182,7 +1182,7 @@ load_door_kind :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, path: []ut
 	read_door_cues(scene, plugin, &mesh, open, &kind.open_cues)
 	read_door_cues(scene, plugin, &mesh, close, &kind.close_cues)
 	// (The frame may be nothing: a door that moves all of itself.)
-	frame, frame_error := add_part_model(scene, loader, &mesh, -1, moving[:])
+	frame, frame_error := add_part_model(scene, loader, &mesh, -1, moving)
 	kind.frame = if frame_error do -1 else frame
 	kind.pieces.len = 0
 	for k in 0:moving.len {
@@ -1192,7 +1192,7 @@ load_door_kind :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, path: []ut
 			if other != moving[k] do &others + other
 		}
 		piece := next(&kind.pieces)
-		piece_model, piece_error := add_part_model(scene, loader, &mesh, moving[k], others[:])
+		piece_model, piece_error := add_part_model(scene, loader, &mesh, moving[k], others)
 		if piece_error {
 			scene.door_kinds.len -= 1
 			return -1, piece_error
@@ -1203,7 +1203,7 @@ load_door_kind :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, path: []ut
 		// Its Close track: the one for its node; else its Open one, run back.
 		piece.closing = opening[k]
 		for &track in closing {
-			if track.node_name[:] == opening[k].node_name[:] do piece.closing = track^
+			if track.node_name == opening[k].node_name do piece.closing = track^
 		}
 	}
 	return scene.door_kinds.len - 1
@@ -1225,7 +1225,7 @@ add_moving_kind :: fun(scene: ^Scene, loader: Loader, mesh: ^Nif, path: []utf8) 
 	kept : [MOVING_PIECES]Track
 	moving : [MOVING_PIECES]i64
 	for &track in tracks {
-		node := find_node(mesh, track.node_name[:])
+		node := find_node(mesh, track.node_name)
 		if node < 0 do continue
 		match mesh.blocks[node] {
 		Node moved
@@ -1245,7 +1245,7 @@ add_moving_kind :: fun(scene: ^Scene, loader: Loader, mesh: ^Nif, path: []utf8) 
 		if sequence.frequency > 0 do kind.frequency = sequence.frequency
 	else
 	}
-	frame, frame_error := add_part_model(scene, loader, mesh, -1, moving[:])
+	frame, frame_error := add_part_model(scene, loader, mesh, -1, moving)
 	if frame_error {
 		scene.moving_kinds.len -= 1
 		return -1, false, frame_error
@@ -1258,7 +1258,7 @@ add_moving_kind :: fun(scene: ^Scene, loader: Loader, mesh: ^Nif, path: []utf8) 
 		for other in moving {
 			if other != moving[k] do &others + other
 		}
-		piece_model, piece_error := add_part_model(scene, loader, mesh, moving[k], others[:])
+		piece_model, piece_error := add_part_model(scene, loader, mesh, moving[k], others)
 		if piece_error {
 			scene.moving_kinds.len -= 1
 			return -1, false, piece_error
@@ -1267,7 +1267,7 @@ add_moving_kind :: fun(scene: ^Scene, loader: Loader, mesh: ^Nif, path: []utf8) 
 		piece.model = piece_model
 		piece.track = kept[k]
 		parent, _ := parent_transform(mesh, moving[k])
-		piece.above = moving_above(mesh, moving[k], moving[:])
+		piece.above = moving_above(mesh, moving[k], moving)
 		piece.from_above = parent
 		if piece.above >= 0 {
 			above_place, _ := object_place(mesh, moving[piece.above])
@@ -1499,12 +1499,12 @@ load_distant_objects :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, loade
 			base, base_error := find_record(plugin, reference.base, &scratch)
 			if base_error or base.header.kind == "TREE" do continue
 			path := model_path(base)
-			if path.len < 4 or is_marker(path[:]) do continue
+			if path.len < 4 or is_marker(path) do continue
 			far : [256]utf8
 			&far + path[0 : path.len - 4]
 			&far + "_far.nif"
-			_, has_far := find_archived(loader.archives, far[:])
-			model_index := scene_model(scene, loader, if has_far do far[:] else path[:])
+			_, has_far := find_archived(loader.archives, far)
+			model_index := scene_model(scene, loader, if has_far do far else path)
 			if model_index < 0 do continue
 			&scene.distant_instances + place_instance(scene.models[model_index], model_index, reference_transform(reference), reference.form_id)
 		}
@@ -1529,7 +1529,7 @@ load_grass :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64, cel
 	if water_error do note_failure(scene, "a cell's water, for its grass", water_error)
 	if not has_water do water_height = -1000000
 	blades : [GRASS_PER_CELL]Placed_Grass
-	place_grass(cell_land, x, y, water_height, textures[:], &scene.grass_kinds, &blades)
+	place_grass(cell_land, x, y, water_height, textures, &scene.grass_kinds, &blades)
 	&scene.grass_cells + upload_grass(loader.renderer, &scene.models, &blades, x, y, slot)
 }
 
@@ -1580,7 +1580,7 @@ grass_kind :: fun(scene: ^Scene, plugin: ^Plugin, grass_id: u32, loader: Loader)
 	if not record_error and scene.grass_kinds.len < scene.grass_kinds.cap {
 		look, readable := read_grass_look(record)
 		if readable {
-			grass_model := scene_model(scene, loader, look.model[:])
+			grass_model := scene_model(scene, loader, look.model)
 			if grass_model >= 0 {
 				&scene.grass_kinds + Grass_Kind{look = look, model = grass_model}
 				kind_index = scene.grass_kinds.len - 1

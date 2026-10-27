@@ -41,13 +41,13 @@ grid_number_text :: fun(number: i64, text: ^[]utf8) {
 		size = -number
 	}
 	if size < 10 do text + "0"
-	text + int_text(size)[:]
+	text + int_text(size)
 }
 
 // A piece's name, from its world and its lowest cell: "60.-32.00.32".
 lod_name :: fun(world_id: u32, x: i64, y: i64) -> str64 {
 	name : str64
-	&name + int_text(i64(world_id))[:]
+	&name + int_text(i64(world_id))
 	&name + "."
 	grid_number_text(x, &name)
 	&name + "."
@@ -75,7 +75,7 @@ load_distant_land :: fun(renderer: ^Renderer, world_id: u32, loader: Loader) -> 
 			x := column * LOD_CELLS - LOD_REACH
 			y := row * LOD_CELLS - LOD_REACH
 			name := lod_name(world_id, x, y)
-			piece_file, found := find_archived(loader.archives, lod_mesh_path(name[:])[:])
+			piece_file, found := find_archived(loader.archives, lod_mesh_path(name))
 			if not found do continue
 			built, read_error := read_lod_mesh(loader.archives, room, piece_file)
 			if read_error {
@@ -85,12 +85,12 @@ load_distant_land :: fun(renderer: ^Renderer, world_id: u32, loader: Loader) -> 
 
 			path : [256]utf8
 			&path + "textures\\landscapelod\\generated\\"
-			&path + name[:]
+			&path + name
 			&path + ".dds"
-			colors := texture_for(renderer, loader.archives, path[:], &room.texture)
+			colors := texture_for(renderer, loader.archives, path, &room.texture)
 			path.len = path.len - 4
 			&path + "_fn.dds"
-			normals := texture_for(renderer, loader.archives, path[:], &room.texture)
+			normals := texture_for(renderer, loader.archives, path, &room.texture)
 			if normals == 0 do normals = renderer.flat_normal_texture
 
 			for k in 0:built.parts.len {

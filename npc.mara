@@ -210,9 +210,9 @@ read_npc_look :: fun(plugin: ^Plugin, npc_id: u32, look: ^Npc_Look) -> err {
 		slot : u32 = SLOT_UPPER_BODY << u32(k)
 		if taken & slot != 0 do continue
 		mesh := body_mesh(k, look.female)
-		add_npc_part(look, mesh[:], body_textures[k][:], "")
+		add_npc_part(look, mesh, body_textures[k], "")
 	}
-	if tail_mesh.len > 0 and taken & SLOT_TAIL == 0 do add_npc_part(look, tail_mesh[:], tail_texture[:], "")
+	if tail_mesh.len > 0 and taken & SLOT_TAIL == 0 do add_npc_part(look, tail_mesh, tail_texture, "")
 	// The head's parts: the head, ears (a man's, a woman's), mouth, lower
 	// and upper teeth, tongue, left and right eyes (drawn with its eyes').
 	eyes_texture : [128]utf8
@@ -228,8 +228,8 @@ read_npc_look :: fun(plugin: ^Plugin, npc_id: u32, look: ^Npc_Look) -> err {
 		if k == 1 and look.female do continue
 		if k == 2 and not look.female do continue
 		if head_meshes[k].len == 0 do continue
-		texture := if k >= 7 and eyes_texture.len > 0 do eyes_texture[:] else head_textures[k][:]
-		add_npc_part(look, head_meshes[k][:], texture, HEAD_BONE)
+		texture := if k >= 7 and eyes_texture.len > 0 do eyes_texture else head_textures[k]
+		add_npc_part(look, head_meshes[k], texture, HEAD_BONE)
 	}
 	// Its hair, unless something worn covers it.
 	if hair_id != 0 and taken & SLOT_HAIR == 0 {
@@ -277,7 +277,7 @@ archive_path_under :: fun(folder: []utf8, name: []utf8, path: ^[256]utf8) {
 		if c == '/' do &cleaned + '\\'
 		else do &cleaned + lower(c)
 	}
-	if not starts_with(cleaned[:], folder) do path + folder
+	if not starts_with(cleaned, folder) do path + folder
 	for c in cleaned {
 		if path.len == path.cap do break
 		path + c
@@ -342,7 +342,7 @@ level_item :: fun(plugin: ^Plugin, item: u32, npc_id: u32, depth: i64) -> u32 {
 // the first time it's asked for, then kept. Empty when it can't be read.
 skeleton_pose :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> []Pose_Bone {
 	for &kept in scene.npc_skeletons {
-		if kept.path[:] == path do return kept.bones[:]
+		if kept.path == path do return kept.bones[:]
 	}
 	if scene.npc_skeletons.len == scene.npc_skeletons.cap do return scene.npc_skeletons[0].bones[0:0]
 	kept := next(&scene.npc_skeletons)
@@ -407,10 +407,10 @@ build_npc_model :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, npc_id: u
 	if scene.models.len == scene.models.cap do return -1, No_Room_For_Models
 	look : Npc_Look
 	read_npc_look(plugin, npc_id, &look)?
-	pose := skeleton_pose(scene, loader, look.skeleton[:])
+	pose := skeleton_pose(scene, loader, look.skeleton)
 	report := Npc_Report{failures = 0, first = [], reason = Not_In_Archive}
 	whole := assemble_npc(loader.archives, loader.room, &look, pose, &report)
-	if report.failures > 0 do note_failure(scene, report.first[:], report.reason)
+	if report.failures > 0 do note_failure(scene, report.first, report.reason)
 	gpu := upload_model(loader.renderer, &whole, loader.archives, &loader.room.texture)?
 	// (No collision: walking goes through people for now.)
 	&scene.model_collision + Collision_Range{first = scene.collision_points.len, count = 0}
@@ -438,9 +438,9 @@ assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose
 	for &part in look.parts {
 		room.file.len = 0
 		room.blocks.len = 0
-		mesh, mesh_error := read_archived_nif(archives, part.mesh[:], &room.file, &room.blocks)
+		mesh, mesh_error := read_archived_nif(archives, part.mesh, &room.file, &room.blocks)
 		if mesh_error {
-			note_npc_failure(report, part.mesh[:], mesh_error)
+			note_npc_failure(report, part.mesh, mesh_error)
 			continue
 		}
 		// Hung from its bone, unless it's skinned (then its bones place it).
@@ -457,7 +457,7 @@ assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose
 		}
 		made, model_error := build_posed_model(&mesh, pose, hang, &room.model)
 		if model_error {
-			note_npc_failure(report, part.mesh[:], model_error)
+			note_npc_failure(report, part.mesh, model_error)
 			continue
 		}
 		for &made_part in made.parts {
@@ -488,7 +488,7 @@ assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose
 		low = low * look.height
 		high = high * look.height
 	}
-	return Model{parts = built[:], flips = [], particles = [], motions = [], bounds_min = low, bounds_max = high}
+	return Model{parts = built, flips = [], particles = [], motions = [], bounds_min = low, bounds_max = high}
 }
 
 note_npc_failure :: fun(report: ^Npc_Report, path: []utf8, reason: err) {

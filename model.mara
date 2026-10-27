@@ -419,7 +419,7 @@ Pose_Bone :: struct {
 // False when the pose hasn't the bone.
 hang_place :: fun(pose: []Pose_Bone, name: []utf8) -> Mat4, bool {
 	for bone in pose {
-		if compare_folded(bone.name[:], name) != 0 do continue
+		if compare_folded(bone.name, name) != 0 do continue
 		resting_turn := bone.rest
 		resting_turn.w.x = 0
 		resting_turn.w.y = 0
@@ -433,7 +433,7 @@ hang_place :: fun(pose: []Pose_Bone, name: []utf8) -> Mat4, bool {
 // the pose hasn't it.
 pose_place :: fun(pose: []Pose_Bone, name: []utf8) -> Mat4, bool {
 	for bone in pose {
-		if compare_folded(bone.name[:], name) == 0 do return bone.place, true
+		if compare_folded(bone.name, name) == 0 do return bone.place, true
 	}
 	return mat4_identity(), false
 }
@@ -455,7 +455,7 @@ pose_node :: fun(mesh: ^Nif, index: i64, parent: Mat4, parent_rest: Mat4, tracks
 		local := local_transform(node.object)
 		rest := mat4_mul(parent_rest, local)
 		for k in 0:tracks.len {
-			if compare_folded(tracks[k].node_name[:], node.object.name) == 0 {
+			if compare_folded(tracks[k].node_name, node.object.name) == 0 {
 				// (What its keys don't say, as the node is.)
 				tracks[k].rest = local
 				local = track_pose(&tracks[k], time)
@@ -1188,7 +1188,7 @@ texture_path :: fun(mesh: ^Nif, slot: Texture_Slot, path: ^[160]utf8) {
 			else do &clean + lower(c)
 		}
 		start : i64 = 0
-		if starts_with(clean[:], "data\\") do start = 5
+		if starts_with(clean, "data\\") do start = 5
 		if not starts_with(clean[start : clean.len], "textures\\") do path + "textures\\"
 		path + clean[start : clean.len]
 	else

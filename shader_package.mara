@@ -161,7 +161,7 @@ register_name :: fun(token: u32, pixel: bool, text: ^[]utf8) {
 	else
 		text + "?"
 	}
-	text + int_text(number)[:]
+	text + int_text(number)
 }
 
 // A number as text, to four places: "-0.5", "2", "0.0011".
@@ -172,7 +172,7 @@ float_text :: fun(value: f32, text: ^[]utf8) {
 		scaled = -scaled
 	}
 	whole := i64(scaled)
-	text + int_text(whole)[:]
+	text + int_text(whole)
 	fraction := i64((scaled - f32(whole)) * 10000 + 0.5)
 	if fraction >= 10000 do fraction = 9999
 	if fraction == 0 do return
@@ -250,9 +250,9 @@ disassemble :: fun(code: []byte, lines: ^[][256]utf8, constants: ^[]Named_Consta
 	line := next(lines)
 	line.len = 0
 	line + (if pixel do "ps_" else "vs_")
-	line + int_text(i64(major))[:]
+	line + int_text(i64(major))
 	line + "_"
-	line + (if minor == 1 and major == 2 do "x" else int_text(i64(minor))[:])
+	line + (if minor == 1 and major == 2 do "x" else int_text(i64(minor)))
 
 	tokens := code.len / 4
 	k : i64 = 1
@@ -303,9 +303,9 @@ disassemble :: fun(code: []byte, lines: ^[][256]utf8, constants: ^[]Named_Consta
 				else do line + "dcl_2d "
 			elif kind == 1 and not pixel or kind == 6 and not pixel
 				line + "dcl_"
-				line + usage_name(i64(usage_token & 31))[:]
+				line + usage_name(i64(usage_token & 31))
 				index := (usage_token >> 16) & 15
-				if index != 0 do line + int_text(i64(index))[:]
+				if index != 0 do line + int_text(i64(index))
 				line + " "
 			else
 				line + "dcl "
@@ -325,9 +325,9 @@ disassemble :: fun(code: []byte, lines: ^[][256]utf8, constants: ^[]Named_Consta
 		else
 			if name.len == 0 {
 				line + "op"
-				line + int_text(opcode)[:]
+				line + int_text(opcode)
 			else
-				line + name[:]
+				line + name
 			}
 			for n in 0:count {
 				parameter : u32 = code[(k + 1 + n) * 4]

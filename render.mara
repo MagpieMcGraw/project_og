@@ -1779,7 +1779,7 @@ one_pixel_texture :: fun(renderer: ^Renderer, pixel: [4!]u8) -> i64 {
 	id : u32 = 0
 	GenTextures(1, &id)
 	BindTexture(TEXTURE_2D, id)
-	TexImage2D(TEXTURE_2D, 0, i32(RGBA8), 1, 1, 0, RGBA, UNSIGNED_BYTE, color[:])
+	TexImage2D(TEXTURE_2D, 0, i32(RGBA8), 1, 1, 0, RGBA, UNSIGNED_BYTE, color)
 	TexParameteri(TEXTURE_2D, TEXTURE_MAX_LEVEL, 0)
 	TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(LINEAR))
 	TexParameteri(TEXTURE_2D, TEXTURE_MAG_FILTER, i32(LINEAR))
@@ -1972,7 +1972,7 @@ make_water_program :: fun(made: ^Water_Program) -> err {
 	shared : [4 * KB]utf8
 	&shared + SKY_COLOR_FUNCTION
 	&shared + HIDDEN_CELLS_FUNCTION
-	made.program = compile_program(WATER_VERTEX_SHADER, WATER_FRAGMENT_SHADER, false, shared[:])?
+	made.program = compile_program(WATER_VERTEX_SHADER, WATER_FRAGMENT_SHADER, false, shared)?
 	program := made.program
 	made.hidden = find_hidden_uniforms(program)
 	made.view_projection_at = GetUniformLocation(program, "view_projection")
@@ -2029,7 +2029,7 @@ setup_water_buffers :: fun(renderer: ^Renderer) {
 	}
 	GenBuffers(1, &renderer.water_index_buffer)
 	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.water_index_buffer)
-	BufferData(ELEMENT_ARRAY_BUFFER, isize(indices.len * 2), indices[:], STATIC_DRAW)
+	BufferData(ELEMENT_ARRAY_BUFFER, isize(indices.len * 2), indices, STATIC_DRAW)
 	BindVertexArray(0)
 	GenBuffers(1, &renderer.water_indirect_buffer)
 	make_ripple_texture(renderer)
@@ -2084,7 +2084,7 @@ make_ripple_texture :: fun(renderer: ^Renderer) {
 	}
 	GenTextures(1, &renderer.ripple_texture)
 	BindTexture(TEXTURE_2D, renderer.ripple_texture)
-	TexImage2D(TEXTURE_2D, 0, i32(RGBA8), RIPPLE_SIZE, RIPPLE_SIZE, 0, RGBA, UNSIGNED_BYTE, pixels[:])
+	TexImage2D(TEXTURE_2D, 0, i32(RGBA8), RIPPLE_SIZE, RIPPLE_SIZE, 0, RGBA, UNSIGNED_BYTE, pixels)
 	GenerateMipmap(TEXTURE_2D)
 	TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(LINEAR_MIPMAP_LINEAR))
 	TexParameteri(TEXTURE_2D, TEXTURE_MAG_FILTER, i32(LINEAR))
@@ -2115,7 +2115,7 @@ upload_water :: fun(renderer: ^Renderer, water: ^Water_Cell, slot: i64) {
 		}
 	}
 	BindBuffer(ARRAY_BUFFER, renderer.water_vertex_buffer)
-	BufferSubData(ARRAY_BUFFER, isize(slot * WATER_VERTICES * size_of(Water_Vertex)), points[:])
+	BufferSubData(ARRAY_BUFFER, isize(slot * WATER_VERTICES * size_of(Water_Vertex)), points)
 }
 
 // The far water: a stretch over a rectangle at a height, deep all over.
@@ -2151,7 +2151,7 @@ setup_distant_buffers :: fun(renderer: ^Renderer) {
 	for k in 0:DISTANT_PIECES do &numbers + u32(k)
 	GenBuffers(1, &renderer.distant_piece_buffer)
 	BindBuffer(ARRAY_BUFFER, renderer.distant_piece_buffer)
-	BufferData(ARRAY_BUFFER, DISTANT_PIECES * 4, numbers[:], STATIC_DRAW)
+	BufferData(ARRAY_BUFFER, DISTANT_PIECES * 4, numbers, STATIC_DRAW)
 	EnableVertexAttribArray(2)
 	VertexAttribIPointer(2, 1, UNSIGNED_INT, 4, 0)    // the piece
 	VertexAttribDivisor(2, 1)
@@ -2252,7 +2252,7 @@ setup_particle_buffers :: fun(renderer: ^Renderer) {
 	}
 	GenBuffers(1, &renderer.particle_index_buffer)
 	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.particle_index_buffer)
-	BufferData(ELEMENT_ARRAY_BUFFER, isize(indices.len * 4), indices[:], STATIC_DRAW)
+	BufferData(ELEMENT_ARRAY_BUFFER, isize(indices.len * 4), indices, STATIC_DRAW)
 	BindVertexArray(0)
 }
 
@@ -2288,7 +2288,7 @@ upload_distant_piece :: fun(renderer: ^Renderer, part: ^Model_Part, color_textur
 	}
 	BindVertexArray(0)   // (binding an index buffer would change a bound vertex array's)
 	BindBuffer(ARRAY_BUFFER, renderer.distant_vertex_buffer)
-	BufferSubData(ARRAY_BUFFER, isize(renderer.distant_vertices_used * size_of(Distant_Vertex)), points[:])
+	BufferSubData(ARRAY_BUFFER, isize(renderer.distant_vertices_used * size_of(Distant_Vertex)), points)
 	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.distant_index_buffer)
 	BufferSubData(ELEMENT_ARRAY_BUFFER, isize(renderer.distant_indices_used * 2), part.indices)
 
@@ -2296,7 +2296,7 @@ upload_distant_piece :: fun(renderer: ^Renderer, part: ^Model_Part, color_textur
 	if renderer.bindless_available {
 		handles : [2!]u64 = [renderer.textures[color_texture].handle, renderer.textures[normal_texture].handle]
 		BindBuffer(SHADER_STORAGE_BUFFER, renderer.distant_texture_buffer)
-		BufferSubData(SHADER_STORAGE_BUFFER, isize(piece_number * 16), handles[:])
+		BufferSubData(SHADER_STORAGE_BUFFER, isize(piece_number * 16), handles)
 	}
 	&renderer.distant_pieces + Distant_Piece{
 		first_index = u32(renderer.distant_indices_used),
@@ -2334,7 +2334,7 @@ setup_tree_buffers :: fun(renderer: ^Renderer) {
 	corners : [6!]u16 = [0, 1, 2, 0, 2, 3]
 	GenBuffers(1, &renderer.tree_index_buffer)
 	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.tree_index_buffer)
-	BufferData(ELEMENT_ARRAY_BUFFER, 12, corners[:], STATIC_DRAW)
+	BufferData(ELEMENT_ARRAY_BUFFER, 12, corners, STATIC_DRAW)
 	BindVertexArray(0)
 	GenBuffers(1, &renderer.tree_indirect_buffer)
 }
@@ -2381,7 +2381,7 @@ upload_trees :: fun(renderer: ^Renderer, trees: ^[]Placed_Tree, x: i64, y: i64, 
 	placed.radius = vec3_length(high - low) * 0.5 + widest * 0.5
 	if instances.len > 0 {
 		BindBuffer(ARRAY_BUFFER, renderer.tree_instance_buffer)
-		BufferSubData(ARRAY_BUFFER, isize(slot * TREES_PER_CELL * size_of(Tree_Instance)), instances[:])
+		BufferSubData(ARRAY_BUFFER, isize(slot * TREES_PER_CELL * size_of(Tree_Instance)), instances)
 	}
 	return placed
 }
@@ -2412,7 +2412,7 @@ draw_trees :: fun(renderer: ^Renderer, tree_cells: ^[]Gpu_Trees, hidden: ^Hidden
 	Uniform1f(made.grown_within_at, TREE_NEAR)
 	BindVertexArray(renderer.tree_vertex_array)
 	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.tree_indirect_buffer)
-	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.tree_commands.len * size_of(Draw_Command)), renderer.tree_commands[:], STREAM_DRAW)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.tree_commands.len * size_of(Draw_Command)), renderer.tree_commands, STREAM_DRAW)
 	Disable(CULL_FACE)
 	if bindless {
 		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, 0, i32(renderer.tree_commands.len), 0)
@@ -2519,7 +2519,7 @@ upload_grass :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, blades: ^[]Placed
 	placed.radius = vec3_length(high - low) * 0.5 + 200
 	if instances.len > 0 {
 		BindBuffer(ARRAY_BUFFER, renderer.grass_instance_buffer)
-		BufferSubData(ARRAY_BUFFER, isize(slot * GRASS_PER_CELL * size_of(Grass_Instance)), instances[:])
+		BufferSubData(ARRAY_BUFFER, isize(slot * GRASS_PER_CELL * size_of(Grass_Instance)), instances)
 	}
 	return placed
 }
@@ -2553,7 +2553,7 @@ draw_grass :: fun(renderer: ^Renderer, grass_cells: ^[]Gpu_Grass, planes: ^View_
 	Uniform1f(made.fade_end_at, fade_end)
 	BindVertexArray(renderer.grass_vertex_array)
 	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.grass_indirect_buffer)
-	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.grass_commands.len * size_of(Draw_Command)), renderer.grass_commands[:], STREAM_DRAW)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.grass_commands.len * size_of(Draw_Command)), renderer.grass_commands, STREAM_DRAW)
 	Disable(CULL_FACE)
 	if renderer.use_bindless {
 		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, 0, i32(renderer.grass_commands.len), 0)
@@ -2620,7 +2620,7 @@ set_hidden_cells :: fun(at: ^Hidden_At, hidden: ^Hidden_Cells) {
 array_uniform :: fun(program: u32, name_start: []utf8, index: i64) -> i32 {
 	name : str64
 	&name + name_start
-	&name + int_text(index)[:]
+	&name + int_text(index)
 	&name + "]"
 	return GetUniformLocation(program, name)   // (the list, its room past the name 0s: C reads up to one)
 }
@@ -2727,7 +2727,7 @@ setup_land_buffers :: fun(renderer: ^Renderer) {
 	land_indices(&indices)
 	GenBuffers(1, &renderer.land_index_buffer)
 	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.land_index_buffer)
-	BufferData(ELEMENT_ARRAY_BUFFER, isize(indices.len * 2), indices[:], STATIC_DRAW)
+	BufferData(ELEMENT_ARRAY_BUFFER, isize(indices.len * 2), indices, STATIC_DRAW)
 	BindVertexArray(0)
 	GenBuffers(1, &renderer.land_indirect_buffer)
 
@@ -2880,7 +2880,7 @@ upload_model :: fun(renderer: ^Renderer, built: ^Model, archives: ^Archives, scr
 		made := next(&renderer.flips)
 		made.first_frame = renderer.flip_frames.len
 		made.frame_count = flip.frames.len
-		for frame in flip.frames do &renderer.flip_frames + texture_for(renderer, archives, frame[:], scratch, clamp_mode)
+		for frame in flip.frames do &renderer.flip_frames + texture_for(renderer, archives, frame, scratch, clamp_mode)
 		made.start_time = flip.start_time
 		made.stop_time = flip.stop_time
 		made.frequency = flip.frequency
@@ -2895,7 +2895,7 @@ upload_model :: fun(renderer: ^Renderer, built: ^Model, archives: ^Archives, scr
 	for &system in built.particles {
 		kind := next(&renderer.particle_kinds)
 		kind.system = system^
-		kind.texture_slot = texture_for(renderer, archives, system.look.texture[:], scratch, system.look.clamp_mode)
+		kind.texture_slot = texture_for(renderer, archives, system.look.texture, scratch, system.look.clamp_mode)
 		kind.flip = -1
 		if system.look.flip >= 0 do kind.flip = first_flip + system.look.flip
 	}
@@ -2940,7 +2940,7 @@ upload_model :: fun(renderer: ^Renderer, built: ^Model, archives: ^Archives, scr
 			first_index = u32(renderer.indices_used),
 			index_count = u32(part.indices.len),
 			base_vertex = i32(renderer.vertices_used),
-			texture_slot = texture_for(renderer, archives, part.texture[:], scratch, part.clamp_mode),
+			texture_slot = texture_for(renderer, archives, part.texture, scratch, part.clamp_mode),
 			glow_slot = glow_map_for(renderer, archives, &part, scratch),
 			normal_slot = normal_slot,
 			first_motion = first_motion,
@@ -2972,29 +2972,29 @@ glow_map_for :: fun(renderer: ^Renderer, archives: ^Archives, part: ^Model_Part,
 	if part.emissive.x <= 0 and part.emissive.y <= 0 and part.emissive.z <= 0 do return -1
 	path : [160]utf8
 	if part.glow_texture.len > 0 {
-		&path + part.glow_texture[:]
-	elif part.texture.len > 4 and ends_with(part.texture[:], ".dds")
+		&path + part.glow_texture
+	elif part.texture.len > 4 and ends_with(part.texture, ".dds")
 		&path + part.texture[0 : part.texture.len - 4]
 		&path + "_g.dds"
 	else
 		return -1
 	}
-	_, found := find_archived(archives, path[:])
+	_, found := find_archived(archives, path)
 	if not found do return -1
-	return texture_for(renderer, archives, path[:], scratch, part.clamp_mode)
+	return texture_for(renderer, archives, path, scratch, part.clamp_mode)
 }
 
 // A part's normal map: its texture's with _n, as the game finds them
 // (doorlow.dds, doorlow_n.dds). Its texture slot; -1 for none, or when it
 // couldn't be loaded (the white texture would tip every pixel).
 normal_map_for :: fun(renderer: ^Renderer, archives: ^Archives, part: ^Model_Part, scratch: ^[]byte) -> i64 {
-	if part.texture.len <= 4 or not ends_with(part.texture[:], ".dds") do return -1
+	if part.texture.len <= 4 or not ends_with(part.texture, ".dds") do return -1
 	path : [160]utf8
 	&path + part.texture[0 : part.texture.len - 4]
 	&path + "_n.dds"
-	_, found := find_archived(archives, path[:])
+	_, found := find_archived(archives, path)
 	if not found do return -1
-	slot := texture_for(renderer, archives, path[:], scratch, part.clamp_mode)
+	slot := texture_for(renderer, archives, path, scratch, part.clamp_mode)
 	return if slot == 0 do -1 else slot
 }
 
@@ -3064,7 +3064,7 @@ set_scene_lights :: fun(renderer: ^Renderer, lights: ^[]Point_Light) {
 	}
 	if records.len == 0 do return
 	BindBuffer(SHADER_STORAGE_BUFFER, renderer.light_buffer)
-	BufferSubData(SHADER_STORAGE_BUFFER, 0, records[:])
+	BufferSubData(SHADER_STORAGE_BUFFER, 0, records)
 }
 
 // ---- land ---------------------------------------------------------------------------------
@@ -3082,8 +3082,8 @@ upload_land :: fun(renderer: ^Renderer, mesh: ^Land_Mesh, x: i64, y: i64, slot: 
 			texture_slot := quadrant.textures[0]
 			normal_slot := quadrant.normal_maps[0]
 			if k < textures.count {
-				texture_slot = texture_for(renderer, archives, textures.paths[k][:], scratch)
-				normal_slot = land_normal_for(renderer, archives, textures.paths[k][:], scratch)
+				texture_slot = texture_for(renderer, archives, textures.paths[k], scratch)
+				normal_slot = land_normal_for(renderer, archives, textures.paths[k], scratch)
 			}
 			quadrant.textures[k] = texture_slot
 			quadrant.normal_maps[k] = normal_slot
@@ -3092,11 +3092,11 @@ upload_land :: fun(renderer: ^Renderer, mesh: ^Land_Mesh, x: i64, y: i64, slot: 
 		}
 		if renderer.bindless_available {
 			BindBuffer(SHADER_STORAGE_BUFFER, renderer.land_texture_buffer)
-			BufferSubData(SHADER_STORAGE_BUFFER, isize((slot * 4 + q) * QUADRANT_TEXTURES * 2 * 8), handles[:])
+			BufferSubData(SHADER_STORAGE_BUFFER, isize((slot * 4 + q) * QUADRANT_TEXTURES * 2 * 8), handles)
 		}
 	}
 	BindBuffer(ARRAY_BUFFER, renderer.land_vertex_buffer)
-	BufferSubData(ARRAY_BUFFER, isize(slot * LAND_MESH_VERTICES * size_of(Land_Vertex)), mesh.vertices[:])
+	BufferSubData(ARRAY_BUFFER, isize(slot * LAND_MESH_VERTICES * size_of(Land_Vertex)), mesh.vertices)
 	return Gpu_Land{x = x, y = y, slot = slot, center = mesh.center, radius = mesh.radius}
 }
 
@@ -3107,9 +3107,9 @@ land_normal_for :: fun(renderer: ^Renderer, archives: ^Archives, texture: []utf8
 	path : [160]utf8
 	&path + texture[0 : texture.len - 4]
 	&path + "_n.dds"
-	_, found := find_archived(archives, path[:])
+	_, found := find_archived(archives, path)
 	if not found do return renderer.flat_normal_texture
-	slot := texture_for(renderer, archives, path[:], scratch)
+	slot := texture_for(renderer, archives, path, scratch)
 	return if slot == 0 do renderer.flat_normal_texture else slot
 }
 
@@ -3371,7 +3371,7 @@ draw_distant_land :: fun(renderer: ^Renderer, grounds: ^[]Gpu_Land, planes: ^Vie
 	set_hidden_cells(&made.hidden, &hidden)
 	BindVertexArray(renderer.distant_vertex_array)
 	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.distant_indirect_buffer)
-	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.distant_commands.len * size_of(Draw_Command)), renderer.distant_commands[:], STREAM_DRAW)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.distant_commands.len * size_of(Draw_Command)), renderer.distant_commands, STREAM_DRAW)
 	if renderer.use_bindless {
 		BindBufferBase(SHADER_STORAGE_BUFFER, 2, renderer.distant_texture_buffer)
 		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, 0, i32(renderer.distant_commands.len), 0)
@@ -3460,7 +3460,7 @@ draw_water_commands :: fun(renderer: ^Renderer, look: ^Sky_Look, view_projection
 	BindTexture(TEXTURE_2D, renderer.ripple_texture)
 	BindVertexArray(renderer.water_vertex_array)
 	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.water_indirect_buffer)
-	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.water_commands.len * size_of(Draw_Command)), renderer.water_commands[:], STREAM_DRAW)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.water_commands.len * size_of(Draw_Command)), renderer.water_commands, STREAM_DRAW)
 	Disable(CULL_FACE)   // (seen from under the water too)
 	Enable(BLEND)
 	BlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
@@ -3503,7 +3503,7 @@ draw_land :: fun(renderer: ^Renderer, grounds: ^[]Gpu_Land, planes: ^View_Planes
 	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
 	BindVertexArray(renderer.land_vertex_array)
 	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.land_indirect_buffer)
-	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.land_commands.len * size_of(Draw_Command)), renderer.land_commands[:], STREAM_DRAW)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.land_commands.len * size_of(Draw_Command)), renderer.land_commands, STREAM_DRAW)
 	if bindless {
 		BindBufferBase(SHADER_STORAGE_BUFFER, 1, renderer.land_texture_buffer)
 		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, 0, i32(renderer.land_commands.len), 0)
@@ -3744,7 +3744,7 @@ gather_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]In
 	BufferData(ARRAY_BUFFER, MAX_DRAWN * size_of(Drawn_Instance), [], STREAM_DRAW)   // (a fresh buffer: no waiting on last frame's)
 	BufferSubData(ARRAY_BUFFER, 0, renderer.records[0 : record_count])
 	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.indirect_buffer)
-	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.commands.len * size_of(Draw_Command)), renderer.commands[:], STREAM_DRAW)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.commands.len * size_of(Draw_Command)), renderer.commands, STREAM_DRAW)
 }
 
 // Draws the gathered meshes' opaque runs, or their blended ones (after the
@@ -3844,7 +3844,7 @@ draw_particles :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]I
 
 	BindBuffer(ARRAY_BUFFER, renderer.particle_vertex_buffer)
 	BufferData(ARRAY_BUFFER, MAX_PARTICLE_SQUARES * 4 * size_of(Particle_Vertex), [], STREAM_DRAW)   // (a fresh buffer)
-	BufferSubData(ARRAY_BUFFER, 0, renderer.particle_vertices[:])
+	BufferSubData(ARRAY_BUFFER, 0, renderer.particle_vertices)
 	made := &renderer.particle_program
 	UseProgram(made.program)
 	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)

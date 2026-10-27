@@ -279,7 +279,7 @@ command_nifs :: fun(name: []utf8) {
 				if not starts_with(type_name, "bhk") and not starts_with(type_name, "hk") do continue
 				counted := false
 				for &entry in havok_types {
-					if entry.name[:] == type_name {
+					if entry.name == type_name {
 						entry.count += 1
 						counted = true
 					}
@@ -337,11 +337,11 @@ command_nifs :: fun(name: []utf8) {
 	line : str1024
 	for &entry in sequence_names {
 		if entry.count < 3 do continue
-		&line + entry.name[:]
+		&line + entry.name
 		&line + " "
-		&line + int_text(entry.count)[:]
+		&line + int_text(entry.count)
 		&line + "/"
-		&line + int_text(entry.looping)[:]
+		&line + int_text(entry.looping)
 		&line + "  "
 		if line.len > 900 {
 			print("  sequences (all/looping): %", line)
@@ -366,7 +366,7 @@ Type_Count :: struct {
 // The entry for a failure at a block type, made when it's the first.
 failure_entry :: fun(failures: ^[]Failure_Count, type_name: []utf8, reason: err) -> ^Failure_Count {
 	for &entry in failures {
-		if entry.type_name[:] == type_name and entry.reason == reason do return entry
+		if entry.type_name == type_name and entry.reason == reason do return entry
 	}
 	entry := next(failures)
 	entry^.type_name.len = 0
@@ -465,7 +465,7 @@ command_texture :: fun(what: []utf8, name: []utf8) {
 	out_name : Path
 	&out_name + get_file(what)
 	&out_name + ".png"
-	write_error := write_entire_file(out_name, png_storage[:])
+	write_error := write_entire_file(out_name, png_storage)
 	if write_error do print("couldn't write %: %", out_name, write_error)
 	else do print("wrote % (% x %, %, % mipmaps)", out_name, texture.width, texture.height, texture.format, texture.mips.len)
 }
@@ -513,7 +513,7 @@ command_model :: fun(what: []utf8, name: []utf8) {
 		type_name := mesh.header.type_names[i64(mesh.header.block_types[b])]
 		counted := false
 		for &entry in types {
-			if entry.name[:] == type_name {
+			if entry.name == type_name {
 				entry.count += 1
 				counted = true
 			}
@@ -527,9 +527,9 @@ command_model :: fun(what: []utf8, name: []utf8) {
 	}
 	line : str1024
 	for &entry in types {
-		&line + entry.name[:]
+		&line + entry.name
 		&line + " "
-		&line + int_text(entry.count)[:]
+		&line + int_text(entry.count)
 		&line + "  "
 	}
 	print("blocks: %", line)
@@ -575,7 +575,7 @@ command_model :: fun(what: []utf8, name: []utf8) {
 		if part.flip >= 0 {
 			flip := &built.flips[part.flip]
 			print("  flipbook: % frames (the first %), % to % s at % times from %; keys at % = %",
-				flip.frames.len, if flip.frames.len > 0 do flip.frames[0][:] else "", flip.start_time, flip.stop_time,
+				flip.frames.len, if flip.frames.len > 0 do flip.frames[0] else "", flip.start_time, flip.stop_time,
 				flip.frequency, flip.phase, flip.key_times, flip.key_values)
 		}
 		if part.indices.len >= 3 {
@@ -650,10 +650,10 @@ load_oblivion :: fun(data_storage: ^[]byte, index_storage: ^[]byte) -> Plugin, e
 	first := data_storage.len
 	for &file, k in order.plugins {
 		at := data_storage.len - first
-		path := data_path(file.name[:])
-		data := read_entire_file(path[:], data_storage)?
+		path := data_path(file.name)
+		data := read_entire_file(path, data_storage)?
 		span := Plugin_Span{0}
-		&span.name + file.name[:]
+		&span.name + file.name
 		span.start = at
 		span.end = at + data.len
 		span.own_index = u32(k)
@@ -777,8 +777,8 @@ command_cell :: fun(name: []utf8, every_one: bool) {
 		base, base_error := find_record(&plugin, reference.base, &scratch)
 		if base_error do continue
 		path := model_path(base)
-		if path.len == 0 or is_marker(path[:]) do continue
-		mesh_file, found := find_archived(&archives, path[:])
+		if path.len == 0 or is_marker(path) do continue
+		mesh_file, found := find_archived(&archives, path)
 		if not found {
 			print("  missing mesh %", path)
 			continue
@@ -924,8 +924,8 @@ command_map :: fun(name: []utf8) {
 	}
 	png_storage : [80 * MB]byte
 	row_storage : [80 * MB]byte
-	encode_png(pixels[:], width, height, &png_storage, &row_storage)
-	write_error := write_entire_file("map.png", png_storage[:])
+	encode_png(pixels, width, height, &png_storage, &row_storage)
+	write_error := write_entire_file("map.png", png_storage)
 	if write_error do print("couldn't write map.png: %", write_error)
 	else do print("wrote map.png: % x %, % cells with land", width, height, lands)
 	for known_height, k in water_heights do print("  water at %: % cells", known_height, water_counts[k])
@@ -979,7 +979,7 @@ command_area :: fun(name: []utf8, x: i64, y: i64) {
 				quadrant := &land_mesh.textures[q]
 				for k in 0:quadrant.count {
 					parts += 1
-					_, texture_found := find_file(&textures, quadrant.paths[k][:])
+					_, texture_found := find_file(&textures, quadrant.paths[k])
 					if not texture_found {
 						missing_textures += 1
 						if missing_textures <= 5 do print("  no texture %", quadrant.paths[k])
@@ -1038,8 +1038,8 @@ command_area :: fun(name: []utf8, x: i64, y: i64) {
 		tally.count += 1
 		if reference.flags & RECORD_DISABLED != 0 do tally.disabled += 1
 		path := model_path(base)
-		if ends_with(path[:], ".spt") do tally.speed_trees += 1
-		_, found := find_file(&meshes, path[:])
+		if ends_with(path, ".spt") do tally.speed_trees += 1
+		_, found := find_file(&meshes, path)
 		if found do tally.with_mesh += 1
 	}
 	for tally in tallies {
@@ -1110,10 +1110,10 @@ command_walk :: fun(name: []utf8, x: i64, y: i64, steps: i64) {
 		for &item in walked.waiting {
 			// Placed as loading would place it (as model 0: there's no card here).
 			add_instance(&walked, 0, item.world)
-			_, known := known_model(&walked, item.path[:])
+			_, known := known_model(&walked, item.path)
 			if known do continue
-			_ = index_put(&walked.paths, text_hash(item.path[:]), 1)
-			index, found := find_file(&meshes, item.path[:])
+			_ = index_put(&walked.paths, text_hash(item.path), 1)
+			index, found := find_file(&meshes, item.path)
 			if not found do continue
 			file_room.len = 0
 			data, read_error := read_file(&meshes, index, &file_room)
@@ -1128,11 +1128,11 @@ command_walk :: fun(name: []utf8, x: i64, y: i64, steps: i64) {
 			mesh_count += 1
 			texture_start := time_now()
 			for part in built.parts {
-				key := text_hash(part.texture[:])
+				key := text_hash(part.texture)
 				_, had := index_get(&seen_textures, key)
 				if had or part.texture.len == 0 do continue
 				_ = index_put(&seen_textures, key, 1)
-				texture_index, texture_found := find_file(&textures, part.texture[:])
+				texture_index, texture_found := find_file(&textures, part.texture)
 				if not texture_found do continue
 				texture_room.len = 0
 				texture_data, texture_error := read_file(&textures, texture_index, &texture_room)
@@ -1192,13 +1192,13 @@ command_records :: fun(kind: []utf8) {
 		entry : str256
 		&entry + editor_id(record.data)
 		&entry + " ("
-		&entry + int_text(i64(key))[:]
+		&entry + int_text(i64(key))
 		&entry + ")  "
 		if line.len + entry.len > 120 {
 			print(line)
 			line.len = 0
 		}
-		&line + entry[:]
+		&line + entry
 		count += 1
 	}
 	print(line)
@@ -1424,7 +1424,7 @@ command_anim :: fun(what: []utf8) {
 	read_tracks(&mesh, idle, &tracks, &track_room, false)
 	start, stop := sequence_span(&mesh, idle)
 	for &track in tracks {
-		node := find_node(&mesh, track.node_name[:])
+		node := find_node(&mesh, track.node_name)
 		if node >= 0 {
 			match mesh.blocks[node] {
 			Node moved
@@ -1435,9 +1435,9 @@ command_anim :: fun(what: []utf8) {
 		line : str1024
 		for quarter in 0:4 {
 			pose := track_pose(track, start + (stop - start) * f32(quarter) / 4)
-			&line + vec3_text(Vec3{pose[3][0], pose[3][1], pose[3][2]})[:]
+			&line + vec3_text(Vec3{pose[3][0], pose[3][1], pose[3][2]})
 			&line + " x "
-			&line + vec3_text(Vec3{pose[0][0], pose[0][1], pose[0][2]})[:]
+			&line + vec3_text(Vec3{pose[0][0], pose[0][1], pose[0][2]})
 			&line + ";  "
 		}
 		print("moves % (% translation keys, % rotation keys, % % % angle keys): %", track.node_name, track.translations.len,
@@ -1453,11 +1453,11 @@ vec3_text :: fun(v: Vec3) -> str64 {
 		if axis > 0 do &text + ", "
 		hundredths := i64(v[axis] * 100)
 		if v[axis] < 0 and hundredths == 0 do &text + "-"
-		&text + int_text(hundredths / 100)[:]
+		&text + int_text(hundredths / 100)
 		&text + "."
 		rest := abs(hundredths % 100)
 		if rest < 10 do &text + "0"
-		&text + int_text(rest)[:]
+		&text + int_text(rest)
 	}
 	&text + "]"
 	return text
@@ -1472,7 +1472,7 @@ Sequence_Count :: struct {
 
 tally_sequence :: fun(counts: ^[]Sequence_Count, name: []utf8, looping: bool) {
 	for &entry in counts {
-		if compare_folded(entry.name[:], name) == 0 {
+		if compare_folded(entry.name, name) == 0 {
 			entry.count += 1
 			if looping do entry.looping += 1
 			return
@@ -1556,11 +1556,11 @@ command_sounds :: fun() {
 				if ends_with(folder_path, "\\") do folder_path = folder_path[0 : folder_path.len - 1]
 				_, found = find_folder(&sounds, folder_path)
 			else
-				_, found = find_file(&sounds, kind.path[:])
+				_, found = find_file(&sounds, kind.path)
 			}
 			if not found {
 				missing += 1
-				if missing == 1 do &first_missing + kind.path[:]
+				if missing == 1 do &first_missing + kind.path
 				if missing <= 25 do print("  missing: %", kind.path)
 			}
 			continue
@@ -1601,7 +1601,7 @@ check_tree_billboards :: fun(plugin: ^Plugin) {
 			print("  % has no size", editor_id(record.data))
 			continue
 		}
-		_, found := find_file(&textures, look.billboard[:])
+		_, found := find_file(&textures, look.billboard)
 		if found do found_count += 1
 		else do print("  % has no billboard: %", editor_id(record.data), look.billboard)
 	}
@@ -1631,9 +1631,9 @@ command_record :: fun(name: []utf8) {
 		for field in next_field(&fields) {
 			line : str1024
 			&line + "  "
-			&line + field.kind[:]
+			&line + field.kind
 			&line + " "
-			&line + int_text(field.data.len)[:]
+			&line + int_text(field.data.len)
 			&line + ": "
 			// As text, where it reads as text.
 			printable := field.data.len > 0
@@ -1649,10 +1649,10 @@ command_record :: fun(name: []utf8) {
 				for k in 0:shown {
 					value : u32 = field.data[k * 4]
 					number : f32 = field.data[k * 4]
-					&line + int_text(i64(value))[:]
+					&line + int_text(i64(value))
 					if value > 0x30000000 and value < 0x50000000 or value > 0xB0000000 and value < 0xD0000000 {
 						&line + "/"
-						&line + int_text(i64(number * 1000))[:]
+						&line + int_text(i64(number * 1000))
 						&line + "m"
 					}
 					&line + " "
@@ -1663,7 +1663,7 @@ command_record :: fun(name: []utf8) {
 						if b >= 64 do break
 						c : u8 = field.data[b]
 						&line + " "
-						&line + int_text(i64(c))[:]
+						&line + int_text(i64(c))
 					}
 				}
 			}
@@ -1720,9 +1720,9 @@ command_sky :: fun(name: []utf8) {
 		region_error := cell_weathers(&plugin, world_id, place[0], place[1], &chances, &scratch)
 		line : str1024
 		for chance in chances {
-			&line + editor_id_of(&plugin, chance.weather)[:]
+			&line + editor_id_of(&plugin, chance.weather)
 			&line + " "
-			&line + int_text(chance.chance)[:]
+			&line + int_text(chance.chance)
 			&line + "  "
 		}
 		if region_error do print("  at %: couldn't read its regions: %", place, region_error)
@@ -1732,11 +1732,11 @@ command_sky :: fun(name: []utf8) {
 		if sounds_error do print("    couldn't read its sounds: %", sounds_error)
 		sound_line : str1024
 		for sound in sounds {
-			&sound_line + editor_id_of(&plugin, sound.sound)[:]
+			&sound_line + editor_id_of(&plugin, sound.sound)
 			&sound_line + " ("
-			&sound_line + int_text(i64(sound.weathers))[:]
+			&sound_line + int_text(i64(sound.weathers))
 			&sound_line + ", "
-			&sound_line + int_text(i64(sound.chance * 100))[:]
+			&sound_line + int_text(i64(sound.chance * 100))
 			&sound_line + "%)  "
 			if sound_line.len > 900 do break
 		}
@@ -1870,7 +1870,7 @@ command_door :: fun(what: []utf8) {
 		else
 		}
 		for &track in tracks {
-			node := find_node(&mesh, track.node_name[:])
+			node := find_node(&mesh, track.node_name)
 			if node >= 0 {
 				match mesh.blocks[node] {
 				Node moved
@@ -1893,8 +1893,8 @@ command_door :: fun(what: []utf8) {
 	}
 	model_storage : [16 * MB]byte
 	points : [200000]Vec3
-	frame, frame_error := build_model_part(&mesh, -1, moving[:], &model_storage)
-	add_collision_part(&mesh, -1, moving[:], &points)
+	frame, frame_error := build_model_part(&mesh, -1, moving, &model_storage)
+	add_collision_part(&mesh, -1, moving, &points)
 	if not frame_error do print("the frame: % parts, % collision triangles", frame.parts.len, points.len / 3)
 	for node in moving {
 		points.len = 0
@@ -2201,7 +2201,7 @@ command_grass :: fun(name: []utf8, x: i64, y: i64) {
 	if not has_water do water_height = -1000000
 	blades : [render.GRASS_PER_CELL]render.Placed_Grass
 	start := time_now()
-	place_grass(&cell_land, x, y, water_height, textures[:], &kinds, &blades)
+	place_grass(&cell_land, x, y, water_height, textures, &kinds, &blades)
 	print("% blades in % us; water at %", blades.len, (time_now() - start) / 1000, if has_water do water_height else 0)
 	small, small_error := small_world(&plugin, world_id, &scratch)
 	if small and not small_error do print("(a small world: the viewer grows none of it)")
@@ -2269,7 +2269,7 @@ survey_distant_objects :: fun(plugin: ^Plugin, world_id: u32, x: i64, y: i64, ar
 		far : [256]utf8
 		&far + path[0 : path.len - 4]
 		&far + "_far.nif"
-		_, found := find_archived(archives, far[:])
+		_, found := find_archived(archives, far)
 		if found do far_meshes += 1
 		if record.header.kind != "TREE" do print("    % %: % (far mesh: %)", record.header.kind, editor_id(record.data), path, found)
 	}
@@ -2299,11 +2299,11 @@ survey_distant_objects :: fun(plugin: ^Plugin, world_id: u32, x: i64, y: i64, ar
 	&path + "distantlod\\"
 	for c in world_name do &path + lower(c)
 	&path + "_"
-	&path + int_text(x)[:]
+	&path + int_text(x)
 	&path + "_"
-	&path + int_text(y)[:]
+	&path + int_text(y)
 	&path + ".lod"
-	lod_file, found := find_archived(archives, path[:])
+	lod_file, found := find_archived(archives, path)
 	if not found {
 		print("no % in the archives", path)
 		return
@@ -2371,7 +2371,7 @@ command_lod :: fun(name: []utf8, x: i64, y: i64) {
 	for row in 0:steps {
 		for column in 0:steps {
 			piece_name := lod_name(world_id, column * LOD_CELLS - LOD_REACH, row * LOD_CELLS - LOD_REACH)
-			piece_file, found := find_archived(&archives, lod_mesh_path(piece_name[:])[:])
+			piece_file, found := find_archived(&archives, lod_mesh_path(piece_name))
 			if not found do continue
 			built, read_error := read_lod_mesh(&archives, &room, piece_file)
 			if read_error {
@@ -2394,10 +2394,10 @@ command_lod :: fun(name: []utf8, x: i64, y: i64) {
 	survey_distant_objects(&plugin, world_id, x, y, &archives)
 	path : [256]utf8
 	&path + "textures\\landscapelod\\generated\\"
-	&path + piece[:]
+	&path + piece
 	&path + "_fn.dds"
 	texture_storage : [16 * MB]byte
-	texture, read_error := render.read_archive_texture(&archives, path[:], &texture_storage)
+	texture, read_error := render.read_archive_texture(&archives, path, &texture_storage)
 	if read_error {
 		print("couldn't read %: %", path, read_error)
 		return
@@ -2481,12 +2481,12 @@ command_shader :: fun(name: []utf8, package: []utf8) {
 			if constant.register_set == 3 do letter = "s"
 			elif constant.register_set == 1 do letter = "i"
 			elif constant.register_set == 0 do letter = "b"
-			&registers + letter[:]
-			&registers + int_text(i64(constant.index))[:]
+			&registers + letter
+			&registers + int_text(i64(constant.index))
 			if constant.count > 1 {
 				&registers + " to "
-				&registers + letter[:]
-				&registers + int_text(i64(constant.index + constant.count - 1))[:]
+				&registers + letter
+				&registers + int_text(i64(constant.index + constant.count - 1))
 			}
 			print("  // %  %", registers, constant.name)
 		}
@@ -2559,7 +2559,7 @@ command_mp3 :: fun(name: []utf8, raw_path: []utf8) {
 	print("% channels at % Hz: % frames, % s of sound, decoded in % ms", decoder.channels, decoder.sample_rate, frames, seconds, elapsed_ms(start))
 	if raw_path.len == 0 do return
 	pcm.len = written
-	write_error := write_entire_file(raw_path, pcm[:])
+	write_error := write_entire_file(raw_path, pcm)
 	if write_error do print("couldn't write %: %", raw_path, write_error)
 }
 
@@ -2593,7 +2593,7 @@ command_skin :: fun(what: []utf8, animation_path: []utf8) {
 	no_tracks : [0]Track
 	bind : [128]Pose_Bone
 	pose_nodes(&mesh, &no_tracks, 0, &bind)
-	in_bind, bind_error := build_posed_model(&mesh, bind[:], mat4_identity(), &model_storage)
+	in_bind, bind_error := build_posed_model(&mesh, bind, mat4_identity(), &model_storage)
 	if bind_error {
 		print("couldn't pose it: %", bind_error)
 		return
@@ -2630,7 +2630,7 @@ command_skin :: fun(what: []utf8, animation_path: []utf8) {
 	}
 	posed_bones : [128]Pose_Bone
 	pose_nodes(&skeleton, &tracks, 0, &posed_bones)
-	posed, posed_error := build_posed_model(&mesh, posed_bones[:], mat4_identity(), &model_storage)
+	posed, posed_error := build_posed_model(&mesh, posed_bones, mat4_identity(), &model_storage)
 	if posed_error {
 		print("couldn't pose it: %", posed_error)
 		return
@@ -2677,13 +2677,13 @@ command_npc :: fun(name: []utf8) {
 	texture_room : [1 * KB]byte
 	room := load_room(&file_room, &block_room, &model_room, &texture_room)
 	bones : [MAX_POSE_BONES]Pose_Bone
-	pose_error := read_skeleton_pose(&archives, &room, look.skeleton[:], &bones)
+	pose_error := read_skeleton_pose(&archives, &room, look.skeleton, &bones)
 	if pose_error {
 		print("couldn't pose its skeleton: %", pose_error)
 		return
 	}
 	report := Npc_Report{failures = 0, first = [], reason = Not_In_Archive}
-	whole := assemble_npc(&archives, &room, &look, bones[:], &report)
+	whole := assemble_npc(&archives, &room, &look, bones, &report)
 	print("% shapes, from % to %", whole.parts.len, whole.bounds_min, whole.bounds_max)
 	for &part in whole.parts {
 		low := Vec3{1000000, 1000000, 1000000}
@@ -2747,7 +2747,7 @@ command_tree :: fun(name: []utf8, seed_text: []utf8) {
 				leaves += report.leaves
 				if report.left_out > 0 do print("  %: % left out", file_path, report.left_out)
 				bark := grown.parts[0].texture
-				_, has_bark := find_archived(&archives, bark[:])
+				_, has_bark := find_archived(&archives, bark)
 				if not has_bark {
 					barkless += 1
 					print("  %: no bark texture %", file_path, bark)
@@ -2761,7 +2761,7 @@ command_tree :: fun(name: []utf8, seed_text: []utf8) {
 	path : [256]utf8
 	&path + "trees\\"
 	&path + name
-	found, in_archives := find_archived(&archives, path[:])
+	found, in_archives := find_archived(&archives, path)
 	if not in_archives {
 		print("no % in the archives", path)
 		return
@@ -2880,10 +2880,10 @@ command_overlaps :: fun(name: []utf8, point: Vec3, radius: f32) {
 				base, base_error := find_record(&plugin, reference.base, &scratch)
 				if base_error do continue
 				path := model_path(base)
-				if path.len == 0 or is_marker(path[:]) do continue
+				if path.len == 0 or is_marker(path) do continue
 				file_room.len = 0
 				block_room.len = 0
-				mesh, mesh_error := read_archived_nif(&archives, path[:], &file_room, &block_room)
+				mesh, mesh_error := read_archived_nif(&archives, path, &file_room, &block_room)
 				if mesh_error do continue
 				model_room.len = 0
 				built, model_error := build_model(&mesh, &model_room)
@@ -3036,7 +3036,7 @@ command_music :: fun(kind_name: []utf8, raw_path: []utf8) {
 	mixer : Mixer
 	audio_init(&mixer, 64 * KB, &room)
 	music_folder := data_path("Music")
-	music_open(&mixer, music_folder[:])
+	music_open(&mixer, music_folder)
 	want_music(&mixer, kind)
 	pcm : [512 * MB]byte
 	written : i64 = 0
@@ -3061,7 +3061,7 @@ command_music :: fun(kind_name: []utf8, raw_path: []utf8) {
 	stop_track(&mixer.music)
 	if raw_path.len == 0 do return
 	pcm.len = written
-	write_error := write_entire_file(raw_path, pcm[:])
+	write_error := write_entire_file(raw_path, pcm)
 	if write_error do print("couldn't write %: %", raw_path, write_error)
 }
 

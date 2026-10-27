@@ -210,16 +210,16 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	read_load_order(&viewer.load_order)?
 	open_game_archives(&viewer.load_order, &viewer.archives, directory_storage)?
 	note(&viewer.journal, "plugins (")
-	note(&viewer.journal, viewer.load_order.listed_in[:])
+	note(&viewer.journal, viewer.load_order.listed_in)
 	note(&viewer.journal, "):")
 	for &plugin in viewer.load_order.plugins {
 		note(&viewer.journal, " ")
-		note(&viewer.journal, plugin.name[:])
+		note(&viewer.journal, plugin.name)
 	}
 	if viewer.load_order.missing.len > 0 do note(&viewer.journal, "; not in the data folder:")
 	for &plugin in viewer.load_order.missing {
 		note(&viewer.journal, " ")
-		note(&viewer.journal, plugin.name[:])
+		note(&viewer.journal, plugin.name)
 	}
 	note(&viewer.journal, "; ")
 	note(&viewer.journal, viewer.archives.list.len)
@@ -228,7 +228,7 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.platform = platform_open("sooblivion", 1280, 720)?
 	audio_init(&viewer.audio, SOUND_ROOM, table_storage)
 	music_folder := data_path("Music")
-	music_open(&viewer.audio, music_folder[:])
+	music_open(&viewer.audio, music_folder)
 	viewer.told_tracks = 0
 	audio_error := audio_open(&viewer.audio)
 	if audio_error {
@@ -305,7 +305,7 @@ viewer_close :: fun(viewer: ^Viewer) {
 }
 
 // The rooms loading uses, as views of storages the caller keeps: each up
-// to its cap ([:] would stop at its len, 0 here).
+// to its cap ( would stop at its len, 0 here).
 load_room :: fun(file_room: ^[]byte, block_room: ^[]byte, model_room: ^[]byte, texture_room: ^[]byte) -> Load_Room {
 	return Load_Room{
 		file = file_room[0 : file_room.cap],
@@ -324,9 +324,9 @@ viewer_loader :: fun(viewer: ^Viewer) -> Loader {
 // fps, vsync on — 140 of 210 in view, 52 draw calls".
 update_title :: fun(viewer: ^Viewer) {
 	title : str256
-	&title + viewer.place[:]
+	&title + viewer.place
 	&title + " — "
-	&title + int_text(viewer.frames_a_second)[:]
+	&title + int_text(viewer.frames_a_second)
 	&title + " fps, vsync "
 	&title + (if viewer.platform.vsync do "on" else "off")
 	&title + (if viewer.renderer.use_bindless do ", bindless" else ", bound textures")
@@ -335,16 +335,16 @@ update_title :: fun(viewer: ^Viewer) {
 	whole_hours := i64(viewer.hour)
 	minutes := i64((viewer.hour - f32(whole_hours)) * 60)
 	if whole_hours < 10 do &title + "0"
-	&title + int_text(whole_hours)[:]
+	&title + int_text(whole_hours)
 	&title + ":"
 	if minutes < 10 do &title + "0"
-	&title + int_text(minutes)[:]
+	&title + int_text(minutes)
 	&title + " — "
-	&title + int_text(viewer.drawn.visible)[:]
+	&title + int_text(viewer.drawn.visible)
 	&title + " of "
-	&title + int_text(viewer.drawn.instances)[:]
+	&title + int_text(viewer.drawn.instances)
 	&title + " in view, "
-	&title + int_text(viewer.drawn.draw_calls)[:]
+	&title + int_text(viewer.drawn.draw_calls)
 	&title + " draw calls"
 	_ = SetWindowTitle(viewer.platform.window, title)   // (the list: a 0 follows the title in its room)
 }
@@ -488,7 +488,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	if music.tracks_started != viewer.told_tracks {
 		viewer.told_tracks = music.tracks_started
 		note(&viewer.journal, "music: ")
-		note(&viewer.journal, music.track[:])
+		note(&viewer.journal, music.track)
 		note_end(&viewer.journal)
 	}
 	card_start := time_now()
@@ -803,7 +803,7 @@ move_night_sky :: fun(viewer: ^Viewer) {
 			&path + "_"
 			&path + MOON_PHASES[phase]
 			&path + ".dds"
-			slot := texture_for(&viewer.renderer, &viewer.archives, path[:], &room.texture, CLAMP_BOTH)
+			slot := texture_for(&viewer.renderer, &viewer.archives, path, &room.texture, CLAMP_BOTH)
 			if moon == "masser" do look.masser = slot
 			else do look.secunda = slot
 		}
@@ -817,12 +817,12 @@ move_night_sky :: fun(viewer: ^Viewer) {
 night_sky_textures :: fun(viewer: ^Viewer) -> err {
 	look := &viewer.look
 	room := &viewer.room
-	look.sun_glare = texture_for(&viewer.renderer, &viewer.archives, viewer.climate.sun_glare_texture[:], &room.texture, CLAMP_BOTH)
+	look.sun_glare = texture_for(&viewer.renderer, &viewer.archives, viewer.climate.sun_glare_texture, &room.texture, CLAMP_BOTH)
 	look.stars = 0
 	look.nebula = 0
 	viewer.moon_phase = -1
 	if viewer.climate.stars.len == 0 do return
-	stars_file, found := find_archived(&viewer.archives, viewer.climate.stars[:])
+	stars_file, found := find_archived(&viewer.archives, viewer.climate.stars)
 	if not found do return Not_In_Archive
 	room.file.len = 0
 	data := read_archived(&viewer.archives, stars_file, &room.file)?
@@ -831,8 +831,8 @@ night_sky_textures :: fun(viewer: ^Viewer) -> err {
 	mesh := read_nif(data, &room.blocks, &failure)?
 	room.model.len = 0
 	built := build_model(&mesh, &room.model)?
-	if built.parts.len > 0 do look.stars = texture_for(&viewer.renderer, &viewer.archives, built.parts[0].texture[:], &room.texture)
-	if built.parts.len > 1 do look.nebula = texture_for(&viewer.renderer, &viewer.archives, built.parts[1].texture[:], &room.texture)
+	if built.parts.len > 0 do look.stars = texture_for(&viewer.renderer, &viewer.archives, built.parts[0].texture, &room.texture)
+	if built.parts.len > 1 do look.nebula = texture_for(&viewer.renderer, &viewer.archives, built.parts[1].texture, &room.texture)
 }
 
 // Water whose colors are lit by a light: dim at night, its own by day.
@@ -911,7 +911,7 @@ use_climate :: fun(viewer: ^Viewer, plugin: ^Plugin, climate: ^Climate) {
 	viewer.climate = climate^
 	viewer.sky_taken = true
 	look := &viewer.look
-	look.sun = texture_for(&viewer.renderer, &viewer.archives, viewer.climate.sun_texture[:], &viewer.room.texture)
+	look.sun = texture_for(&viewer.renderer, &viewer.archives, viewer.climate.sun_texture, &viewer.room.texture)
 	night_error := night_sky_textures(viewer)
 	if night_error {
 		note(&viewer.journal, "couldn't read the night sky: ")
@@ -1000,14 +1000,14 @@ change_weather :: fun(viewer: ^Viewer, plugin: ^Plugin, at_once: bool) {
 	if at_once do look.last_precipitation.len = 0
 	viewer.weather = weather
 	viewer.weather_share = if at_once do 1 else 0
-	look.cloud_lower = texture_for(&viewer.renderer, &viewer.archives, weather.cloud_lower[:], &room.texture)
-	look.cloud_upper = texture_for(&viewer.renderer, &viewer.archives, weather.cloud_upper[:], &room.texture)
+	look.cloud_lower = texture_for(&viewer.renderer, &viewer.archives, weather.cloud_lower, &room.texture)
+	look.cloud_upper = texture_for(&viewer.renderer, &viewer.archives, weather.cloud_upper, &room.texture)
 	if at_once {
 		look.cloud_lower_last = look.cloud_lower
 		look.cloud_upper_last = look.cloud_upper
 	}
 	note(&viewer.journal, "the weather: ")
-	note(&viewer.journal, editor_id_of(plugin, chosen)[:])
+	note(&viewer.journal, editor_id_of(plugin, chosen))
 	note(&viewer.journal, if at_once do "" else ", coming in")
 	note_end(&viewer.journal)
 }
@@ -1020,7 +1020,7 @@ precipitation_of :: fun(viewer: ^Viewer, weather: ^Weather, layers: ^[]Precipita
 	layers.len = 0
 	if weather.precipitation.len == 0 do return
 	room := &viewer.room
-	rain_file, found := find_archived(&viewer.archives, weather.precipitation[:])
+	rain_file, found := find_archived(&viewer.archives, weather.precipitation)
 	if not found do return Not_In_Archive
 	room.file.len = 0
 	data := read_archived(&viewer.archives, rain_file, &room.file)?
@@ -1044,7 +1044,7 @@ precipitation_of :: fun(viewer: ^Viewer, weather: ^Weather, layers: ^[]Precipita
 		layer.size = max(emitter.radius, 1)
 		layer.streak = emitter.speed > 400
 		layer.light = system.look.emissive
-		layer.texture = texture_for(&viewer.renderer, &viewer.archives, system.look.texture[:], &room.texture, system.look.clamp_mode)
+		layer.texture = texture_for(&viewer.renderer, &viewer.archives, system.look.texture, &room.texture, system.look.clamp_mode)
 	}
 }
 
@@ -1065,7 +1065,7 @@ note_failures :: fun(viewer: ^Viewer) {
 		note(journal, "  couldn't load ")
 		note(journal, shown.failures)
 		note(journal, ", left out; the first: ")
-		note(journal, shown.first_failure[:])
+		note(journal, shown.first_failure)
 		note(journal, ", ")
 		note_error(journal, shown.first_failure_reason)
 		note_end(journal)
@@ -1075,7 +1075,7 @@ note_failures :: fun(viewer: ^Viewer) {
 		note(journal, "  couldn't load ")
 		note(journal, renderer.texture_failures)
 		note(journal, " textures, drawn white; the first: ")
-		note(journal, renderer.first_texture_failure[:])
+		note(journal, renderer.first_texture_failure)
 		note(journal, ", ")
 		note_error(journal, renderer.first_texture_reason)
 		note_end(journal)
@@ -1086,7 +1086,7 @@ note_failures :: fun(viewer: ^Viewer) {
 		note(journal, "  couldn't play ")
 		note(journal, sound.failures)
 		note(journal, " sounds; the first: ")
-		note(journal, sound.first_failure[:])
+		note(journal, sound.first_failure)
 		note(journal, ", ")
 		note_error(journal, sound.first_failure_reason)
 		note_end(journal)
@@ -1171,7 +1171,7 @@ note_missed :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 		if has_base do what = editor_id_of(plugin, base)
 	}
 	note(journal, "E: the reticle is on ")
-	note(journal, what[:])
+	note(journal, what)
 	note(journal, " (reference ")
 	note(journal, i64(viewer.missed_target))
 	note(journal, "), not a door that leads somewhere or opens")
@@ -1381,9 +1381,9 @@ go_inside :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
 	choose_music(viewer, plugin, cell, 0)
 	viewer.speed = 400
 	name := record_name(plugin, cell)
-	set_place(viewer, name[:])
+	set_place(viewer, name)
 	journal := &viewer.journal
-	note(journal, name[:])
+	note(journal, name)
 	note(journal, ": ")
 	note(journal, shown.instances.len)
 	note(journal, " instances, ")
@@ -1445,9 +1445,9 @@ go_outside :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32, place: Vec3) 
 	viewer.camera.position = place
 	viewer.speed = 1500
 	name := record_name(plugin, world_id)
-	set_place(viewer, name[:])
+	set_place(viewer, name)
 	journal := &viewer.journal
-	note(journal, name[:])
+	note(journal, name)
 	note(journal, " (")
 	note(journal, x)
 	note(journal, " ")

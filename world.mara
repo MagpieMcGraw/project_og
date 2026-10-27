@@ -151,7 +151,7 @@ read_masters :: fun(plugin: ^Plugin, file: i64) -> err {
 		name := field_text(field.data)
 		found := false
 		for &other in plugin.files {
-			if compare_folded(other.name[:], name) == 0 {
+			if compare_folded(other.name, name) == 0 {
 				span.masters[span.master_count] = other.own_index
 				found = true
 			}
@@ -611,7 +611,7 @@ sound_kind_of :: fun(base: Record) -> Sound_Kind, bool {
 		if c == '/' do &kind.path + '\\'
 		else do &kind.path + lower(c)
 	}
-	kind.folder = not ends_with(kind.path[:], ".wav")
+	kind.folder = not ends_with(kind.path, ".wav")
 	data, has_data := find_field(base.data, "SNDX")
 	if not has_data do data, has_data = find_field(base.data, "SNDD")
 	if has_data and data.len >= 8 {

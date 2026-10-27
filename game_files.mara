@@ -48,7 +48,7 @@ read_load_order :: fun(order: ^Load_Order) -> err {
 	else
 		&order.listed_in + "DLCList.txt"
 		list_path := data_path("DLCList.txt")
-		data, read_error := read_entire_file(list_path[:], &storage)
+		data, read_error := read_entire_file(list_path, &storage)
 		if read_error == File_Error.Open_Failed do return   // (no downloaded content)
 		if read_error do return read_error
 		text = data
@@ -73,7 +73,7 @@ read_player_plugins :: fun(storage: ^[]byte) -> []utf8, err {
 	ending := "/Oblivion/Plugins.txt"
 	if local.len + ending.len >= local.cap do return none_read
 	path := local + ending
-	data, read_error := read_entire_file(path[:], storage)
+	data, read_error := read_entire_file(path, storage)
 	if read_error == File_Error.Open_Failed do return none_read
 	if read_error do return none_read, read_error
 	return data
@@ -85,12 +85,12 @@ read_player_plugins :: fun(storage: ^[]byte) -> []utf8, err {
 add_plugin :: fun(order: ^Load_Order, name: []utf8) {
 	if order.plugins.len == order.plugins.cap or name.len > 64 do return
 	for &plugin in order.plugins {
-		if compare_folded(plugin.name[:], name) == 0 do return
+		if compare_folded(plugin.name, name) == 0 do return
 	}
 	added := Plugin_File{name = [], written = 0}
 	&added.name + name
 	path := data_path(name)
-	written := file_mtime(path[:])
+	written := file_mtime(path)
 	if written == 0 {
 		if order.missing.len < order.missing.cap do &order.missing + added
 		return
@@ -119,8 +119,8 @@ open_game_archives :: fun(order: ^Load_Order, archives: ^Archives, storage: ^[]b
 		name := order.plugins[order.plugins.len - back].name[:]
 		stem := name[0 : name.len - 4]   // (without ".esp")
 		for entry in entries {
-			if entry.dir or not plugin_archive(stem, entry.name[:]) do continue
-			open_one_archive(archives, entry.name[:], storage)?
+			if entry.dir or not plugin_archive(stem, entry.name) do continue
+			open_one_archive(archives, entry.name, storage)?
 		}
 	}
 	list := MASTER_ARCHIVES
@@ -154,7 +154,7 @@ plugin_archive :: fun(stem: []utf8, name: []utf8) -> bool {
 open_one_archive :: fun(archives: ^Archives, name: []utf8, storage: ^[]byte) -> err {
 	if archives.list.len == archives.list.cap do return Too_Many_Archives
 	path := data_path(name)
-	archive := open_archive(path[:], storage)?
+	archive := open_archive(path, storage)?
 	&archives.list + archive
 }
 
