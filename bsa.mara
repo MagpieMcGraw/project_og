@@ -88,9 +88,9 @@ file_name :: fun(archive: ^Archive, file: Archive_File) -> []utf8 {
 	return names[file.name_at : file.name_at + file.name_len]
 }
 
-// Fills view from the file's current place: all of it, in as many reads as
-// that takes. Read_Failed when the file ends first.
-read_exactly :: fun(file: File_Id, view: []byte) -> err {
+// Fills view (all its len) from the file's current place, in as many reads
+// as that takes. Read_Failed when the file ends first.
+read_exactly :: fun(file: File_Id, view: ^[]byte) -> err {
 	got : i64 = 0
 	for got < view.len {
 		rest := view[got : view.len]
@@ -107,7 +107,8 @@ open_archive :: fun(path: []utf8, storage: ^[]byte) -> Archive, err {
 	defer? file_close(file)
 
 	header_bytes : [36!]byte
-	read_exactly(file, header_bytes[:])?
+	header_view := header_bytes[:]
+	read_exactly(file, &header_view)?
 	header : Archive_Header = header_bytes[0]
 	if header.magic[0:3] != "BSA" do return Archive{0}, Not_An_Archive
 	if header.version != OBLIVION_VERSION do return Archive{0}, Wrong_Version
@@ -121,7 +122,7 @@ open_archive :: fun(path: []utf8, storage: ^[]byte) -> Archive, err {
 	start := storage.len
 	directory := storage[start : start + directory_size]
 	_ = file_seek(file, 0, SEEK_SET)?
-	read_exactly(file, directory)?
+	read_exactly(file, &directory)?
 	storage.len = start + directory_size
 
 	folders := slice([:folder_count]Folder, storage)
@@ -305,14 +306,14 @@ read_file :: fun(archive: ^Archive, index: i64, storage: ^[]byte) -> []byte, err
 
 	if not entry.packed {
 		data := storage[start : start + entry.size]
-		read_exactly(archive.file, data)?
+		read_exactly(archive.file, &data)?
 		storage.len = start + entry.size
 		return data
 	}
 
 	// Packed: read into the end of storage's room, unpacked in front of it.
 	packed := storage[storage.cap - entry.size : storage.cap]
-	read_exactly(archive.file, packed)?
+	read_exactly(archive.file, &packed)?
 	unpacked_size : u32 = packed[0]
 	if unpacked_size == 0 do return none   // an empty file: its size and nothing more
 	if start + i64(unpacked_size) > storage.cap - entry.size do return none, No_Room

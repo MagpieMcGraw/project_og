@@ -150,7 +150,7 @@ command_bsa :: fun(name: []utf8, what: []utf8) {
 			storage.len = 0
 			packed := storage[storage.cap - file.size : storage.cap]
 			_, seek_error := file_seek(archive.file, file.offset, SEEK_SET)
-			read_error := read_exactly(archive.file, packed)
+			read_error := read_exactly(archive.file, &packed)
 			if seek_error or read_error {
 				print("  couldn't read %: % %", file_name(&archive, file), seek_error, read_error)
 				continue
@@ -206,7 +206,7 @@ write_entire_file :: fun(path: []utf8, data: []byte) -> err {
 	defer file_close(file)
 	rest := data
 	for rest.len > 0 {
-		written := file_write(file, &rest)?
+		written := file_write(file, rest)?
 		if written <= 0 do return Write_Failed
 		rest = rest[written : rest.len]
 	}
@@ -2485,7 +2485,7 @@ command_mp3 :: fun(name: []utf8, raw_path: []utf8) {
 	print("% channels at % Hz: % frames, % s of sound, decoded in % ms", decoder.channels, decoder.sample_rate, frames, seconds, elapsed_ms(start))
 	if raw_path.len == 0 do return
 	pcm.len = written
-	write_error := write_bytes(raw_path, pcm[:])
+	write_error := write_entire_file(raw_path, pcm[:])
 	if write_error do print("couldn't write %: %", raw_path, write_error)
 }
 
@@ -2526,20 +2526,8 @@ command_music :: fun(kind_name: []utf8, raw_path: []utf8) {
 	stop_track(&mixer.music)
 	if raw_path.len == 0 do return
 	pcm.len = written
-	write_error := write_bytes(raw_path, pcm[:])
+	write_error := write_entire_file(raw_path, pcm[:])
 	if write_error do print("couldn't write %: %", raw_path, write_error)
-}
-
-// Writes bytes to a file, all of them.
-write_bytes :: fun(path: []utf8, data: []byte) -> err {
-	file := file_open_write(path)?
-	defer file_close(file)
-	rest := data
-	for rest.len > 0 {
-		count := file_write(file, &rest)?
-		if count <= 0 do return Write_Failed
-		rest = rest[count : rest.len]
-	}
 }
 
 // Keeps the console open until Enter is pressed (or its input ends).
