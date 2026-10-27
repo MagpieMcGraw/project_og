@@ -387,6 +387,7 @@ Block :: union {
 	Strips_Shape {
 		scale: Vec3
 		strips: Refs
+		filters: []byte   // each strip's Havok filter, 4 bytes: its layer, flags, group (2)
 	}
 	// bhkPackedNiTriStripsShape: triangles in an hkPackedNiTriStripsData.
 	Packed_Shape {

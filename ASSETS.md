@@ -165,6 +165,10 @@ guesses for now.
 - The weather through a gate: it goes on into a world of the same
   climate here (a city has its parent Tamriel's); another climate's
   world (an Oblivion realm) starts its own at once.
+- What E aims at: the collision here, a door counting up to 48 units
+  behind a wall's collision (the castles' tower walls close their
+  collision over their load doors' doorways). The game may aim at what's
+  drawn instead.
 - Which archive's file wins where two have one: the plugins' own here,
   the last loaded first, then the master's.
 - Music: what an interior cell of the default type plays (Explore here);

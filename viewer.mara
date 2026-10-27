@@ -48,6 +48,11 @@ EYES_CATCH_UP :: 12
 EYE_HEIGHT :: 120
 // How near a door must be to use it: how far the eyes reach.
 DOOR_REACH :: 300
+// How far behind a wall's collision a door may be set and still be used:
+// some walls' collision runs straight across a load door's doorway (the
+// castles' tower walls, 19 units in front of their doors), the doorway and
+// the door in its recess drawn behind it.
+DOOR_RECESS :: 48
 // Without vsync, frames are kept to this many a second at most: the game
 // has to feel good at 60.
 MOST_FRAMES_A_SECOND :: 60
@@ -1130,9 +1135,16 @@ load_some :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 // (a wall between hides what's behind it), its reference; 0 for none.
 targeted_reference :: fun(shown: ^Scene, camera: render.Camera) -> u32 {
 	forward, _, _ := camera_axes(camera)
-	picked, _, hit := pick(shown, camera.position, forward, DOOR_REACH)
-	if not hit do return 0
-	return shown.instances[picked].reference
+	picked, distance, hit := pick(shown, camera.position, forward, DOOR_REACH)
+	if hit and is_door(shown, shown.instances[picked].reference) do return shown.instances[picked].reference
+	// A door set into a recess behind what the line meets first: a wall
+	// whose collision closes over the doorway, as the drawn wall doesn't.
+	if hit {
+		behind, _, door_hit := pick_door(shown, camera.position, forward, min(distance + DOOR_RECESS, DOOR_REACH))
+		if door_hit do return shown.instances[behind].reference
+		return shown.instances[picked].reference
+	}
+	return 0
 }
 
 // Tells the journal what E was pressed at that it couldn't use: nothing

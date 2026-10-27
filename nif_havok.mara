@@ -187,8 +187,10 @@ read_tri_strips_shape :: fun(reader: ^Nif_Reader) -> Block {
 	}
 	strips := read_refs(reader)
 	filter_count := i64(read_u32(reader))
+	filters_at := reader.at
 	skip(reader, filter_count * 4)
-	return Strips_Shape{scale = scale, strips = strips}
+	if reader.broken do return Strips_Shape{scale = scale, strips = strips, filters = reader.data[0:0]}
+	return Strips_Shape{scale = scale, strips = strips, filters = reader.data[filters_at : reader.at]}
 }
 
 read_mesh_shape :: fun(reader: ^Nif_Reader) -> Block {

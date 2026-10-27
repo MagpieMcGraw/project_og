@@ -1963,7 +1963,7 @@ Base_Count :: struct {
 // drawn. `collision -all`: every mesh's, counted; and how many of the
 // convex hulls' faces are found with the planes' distance added (as
 // collision.mara takes it) and subtracted.
-command_collision :: fun(what: []utf8) {
+command_collision :: fun(what: []utf8, through: Vec3, has_point: bool) {
 	path := data_path("Oblivion - Meshes.bsa")
 	directory_storage : [64 * MB]byte
 	archive, open_error := open_archive(path, &directory_storage)
@@ -2058,6 +2058,33 @@ command_collision :: fun(what: []utf8) {
 	}
 	print("% collision triangles, from % to %", points.len / 3, low, high)
 	if not model_error do print("drawn: from % to %", built.bounds_min, built.bounds_max)
+	if has_point and not model_error {
+		// Lines along each axis through the point: where they meet the
+		// collision, and the drawn triangles (a hole drawn but not in the
+		// collision shows here).
+		for axis in 0:3 {
+			start := through
+			start[axis] = through[axis] - 2000
+			way := Vec3{0, 0, 0}
+			way[axis] = 1
+			collision_hits : [16]f32
+			for t in 0:points.len / 3 {
+				distance, hit := line_hits(start, way, points[t * 3], points[t * 3 + 1], points[t * 3 + 2])
+				if hit and collision_hits.len < collision_hits.cap do &collision_hits + (start[axis] + distance)
+			}
+			drawn_hits : [16]f32
+			for &part in built.parts {
+				for t in 0:part.indices.len / 3 {
+					a := part.vertices[i64(part.indices[t * 3])].position
+					b := part.vertices[i64(part.indices[t * 3 + 1])].position
+					c := part.vertices[i64(part.indices[t * 3 + 2])].position
+					distance, hit := line_hits(start, way, a, b, c)
+					if hit and drawn_hits.len < drawn_hits.cap do &drawn_hits + (start[axis] + distance)
+				}
+			}
+			print("  along axis % through %: collision at %; drawn at %", axis, through, collision_hits, drawn_hits)
+		}
+	}
 	// Lines through the middle along each axis, from outside the box: where
 	// each first meets the collision (an opening, a doorway's, meets none).
 	middle := (low + high) * 0.5
@@ -2079,6 +2106,11 @@ command_collision :: fun(what: []utf8) {
 		match block^ {
 		Rigid_Body body
 			print("  block % (%): a body on layer %, its shape block % %", k, type_name, body.layer, body.shape, if body.moved do "(moved)" else "")
+		Strips_Shape strips_shape
+			for s in 0:strips_shape.strips.count {
+				layer := if strips_shape.filters.len >= (s + 1) * 4 do i64(u8(strips_shape.filters[s * 4])) else -1
+				print("  block % (%): strips block %, on layer %", k, type_name, strips_shape.strips.at(s), layer)
+			}
 		Other
 			if starts_with(type_name, "bhk") do print("  block % (%): kept as Other", k, type_name)
 		else
@@ -2654,8 +2686,14 @@ main :: (args: [][]utf8) {
 		command_door(args[2])
 	elif command == "anim" and args.len > 2
 		command_anim(args[2])
+	elif command == "collision" and args.len > 5
+		x, x_ok := parse_number(args[3])
+		y, y_ok := parse_number(args[4])
+		z, z_ok := parse_number(args[5])
+		if x_ok and y_ok and z_ok do command_collision(args[2], Vec3{f32(x), f32(y), f32(z)}, true)
+		else do usage()
 	elif command == "collision" and args.len > 2
-		command_collision(args[2])
+		command_collision(args[2], Vec3{0, 0, 0}, false)
 	elif command == "grass" and args.len > 4
 		x, x_ok := parse_number(args[3])
 		y, y_ok := parse_number(args[4])
