@@ -10,3 +10,4 @@ memory.txt
 *.dds
 *.png
 *.log
+compiler/

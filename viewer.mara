@@ -138,7 +138,9 @@ Viewer :: struct {
 	region_sounds_tried: f64
 	thunder_tried: f64
 	lightning: f32
-	sky_world: u32      // the world they're of, 0 for none yet
+	sky_world: u32      // the world they're of, 0 for none yet (or an interior's own)
+	sky_taken: bool     // a sky has been taken: there's a weather to go on with
+	sky_inside: bool    // in an interior that behaves like an exterior: lit by the sky
 	hour: f32
 	look: Sky_Look
 	water: Water_Type   // the world's water, as its WATR has it
@@ -225,6 +227,8 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.walker = Walker{position = Vec3{0, 0, 0}, rising = 0, on_ground = false}
 	viewer.eyes = 0
 	viewer.sky_world = 0
+	viewer.sky_taken = false
+	viewer.sky_inside = false
 	viewer.hour = START_HOUR
 	viewer.weather = default_weather()
 	viewer.last_weather = default_weather()
@@ -245,7 +249,7 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 		weather_share = 1, sun = 0, precipitation = [], last_precipitation = [],
 		stars = 0, nebula = 0, stars_turn = 0, masser = 0, secunda = 0, masser_direction = Vec3{0, 0, -1},
 		secunda_direction = Vec3{0, 0, -1}, masser_size = 0, secunda_size = 0, sun_glare = 0, sun_glare_strength = 0,
-		cloud_lower_offset = 0, cloud_upper_offset = 0, outside = false, time = 0, water = DEFAULT_WATER, wind = 0}
+		cloud_lower_offset = 0, cloud_upper_offset = 0, outside = false, sky = false, time = 0, water = DEFAULT_WATER, wind = 0}
 	viewer.water = DEFAULT_WATER
 	viewer.frame_start = time_now()
 	viewer.next_frame = viewer.frame_start
@@ -640,7 +644,8 @@ pass_time :: fun(viewer: ^Viewer, seconds: f32, hurried: bool) {
 	look.time += seconds
 	shown := &viewer.shown
 	look.outside = shown.world != 0
-	if not look.outside {
+	look.sky = look.outside or viewer.sky_inside
+	if not look.sky {
 		// Inside, what water there is reflects the cell's fog and ambient.
 		lighting := shown.lighting
 		look.state = Sky_State{upper = lighting.ambient, lower = lighting.fog_color, horizon = lighting.fog_color,
@@ -816,21 +821,16 @@ mix_number :: fun(from: f32, to: f32, share: f32) -> f32 {
 	return from + (to - from) * share
 }
 
-// Reads a world's climate and water and puts its sun on the card, and
-// finds the weathers that may come where the camera is: when the viewer
-// goes out into a world it wasn't in. The weather is the sky's, not the
-// world's: it goes on into a world of the same climate (from Tamriel into a
-// city, and back); only a first sky, or another climate's, starts at once
-// with one of its own.
+// Takes a world's sky when the viewer goes out into a world it wasn't in:
+// its climate (see use_climate) and water.
 take_sky :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32) {
+	viewer.sky_inside = false
 	if viewer.sky_world == world_id do return
-	had_sky := viewer.sky_world != 0
-	last_climate := viewer.climate.form_id
 	viewer.sky_world = world_id
 	scratch : [4 * MB]byte
 	// What can't be read is told of, and the defaults go in its place.
 	climate, climate_error := world_climate(plugin, world_id, &scratch)
-	viewer.climate = if climate_error do default_climate() else climate
+	if climate_error do climate = default_climate()
 	water, water_error := world_water(plugin, world_id, &scratch)
 	viewer.water = if water_error do DEFAULT_WATER else water
 	for sky_error in [climate_error, water_error] {
@@ -840,6 +840,48 @@ take_sky :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32) {
 		note_end(&viewer.journal)
 		break
 	}
+	use_climate(viewer, plugin, &climate)
+}
+
+// In an interior that behaves like an exterior (the Temple of the One, the
+// Arena, Oblivion's towers), the sky lights it and shows through it: its own
+// climate's (XCCM), or the one outside's when it names none. Elsewhere
+// inside, none.
+take_cell_sky :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
+	scratch : [4 * MB]byte
+	behaves, climate_id, sky_error := cell_sky(plugin, cell, &scratch)
+	if sky_error {
+		note(&viewer.journal, "couldn't tell whether the cell is lit by the sky: ")
+		note_error(&viewer.journal, sky_error)
+		note_end(&viewer.journal)
+		behaves = false
+	}
+	viewer.sky_inside = behaves
+	if not behaves do return
+	if climate_id == 0 {
+		if viewer.sky_taken do return   // (the sky outside goes on)
+		climate_id = fallback_climate(plugin, &scratch)
+	}
+	climate, climate_error := read_climate(plugin, climate_id, &scratch)
+	if climate_error {
+		note(&viewer.journal, "couldn't read the cell's climate: the default instead; ")
+		note_error(&viewer.journal, climate_error)
+		note_end(&viewer.journal)
+		climate = default_climate()
+	}
+	// (Its own sky: going out into a world reads that world's again.)
+	viewer.sky_world = 0
+	use_climate(viewer, plugin, &climate)
+}
+
+// Takes a climate: its sun and night sky on the card, the weathers that may
+// come where the camera is. The weather is the sky's, not the world's: it
+// goes on under the same climate (from Tamriel into a city, and back); a
+// first sky, or another climate's, starts one of its own at once.
+use_climate :: fun(viewer: ^Viewer, plugin: ^Plugin, climate: ^Climate) {
+	same := viewer.sky_taken and climate.form_id == viewer.climate.form_id
+	viewer.climate = climate^
+	viewer.sky_taken = true
 	look := &viewer.look
 	look.sun = texture_for(&viewer.renderer, &viewer.textures, viewer.climate.sun_texture[:], &viewer.room.texture)
 	night_error := night_sky_textures(viewer)
@@ -859,8 +901,7 @@ take_sky :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32) {
 	note(journal, i64(viewer.climate.sunset_end))
 	note_end(journal)
 	_ = weathers_at_camera(viewer, plugin)
-	if had_sky and viewer.climate.form_id == last_climate do return
-	change_weather(viewer, plugin, true)
+	if not same do change_weather(viewer, plugin, true)
 }
 
 // The weathers that may come where the camera is: its cell's regions', or
@@ -1257,6 +1298,8 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 			viewer.camera.pitch = 0
 			place_walker(viewer)
 		}
+		// A weather's time up: the next one comes in.
+		if viewer.weather_due do change_weather(viewer, plugin, false)
 		// (Not on the frame that placed cells: it's had its share of work.)
 		if not placed_this_frame do load_some(viewer, plugin)
 	}
@@ -1267,6 +1310,7 @@ go_inside :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
 	shown := &viewer.shown
 	start := time_now()
 	show_error := show_interior(shown, plugin, cell, viewer_loader(viewer))
+	take_cell_sky(viewer, plugin, cell)
 	choose_music(viewer, plugin, cell, 0)
 	viewer.speed = 400
 	name := record_name(plugin, cell)

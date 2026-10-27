@@ -122,10 +122,8 @@ Sky_State :: struct {
 }
 
 // The climate of a world: its CNAM's; for a world without one, its parent's
-// (WNAM: a city's is Tamriel's), and so on up; else TamrielClimate, or
-// DefaultClimate.
+// (WNAM: a city's is Tamriel's), and so on up; else the fallback climate.
 world_climate :: fun(plugin: ^Plugin, world_id: u32, scratch: ^[]byte) -> Climate, err {
-	climate := default_climate()
 	climate_id : u32 = 0
 	asked := world_id
 	for depth in 0:4 {
@@ -139,10 +137,33 @@ world_climate :: fun(plugin: ^Plugin, world_id: u32, scratch: ^[]byte) -> Climat
 		if not has_parent or parent == 0 do break
 		asked = parent
 	}
-	if climate_id == 0 do climate_id = find_by_editor_id(plugin, "CLMT", "TamrielClimate", scratch)
-	if climate_id == 0 do climate_id = find_by_editor_id(plugin, "CLMT", "DefaultClimate", scratch)
-	if climate_id == 0 do return climate
+	if climate_id == 0 do climate_id = fallback_climate(plugin, scratch)
+	return read_climate(plugin, climate_id, scratch)
+}
 
+// The climate for where none is named: TamrielClimate, or DefaultClimate;
+// 0 when there's neither.
+fallback_climate :: fun(plugin: ^Plugin, scratch: ^[]byte) -> u32 {
+	climate_id := find_by_editor_id(plugin, "CLMT", "TamrielClimate", scratch)
+	if climate_id == 0 do climate_id = find_by_editor_id(plugin, "CLMT", "DefaultClimate", scratch)
+	return climate_id
+}
+
+// Whether an interior cell behaves like an exterior (its DATA's flag 0x80:
+// the Temple of the One, the Arena, Oblivion's towers), lit by the sky, and
+// the climate it names (XCCM; 0 for none: the one outside's).
+cell_sky :: fun(plugin: ^Plugin, cell: u32, scratch: ^[]byte) -> bool, u32, err {
+	record := find_record(plugin, cell, scratch)?
+	flags, has_flags := find_field(record.data, "DATA")
+	if not has_flags or flags.len == 0 or (u8(flags[0]) & 0x80) == 0 do return false, 0
+	climate_id, _ := form_field(record.data, "XCCM")
+	return true, climate_id
+}
+
+// A CLMT record's climate; the default climate for 0.
+read_climate :: fun(plugin: ^Plugin, climate_id: u32, scratch: ^[]byte) -> Climate, err {
+	climate := default_climate()
+	if climate_id == 0 do return climate
 	climate_record := find_record(plugin, climate_id, scratch)?
 	climate.form_id = climate_id
 	// Its weathers: WLST is (weather, chance) pairs.

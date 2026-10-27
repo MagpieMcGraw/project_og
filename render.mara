@@ -1254,7 +1254,8 @@ Sky_Look :: struct {
 	last_precipitation: [PRECIPITATION_LAYERS]Precipitation_Layer
 	cloud_lower_offset: f32
 	cloud_upper_offset: f32
-	outside: bool        // the sky is drawn only outside
+	outside: bool        // outside: a world's land, trees, grass, distant land and rain are drawn
+	sky: bool            // the sky is drawn: outside, or in an interior that behaves like an exterior
 	time: f32            // seconds, for the water's ripples and the grass's swaying
 	water: Water_Type    // its colors lit by the hour's light
 	wind: f32            // the weather's wind, 0 to 1
@@ -3192,7 +3193,7 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 	sun := vec3_normalize(lighting.direction)
 
 	BindBufferBase(SHADER_STORAGE_BUFFER, 3, renderer.light_buffer)
-	if look.outside do draw_sky(renderer, look, view_projection, lighting, camera, &stats)
+	if look.sky do draw_sky(renderer, look, view_projection, lighting, camera, &stats)
 	// The cells drawn in full: what the far pass leaves out.
 	near_cells := hidden_around(camera.position)
 	for ground in grounds do hide_cell(&near_cells, ground.x, ground.y)

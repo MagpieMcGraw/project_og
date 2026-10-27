@@ -16,8 +16,9 @@ Oblivion.esm and the base game's archives; sizes are as stored.
   containers, furniture, flora, and items lying about.
 - **Plants:** trees (as billboards only), grass.
 - **Light and sky:** cell lighting and fog, point lights (flicker, pulse),
-  climate (its likeliest weather only), weather colors, fog and two cloud
-  layers, the sun.
+  climates and their weathers (see below), weather colors, fog and two
+  cloud layers, the sun; interiors that behave like exteriors (the
+  Temple of the One, the Arena, Oblivion's towers) lit by the sky.
 - **Water:** WATR colors, ripples and scroll, cell water heights.
 - **Meshes:** NIF geometry, base and glow textures, normal maps (`_n`,
   with their tangent space) and specular (the normal map's alpha, where it
@@ -153,6 +154,10 @@ guesses for now.
   the Oblivion realms): none grows here. A city's world shows Tamriel's
   land, and with the cities put back in Tamriel (Open Cities) grass is
   known to come up through their streets from that land.
+- An interior that behaves like an exterior: lit by the weather's sun
+  and ambient here, its own XCLL unused; the sky drawn, no rain or
+  snow; one naming no climate (the Temple of the One) under the one
+  outside's.
 - The weather through a gate: it goes on into a world of the same
   climate here (a city has its parent Tamriel's); another climate's
   world (an Oblivion realm) starts its own at once.
