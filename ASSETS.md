@@ -147,6 +147,14 @@ guesses for now.
 - Point lights' falloff (the game reads a lookup texture), and the mist
   near ruin lamps looking brighter than remembered.
 - Placed sounds that don't loop (played again after 6 to 12 s here).
+- Grass in small worlds (the walled cities', the Imperial City districts',
+  the Oblivion realms): none grows here. Their land often isn't their
+  ground (Green Emperor Way's is over its garden, the districts' under
+  their streets), and Open Cities is known for grass then coming up
+  through the streets.
+- The weather through a gate: it goes on into a world of the same
+  climate here (a city has its parent Tamriel's); another climate's
+  world (an Oblivion realm) starts its own at once.
 - Music: what an interior cell of the default type plays (Explore here);
   how loud it is beside the sounds (the Oblivion.ini here: 0.3 to 0.8);
   whether tracks have pauses between them (none here), and how a change

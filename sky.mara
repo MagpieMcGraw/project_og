@@ -92,6 +92,7 @@ Weather_Chance :: struct {
 // glare's textures, the night sky's mesh (its stars), and its moons:
 // which there are and how many days each phase lasts.
 Climate :: struct {
+	form_id: u32               // its CLMT's (0: the default, none read)
 	weathers: [16]Weather_Chance
 	sunrise_begin: f32         // hours, 0 to 24
 	sunrise_end: f32
@@ -120,18 +121,30 @@ Sky_State :: struct {
 	lighting: Cell_Lighting
 }
 
-// The climate of a world: its CNAM's, or TamrielClimate, or DefaultClimate.
+// The climate of a world: its CNAM's; for a world without one, its parent's
+// (WNAM: a city's is Tamriel's), and so on up; else TamrielClimate, or
+// DefaultClimate.
 world_climate :: fun(plugin: ^Plugin, world_id: u32, scratch: ^[]byte) -> Climate, err {
 	climate := default_climate()
 	climate_id : u32 = 0
-	record := find_record(plugin, world_id, scratch)?
-	field, found := find_field(record.data, "CNAM")
-	if found and field.len >= 4 do climate_id = field[0]
+	asked := world_id
+	for depth in 0:4 {
+		record := find_record(plugin, asked, scratch)?
+		own, has_own := form_field(record.data, "CNAM")
+		if has_own and own != 0 {
+			climate_id = own
+			break
+		}
+		parent, has_parent := form_field(record.data, "WNAM")
+		if not has_parent or parent == 0 do break
+		asked = parent
+	}
 	if climate_id == 0 do climate_id = find_by_editor_id(plugin, "CLMT", "TamrielClimate", scratch)
 	if climate_id == 0 do climate_id = find_by_editor_id(plugin, "CLMT", "DefaultClimate", scratch)
 	if climate_id == 0 do return climate
 
 	climate_record := find_record(plugin, climate_id, scratch)?
+	climate.form_id = climate_id
 	// Its weathers: WLST is (weather, chance) pairs.
 	weathers, has_weathers := find_field(climate_record.data, "WLST")
 	if has_weathers do add_weather_chances(weathers, &climate.weathers)
@@ -284,7 +297,7 @@ pick_weather :: fun(chances: ^[]Weather_Chance, pick: f32) -> u32 {
 // A climate for a world that has none: no weathers (the default one), the
 // sun up from 6 to 20.
 default_climate :: fun() -> Climate {
-	return Climate{weathers = [], sunrise_begin = 6, sunrise_end = 10, sunset_begin = 16, sunset_end = 20, sun_texture = [],
+	return Climate{form_id = 0, weathers = [], sunrise_begin = 6, sunrise_end = 10, sunset_begin = 16, sunset_end = 20, sun_texture = [],
 		sun_glare_texture = [], stars = [], masser = false, secunda = false, phase_days = 3}
 }
 

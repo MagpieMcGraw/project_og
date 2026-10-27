@@ -817,10 +817,15 @@ mix_number :: fun(from: f32, to: f32, share: f32) -> f32 {
 }
 
 // Reads a world's climate and water and puts its sun on the card, and
-// starts its weather where the camera is: when the viewer goes out into a
-// world it wasn't in.
+// finds the weathers that may come where the camera is: when the viewer
+// goes out into a world it wasn't in. The weather is the sky's, not the
+// world's: it goes on into a world of the same climate (from Tamriel into a
+// city, and back); only a first sky, or another climate's, starts at once
+// with one of its own.
 take_sky :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32) {
 	if viewer.sky_world == world_id do return
+	had_sky := viewer.sky_world != 0
+	last_climate := viewer.climate.form_id
 	viewer.sky_world = world_id
 	scratch : [4 * MB]byte
 	// What can't be read is told of, and the defaults go in its place.
@@ -854,6 +859,7 @@ take_sky :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32) {
 	note(journal, i64(viewer.climate.sunset_end))
 	note_end(journal)
 	_ = weathers_at_camera(viewer, plugin)
+	if had_sky and viewer.climate.form_id == last_climate do return
 	change_weather(viewer, plugin, true)
 }
 

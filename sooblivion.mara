@@ -1668,6 +1668,7 @@ command_sky :: fun(name: []utf8) {
 		print("couldn't read the climate: %", climate_error)
 		return
 	}
+	print("climate %", editor_id_of(&plugin, climate.form_id))
 	// The climate's likeliest weather.
 	likeliest : u32 = 0
 	best : i64 = -1
@@ -2128,6 +2129,8 @@ command_grass :: fun(name: []utf8, x: i64, y: i64) {
 	start := time_now()
 	place_grass(&cell_land, x, y, water_height, textures[:], &kinds, &blades)
 	print("% blades in % us; water at %", blades.len, (time_now() - start) / 1000, if has_water do water_height else 0)
+	small, small_error := small_world(&plugin, world_id, &scratch)
+	if small and not small_error do print("(a small world: the viewer grows none of it)")
 	for &kind, k in kinds {
 		count : i64 = 0
 		lowest : f32 = 1000000

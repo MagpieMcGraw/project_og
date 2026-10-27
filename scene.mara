@@ -230,6 +230,7 @@ Scene :: struct {
 	door_sounds: [2048]Door_Sounds
 	lighting: Cell_Lighting
 	world: u32                   // the world shown outside, 0 inside
+	grows_grass: bool            // its land grows grass: not a small world (a city's, a realm)
 	center_x: i64                // the cell the exterior was loaded around
 	center_y: i64
 	grounds: [LAND_SLOTS]Gpu_Land
@@ -322,6 +323,7 @@ scene_clear :: fun(scene: ^Scene, storage: ^[]byte) {
 	scene.failures = 0
 	scene.grounds.len = 0
 	scene.world = 0
+	scene.grows_grass = true
 	scene.tree_kinds = key_index(1 << 11, storage)
 	scene.kinds.len = 0
 	scene.grass_index = key_index(1 << 9, storage)
@@ -1386,7 +1388,7 @@ load_distant_objects :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, loade
 // Places a cell's grass over its land and puts it on the card, in the
 // land's slot.
 load_grass :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64, cell_land: ^Land, slot: i64, loader: Loader) {
-	if scene.grass_cells.len == scene.grass_cells.cap do return
+	if not scene.grows_grass or scene.grass_cells.len == scene.grass_cells.cap do return
 	// The grasses of each texture in the land.
 	textures : [40]Texture_Grasses
 	for &quadrant in cell_land.quadrants {
@@ -1491,6 +1493,13 @@ show_exterior :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, x: i64, y: i
 		drop_land(scene, area, true)
 		scene_clear_cell(scene)
 		scene.lighting = exterior_lighting()
+		// The game grows no grass in a small world's land: the cities' and
+		// the Imperial City districts' land isn't their ground (it's under
+		// their streets, or over Green Emperor Way's garden).
+		scratch : [64 * KB]byte
+		small, small_error := small_world(plugin, world_id, &scratch)
+		if small_error do note_failure(scene, "a world's record, for its grass", small_error)
+		scene.grows_grass = not small
 	}
 	scene.world = world_id
 	scene.center_x = x

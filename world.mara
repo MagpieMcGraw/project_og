@@ -525,6 +525,14 @@ sound_kind_of :: fun(base: Record) -> Sound_Kind, bool {
 	return kind, true
 }
 
+// Whether a world is a small one (its DATA's flag 0x01): a walled city's
+// own, an Imperial City district, an Oblivion realm.
+small_world :: fun(plugin: ^Plugin, world_id: u32, scratch: ^[]byte) -> bool, err {
+	record := find_record(plugin, world_id, scratch)?
+	flags, found := find_field(record.data, "DATA")
+	return found and flags.len > 0 and (u8(flags[0]) & 0x01) != 0
+}
+
 // The kind of music a place wants (0 exploring, 1 public, 2 dungeon): a
 // cell's own (XCMT; 0 or none is the default); outside, for a cell with the
 // default (or no cell), its world's (SNAM), then its regions' (RDMD, among
