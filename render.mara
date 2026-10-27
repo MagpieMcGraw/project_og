@@ -85,6 +85,9 @@ DISTANT_NEAR :: 256
 // have (Tamriel's most is 54), the kinds of tree in a cell.
 TREE_CELLS :: 1024
 TREES_PER_CELL :: 128
+// How far (along the ground) trees are grown in full (speedtree.mara);
+// past it, their billboards.
+TREE_NEAR :: 4096
 TREE_RUNS :: 16
 
 // Grass: blades a cell's land can have at once (its grid has 51 x 51
@@ -145,6 +148,11 @@ layout(location = 13) in vec4 specular;     // the color it shines
 layout(location = 14) in vec4 motion;       // its texture moved across and up, its opacity (as they change)
 
 uniform mat4 view_projection;
+uniform vec3 view_right;    // the camera's right and up, in the world: leaf cards face it
+uniform vec3 view_up;
+
+// An instance's flags (Drawn_Instance's, as PART_*).
+const uint LEAF_CARDS = 1u;
 
 out vec3 world_position;
 out vec3 world_normal;
@@ -164,10 +172,17 @@ flat out vec4 part_motion;
 void main() {
 	mat4 world = mat4(world_x, world_y, world_z, world_w);
 	vec4 placed = world * vec4(position, 1.0);
+	world_tangent = mat3(world) * tangent.xyz;
+	if ((normal_map.w & LEAF_CARDS) != 0u) {
+		// A leaf card's corner: set off from the card's place across and up
+		// the view, as far as its tangent says (scaled with the tree). (No
+		// normal map on leaves: its tangent isn't one.)
+		placed.xyz += (view_right * tangent.x + view_up * tangent.y) * length(world_x.xyz);
+		world_tangent = vec3(0.0);
+	}
 	gl_Position = view_projection * placed;
 	world_position = placed.xyz;
 	world_normal = mat3(world) * normal;
-	world_tangent = mat3(world) * tangent.xyz;
 	tangent_way = tangent.w;
 	texture_uv = uv;
 	vertex_color = color;
@@ -649,6 +664,7 @@ layout(location = 1) in vec3 tree_size;     // width, height, and how bright it 
 layout(location = 2) in uvec2 tree_texture;
 uniform mat4 view_projection;
 uniform vec3 camera_position;
+uniform float grown_within;   // trees nearer than this (along the ground) are grown in full, not drawn here
 out vec3 world_position;
 out vec2 texture_uv;
 out float brightness;
@@ -659,6 +675,10 @@ void main() {
 	int corner = gl_VertexID;
 	vec2 toward = camera_position.xy - tree_position.xy;
 	float away = length(toward);
+	if (away < grown_within) {
+		gl_Position = vec4(2.0, 2.0, 2.0, 1.0);   // (outside the view: nothing drawn)
+		return;
+	}
 	vec2 right = away > 0.001 ? vec2(-toward.y, toward.x) / away : vec2(1.0, 0.0);
 	float across = (corner == 1 || corner == 2) ? 0.5 : -0.5;
 	float up = corner >= 2 ? 1.0 : 0.0;
@@ -1073,6 +1093,7 @@ Mesh_Part :: struct {
 	additive: bool         // blended by adding its light to what's behind (fire)
 	flip: i64              // its texture's flipbook (in the renderer's flips), -1 for none
 	billboard: i64         // turned to face the camera: its billboard (in the renderer's), -1 for none
+	leaf_cards: bool       // a tree's leaves, each card turned to face the camera (Model_Part's)
 }
 
 // A flipbook on the card: its frames' textures (in the renderer's
@@ -1186,6 +1207,7 @@ Instance :: struct {
 	moving_kind: i32
 	moving_piece: i32
 	placement: Mat4
+	reach: f32             // drawn only this near the camera (along the ground, from its place); 0: at any distance
 }
 
 // A cell's land on the card: where on the grid, its slot in the land
@@ -1420,6 +1442,7 @@ Grass_Program :: struct {
 Tree_Program :: struct {
 	program: u32
 	shared: Shared_Uniforms
+	grown_within_at: i32
 }
 
 // A distant land program, and where its uniforms are.
@@ -1473,10 +1496,14 @@ Drawn_Instance :: struct {
 	glow: u64              // its glow map's bindless handle (without bindless, 1 when it has one); 0 for none
 	normal_map: u64        // its normal map's, as the glow map's
 	glossiness: f32
-	flags: u32             // (none yet)
+	flags: u32             // PART_*
 	specular: [4!]f32      // the color it shines, red, green, blue; the last unused
 	motion: [4!]f32        // its texture moved across and up, its opacity; the last unused
 }
+
+// A drawn instance's flags (for the mesh program, which reads them as the
+// fourth word of its normal map's).
+PART_LEAF_CARDS :: 1   // its vertices are leaf cards (Model_Part.leaf_cards)
 
 // One draw of MultiDrawElementsIndirect, as OpenGL reads it: 20 bytes.
 Draw_Command :: struct {
@@ -1515,6 +1542,8 @@ Mesh_Program :: struct {
 	adding_at: i32
 	soft_distance_at: i32
 	depth_range_at: i32
+	view_right_at: i32
+	view_up_at: i32
 }
 
 // A land program, and where its uniforms are.
@@ -1809,6 +1838,8 @@ make_mesh_program :: fun(made: ^Mesh_Program, bindless: bool) -> err {
 	made.adding_at = GetUniformLocation(made.program, "adding")
 	made.soft_distance_at = GetUniformLocation(made.program, "soft_distance")
 	made.depth_range_at = GetUniformLocation(made.program, "depth_range")
+	made.view_right_at = GetUniformLocation(made.program, "view_right")
+	made.view_up_at = GetUniformLocation(made.program, "view_up")
 	UseProgram(made.program)
 	Uniform1i(GetUniformLocation(made.program, "scene_depth"), 2)
 	if not bindless {
@@ -1907,6 +1938,7 @@ make_distant_program :: fun(made: ^Distant_Program, bindless: bool) -> err {
 make_tree_program :: fun(made: ^Tree_Program, bindless: bool) -> err {
 	made.program = compile_program(TREE_VERTEX_SHADER, TREE_FRAGMENT_SHADER, bindless)?
 	made.shared = find_shared_uniforms(made.program)
+	made.grown_within_at = GetUniformLocation(made.program, "grown_within")
 	UseProgram(made.program)
 	if not bindless do Uniform1i(GetUniformLocation(made.program, "picture_texture"), 0)
 }
@@ -2363,6 +2395,7 @@ draw_trees :: fun(renderer: ^Renderer, tree_cells: ^[]Gpu_Trees, hidden: ^Hidden
 	made := &renderer.tree_programs[which_program(renderer)]
 	UseProgram(made.program)
 	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
+	Uniform1f(made.grown_within_at, TREE_NEAR)
 	BindVertexArray(renderer.tree_vertex_array)
 	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.tree_indirect_buffer)
 	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.tree_commands.len * size_of(Draw_Command)), renderer.tree_commands[:], STREAM_DRAW)
@@ -2907,7 +2940,8 @@ upload_model :: fun(renderer: ^Renderer, built: ^Model, archives: ^Archives, scr
 			emissive = part.emissive,
 			additive = part.additive,
 			flip = flip,
-			billboard = billboard}
+			billboard = billboard,
+			leaf_cards = part.leaf_cards}
 		renderer.vertices_used += part.vertices.len
 		renderer.indices_used += part.indices.len
 		gpu.part_count += 1
@@ -2965,7 +2999,8 @@ place_instance :: fun(gpu: Gpu_Model, model_index: i64, placement: Mat4, referen
 		lights = [],
 		moving_kind = -1,
 		moving_piece = 0,
-		placement = placement}
+		placement = placement,
+		reach = 0}
 	for k in 0:LIGHTS_PER_OBJECT do instance.lights[k] = NO_LIGHT
 	return instance
 }
@@ -3593,6 +3628,11 @@ gather_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]In
 	record_count : i64 = 0
 	for &instance, index in instances {
 		if not sphere_in_view(planes, instance.center, instance.radius) do continue
+		if instance.reach > 0 {
+			away_x := instance.world[3][0] - camera.position.x
+			away_y := instance.world[3][1] - camera.position.y
+			if away_x * away_x + away_y * away_y > instance.reach * instance.reach do continue
+		}
 		x, y := grid_of(Vec3{instance.world[3][0], instance.world[3][1], 0})
 		if hidden_cell_at(left_out, x, y) do continue
 		placed_model := models[instance.model]
@@ -3680,7 +3720,7 @@ gather_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]In
 			record.normal_map = 0
 			if part.normal_slot >= 0 do record.normal_map = if bindless do renderer.textures[part.normal_slot].handle else 1
 			record.glossiness = max(part.glossiness, 1)
-			record.flags = 0
+			record.flags = if part.leaf_cards do PART_LEAF_CARDS else 0
 			record.specular = [part.specular.x, part.specular.y, part.specular.z, 0]
 		}
 	}
@@ -3710,6 +3750,9 @@ draw_mesh_runs :: fun(renderer: ^Renderer, view_projection: Mat4, lighting: Cell
 	Uniform1i(made.adding_at, 0)
 	Uniform1f(made.soft_distance_at, 0)
 	Uniform2f(made.depth_range_at, camera.near, camera.far)
+	_, right, up := camera_axes(camera)
+	Uniform3f(made.view_right_at, right.x, right.y, right.z)
+	Uniform3f(made.view_up_at, up.x, up.y, up.z)
 	run_start : i64 = 0
 	for run_start < renderer.commands.len {
 		group_key := renderer.touched[run_start] >> 20

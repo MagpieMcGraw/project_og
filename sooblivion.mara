@@ -33,6 +33,7 @@ use animation
 use particles
 use audio
 use mp3
+use speedtree
 render :: use render
 use mara.math
 use sdl_platform
@@ -2504,6 +2505,8 @@ usage :: fun() {
 	print("sooblivion bsa <archive>           an archive's folders and files")
 	print("sooblivion bsa <archive> <file>    one file from an archive, unpacked")
 	print("sooblivion plugins                 the plugins loaded, in order, and the archives")
+	print("sooblivion tree <name.spt | -all> [seed]")
+	print("                                   a SpeedTree file read and grown (every one: -all)")
 	print("sooblivion overlaps <world> <x> <y> <z> [radius]")
 	print("                                   drawn shapes lying on one another near a point (flicker)")
 	print("sooblivion mp3 <file> [raw]        decodes an MP3 (into raw floats, if given)")
@@ -2692,6 +2695,107 @@ command_npc :: fun(name: []utf8) {
 		print("    % from % to %", part.texture, low, high)
 	}
 	if report.failures > 0 do print("% parts left out; the first: %, %", report.failures, report.first, report.reason)
+}
+
+// `sooblivion tree <name.spt> [seed]`: a SpeedTree file (in trees\) read
+// and grown, no window: its size, its levels and leaf pictures, then the
+// tree grown with the seed (its own when not given): how many branches and
+// leaves, the box round it. `-all`: every tree file read and grown, how
+// long it took and which failed.
+command_tree :: fun(name: []utf8, seed_text: []utf8) {
+	directory_storage : [64 * MB]byte
+	archives : Archives
+	open_error := open_all_archives(&archives, &directory_storage)
+	if open_error {
+		print("couldn't open the archives: %", open_error)
+		return
+	}
+	defer close_archives(&archives)
+	file_storage : [1 * MB]byte
+	model_storage : [32 * MB]byte
+	tree : Speed_Tree
+	if name == "-all" {
+		start := time_now()
+		files : i64 = 0
+		failed : i64 = 0
+		branches : i64 = 0
+		leaves : i64 = 0
+		barkless : i64 = 0
+		for &archive in archives.list {
+			for file, i in archive.files {
+				file_path := file_name(archive, file)
+				if not ends_with(file_path, ".spt") do continue
+				files += 1
+				file_storage.len = 0
+				data, read_error := read_file(archive, i, &file_storage)
+				tree_error := if read_error do read_error else read_speed_tree(data, &tree)
+				if tree_error {
+					failed += 1
+					print("  % couldn't be read: %", file_path, tree_error)
+					continue
+				}
+				model_storage.len = 0
+				grown, report, grow_error := grow_tree(&tree, tree.seed, "", &model_storage)
+				if grow_error {
+					failed += 1
+					print("  % couldn't be grown: %", file_path, grow_error)
+					continue
+				}
+				branches += report.branches
+				leaves += report.leaves
+				if report.left_out > 0 do print("  %: % left out", file_path, report.left_out)
+				bark := grown.parts[0].texture
+				_, has_bark := find_archived(&archives, bark[:])
+				if not has_bark {
+					barkless += 1
+					print("  %: no bark texture %", file_path, bark)
+				}
+			}
+		}
+		print("% tree files read and grown in % ms, % failed: % branches, % leaves; % without their bark texture", files,
+			elapsed_ms(start), failed, branches, leaves, barkless)
+		return
+	}
+	path : [256]utf8
+	&path + "trees\\"
+	&path + name
+	found, in_archives := find_archived(&archives, path[:])
+	if not in_archives {
+		print("no % in the archives", path)
+		return
+	}
+	data, read_error := read_archived(&archives, found, &file_storage)
+	if read_error {
+		print("couldn't read %: %", path, read_error)
+		return
+	}
+	tree_error := read_speed_tree(data, &tree)
+	if tree_error {
+		print("couldn't read % as a tree: %", path, tree_error)
+		return
+	}
+	print("%: bark %, size % at % percent, seed %, % levels, % leaf pictures", path, tree.bark, tree.size, tree.scale,
+		tree.seed, tree.levels.len, tree.leaves.len)
+	for &level, k in tree.levels {
+		print("  level %: length % to %, radius % to %, angle % to %, gravity % to %, % round x % along, children from % to %, %",
+			k, level.length.low, level.length.high, level.radius.low, level.radius.high, level.start_angle.low,
+			level.start_angle.high, level.gravity.low, level.gravity.high, level.around, level.along, level.first_child,
+			level.last_child, level.frequency)
+	}
+	for &leaf in tree.leaves do print("  leaf picture: size %, held at %, corners %", leaf.size, leaf.pivot, leaf.corners)
+	seed := tree.seed
+	if seed_text.len > 0 {
+		number, is_number := parse_number(seed_text)
+		if is_number do seed = i64(number)
+	}
+	grown, report, grow_error := grow_tree(&tree, seed, "", &model_storage)
+	if grow_error {
+		print("couldn't grow it: %", grow_error)
+		return
+	}
+	print("grown with seed %: % branches, % leaves (% left out); % parts, from % to %", seed, report.branches,
+		report.leaves, report.left_out, grown.parts.len, grown.bounds_min, grown.bounds_max)
+	for &part in grown.parts do print("  % vertices, % triangles, %", part.vertices.len, part.indices.len / 3, part.texture)
 }
 
 // A drawn triangle in the world, for command_overlaps: its corners, the
@@ -3060,6 +3164,8 @@ main :: (args: [][]utf8) {
 		command_sounds()
 	elif command == "plugins"
 		command_plugins()
+	elif command == "tree" and args.len > 2
+		command_tree(args[2], if args.len > 3 do args[3] else "")
 	elif command == "overlaps" and args.len > 5
 		x, x_ok := parse_number(args[3])
 		y, y_ok := parse_number(args[4])

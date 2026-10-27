@@ -14,7 +14,9 @@ Oblivion.esm and the base game's archives; sizes are as stored.
 - **Things placed:** every base object with a model is drawn where it's
   placed — statics, activators, doors (swinging ones animated), lights,
   containers, furniture, flora, and items lying about.
-- **Plants:** trees (as billboards only), grass.
+- **Plants:** trees, grown from their SpeedTree files within 4096 units
+  (bark with its normal maps, leaf cards facing the camera; a seed of the
+  record's each) and billboards past that; grass.
 - **Light and sky:** cell lighting and fog, point lights (flicker, pulse),
   climates and their weathers (see below), weather colors, fog and two
   cloud layers, the sun; interiors that behave like exteriors (the
@@ -75,7 +77,7 @@ lightning) and the regions' sounds (birds, insects, wind).
 
 | What | Data | Notes |
 |---|---|---|
-| 3D trees | 113 SpeedTree `.spt`; `textures\trees\branches` 90, `leaves` 78 | near trees are billboards now |
+| Trees' wind, fronds, collision | `.spt` flexibility curves (6002, 6003), wind (9000s, 16000s), fronds (13000s, 14002), collision (5000s); TREE CNAM leaf angles, dimming, rock and rustle speeds | trees stand still and can be walked through |
 | Sunbeams | `sunbeam01–03.nif` | |
 | HDR (eye adapting, bloom) | WTHR HNAM | |
 | Water reflections | — | framebuffers are in now; left for later earlier |
@@ -187,6 +189,15 @@ guesses for now.
   stand there already.
 - Which archive's file wins where two have one: the plugins' own here,
   the last loaded first, then the master's.
+- Trees, grown here as SpeedTree's library isn't to be had (see
+  speedtree.mara): lengths as shares of the file's size times its scale
+  (2006, in percent: what makes young trees small); the children's curves
+  read across the span they grow from; a branch's count its frequency
+  times its length's share of the size, and a quarter of the leaf places
+  given a card; gravity bending each segment down by how far it reaches
+  sideways. Which of a record's seeds a reference grows (its form id
+  picks one here), and how far away the game turns trees to billboards
+  (4096 units here).
 - Music: what an interior cell of the default type plays (Explore here);
   how loud it is beside the sounds (the Oblivion.ini here: 0.3 to 0.8);
   whether tracks have pauses between them (none here), and how a change

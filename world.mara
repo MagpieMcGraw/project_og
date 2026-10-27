@@ -836,11 +836,16 @@ world_water :: fun(plugin: ^Plugin, world_id: u32, scratch: ^[]byte) -> Water_Ty
 	return water
 }
 
-// How a tree (TREE) is drawn: as its billboard — the picture of it the
-// editor made for seeing it from afar, textures\trees\billboards\ and its
-// SpeedTree file's name — this wide and tall (BNAM) at a scale of 1.
-// (The SpeedTree files hold how to grow the tree, not its shape.)
+// How a tree (TREE) is drawn. Near, grown from its SpeedTree file
+// (speedtree.mara: the file holds how to grow the tree, not its shape) with
+// its leaves' texture (ICON, in textures\trees\leaves\) and one of its seeds
+// (SNAM: each grows another tree); afar, as its billboard, the picture of it
+// the editor made (textures\trees\billboards\ and its SpeedTree file's
+// name), this wide and tall (BNAM) at a scale of 1.
 Tree_Look :: struct {
+	model: [160]utf8      // its SpeedTree file's archive path: trees\…
+	leaves: [160]utf8
+	seeds: [8]i64
 	billboard: [160]utf8
 	width: f32
 	height: f32
@@ -848,7 +853,7 @@ Tree_Look :: struct {
 
 // A TREE record's look; false for other records, or a tree without a size.
 tree_look :: fun(base: Record) -> Tree_Look, bool {
-	look := Tree_Look{billboard = [], width = 0, height = 0}
+	look := Tree_Look{model = [], leaves = [], seeds = [], billboard = [], width = 0, height = 0}
 	if base.header.kind != "TREE" do return look, false
 	model, has_model := find_field(base.data, "MODL")
 	size, has_size := find_field(base.data, "BNAM")
@@ -868,5 +873,20 @@ tree_look :: fun(base: Record) -> Tree_Look, bool {
 	&look.billboard + "textures\\trees\\billboards\\"
 	for k in start:end do &look.billboard + lower(name[k])
 	&look.billboard + ".dds"
+	&look.model + "trees\\"
+	for k in start:name.len do &look.model + lower(name[k])
+	leaves, has_leaves := find_field(base.data, "ICON")
+	if has_leaves {
+		&look.leaves + "textures\\trees\\leaves\\"
+		for c in field_text(leaves) do &look.leaves + lower(c)
+	}
+	seeds, has_seeds := find_field(base.data, "SNAM")
+	if has_seeds {
+		for k in 0:seeds.len / 4 {
+			if look.seeds.len == look.seeds.cap do break
+			seed : u32 = seeds[4 * k]
+			&look.seeds + i64(seed)
+		}
+	}
 	return look, true
 }

@@ -47,6 +47,8 @@ Model_Part :: struct {
 	alpha: f32
 	vertex_mode: u32        // what its vertex colors stand for: 0 nothing, 1 its own light, 2 its color
 	lighting_mode: u32      // 0 lit by its own light only, 1 by the scene's lights too
+	leaf_cards: bool        // a tree's leaves: each four vertices a card at their place, turned to face
+	                        // the camera, each corner set off across and up by its tangent's first two
 }
 
 // A whole model: its parts, its particle systems, and a box around them.
@@ -826,7 +828,8 @@ part_look :: fun(mesh: ^Nif, properties: Inherited, model: ^Model) -> Model_Part
 		glossiness = 10,
 		alpha = 1,
 		vertex_mode = 2,
-		lighting_mode = 1}
+		lighting_mode = 1,
+		leaf_cards = false}
 	apply_properties(mesh, properties, &part, model)
 	return part
 }

@@ -7,6 +7,73 @@ against Mara at the time written. When one is fixed, move it to Fixed
 
 ## Open
 
+- An immutable slice param stored into a struct field makes that field
+  read-only everywhere in the program, not just in the values made from
+  the param. Checked against 3a5d0f3:
+
+  ```
+  Holder :: struct {
+  	numbers: []i64
+  }
+  hold :: fun(numbers: []i64) -> Holder {
+  	return Holder{numbers = numbers}
+  }
+  fill :: fun(storage: ^[]byte) -> i64 {
+  	holder := Holder{numbers = slice([:4]i64, storage)}
+  	&holder.numbers + 1
+  	return holder.numbers.len
+  }
+  ```
+
+  says, at the append in fill, "`holder.numbers` is a copy of the
+  immutable param `numbers` (in hold)". In sooblivion a tree's part made
+  from a slice param turned every `part.vertices` write (model.mara,
+  npc.mara) into an error. Expected: fill's holder, carved from mutable
+  storage, can be appended to; or, if a field is meant to take one
+  mutability for the whole program, an error at hold saying so. sooblivion
+  passes the growing tree itself (speedtree.mara, tree_part), so the
+  slices come from its mutable lists.
+
+- A struct made from a pointer to a local struct counts as holding every
+  pointer that local holds, though it takes only some of its fields; so a
+  pointer param kept in a local beside lists carved from storage is "stored
+  into" the storage. Checked against 3a5d0f3:
+
+  ```
+  Work :: struct {
+  	settings: ^Settings
+  	numbers: []i64
+  }
+  Summary :: struct {
+  	numbers: []i64
+  }
+  summary_of :: fun(work: ^Work) -> Summary {
+  	return Summary{numbers = work.numbers}
+  }
+  fill :: fun(settings: ^Settings, storage: ^[]byte) -> i64 {
+  	work := Work{settings = settings, numbers = slice([:16]i64, storage)}
+  	for k in 0:work.settings.count do &work.numbers + k
+  	summaries := slice([:2]Summary, storage)
+  	&summaries + summary_of(&work)
+  	return summaries[0].numbers.len
+  }
+  run :: fun(storage: ^[]byte) -> i64 {
+  	settings := Settings{count = 4}
+  	return fill(&settings, storage)
+  }
+  ```
+
+  says, at `fill(&settings, storage)`, "`fill(...)` stores its `settings`
+  argument into its `storage` argument: reference to local `settings`
+  would escape". Without the summary it builds. Expected: no error, as a
+  Summary has no place for settings. sooblivion passes the Speed_Tree
+  beside its Growth instead of keeping it in there (speedtree.mara).
+
+- mara.string's `parse_number` reads no exponent: `parse_number("-6.24607e-008")`
+  is false. SpeedTree's curves are written so (`%g`). Expected: exponents
+  read, as Mara's own float literals now are (8a8319d). sooblivion reads
+  the exponent itself (speedtree.mara, next_number).
+
 - `return []` in a fun that gives back a slice is refused: the `[]` is
   typed as an empty array, `[0!]utf8`, which (rightly) doesn't turn into a
   slice when given back. Checked against 3a5d0f3:
