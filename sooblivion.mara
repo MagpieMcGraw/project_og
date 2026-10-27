@@ -2386,18 +2386,38 @@ command_shader :: fun(name: []utf8, package: []utf8) {
 }
 
 usage :: fun() {
+	print("sooblivion                         the game's world, from the Inn of Ill Omen (as when double-clicked)")
+	print("sooblivion view-cell <editor id>   an interior cell; its doors lead on, inside and out")
+	print("sooblivion view-world [world x y]  a world's exterior from a cell (Tamriel 0 0)")
+	print("sooblivion view <mesh>             one mesh")
 	print("sooblivion esm [plugin]            what a plugin holds, by record type")
 	print("sooblivion bsa <archive>           an archive's folders and files")
 	print("sooblivion bsa <archive> <file>    one file from an archive, unpacked")
+	print("sooblivion help                    this")
 }
+
+// Keeps the console open until Enter is pressed (or its input ends).
+wait_for_enter :: fun() {
+	print("press Enter to close")
+	line : [256]byte
+	_ = file_read(standard_input(), &line)   // (what's typed, or nothing: done either way)
+}
+
+// Where the game starts when sooblivion is given nothing to do (double-
+// clicked): an inn by the road, its door leading outside.
+START_CELL :: "InnIllOmen"
 
 main :: (args: [][]utf8) {
 	if args.len < 2 {
-		usage()
+		// Double-clicked, most likely: the console window goes when the
+		// program does, so a message about not starting is waited on.
+		if command_view_cell(START_CELL) do wait_for_enter()
 		return
 	}
 	command := args[1]
-	if command == "esm" {
+	if command == "help" {
+		usage()
+	elif command == "esm"
 		command_esm(if args.len > 2 do args[2] else "Oblivion.esm")
 	elif command == "view" and args.len > 2
 		command_view(args[2])
@@ -2408,7 +2428,7 @@ main :: (args: [][]utf8) {
 	elif command == "cells"
 		command_cells(if args.len > 2 do args[2] else "")
 	elif command == "view-cell" and args.len > 2
-		command_view_cell(args[2])
+		_ = command_view_cell(args[2])   // (it says why it couldn't)
 	elif command == "area" and args.len > 4
 		x, x_ok := parse_number(args[3])
 		y, y_ok := parse_number(args[4])

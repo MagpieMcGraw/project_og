@@ -763,20 +763,21 @@ command_view :: fun(what: []utf8) {
 }
 
 // `sooblivion view-cell <editor id>`: shows an interior cell in the
-// window; its doors lead on, inside and out.
-command_view_cell :: fun(name: []utf8) {
+// window; its doors lead on, inside and out. When it can't, it says why
+// on the console, and gives the reason back.
+command_view_cell :: fun(name: []utf8) -> err {
 	data_storage : [400 * MB]byte
 	index_storage : [96 * MB]byte
 	plugin, load_error := load_oblivion(&data_storage, &index_storage)
 	if load_error {
 		print("couldn't load the plugin: %", load_error)
-		return
+		return load_error
 	}
 	scratch : [16 * MB]byte
 	cell, cell_error := find_interior_cell(&plugin, name, &scratch)
 	if cell_error {
 		print("no interior cell %", name)
-		return
+		return cell_error
 	}
 	directory_storage : [64 * MB]byte
 	table_storage : [SOUND_ROOM + 8 * MB]byte
@@ -784,7 +785,7 @@ command_view_cell :: fun(name: []utf8) {
 	open_error := viewer_open(&viewer, &directory_storage, &table_storage)
 	if open_error {
 		print("couldn't open the viewer: %", open_error)
-		return
+		return open_error
 	}
 	defer viewer_close(&viewer)
 	file_room : [64 * MB]byte
