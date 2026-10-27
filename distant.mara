@@ -75,9 +75,9 @@ load_distant_land :: fun(renderer: ^Renderer, world_id: u32, loader: Loader) -> 
 			x := column * LOD_CELLS - LOD_REACH
 			y := row * LOD_CELLS - LOD_REACH
 			name := lod_name(world_id, x, y)
-			index, found := find_file(loader.meshes, lod_mesh_path(name[:])[:])
+			piece_file, found := find_archived(loader.archives, lod_mesh_path(name[:])[:])
 			if not found do continue
-			built, read_error := read_lod_mesh(loader.meshes, room, index)
+			built, read_error := read_lod_mesh(loader.archives, room, piece_file)
 			if read_error {
 				if not first_failure do first_failure = read_error
 				continue
@@ -87,10 +87,10 @@ load_distant_land :: fun(renderer: ^Renderer, world_id: u32, loader: Loader) -> 
 			&path + "textures\\landscapelod\\generated\\"
 			&path + name[:]
 			&path + ".dds"
-			colors := texture_for(renderer, loader.textures, path[:], &room.texture)
+			colors := texture_for(renderer, loader.archives, path[:], &room.texture)
 			path.len = path.len - 4
 			&path + "_fn.dds"
-			normals := texture_for(renderer, loader.textures, path[:], &room.texture)
+			normals := texture_for(renderer, loader.archives, path[:], &room.texture)
 			if normals == 0 do normals = renderer.flat_normal_texture
 
 			for k in 0:built.parts.len {
@@ -115,10 +115,10 @@ lod_mesh_path :: fun(name: []utf8) -> [256]utf8 {
 	return path
 }
 
-// A piece's mesh (the archive's file at index) as a model, made in room.
-read_lod_mesh :: fun(meshes: ^Archive, room: ^Load_Room, index: i64) -> Model, err {
+// A piece's mesh (a file found in the archives) as a model, made in room.
+read_lod_mesh :: fun(archives: ^Archives, room: ^Load_Room, piece_file: Archived_File) -> Model, err {
 	room.file.len = 0
-	data := read_file(meshes, index, &room.file)?
+	data := read_archived(archives, piece_file, &room.file)?
 	room.blocks.len = 0
 	failure := Nif_Failure{block = 0, type_name = room.file[0:0]}
 	mesh := read_nif(data, &room.blocks, &failure)?

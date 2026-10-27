@@ -44,6 +44,15 @@ against Mara at the time written. When one is fixed, move it to Fixed
   `f64(i)`), as it is when declaring. sooblivion puts the f64 first and
   calls cos_f64/sin_f64 (mp3.mara, build_tables).
 
+- There's no way to read an environment variable on Windows: mara.os
+  declares `getenv` only in its Linux foreign block (file-private), and
+  nothing public wraps it or GetEnvironmentVariable. sooblivion wants
+  `%LOCALAPPDATA%\Oblivion\Plugins.txt` (the player's chosen plugins) and
+  `%USERPROFILE%\Documents\My Games\Oblivion\Oblivion.ini`. Expected: an
+  `env(name) -> text, bool` (or similar) on both systems. sooblivion reads
+  the Data folder's DLCList.txt instead, and keeps the ini's archive list
+  as a constant (game_files.mara).
+
 ## Answered (not issues)
 
 - Struct values can't be compared (`part.diffuse != Vec3{1, 1, 1}`): not

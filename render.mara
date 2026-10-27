@@ -2701,14 +2701,14 @@ setup_land_buffers :: fun(renderer: ^Renderer) {
 // reading and decoding it. clamp_mode is how its edges go, as a NIF says
 // (CLAMP_* : repeating both ways unless asked); a texture asked for with
 // two is loaded twice, as a texture's handle keeps its edges for good.
-texture_for :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratch: ^[]byte, clamp_mode: u32 = REPEAT_BOTH) -> i64 {
+texture_for :: fun(renderer: ^Renderer, archives: ^Archives, path: []utf8, scratch: ^[]byte, clamp_mode: u32 = REPEAT_BOTH) -> i64 {
 	if path.len == 0 do return 0
 	key := text_hash(path)
 	if clamp_mode != REPEAT_BOTH do key = (key ~ (u64(clamp_mode + 1) *% 0x9E3779B97F4A7C15)) | 1
 	known, found := index_get(&renderer.texture_index, key)
 	if found do return known
 	if renderer.textures.len == renderer.textures.cap do return 0
-	id, has_alpha, load_error := load_texture(renderer, archive, path, scratch, clamp_mode)
+	id, has_alpha, load_error := load_texture(renderer, archives, path, scratch, clamp_mode)
 	slot : i64 = 0
 	if load_error {
 		renderer.texture_failures += 1
@@ -2740,11 +2740,11 @@ text_hash :: fun(text: []utf8) -> u64 {
 	return hash
 }
 
-// Reads a texture from the archive onto the card: block compressed ones as
+// Reads a texture from the archives onto the card: block compressed ones as
 // they are, the rest decoded to plain pixels; its mipmaps as many as it
 // has, sharp at a slant.
-load_texture :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratch: ^[]byte, clamp_mode: u32) -> u32, bool, err {
-	texture := read_archive_texture(archive, path, scratch)?
+load_texture :: fun(renderer: ^Renderer, archives: ^Archives, path: []utf8, scratch: ^[]byte, clamp_mode: u32) -> u32, bool, err {
+	texture := read_archive_texture(archives, path, scratch)?
 	has_alpha := texture.format == .dxt3 or texture.format == .dxt5 or texture.format == .bgra8 or texture.format == .bgra4
 
 	id : u32 = 0
@@ -2781,12 +2781,12 @@ load_texture :: fun(renderer: ^Renderer, archive: ^Archive, path: []utf8, scratc
 	return id, has_alpha
 }
 
-// A texture from the archive, its header read: into scratch (len set to 0).
-read_archive_texture :: fun(archive: ^Archive, path: []utf8, scratch: ^[]byte) -> Texture, err {
+// A texture from the archives, its header read: into scratch (len set to 0).
+read_archive_texture :: fun(archives: ^Archives, path: []utf8, scratch: ^[]byte) -> Texture, err {
 	scratch.len = 0
-	index, found := find_file(archive, path)
+	texture_file, found := find_archived(archives, path)
 	if not found do return Texture(), Not_Found
-	data := read_file(archive, index, scratch)?
+	data := read_archived(archives, texture_file, scratch)?
 	return read_texture(data)
 }
 
@@ -2799,7 +2799,7 @@ Upload_Error :: error {
 
 // Puts a model's parts into the shared buffers, their textures read from
 // the archive: the model on the card.
-upload_model :: fun(renderer: ^Renderer, built: ^Model, archive: ^Archive, scratch: ^[]byte) -> Gpu_Model, err {
+upload_model :: fun(renderer: ^Renderer, built: ^Model, archives: ^Archives, scratch: ^[]byte) -> Gpu_Model, err {
 	vertex_total : i64 = 0
 	index_total : i64 = 0
 	for part in built.parts {
@@ -2833,7 +2833,7 @@ upload_model :: fun(renderer: ^Renderer, built: ^Model, archive: ^Archive, scrat
 		made := next(&renderer.flips)
 		made.first_frame = renderer.flip_frames.len
 		made.frame_count = flip.frames.len
-		for frame in flip.frames do &renderer.flip_frames + texture_for(renderer, archive, frame[:], scratch, clamp_mode)
+		for frame in flip.frames do &renderer.flip_frames + texture_for(renderer, archives, frame[:], scratch, clamp_mode)
 		made.start_time = flip.start_time
 		made.stop_time = flip.stop_time
 		made.frequency = flip.frequency
@@ -2848,7 +2848,7 @@ upload_model :: fun(renderer: ^Renderer, built: ^Model, archive: ^Archive, scrat
 	for &system in built.particles {
 		kind := next(&renderer.particle_kinds)
 		kind.system = system^
-		kind.texture_slot = texture_for(renderer, archive, system.look.texture[:], scratch, system.look.clamp_mode)
+		kind.texture_slot = texture_for(renderer, archives, system.look.texture[:], scratch, system.look.clamp_mode)
 		kind.flip = -1
 		if system.look.flip >= 0 do kind.flip = first_flip + system.look.flip
 	}
@@ -2872,7 +2872,7 @@ upload_model :: fun(renderer: ^Renderer, built: ^Model, archive: ^Archive, scrat
 		if part.alpha_test do threshold = part.alpha_threshold
 		// It shines where its normal map's alpha says: one without an alpha
 		// channel (DXT1, as the game's matte stone and wood have) not at all.
-		normal_slot := normal_map_for(renderer, archive, &part, scratch)
+		normal_slot := normal_map_for(renderer, archives, &part, scratch)
 		shines := normal_slot >= 0 and renderer.textures[normal_slot].has_alpha
 		// Its values that change over time.
 		first_motion := renderer.motions.len
@@ -2893,8 +2893,8 @@ upload_model :: fun(renderer: ^Renderer, built: ^Model, archive: ^Archive, scrat
 			first_index = u32(renderer.indices_used),
 			index_count = u32(part.indices.len),
 			base_vertex = i32(renderer.vertices_used),
-			texture_slot = texture_for(renderer, archive, part.texture[:], scratch, part.clamp_mode),
-			glow_slot = glow_map_for(renderer, archive, &part, scratch),
+			texture_slot = texture_for(renderer, archives, part.texture[:], scratch, part.clamp_mode),
+			glow_slot = glow_map_for(renderer, archives, &part, scratch),
 			normal_slot = normal_slot,
 			first_motion = first_motion,
 			motion_count = renderer.motions.len - first_motion,
@@ -2920,7 +2920,7 @@ upload_model :: fun(renderer: ^Renderer, built: ^Model, archive: ^Archive, scrat
 // else its texture's with _g, as the game finds them (runestone02a.dds,
 // runestone02a_g.dds). Its texture slot; -1 for none, or when its
 // material emits nothing (the map would show nothing).
-glow_map_for :: fun(renderer: ^Renderer, archive: ^Archive, part: ^Model_Part, scratch: ^[]byte) -> i64 {
+glow_map_for :: fun(renderer: ^Renderer, archives: ^Archives, part: ^Model_Part, scratch: ^[]byte) -> i64 {
 	if part.emissive.x <= 0 and part.emissive.y <= 0 and part.emissive.z <= 0 do return -1
 	path : [160]utf8
 	if part.glow_texture.len > 0 {
@@ -2931,22 +2931,22 @@ glow_map_for :: fun(renderer: ^Renderer, archive: ^Archive, part: ^Model_Part, s
 	else
 		return -1
 	}
-	_, found := find_file(archive, path[:])
+	_, found := find_archived(archives, path[:])
 	if not found do return -1
-	return texture_for(renderer, archive, path[:], scratch, part.clamp_mode)
+	return texture_for(renderer, archives, path[:], scratch, part.clamp_mode)
 }
 
 // A part's normal map: its texture's with _n, as the game finds them
 // (doorlow.dds, doorlow_n.dds). Its texture slot; -1 for none, or when it
 // couldn't be loaded (the white texture would tip every pixel).
-normal_map_for :: fun(renderer: ^Renderer, archive: ^Archive, part: ^Model_Part, scratch: ^[]byte) -> i64 {
+normal_map_for :: fun(renderer: ^Renderer, archives: ^Archives, part: ^Model_Part, scratch: ^[]byte) -> i64 {
 	if part.texture.len <= 4 or not ends_with(part.texture[:], ".dds") do return -1
 	path : [160]utf8
 	&path + part.texture[0 : part.texture.len - 4]
 	&path + "_n.dds"
-	_, found := find_file(archive, path[:])
+	_, found := find_archived(archives, path[:])
 	if not found do return -1
-	slot := texture_for(renderer, archive, path[:], scratch, part.clamp_mode)
+	slot := texture_for(renderer, archives, path[:], scratch, part.clamp_mode)
 	return if slot == 0 do -1 else slot
 }
 
@@ -3024,7 +3024,7 @@ set_scene_lights :: fun(renderer: ^Renderer, lights: ^[]Point_Light) {
 // and their normal maps (loaded the first time each is asked for, their
 // handles where the quadrant's land reads them), its vertices into a slot
 // (0 to LAND_SLOTS - 1, one no other land is in).
-upload_land :: fun(renderer: ^Renderer, mesh: ^Land_Mesh, x: i64, y: i64, slot: i64, archive: ^Archive, scratch: ^[]byte) -> Gpu_Land {
+upload_land :: fun(renderer: ^Renderer, mesh: ^Land_Mesh, x: i64, y: i64, slot: i64, archives: ^Archives, scratch: ^[]byte) -> Gpu_Land {
 	for q in 0:4 {
 		textures := &mesh.textures[q]
 		quadrant := &renderer.land_quadrants[slot * 4 + q]
@@ -3033,8 +3033,8 @@ upload_land :: fun(renderer: ^Renderer, mesh: ^Land_Mesh, x: i64, y: i64, slot: 
 			texture_slot := quadrant.textures[0]
 			normal_slot := quadrant.normal_maps[0]
 			if k < textures.count {
-				texture_slot = texture_for(renderer, archive, textures.paths[k][:], scratch)
-				normal_slot = land_normal_for(renderer, archive, textures.paths[k][:], scratch)
+				texture_slot = texture_for(renderer, archives, textures.paths[k][:], scratch)
+				normal_slot = land_normal_for(renderer, archives, textures.paths[k][:], scratch)
 			}
 			quadrant.textures[k] = texture_slot
 			quadrant.normal_maps[k] = normal_slot
@@ -3053,14 +3053,14 @@ upload_land :: fun(renderer: ^Renderer, mesh: ^Land_Mesh, x: i64, y: i64, slot: 
 
 // A land texture's normal map (its path with _n): its texture slot; the
 // flat normal map's where it has none.
-land_normal_for :: fun(renderer: ^Renderer, archive: ^Archive, texture: []utf8, scratch: ^[]byte) -> i64 {
+land_normal_for :: fun(renderer: ^Renderer, archives: ^Archives, texture: []utf8, scratch: ^[]byte) -> i64 {
 	if texture.len <= 4 or not ends_with(texture, ".dds") do return renderer.flat_normal_texture
 	path : [160]utf8
 	&path + texture[0 : texture.len - 4]
 	&path + "_n.dds"
-	_, found := find_file(archive, path[:])
+	_, found := find_archived(archives, path[:])
 	if not found do return renderer.flat_normal_texture
-	slot := texture_for(renderer, archive, path[:], scratch)
+	slot := texture_for(renderer, archives, path[:], scratch)
 	return if slot == 0 do renderer.flat_normal_texture else slot
 }
 

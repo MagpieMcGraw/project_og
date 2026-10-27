@@ -41,7 +41,7 @@ Audio_Error :: error {
 	Not_Pcm           // a WAV of a kind not played: 16-bit PCM only
 	Empty_Folder      // a sound naming a folder with no files
 	No_Room_For_Sound // the clips' room is full
-	No_Sound_File     // no file (or folder) of the path in the archive
+	No_Sound_File     // no file (or folder) of the path in the archives
 	Wrong_Rate        // music at a rate other than the mix's
 }
 
@@ -157,14 +157,16 @@ read_wave :: fun(data: []byte) -> Clip, err {
 }
 
 // The clip for a sound (its index in the clips): its file's, loaded from
-// the archive the first time; a folder's, one of its files at random.
-clip_for :: fun(audio: ^Mixer, archive: ^Archive, kind: ^Sound_Kind) -> i64, err {
+// the archives the first time; a folder's, one of its files at random (in
+// the first archive with the folder).
+clip_for :: fun(audio: ^Mixer, archives: ^Archives, kind: ^Sound_Kind) -> i64, err {
 	path : [256]utf8
 	if kind.folder {
 		folder_path := kind.path[:]
 		if ends_with(folder_path, "\\") do folder_path = folder_path[0 : folder_path.len - 1]
-		folder_at, found := find_folder(archive, folder_path)
+		archive_at, folder_at, found := find_archived_folder(archives, folder_path)
 		if not found do return -1, No_Sound_File
+		archive := &archives.list[archive_at]
 		folder := archive.folders[folder_at]
 		if folder.file_count == 0 do return -1, Empty_Folder
 		pick := folder.first_file + i64(next_random(&audio.seed) % u64(folder.file_count))
@@ -178,10 +180,10 @@ clip_for :: fun(audio: ^Mixer, archive: ^Archive, kind: ^Sound_Kind) -> i64, err
 	known, found := index_get(&audio.clip_index, key)
 	if found do return known
 	if audio.clips.len == audio.clips.cap do return -1, No_Room_For_Sound
-	index, in_archive := find_file(archive, path[:])
+	sound_file, in_archive := find_archived(archives, path[:])
 	if not in_archive do return -1, No_Sound_File
-	if archive.files[index].size > audio.clip_room.cap - audio.clip_room.len do return -1, No_Room_For_Sound
-	data := read_file(archive, index, &audio.clip_room)?
+	if archived_size(archives, sound_file) > audio.clip_room.cap - audio.clip_room.len do return -1, No_Room_For_Sound
+	data := read_archived(archives, sound_file, &audio.clip_room)?
 	clip := read_wave(data)?
 	&audio.clips + clip
 	index_put(&audio.clip_index, key, audio.clips.len - 1)?
@@ -290,9 +292,9 @@ start_voice :: fun(audio: ^Mixer, kind: ^Sound_Kind, clip_index: i64, source: u6
 
 // Plays a sound once at a place (a door opening, say), heard from where the
 // listener is now.
-play_once :: fun(audio: ^Mixer, archive: ^Archive, kind: ^Sound_Kind, position: Vec3, listener: Listener) {
+play_once :: fun(audio: ^Mixer, archives: ^Archives, kind: ^Sound_Kind, position: Vec3, listener: Listener) {
 	if not audio.open do return
-	clip_index, clip_error := clip_for(audio, archive, kind)
+	clip_index, clip_error := clip_for(audio, archives, kind)
 	if clip_error {
 		note_sound_failure(audio, kind, clip_error)
 		return
@@ -330,7 +332,7 @@ hear_finish :: fun(audio: ^Mixer) {
 // hearing range (and the others when their pause is over), and moves the
 // playing ones' gains to where they are now. The time is the mix's, in
 // seconds.
-hear_sounds :: fun(audio: ^Mixer, archive: ^Archive, sounds: ^[]Placed_Sound, listener: Listener, hour: f32, now: f64) {
+hear_sounds :: fun(audio: ^Mixer, archives: ^Archives, sounds: ^[]Placed_Sound, listener: Listener, hour: f32, now: f64) {
 	if not audio.open do return
 	for &sound in sounds {
 		loud : f32 = 0
@@ -354,7 +356,7 @@ hear_sounds :: fun(audio: ^Mixer, archive: ^Archive, sounds: ^[]Placed_Sound, li
 		if now < sound.next_play do continue
 		looping := sound.kind.flags & SOUND_LOOP != 0
 		if not looping do sound.next_play = now + f64(REPLAY_PAUSE * (1 + random_share(&audio.seed)))
-		clip_index, clip_error := clip_for(audio, archive, &sound.kind)
+		clip_index, clip_error := clip_for(audio, archives, &sound.kind)
 		if clip_error {
 			note_sound_failure(audio, &sound.kind, clip_error)
 			sound.next_play = now + 1000000   // (not tried again)

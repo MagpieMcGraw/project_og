@@ -1,0 +1,132 @@
+// The game's files as the game loads them: its plugins in their order,
+// and their archives — the master's (Oblivion.ini's SArchiveList) and each
+// plugin's own, named after it (Knights.bsa; "DLCShiveringIsles -
+// Meshes.bsa").
+module sooblivion
+
+use mara.core
+use mara.os
+use mara.memory
+use mara.string
+use bsa
+
+// The plugins loaded, at most.
+MAX_PLUGINS :: 16
+
+// The master's archives, as Oblivion.ini's SArchiveList has them unless
+// it's been changed.
+MASTER_ARCHIVES :: "Oblivion - Meshes.bsa, Oblivion - Textures - Compressed.bsa, Oblivion - Sounds.bsa, Oblivion - Voices1.bsa, Oblivion - Voices2.bsa, Oblivion - Misc.bsa"
+
+// A plugin file the game loads: its name in the data folder, and when it
+// was last written (the game's order goes by it).
+Plugin_File :: struct {
+	name: [64]utf8
+	written: i64
+}
+
+// The plugins the game loads, in its order: the master first.
+Load_Order :: struct {
+	plugins: [MAX_PLUGINS]Plugin_File
+}
+
+// The plugins the game loads, in its order: Oblivion.esm, then the
+// downloaded content it keeps track of (DLCList.txt) that's in the data
+// folder, the one written longest ago first, as the game orders them. (The
+// player's own choice, Plugins.txt, is in their local app data, whose path
+// sooblivion can't get yet: see MARA_ISSUES.md.)
+read_load_order :: fun(order: ^Load_Order) -> err {
+	order.plugins.len = 0
+	add_plugin(order, "Oblivion.esm")
+	storage : [16 * KB]byte
+	list_path := data_path("DLCList.txt")
+	data, read_error := read_entire_file(list_path[:], &storage)
+	if read_error == File_Error.Open_Failed do return   // (no downloaded content)
+	if read_error do return read_error
+	text : []utf8 = data
+	start : i64 = 0
+	for at in 0..text.len {
+		if at < text.len and text[at] != '\n' do continue
+		line := trimmed(text[start : at])
+		start = at + 1
+		if line.len == 0 or line[0] == '#' do continue
+		add_plugin(order, line)
+	}
+}
+
+// Adds a plugin to the load order by when it was written, after the master
+// (which stays first); not one the data folder hasn't, or one there already.
+add_plugin :: fun(order: ^Load_Order, name: []utf8) {
+	if order.plugins.len == order.plugins.cap or name.len > 64 do return
+	for &plugin in order.plugins {
+		if compare_folded(plugin.name[:], name) == 0 do return
+	}
+	path := data_path(name)
+	written := file_mtime(path[:])
+	if written == 0 do return
+	added := Plugin_File{name = [], written = written}
+	&added.name + name
+	place := order.plugins.len
+	for place > 1 and order.plugins[place - 1].written > written do place -= 1
+	order.plugins.len += 1
+	moved := order.plugins.len - 1
+	for moved > place {
+		order.plugins[moved] = order.plugins[moved - 1]
+		moved -= 1
+	}
+	order.plugins[place] = added
+}
+
+// Opens the game's archives into archives, in the order a file is looked
+// for in them: each plugin's own, the last loaded first (so a plugin's
+// files win over those of the plugins before it), then the master's. Their
+// directories go into storage.
+open_game_archives :: fun(order: ^Load_Order, archives: ^Archives, storage: ^[]byte) -> err {
+	archives.list.len = 0
+	listing : [256 * KB]byte
+	entries := dir_read(DATA_FOLDER, &listing)?
+	for back in 1:order.plugins.len {
+		name := order.plugins[order.plugins.len - back].name[:]
+		stem := name[0 : name.len - 4]   // (without ".esp")
+		for entry in entries {
+			if entry.dir or not plugin_archive(stem, entry.name[:]) do continue
+			open_one_archive(archives, entry.name[:], storage)?
+		}
+	}
+	list := MASTER_ARCHIVES
+	start : i64 = 0
+	for at in 0..list.len {
+		if at < list.len and list[at] != ',' do continue
+		name := trimmed(list[start : at])
+		start = at + 1
+		if name.len > 0 do open_one_archive(archives, name, storage)?
+	}
+}
+
+// The game's archives opened as the viewer has them, for a command.
+open_all_archives :: fun(archives: ^Archives, storage: ^[]byte) -> err {
+	order : Load_Order
+	read_load_order(&order)?
+	open_game_archives(&order, archives, storage)?
+}
+
+// Whether an archive in the data folder is a plugin's own: named after it
+// (its name without the extension, the stem), alone or followed by " - "
+// and what it holds. Letters' case not minded.
+plugin_archive :: fun(stem: []utf8, name: []utf8) -> bool {
+	if name.len <= stem.len or compare_folded(name[0 : stem.len], stem) != 0 do return false
+	if compare_folded(name[name.len - 4 : name.len], ".bsa") != 0 do return false
+	rest := name[stem.len : name.len]
+	return rest.len == 4 or (rest.len > 3 and rest[0:3] == " - ")
+}
+
+// Opens an archive in the data folder and adds it to archives.
+open_one_archive :: fun(archives: ^Archives, name: []utf8, storage: ^[]byte) -> err {
+	if archives.list.len == archives.list.cap do return Too_Many_Archives
+	path := data_path(name)
+	archive := open_archive(path[:], storage)?
+	&archives.list + archive
+}
+
+Game_Files_Error :: error {
+	Too_Many_Archives   // more archives than MAX_ARCHIVES
+}

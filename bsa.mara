@@ -323,3 +323,55 @@ read_file :: fun(archive: ^Archive, index: i64, storage: ^[]byte) -> []byte, err
 	storage.len = start + output.len
 	return storage[start : start + output.len]
 }
+
+// ---- several archives -----------------------------------------------------------
+
+// Archives open at once, at most.
+MAX_ARCHIVES :: 32
+
+// Several archives searched as one, in their order: the game's meshes,
+// textures and sounds with the plugins' own (see open_game_archives).
+Archives :: struct {
+	list: [MAX_ARCHIVES]Archive
+}
+
+// A file found in archives: which archive (its index in the list), and
+// which of that archive's files.
+Archived_File :: struct {
+	archive: i64
+	index: i64
+}
+
+// The file at path in the first of the archives that has one.
+find_archived :: fun(archives: ^Archives, path: []utf8) -> Archived_File, bool {
+	for &archive, k in archives.list {
+		index, found := find_file(archive, path)
+		if found do return Archived_File{archive = k, index = index}, true
+	}
+	return Archived_File{archive = -1, index = -1}, false
+}
+
+// The folder at path in the first of the archives that has one: the
+// archive (its index in the list) and the folder's index in it.
+find_archived_folder :: fun(archives: ^Archives, path: []utf8) -> i64, i64, bool {
+	for &archive, k in archives.list {
+		folder_at, found := find_folder(archive, path)
+		if found do return k, folder_at, true
+	}
+	return -1, -1, false
+}
+
+// Reads a file found in archives into storage, as read_file does.
+read_archived :: fun(archives: ^Archives, file: Archived_File, storage: ^[]byte) -> []byte, err {
+	return read_file(&archives.list[file.archive], file.index, storage)
+}
+
+// A file's size in its archive (packed, if it's packed).
+archived_size :: fun(archives: ^Archives, file: Archived_File) -> i64 {
+	return archives.list[file.archive].files[file.index].size
+}
+
+close_archives :: fun(archives: ^Archives) {
+	for &archive in archives.list do close_archive(archive)
+	archives.list.len = 0
+}
