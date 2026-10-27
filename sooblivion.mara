@@ -28,6 +28,7 @@ use shader_package
 use distant
 use grass
 use collision
+use walking
 use animation
 use particles
 use audio
@@ -2057,6 +2058,22 @@ command_collision :: fun(what: []utf8) {
 	}
 	print("% collision triangles, from % to %", points.len / 3, low, high)
 	if not model_error do print("drawn: from % to %", built.bounds_min, built.bounds_max)
+	// Lines through the middle along each axis, from outside the box: where
+	// each first meets the collision (an opening, a doorway's, meets none).
+	middle := (low + high) * 0.5
+	for axis in 0:3 {
+		start := middle
+		start[axis] = low[axis] - 50
+		way := Vec3{0, 0, 0}
+		way[axis] = 1
+		nearest : f32 = 1000000
+		for t in 0:points.len / 3 {
+			distance, hit := line_hits(start, way, points[t * 3], points[t * 3 + 1], points[t * 3 + 2])
+			if hit and distance < nearest do nearest = distance
+		}
+		if nearest < 1000000 do print("  a line through the middle along axis % meets it at %", axis, start[axis] + nearest)
+		else do print("  a line through the middle along axis % meets nothing", axis)
+	}
 	for &block, k in mesh.blocks {
 		type_name := mesh.header.type_names[i64(mesh.header.block_types[k])]
 		match block^ {

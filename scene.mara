@@ -591,7 +591,9 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, plac
 		if base.header.kind == "DOOR" do add_door_sounds(scene, plugin, base, reference)
 		in_place := false
 		if base.header.kind == "DOOR" {
-			_, leads := door_destination(plugin, reference.form_id, &scratch)?
+			// (Its own scratch: base's data may be in scratch.)
+			door_scratch : [64 * KB]byte
+			_, leads := door_destination(plugin, reference.form_id, &door_scratch)?
 			if leads and scene.doors.len < scene.doors.cap do &scene.doors + Scene_Door{reference = reference.form_id, position = reference.position}
 			in_place = not leads
 		}

@@ -109,6 +109,10 @@ Viewer :: struct {
 	journal: Journal
 	place: str256       // what's shown, for the window's title
 	chosen_door: i64    // the door view_frame stopped for
+	// E pressed at what isn't a door that leads somewhere or opens: the
+	// reference (0: nothing within reach), for the journal (explore tells it).
+	missed: bool
+	missed_target: u32
 	walking: bool       // on foot (F), not flying
 	walker: Walker
 	eyes: f32           // how high the walker's eyes are: smoothed over steps
@@ -231,6 +235,8 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.speed = 400
 	viewer.place.len = 0
 	viewer.chosen_door = -1
+	viewer.missed = false
+	viewer.missed_target = 0
 	viewer.walking = false
 	viewer.walker = Walker{position = Vec3{0, 0, 0}, rising = 0, on_ground = false}
 	viewer.eyes = 0
@@ -378,6 +384,10 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 			return .door
 		}
 		_ = use_door(shown, targeted)
+	}
+	if input.pressed[E] and not usable {
+		viewer.missed = true
+		viewer.missed_target = targeted
 	}
 
 	seconds, now := time_since(viewer.frame_start)
@@ -1125,6 +1135,30 @@ targeted_reference :: fun(shown: ^Scene, camera: render.Camera) -> u32 {
 	return shown.instances[picked].reference
 }
 
+// Tells the journal what E was pressed at that it couldn't use: nothing
+// within reach, or what the reticle was on.
+note_missed :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	journal := &viewer.journal
+	if viewer.missed_target == 0 {
+		note(journal, "E: nothing within reach")
+		note_end(journal)
+		return
+	}
+	scratch : [64 * KB]byte
+	what : str256
+	reference, reference_error := find_record(plugin, viewer.missed_target, &scratch)
+	if not reference_error {
+		base, has_base := form_field(plugin, reference, "NAME")
+		if has_base do what = editor_id_of(plugin, base)
+	}
+	note(journal, "E: the reticle is on ")
+	note(journal, what[:])
+	note(journal, " (reference ")
+	note(journal, i64(viewer.missed_target))
+	note(journal, "), not a door that leads somewhere or opens")
+	note_end(journal)
+}
+
 // A reference's door that leads somewhere: its index in the scene's
 // doors, -1 when it isn't one.
 leading_door :: fun(shown: ^Scene, reference: u32) -> i64 {
@@ -1288,7 +1322,11 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 				note_end(journal)
 				continue
 			}
-			if not leads do continue
+			if not leads {
+				note(journal, "that door leads nowhere")
+				note_end(journal)
+				continue
+			}
 			target := cell_of_reference(plugin, there.door)
 			if target == 0 {
 				note(journal, "that door's other side isn't in any cell found")
@@ -1303,6 +1341,10 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 			viewer.camera.yaw = there.rotation.z
 			viewer.camera.pitch = 0
 			place_walker(viewer)
+		}
+		if viewer.missed {
+			note_missed(viewer, plugin)
+			viewer.missed = false
 		}
 		// A weather's time up: the next one comes in.
 		if viewer.weather_due do change_weather(viewer, plugin, false)
