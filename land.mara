@@ -119,6 +119,24 @@ read_heights :: fun(bytes: []byte, land: ^Land) {
 	}
 }
 
+// The LAND record a world shows at a place on its grid (its place in the
+// plugin's data), and false when there's none. A world that's part of
+// another (a city's, of Tamriel) shows its parent's land where the parent
+// has some: what's placed in it stands on that, and its own LAND records
+// there are left over, at other heights. Elsewhere, its own.
+shown_land :: fun(plugin: ^Plugin, world_id: u32, parent_id: u32, x: i64, y: i64) -> i64, bool {
+	if parent_id != 0 {
+		parent_cell := exterior_cell(plugin, parent_id, x, y)
+		if parent_cell != 0 {
+			land_at, found := find_land(plugin, parent_cell)
+			if found do return land_at, true
+		}
+	}
+	cell := exterior_cell(plugin, world_id, x, y)
+	if cell == 0 do return 0, false
+	return find_land(plugin, cell)
+}
+
 // The LAND record of an exterior cell: its place in the plugin's data, and
 // false when the cell has none.
 find_land :: fun(plugin: ^Plugin, cell: u32) -> i64, bool {

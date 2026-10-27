@@ -231,6 +231,7 @@ Scene :: struct {
 	lighting: Cell_Lighting
 	world: u32                   // the world shown outside, 0 inside
 	grows_grass: bool            // its land grows grass: not a small world (a city's, a realm)
+	parent_world: u32            // the world it's part of, whose land it shows (0: none, its own)
 	center_x: i64                // the cell the exterior was loaded around
 	center_y: i64
 	grounds: [LAND_SLOTS]Gpu_Land
@@ -324,6 +325,7 @@ scene_clear :: fun(scene: ^Scene, storage: ^[]byte) {
 	scene.grounds.len = 0
 	scene.world = 0
 	scene.grows_grass = true
+	scene.parent_world = 0
 	scene.tree_kinds = key_index(1 << 11, storage)
 	scene.kinds.len = 0
 	scene.grass_index = key_index(1 << 9, storage)
@@ -923,7 +925,7 @@ load_land :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64, load
 	if land_loaded(scene, x, y) do return
 	slot := free_land_slot(scene)
 	if slot < 0 do return
-	land_at, found := find_land(plugin, cell)
+	land_at, found := shown_land(plugin, scene.world, scene.parent_world, x, y)
 	if not found do return
 	room := loader.room
 	room.file.len = 0
@@ -1493,10 +1495,14 @@ show_exterior :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, x: i64, y: i
 		drop_land(scene, area, true)
 		scene_clear_cell(scene)
 		scene.lighting = exterior_lighting()
-		// The game grows no grass in a small world's land: the cities' and
-		// the Imperial City districts' land isn't their ground (it's under
-		// their streets, or over Green Emperor Way's garden).
-		scratch : [64 * KB]byte
+		// A world that's part of another shows its land (see shown_land). A
+		// small world's land grows no grass: a guess (see ASSETS.md), but
+		// with the cities put back in Tamriel (Open Cities), grass is known
+		// to come up through their streets from the same land.
+		scratch : [1 * MB]byte
+		parent, parent_error := world_parent(plugin, world_id, &scratch)
+		if parent_error do note_failure(scene, "a world's record, for its land", parent_error)
+		scene.parent_world = parent
 		small, small_error := small_world(plugin, world_id, &scratch)
 		if small_error do note_failure(scene, "a world's record, for its grass", small_error)
 		scene.grows_grass = not small
@@ -1606,7 +1612,7 @@ add_cell_water :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64)
 	// Deep where there's no land under it to know.
 	depths : [WATER_VERTICES!]f32
 	for k in 0:WATER_VERTICES do depths[k] = 1000
-	land_at, has_land := find_land(plugin, cell)
+	land_at, has_land := shown_land(plugin, scene.world, scene.parent_world, x, y)
 	if has_land {
 		scratch.len = 0
 		record, record_error := record_at(plugin, land_at, &scratch)

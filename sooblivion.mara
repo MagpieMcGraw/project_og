@@ -2062,7 +2062,9 @@ command_grass :: fun(name: []utf8, x: i64, y: i64) {
 	scratch : [16 * MB]byte
 	world_id := find_world(&plugin, name, &scratch)
 	cell := exterior_cell(&plugin, world_id, x, y)
-	land_at, has_land := find_land(&plugin, cell)
+	parent, parent_error := world_parent(&plugin, world_id, &scratch)
+	if parent_error do parent = 0
+	land_at, has_land := shown_land(&plugin, world_id, parent, x, y)
 	if world_id == 0 or cell == 0 or not has_land {
 		print("no land at % % in %", x, y, name)
 		return

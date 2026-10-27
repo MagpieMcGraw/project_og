@@ -7,8 +7,10 @@ Oblivion.esm and the base game's archives; sizes are as stored.
 ## In use
 
 - **World:** cells and their references, land (heights, normals, colors,
-  texture layers), LTEX land textures, worlds, distant land (LOD pieces
-  and far water), distant objects (`_far.nif`).
+  texture layers; a world that's part of another, as a city's is of
+  Tamriel, shows its parent's land: its own LAND records are left over),
+  LTEX land textures, worlds, distant land (LOD pieces and far water),
+  distant objects (`_far.nif`).
 - **Things placed:** every base object with a model is drawn where it's
   placed — statics, activators, doors (swinging ones animated), lights,
   containers, furniture, flora, and items lying about.
@@ -148,10 +150,9 @@ guesses for now.
   near ruin lamps looking brighter than remembered.
 - Placed sounds that don't loop (played again after 6 to 12 s here).
 - Grass in small worlds (the walled cities', the Imperial City districts',
-  the Oblivion realms): none grows here. Their land often isn't their
-  ground (Green Emperor Way's is over its garden, the districts' under
-  their streets), and Open Cities is known for grass then coming up
-  through the streets.
+  the Oblivion realms): none grows here. A city's world shows Tamriel's
+  land, and with the cities put back in Tamriel (Open Cities) grass is
+  known to come up through their streets from that land.
 - The weather through a gate: it goes on into a world of the same
   climate here (a city has its parent Tamriel's); another climate's
   world (an Oblivion realm) starts its own at once.

@@ -1411,13 +1411,13 @@ start_in_cell :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	viewer.camera.position = (low + high) * 0.5
 }
 
-// The height of a world's land under a place: its nearest vertex's. 0 where
-// there's no land.
+// The height of the land a world shows under a place: its nearest vertex's.
+// 0 where there's no land.
 ground_height :: fun(plugin: ^Plugin, world_id: u32, place: Vec3, scratch: ^[]byte) -> f32 {
 	x, y := grid_of(place)
-	cell := exterior_cell(plugin, world_id, x, y)
-	if cell == 0 do return 0
-	land_at, found := find_land(plugin, cell)
+	parent, parent_error := world_parent(plugin, world_id, scratch)
+	if parent_error do parent = 0
+	land_at, found := shown_land(plugin, world_id, parent, x, y)
 	if not found do return 0
 	scratch.len = 0
 	record, record_error := record_at(plugin, land_at, scratch)
