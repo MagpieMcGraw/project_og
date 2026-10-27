@@ -1725,8 +1725,7 @@ command_sky :: fun(name: []utf8) {
 			&line + "  "
 		}
 		if region_error do print("  at %: couldn't read its regions: %", place, region_error)
-		elif chances.len == 0 do print("  at %: the climate's", place)
-		else do print("  at %: %", place, line)
+		else do print("  at %: %", place, if chances.len == 0 do "the climate's" else line[:])
 		sounds : [32]Region_Sound
 		sounds_error := cell_region_sounds(&plugin, world_id, place[0], place[1], &sounds, &scratch)
 		if sounds_error do print("    couldn't read its sounds: %", sounds_error)
@@ -2905,7 +2904,9 @@ command_plugins :: fun() {
 		print("couldn't read the load order: %", order_error)
 		return
 	}
+	print("from %:", order.listed_in)
 	for &plugin, k in order.plugins do print("  % %", k, plugin.name)
+	for &plugin in order.missing do print("  (% isn't in the data folder)", plugin.name)
 	directory_storage : [64 * MB]byte
 	archives : Archives
 	open_error := open_game_archives(&order, &archives, &directory_storage)

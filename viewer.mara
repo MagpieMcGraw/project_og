@@ -209,8 +209,15 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.journal = journal_open(LOG_PATH)
 	read_load_order(&viewer.load_order)?
 	open_game_archives(&viewer.load_order, &viewer.archives, directory_storage)?
-	note(&viewer.journal, "plugins:")
+	note(&viewer.journal, "plugins (")
+	note(&viewer.journal, viewer.load_order.listed_in[:])
+	note(&viewer.journal, "):")
 	for &plugin in viewer.load_order.plugins {
+		note(&viewer.journal, " ")
+		note(&viewer.journal, plugin.name[:])
+	}
+	if viewer.load_order.missing.len > 0 do note(&viewer.journal, "; not in the data folder:")
+	for &plugin in viewer.load_order.missing {
 		note(&viewer.journal, " ")
 		note(&viewer.journal, plugin.name[:])
 	}

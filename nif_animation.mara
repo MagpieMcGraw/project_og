@@ -9,7 +9,7 @@ use mara.math
 
 // Beyond this, an interpolator's value is unset (the files hold the
 // largest f32, negated).
-UNSET_BEYOND :: 1000000000000.0
+UNSET_BEYOND :: 1e12
 
 // A controlled block in a sequence, as Oblivion's files (20.0.0.4 and .5)
 // have it: interpolator, controller, priority (a byte), string palette,

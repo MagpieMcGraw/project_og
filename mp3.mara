@@ -254,27 +254,27 @@ build_tables :: fun(tables: ^Mp3_Tables) {
 	for value in 0..LARGEST_VALUE do tables.powers[value] = f32(pow(f64(value), 4.0 / 3))
 
 	for i in 0:36 {
-		for k in 0:18 do tables.long_cosines[i][k] = f32(cos_f64(f64(2 * i + 1 + 18) * f64(2 * k + 1) * PI / 72))
+		for k in 0:18 do tables.long_cosines[i][k] = f32(cos(f64(2 * i + 1 + 18) * f64(2 * k + 1) * PI / 72))
 	}
 	for i in 0:12 {
-		for k in 0:6 do tables.short_cosines[i][k] = f32(cos_f64(f64(2 * i + 1 + 6) * f64(2 * k + 1) * PI / 24))
+		for k in 0:6 do tables.short_cosines[i][k] = f32(cos(f64(2 * i + 1 + 6) * f64(2 * k + 1) * PI / 24))
 	}
 	for i in 0:36 {
-		long := sin_f64((f64(i) + 0.5) * PI / 36)
+		long := sin((f64(i) + 0.5) * PI / 36)
 		tables.windows[0][i] = f32(long)
 		// The start block: the long window's rise, flat, the short one's fall.
 		start : f64 = 0
 		if i < 18 do start = long
 		elif i < 24 do start = 1
-		elif i < 30 do start = sin_f64((f64(i - 18) + 0.5) * PI / 12)
+		elif i < 30 do start = sin((f64(i - 18) + 0.5) * PI / 12)
 		tables.windows[START_BLOCK][i] = f32(start)
 		// The stop block: the short window's rise, flat, the long one's fall.
 		stop : f64 = 0
 		if i >= 18 do stop = long
 		elif i >= 12 do stop = 1
-		elif i >= 6 do stop = sin_f64((f64(i - 6) + 0.5) * PI / 12)
+		elif i >= 6 do stop = sin((f64(i - 6) + 0.5) * PI / 12)
 		tables.windows[STOP_BLOCK][i] = f32(stop)
-		tables.windows[SHORT_BLOCK][i] = if i < 12 do f32(sin_f64((f64(i) + 0.5) * PI / 12)) else 0
+		tables.windows[SHORT_BLOCK][i] = if i < 12 do f32(sin((f64(i) + 0.5) * PI / 12)) else 0
 	}
 	for i in 0:8 {
 		c := ANTIALIAS[i]
@@ -283,7 +283,7 @@ build_tables :: fun(tables: ^Mp3_Tables) {
 	}
 
 	for i in 0:64 {
-		for k in 0:32 do tables.matrix[i][k] = f32(cos_f64(f64((16 + i) * (2 * k + 1)) * PI / 64))
+		for k in 0:32 do tables.matrix[i][k] = f32(cos(f64((16 + i) * (2 * k + 1)) * PI / 64))
 	}
 	for i in 0..256 {
 		value := f32(SYNTHESIS_WINDOW[i]) / 65536

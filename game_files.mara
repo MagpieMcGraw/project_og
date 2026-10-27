@@ -27,22 +27,32 @@ Plugin_File :: struct {
 // The plugins the game loads, in its order: the master first.
 Load_Order :: struct {
 	plugins: [MAX_PLUGINS]Plugin_File
+	listed_in: [16]utf8                  // the list of plugins read: Plugins.txt, or DLCList.txt
+	missing: [MAX_PLUGINS]Plugin_File    // those it names that the data folder hasn't (written 0)
 }
 
-// The plugins the game loads, in its order: Oblivion.esm, then the
-// downloaded content it keeps track of (DLCList.txt) that's in the data
-// folder, the one written longest ago first, as the game orders them. (The
-// player's own choice, Plugins.txt, is in their local app data, whose path
-// sooblivion can't get yet: see MARA_ISSUES.md.)
+// The plugins the game loads, in its order: Oblivion.esm, then those the
+// player chose (Plugins.txt, in their local app data) that are in the data
+// folder, the one written longest ago first, as the game orders them.
+// Without a Plugins.txt, the downloaded content the game keeps track of
+// (the data folder's DLCList.txt) instead.
 read_load_order :: fun(order: ^Load_Order) -> err {
 	order.plugins.len = 0
+	order.missing.len = 0
 	add_plugin(order, "Oblivion.esm")
 	storage : [16 * KB]byte
-	list_path := data_path("DLCList.txt")
-	data, read_error := read_entire_file(list_path[:], &storage)
-	if read_error == File_Error.Open_Failed do return   // (no downloaded content)
-	if read_error do return read_error
-	text : []utf8 = data
+	order.listed_in.len = 0
+	text := read_player_plugins(&storage)?
+	if text.len > 0 {
+		&order.listed_in + "Plugins.txt"
+	else
+		&order.listed_in + "DLCList.txt"
+		list_path := data_path("DLCList.txt")
+		data, read_error := read_entire_file(list_path[:], &storage)
+		if read_error == File_Error.Open_Failed do return   // (no downloaded content)
+		if read_error do return read_error
+		text = data
+	}
 	start : i64 = 0
 	for at in 0..text.len {
 		if at < text.len and text[at] != '\n' do continue
@@ -53,18 +63,39 @@ read_load_order :: fun(order: ^Load_Order) -> err {
 	}
 }
 
+// The player's chosen plugins, %LOCALAPPDATA%\Oblivion\Plugins.txt, read
+// into storage; empty when there's no such file.
+read_player_plugins :: fun(storage: ^[]byte) -> []utf8, err {
+	none_read : []utf8 = storage[0:0]   // (`return []` gives back an array: MARA_ISSUES.md)
+	local, env_error := env("LOCALAPPDATA")
+	if env_error == Env_Error.Not_Set do return none_read
+	if env_error do return none_read, env_error
+	ending := "/Oblivion/Plugins.txt"
+	if local.len + ending.len >= local.cap do return none_read
+	path := local + ending
+	data, read_error := read_entire_file(path[:], storage)
+	if read_error == File_Error.Open_Failed do return none_read
+	if read_error do return none_read, read_error
+	return data
+}
+
 // Adds a plugin to the load order by when it was written, after the master
-// (which stays first); not one the data folder hasn't, or one there already.
+// (which stays first); not one there already. One the data folder hasn't
+// goes into the missing instead.
 add_plugin :: fun(order: ^Load_Order, name: []utf8) {
 	if order.plugins.len == order.plugins.cap or name.len > 64 do return
 	for &plugin in order.plugins {
 		if compare_folded(plugin.name[:], name) == 0 do return
 	}
+	added := Plugin_File{name = [], written = 0}
+	&added.name + name
 	path := data_path(name)
 	written := file_mtime(path[:])
-	if written == 0 do return
-	added := Plugin_File{name = [], written = written}
-	&added.name + name
+	if written == 0 {
+		if order.missing.len < order.missing.cap do &order.missing + added
+		return
+	}
+	added.written = written
 	place := order.plugins.len
 	for place > 1 and order.plugins[place - 1].written > written do place -= 1
 	order.plugins.len += 1
