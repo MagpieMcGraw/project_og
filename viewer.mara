@@ -349,6 +349,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	pass_time(viewer, f32(seconds), input.held[T])
 	noises : [16]Door_Noise
 	swing_doors(shown, f32(seconds), &noises)
+	move_pieces(shown, viewer.look.time)
 	for &noise in noises do play_once(&viewer.audio, &viewer.sounds, &shown.sound_kinds[noise.sound], noise.position, listener_of(camera^))
 	if change_lights(shown, f32(seconds)) do shown.lights_changed = true
 	drawing_start := time_now()
@@ -751,7 +752,7 @@ command_view :: fun(what: []utf8) {
 		print("couldn't load %: %", what, shown.first_failure_reason)
 		return
 	}
-	add_instance(shown, model_index, mat4_identity())
+	place_model(shown, model_index, what, mat4_identity(), 0)
 	set_place(&viewer, what)
 
 	// Start back from the model's middle, far enough to see all of it.

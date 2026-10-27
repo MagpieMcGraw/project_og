@@ -114,6 +114,35 @@ Door_Kind :: struct {
 	close_cues: [DOOR_CUES]Door_Cue
 }
 
+// The room for the scene's animations' keys.
+TRACK_ROOM :: 16 * MB
+
+// The pieces a model that moves by itself is in, at most.
+MOVING_PIECES :: 8
+
+// A piece of a model that moves by itself: one of its mesh's moving nodes
+// (and what's under it, but other moving nodes) as a model of its own;
+// the nearest moving node above it (a piece of the same kind; -1 for none)
+// and where its parent is from that node (or from the model's root); its
+// track.
+Moving_Piece :: struct {
+	model: i64
+	above: i64
+	from_above: Mat4
+	track: Track
+}
+
+// A kind of model that moves by itself — its mesh's Idle (or SpecialIdle)
+// sequence moves some of its nodes, round and round: the frame's model
+// (what doesn't move), its pieces, and the sequence's span and speed.
+Moving_Kind :: struct {
+	frame: i64
+	pieces: [MOVING_PIECES]Moving_Piece
+	start: f32
+	stop: f32
+	frequency: f32
+}
+
 // The sounds a door's sequence makes, at most.
 DOOR_CUES :: 4
 
@@ -191,6 +220,12 @@ Scene :: struct {
 	sound_kind_index: Key_Index
 	sound_names: Key_Index       // each SOUN's form id (+1), by its editor id's hash (any case)
 	sound_names_read: bool       // whether sound_names has been made
+	// The keys of the animations of the doors and of what moves by itself.
+	track_room: [TRACK_ROOM]byte
+	// The kinds of model that move by themselves, found by their mesh's
+	// path (+1; 0 for a mesh that doesn't).
+	moving_kinds: [256]Moving_Kind
+	moving_index: Key_Index
 	sounds: [1024]Placed_Sound
 	door_sounds: [2048]Door_Sounds
 	lighting: Cell_Lighting
@@ -281,6 +316,9 @@ scene_clear :: fun(scene: ^Scene, storage: ^[]byte) {
 	scene.sound_kind_index = key_index(1 << 11, storage)
 	scene.sound_names = key_index(1 << 12, storage)
 	scene.sound_names_read = false
+	scene.track_room.len = 0
+	scene.moving_kinds.len = 0
+	scene.moving_index = key_index(1 << 12, storage)
 	scene.failures = 0
 	scene.grounds.len = 0
 	scene.world = 0
@@ -475,6 +513,10 @@ load_model :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64, err {
 	room.blocks.len = 0
 	failure := Nif_Failure{block = 0, type_name = room.file[0:0]}
 	mesh := read_nif(data, &room.blocks, &failure)?
+	// A mesh that moves by itself: its frame is the path's model, its
+	// pieces apart.
+	frame, moves := add_moving_kind(scene, loader, &mesh, path)?
+	if moves do return frame
 	room.model.len = 0
 	built := build_model(&mesh, &room.model)?
 	gpu := upload_model(loader.renderer, &built, loader.textures, &room.texture)?
@@ -566,7 +608,7 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, plac
 		}
 		model_index, known := known_model(scene, path[:])
 		if known {
-			if model_index >= 0 do add_instance(scene, model_index, reference_transform(reference), reference.form_id)
+			if model_index >= 0 do place_model(scene, model_index, path[:], reference_transform(reference), reference.form_id)
 		elif scene.waiting.len < scene.waiting.cap
 			waiting := next(&scene.waiting)
 			waiting.reference = reference.form_id
@@ -605,7 +647,7 @@ load_waiting :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, budget: u64)
 			}
 		}
 		model_index := scene_model(scene, loader, item.path[:])
-		if model_index >= 0 do add_instance(scene, model_index, item.world, item.reference)
+		if model_index >= 0 do place_model(scene, model_index, item.path[:], item.world, item.reference)
 	}
 	for scene.waiting_trees_next < scene.waiting_trees.len {
 		if time_now() - start > budget do return false
@@ -970,8 +1012,8 @@ load_door_kind :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, path: []ut
 	if open < 0 or close < 0 do return -1
 	opening : [DOOR_PIECES]Track
 	closing : [DOOR_PIECES]Track
-	read_tracks(&mesh, open, &opening)
-	read_tracks(&mesh, close, &closing)
+	read_tracks(&mesh, open, &opening, &scene.track_room)
+	read_tracks(&mesh, close, &closing, &scene.track_room)
 	// The nodes they move, each found, its rest taken.
 	moving : [DOOR_PIECES]i64
 	for &track in opening {
@@ -1001,7 +1043,7 @@ load_door_kind :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, path: []ut
 	read_door_cues(scene, plugin, &mesh, open, &kind.open_cues)
 	read_door_cues(scene, plugin, &mesh, close, &kind.close_cues)
 	// (The frame may be nothing: a door that moves all of itself.)
-	frame, frame_error := add_door_model(scene, loader, &mesh, -1, moving[:])
+	frame, frame_error := add_part_model(scene, loader, &mesh, -1, moving[:])
 	kind.frame = if frame_error do -1 else frame
 	kind.pieces.len = 0
 	for k in 0:moving.len {
@@ -1011,7 +1053,7 @@ load_door_kind :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, path: []ut
 			if other != moving[k] do &others + other
 		}
 		piece := next(&kind.pieces)
-		piece_model, piece_error := add_door_model(scene, loader, &mesh, moving[k], others[:])
+		piece_model, piece_error := add_part_model(scene, loader, &mesh, moving[k], others[:])
 		if piece_error {
 			scene.door_kinds.len -= 1
 			return -1, piece_error
@@ -1028,15 +1070,174 @@ load_door_kind :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, path: []ut
 	return scene.door_kinds.len - 1
 }
 
-// Puts part of a door's mesh on the card as a model, with its collision:
-// what's under a node, in its space (node -1: all but what's under the
-// nodes left out). Its index in the scene's models.
-add_door_model :: fun(scene: ^Scene, loader: Loader, mesh: ^Nif, node: i64, left_out: []i64) -> i64, err {
+// ---- what moves by itself ------------------------------------------------------------
+
+// For a mesh whose Idle (or SpecialIdle) sequence moves some of its nodes:
+// its moving kind — the frame and each moving node put on the card as a
+// model, the tracks kept — and the frame's index in the scene's models,
+// true. False for a mesh that doesn't move so (or when there's no room).
+add_moving_kind :: fun(scene: ^Scene, loader: Loader, mesh: ^Nif, path: []utf8) -> i64, bool, err {
+	idle := find_sequence(mesh, "Idle")
+	if idle < 0 do idle = find_sequence(mesh, "SpecialIdle")
+	if idle < 0 or scene.moving_kinds.len == scene.moving_kinds.cap do return -1, false
+	tracks : [MOVING_PIECES]Track
+	read_tracks(mesh, idle, &tracks, &scene.track_room)
+	// The nodes they move, each found, its rest taken.
+	kept : [MOVING_PIECES]Track
+	moving : [MOVING_PIECES]i64
+	for &track in tracks {
+		node := find_node(mesh, track.node_name[:])
+		if node < 0 do continue
+		match mesh.blocks[node] {
+		Node moved
+			track.rest = local_transform(moved.object)
+			&kept + track^
+			&moving + node
+		else
+		}
+	}
+	if moving.len == 0 do return -1, false
+
+	kind := next(&scene.moving_kinds)
+	kind.start, kind.stop = sequence_span(mesh, idle)
+	kind.frequency = 1
+	match mesh.blocks[idle] {
+	Sequence sequence
+		if sequence.frequency > 0 do kind.frequency = sequence.frequency
+	else
+	}
+	frame, frame_error := add_part_model(scene, loader, mesh, -1, moving[:])
+	if frame_error {
+		scene.moving_kinds.len -= 1
+		return -1, false, frame_error
+	}
+	kind.frame = frame
+	kind.pieces.len = 0
+	for k in 0:moving.len {
+		// (A moving node under another is its own piece, not part of that one's.)
+		others : [MOVING_PIECES]i64
+		for other in moving {
+			if other != moving[k] do &others + other
+		}
+		piece_model, piece_error := add_part_model(scene, loader, mesh, moving[k], others[:])
+		if piece_error {
+			scene.moving_kinds.len -= 1
+			return -1, false, piece_error
+		}
+		piece := next(&kind.pieces)
+		piece.model = piece_model
+		piece.track = kept[k]
+		parent, _ := parent_transform(mesh, moving[k])
+		piece.above = moving_above(mesh, moving[k], moving[:])
+		piece.from_above = parent
+		if piece.above >= 0 {
+			above_place, _ := object_place(mesh, moving[piece.above])
+			piece.from_above = mat4_mul(mat4_inverse(above_place), parent)
+		}
+	}
+	_ = index_put(&scene.moving_index, text_hash(path), scene.moving_kinds.len)
+	return frame, true
+}
+
+// The nearest of the moving nodes above a node: its index among them; -1
+// for none.
+moving_above :: fun(mesh: ^Nif, node: i64, moving: []i64) -> i64 {
+	at := node_parent(mesh, node)
+	for at >= 0 {
+		for other, k in moving {
+			if other == at do return k
+		}
+		at = node_parent(mesh, at)
+	}
+	return -1
+}
+
+// The node a block is a child of; -1 for none.
+node_parent :: fun(mesh: ^Nif, child: i64) -> i64 {
+	for &block, index in mesh.blocks {
+		match block^ {
+		Node node
+			for k in 0:node.children.count {
+				if node.children.at(k) == child do return index
+			}
+		else
+		}
+	}
+	return -1
+}
+
+// Places a model where a reference is: one that moves by itself, its frame
+// and its pieces; another, itself.
+place_model :: fun(scene: ^Scene, model_index: i64, path: []utf8, placement: Mat4, reference: u32) {
+	kind, found := index_get(&scene.moving_index, text_hash(path))
+	if found and kind > 0 {
+		place_moving(scene, kind - 1, placement, reference)
+		return
+	}
+	add_instance(scene, model_index, placement, reference)
+}
+
+// Places a model that moves by itself: its frame, and its pieces where the
+// start of its sequence has them, each told its kind, piece and placement.
+place_moving :: fun(scene: ^Scene, kind_index: i64, placement: Mat4, reference: u32) {
+	kind := &scene.moving_kinds[kind_index]
+	add_instance(scene, kind.frame, placement, reference)
+	for p in 0:kind.pieces.len {
+		if scene.instances.len == scene.instances.cap do return
+		add_instance(scene, kind.pieces[p].model, moving_piece_world(kind, p, placement, kind.start), reference)
+		instance := &scene.instances[scene.instances.len - 1]
+		instance.moving_kind = i32(kind_index)
+		instance.moving_piece = i32(p)
+		instance.placement = placement
+	}
+}
+
+// Where a piece of a model that moves by itself is, its object placed at
+// placement, at a moment (seconds) of its sequence.
+moving_piece_world :: fun(kind: ^Moving_Kind, piece_index: i64, placement: Mat4, moment: f32) -> Mat4 {
+	return mat4_mul(placement, piece_in_model(kind, piece_index, moment))
+}
+
+// A piece's place in its model at a moment: the moving pieces above it
+// posed too, each by its own track.
+piece_in_model :: fun(kind: ^Moving_Kind, piece_index: i64, moment: f32) -> Mat4 {
+	piece := &kind.pieces[piece_index]
+	own := mat4_mul(piece.from_above, track_pose(&piece.track, moment))
+	if piece.above < 0 do return own
+	return mat4_mul(piece_in_model(kind, piece.above, moment), own)
+}
+
+// Moves the pieces of what moves by itself to where their sequences have
+// them at a time (seconds), round and round; each object its own way into
+// its loop, so two alike don't move in step.
+move_pieces :: fun(scene: ^Scene, seconds: f32) {
+	for &instance in scene.instances {
+		if instance.moving_kind < 0 do continue
+		kind := &scene.moving_kinds[i64(instance.moving_kind)]
+		moment := kind.start
+		span := kind.stop - kind.start
+		if span > 0 {
+			played := seconds * kind.frequency + f32(instance.reference % 101) * 0.61
+			moment = kind.start + played - floor_f32(played / span) * span
+		}
+		posed := moving_piece_world(kind, i64(instance.moving_piece), instance.placement, moment)
+		// (Moved, its lights kept.)
+		moved := place_instance(scene.models[instance.model], instance.model, posed, instance.reference)
+		instance.world = moved.world
+		instance.center = moved.center
+		instance.radius = moved.radius
+	}
+}
+
+// Puts part of a mesh on the card as a model, with its collision: what's
+// under a node, in its space (node -1: all but what's under the nodes left
+// out). Its index in the scene's models. A part with nothing to draw is a
+// model of no parts.
+add_part_model :: fun(scene: ^Scene, loader: Loader, mesh: ^Nif, node: i64, left_out: []i64) -> i64, err {
 	if scene.models.len == scene.models.cap do return -1, No_Room_For_Models
 	room := loader.room
 	room.model.len = 0
 	built := build_model_part(mesh, node, left_out, &room.model)?
-	if built.parts.len == 0 do return -1, No_Parts
 	gpu := upload_model(loader.renderer, &built, loader.textures, &room.texture)?
 	collision_start := scene.collision_points.len
 	add_collision_part(mesh, node, left_out, &scene.collision_points)

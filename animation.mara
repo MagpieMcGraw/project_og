@@ -12,22 +12,37 @@ use mara.math
 use mara.string
 use nif
 
-// The keys a track holds of each kind, at most.
-TRACK_KEYS :: 32
-
-// A node's movement in one sequence: its keys (times in seconds), and its
-// pose where they say nothing: the interpolator's, else the node's own.
+// A node's movement in one sequence: its keys (times in seconds; each kind
+// carved from a room as long as the file has it), and its pose where they
+// say nothing: the interpolator's, else the node's own.
 Track :: struct {
 	node_name: [64]utf8
-	rotation_times: [TRACK_KEYS]f32
-	rotations: [TRACK_KEYS][4!]f32    // quaternions: w, x, y, z
+	rotation_times: []f32
+	rotations: [][4!]f32    // quaternions: w, x, y, z
 	// Or rotations as three angles (radians) about x, y and z, each with
 	// its own keys: turned about x, then y, then z.
-	angle_times: [3!][TRACK_KEYS]f32
-	angles: [3!][TRACK_KEYS]f32
-	translation_times: [TRACK_KEYS]f32
-	translations: [TRACK_KEYS]Vec3
-	rest: Mat4                         // the node's place in its parent, unmoved
+	angle_times: [3!][]f32
+	angles: [3!][]f32
+	translation_times: []f32
+	translations: []Vec3
+	rest: Mat4              // the node's place in its parent, unmoved
+}
+
+// Room for a track's keys of a kind, count of them, carved from room
+// (empty, its len 0): none when room hasn't that much left.
+key_times_room :: fun(room: ^[]byte, count: i64) -> []f32 {
+	if room.cap - room.len < count * 4 + 16 do return slice([:0]f32, room)
+	return slice([:count]f32, room)
+}
+
+rotations_room :: fun(room: ^[]byte, count: i64) -> [][4!]f32 {
+	if room.cap - room.len < count * 16 + 16 do return slice([:0][4!]f32, room)
+	return slice([:count][4!]f32, room)
+}
+
+translations_room :: fun(room: ^[]byte, count: i64) -> []Vec3 {
+	if room.cap - room.len < count * 12 + 16 do return slice([:0]Vec3, room)
+	return slice([:count]Vec3, room)
 }
 
 // A sequence of a NIF by its name ("Open"): the index of its block; -1
@@ -54,8 +69,8 @@ sequence_span :: fun(mesh: ^Nif, sequence_index: i64) -> f32, f32 {
 }
 
 // The tracks of a sequence: each node it moves by a transform
-// interpolator, its keys copied out of the file. Into tracks.
-read_tracks :: fun(mesh: ^Nif, sequence_index: i64, tracks: ^[]Track) {
+// interpolator, its keys copied out of the file into room. Into tracks.
+read_tracks :: fun(mesh: ^Nif, sequence_index: i64, tracks: ^[]Track, room: ^[]byte) {
 	match mesh.blocks[sequence_index] {
 	Sequence sequence
 		for b in 0:sequence.block_count {
@@ -67,17 +82,17 @@ read_tracks :: fun(mesh: ^Nif, sequence_index: i64, tracks: ^[]Track) {
 			if interpolator < 0 or palette < 0 do continue
 			track := next(tracks)
 			track.node_name.len = 0
-			track.rotation_times.len = 0
-			track.rotations.len = 0
+			track.rotation_times = []
+			track.rotations = []
 			for axis in 0:3 {
-				track.angle_times[axis].len = 0
-				track.angles[axis].len = 0
+				track.angle_times[axis] = []
+				track.angles[axis] = []
 			}
-			track.translation_times.len = 0
-			track.translations.len = 0
+			track.translation_times = []
+			track.translations = []
 			track.rest = mat4_identity()
 			palette_name(mesh, i64(palette), i64(name_offset), &track.node_name)
-			read_track_keys(mesh, i64(interpolator), track)
+			read_track_keys(mesh, i64(interpolator), track, room)
 			// A node it doesn't move (one held still, as a root is): not a track.
 			if not track_moves(track) do tracks.len -= 1
 		}
@@ -101,12 +116,28 @@ palette_name :: fun(mesh: ^Nif, palette_index: i64, offset: i64, name: ^[64]utf8
 	}
 }
 
-// A transform interpolator's keys into a track: its data's, and where it
-// has none of a kind, its own pose as the one key of that kind.
-read_track_keys :: fun(mesh: ^Nif, interpolator_index: i64, track: ^Track) {
+// A transform interpolator's keys into a track (copied into room): its
+// data's, and where it has none of a kind, its own pose as the one key of
+// that kind.
+read_track_keys :: fun(mesh: ^Nif, interpolator_index: i64, track: ^Track, room: ^[]byte) {
 	if interpolator_index >= mesh.blocks.len do return
 	match mesh.blocks[interpolator_index] {
 	Transform_Interpolator interpolator
+		rotation_count : i64 = 0
+		translation_count : i64 = 0
+		if interpolator.data >= 0 and interpolator.data < mesh.blocks.len {
+			match mesh.blocks[interpolator.data] {
+			Transform_Data data
+				rotation_count = data.rotation_count
+				translation_count = data.translation_count
+			else
+			}
+		}
+		// (Each kind with room for one more: the interpolator's own pose.)
+		track.rotation_times = key_times_room(room, rotation_count + 1)
+		track.rotations = rotations_room(room, rotation_count + 1)
+		track.translation_times = key_times_room(room, translation_count + 1)
+		track.translations = translations_room(room, translation_count + 1)
 		if interpolator.data >= 0 and interpolator.data < mesh.blocks.len {
 			match mesh.blocks[interpolator.data] {
 			Transform_Data data
@@ -118,7 +149,7 @@ read_track_keys :: fun(mesh: ^Nif, interpolator_index: i64, track: ^Track) {
 					&track.rotation_times + time
 					&track.rotations + rotation
 				}
-				read_angle_keys(data.angles, track)
+				read_angle_keys(data.angles, track, room)
 				translation_size := key_bytes(data.translation_type, 12)
 				for k in 0:data.translation_count {
 					if track.translations.len == track.translations.cap do break
@@ -130,11 +161,11 @@ read_track_keys :: fun(mesh: ^Nif, interpolator_index: i64, track: ^Track) {
 			else
 			}
 		}
-		if track.rotations.len == 0 and track.angles[0].len + track.angles[1].len + track.angles[2].len == 0 and abs_f32(interpolator.rotation[0]) < UNSET_BEYOND {
+		if track.rotations.len == 0 and track.rotations.cap > 0 and track.angles[0].len + track.angles[1].len + track.angles[2].len == 0 and abs_f32(interpolator.rotation[0]) < UNSET_BEYOND {
 			&track.rotation_times + 0
 			&track.rotations + interpolator.rotation
 		}
-		if track.translations.len == 0 and abs_f32(interpolator.translation.x) < UNSET_BEYOND {
+		if track.translations.len == 0 and track.translations.cap > 0 and abs_f32(interpolator.translation.x) < UNSET_BEYOND {
 			&track.translation_times + 0
 			&track.translations + interpolator.translation
 		}
@@ -144,8 +175,8 @@ read_track_keys :: fun(mesh: ^Nif, interpolator_index: i64, track: ^Track) {
 
 // The three angles' tracks of a rotation (KEY_XYZ), as the file has
 // them: for each axis, a count, a type if there are keys, the keys
-// (time, angle, and what the type adds).
-read_angle_keys :: fun(angles: []byte, track: ^Track) {
+// (time, angle, and what the type adds). Copied into room.
+read_angle_keys :: fun(angles: []byte, track: ^Track, room: ^[]byte) {
 	at : i64 = 0
 	for axis in 0:3 {
 		if at + 4 > angles.len do return
@@ -155,6 +186,8 @@ read_angle_keys :: fun(angles: []byte, track: ^Track) {
 		key_type : u32 = angles[at]
 		at += 4
 		size := key_bytes(i64(key_type), 4)
+		track.angle_times[axis] = key_times_room(room, i64(count))
+		track.angles[axis] = key_times_room(room, i64(count))
 		for k in 0:i64(count) {
 			if at + size > angles.len do return
 			time : f32 = angles[at]
@@ -224,8 +257,14 @@ key_between :: fun(times: ^[]f32, time: f32) -> i64, f32 {
 	if times.len == 1 or time <= times[0] do return 0, 0
 	last := times.len - 1
 	if time >= times[last] do return last, 0
+	// The last key at or before it, halving the keys between.
 	k : i64 = 0
-	for k + 1 < last and times[k + 1] <= time do k += 1
+	after := last
+	for after - k > 1 {
+		middle := (k + after) / 2
+		if times[middle] <= time do k = middle
+		else do after = middle
+	}
 	span := times[k + 1] - times[k]
 	if span <= 0 do return k, 0
 	return k, (time - times[k]) / span

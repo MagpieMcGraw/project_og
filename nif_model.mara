@@ -486,6 +486,8 @@ Block :: union {
 		start_time: f32
 		stop_time: f32
 		text_keys: i64       // its text keys (a Text_Keys block), -1 for none
+		cycle: u32           // past its stop: CYCLE_LOOP, CYCLE_REVERSE or CYCLE_CLAMP
+		frequency: f32
 	}
 	// NiTextKeyExtraData: texts at times in an animation ("start", "end",
 	// "Sound: DRSMetalOpen01"…): how many, and the keys as the file has them

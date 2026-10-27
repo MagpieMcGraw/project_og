@@ -253,6 +253,8 @@ command_nifs :: fun(name: []utf8) {
 	glossiness_total : f64 = 0
 	materials : i64 = 0
 	black_specular : i64 = 0
+	// The animations' sequences: each name, how many, how many loop.
+	sequence_names : [256]Sequence_Count
 	start := time_now()
 
 	for file, i in archive.files {
@@ -291,6 +293,9 @@ command_nifs :: fun(name: []utf8) {
 				Specular specular
 					if specular.enabled do specular_on += 1
 					else do specular_off += 1
+				Sequence sequence
+					tally_sequence(&sequence_names, sequence.name, sequence.cycle == CYCLE_LOOP)
+					if sequence.name == "Idle" or sequence.name == "SpecialIdle" do print("  idle: % %", sequence.name, file_name(&archive, file))
 				Material material
 					glossiness_total += f64(material.glossiness)
 					materials += 1
@@ -326,6 +331,21 @@ command_nifs :: fun(name: []utf8) {
 	print("models: % parts, % triangles, % parts without a texture, % failed",
 		part_total, triangle_total, untextured, model_failures)
 	print("a vertex is % bytes, an instance drawn % (the mesh program reads 64 and 160)", size_of(Vertex), size_of(Drawn_Instance))
+	line : str1024
+	for &entry in sequence_names {
+		if entry.count < 3 do continue
+		&line + entry.name[:]
+		&line + " "
+		&line + int_text(entry.count)[:]
+		&line + "/"
+		&line + int_text(entry.looping)[:]
+		&line + "  "
+		if line.len > 900 {
+			print("  sequences (all/looping): %", line)
+			line.len = 0
+		}
+	}
+	print("  sequences (all/looping): %", line)
 	print("specular properties: % on, % off; % materials, % with a black specular color, glossiness % on average", specular_on,
 		specular_off, materials, black_specular, if materials > 0 do glossiness_total / f64(materials) else 0)
 	for entry in failures {
@@ -1286,6 +1306,148 @@ uv_directions :: fun(points: [3!]Vec3, uvs: [3!][2!]f32) -> Vec3, Vec3 {
 	return vec3_normalize(along_u), vec3_normalize(along_v)
 }
 
+// `sooblivion anim <mesh>`: a mesh's animations — each sequence (its
+// span, how it goes on past its end, its speed) and what it drives: each
+// block's node, controller and property type, and its interpolator's kind
+// — and the controllers on the mesh's objects that run by themselves.
+command_anim :: fun(what: []utf8) {
+	path := data_path("Oblivion - Meshes.bsa")
+	directory_storage : [64 * MB]byte
+	archive, open_error := open_archive(path, &directory_storage)
+	if open_error {
+		print("couldn't open %: %", path, open_error)
+		return
+	}
+	defer close_archive(&archive)
+	index, found := find_file(&archive, what)
+	if not found {
+		print("no % in %", what, path)
+		return
+	}
+	storage : [16 * MB]byte
+	data, read_error := read_file(&archive, index, &storage)
+	if read_error {
+		print("couldn't read it: %", read_error)
+		return
+	}
+	nif_storage : [16 * MB]byte
+	failure := Nif_Failure{block = 0, type_name = storage[0:0]}
+	mesh, nif_error := read_nif(data, &nif_storage, &failure)
+	if nif_error {
+		print("couldn't read it: %", nif_error)
+		return
+	}
+	for &block, b in mesh.blocks {
+		match block^ {
+		Sequence sequence
+			print("sequence %: % to % s, cycle %, frequency %, % blocks", sequence.name, sequence.start_time, sequence.stop_time,
+				sequence.cycle, sequence.frequency, sequence.block_count)
+			for k in 0:sequence.block_count {
+				if sequence.blocks.len < (k + 1) * CONTROLLED_BLOCK_SIZE do break
+				at := k * CONTROLLED_BLOCK_SIZE
+				interpolator : i32 = sequence.blocks[at]
+				palette : i32 = sequence.blocks[at + 9]
+				node_at : u32 = sequence.blocks[at + 13]
+				property_at : u32 = sequence.blocks[at + 17]
+				controller_at : u32 = sequence.blocks[at + 21]
+				node : [64]utf8
+				property : [64]utf8
+				controller : [64]utf8
+				if palette >= 0 {
+					palette_name(&mesh, i64(palette), i64(node_at), &node)
+					if property_at != 0xFFFFFFFF do palette_name(&mesh, i64(palette), i64(property_at), &property)
+					palette_name(&mesh, i64(palette), i64(controller_at), &controller)
+				}
+				if interpolator >= 0 and i64(interpolator) < mesh.blocks.len {
+					print("  % % % (%)", node, controller, property, mesh.header.type_names[i64(mesh.header.block_types[i64(interpolator)])])
+				else
+					print("  % % % (no interpolator)", node, controller, property)
+				}
+			}
+		else
+		}
+		match block^ {
+		Transform_Data keys
+			print("transform data %: % rotation keys (type %), % translation keys", b, keys.rotation_count, keys.rotation_type, keys.translation_count)
+		else
+		}
+		type_name := mesh.header.type_names[i64(mesh.header.block_types[b])]
+		if ends_with(type_name, "Controller") and type_name != "NiControllerManager" {
+			print("controller %: %", b, type_name)
+		}
+	}
+	// What moves by itself: the Idle's moving tracks, each node's pose at
+	// four moments of the loop.
+	idle := find_sequence(&mesh, "Idle")
+	if idle < 0 do idle = find_sequence(&mesh, "SpecialIdle")
+	if idle < 0 do return
+	tracks : [8]Track
+	track_room : [4 * MB]byte
+	read_tracks(&mesh, idle, &tracks, &track_room)
+	start, stop := sequence_span(&mesh, idle)
+	for &track in tracks {
+		node := find_node(&mesh, track.node_name[:])
+		if node >= 0 {
+			match mesh.blocks[node] {
+			Node moved
+				track.rest = local_transform(moved.object)
+			else
+			}
+		}
+		line : str1024
+		for quarter in 0:4 {
+			pose := track_pose(track, start + (stop - start) * f32(quarter) / 4)
+			&line + vec3_text(Vec3{pose[3][0], pose[3][1], pose[3][2]})[:]
+			&line + " x "
+			&line + vec3_text(Vec3{pose[0][0], pose[0][1], pose[0][2]})[:]
+			&line + ";  "
+		}
+		print("moves % (% translation keys, % rotation keys, % % % angle keys): %", track.node_name, track.translations.len,
+			track.rotations.len, track.angles[0].len, track.angles[1].len, track.angles[2].len, line)
+	}
+}
+
+// A vector as text, two decimals each: "[1.25, -3, 0.5]".
+vec3_text :: fun(v: Vec3) -> str64 {
+	text : str64
+	&text + "["
+	for axis in 0:3 {
+		if axis > 0 do &text + ", "
+		hundredths := i64(v[axis] * 100)
+		if v[axis] < 0 and hundredths == 0 do &text + "-"
+		&text + int_text(hundredths / 100)[:]
+		&text + "."
+		rest := abs(hundredths % 100)
+		if rest < 10 do &text + "0"
+		&text + int_text(rest)[:]
+	}
+	&text + "]"
+	return text
+}
+
+// A sequence name's count in the survey, and how many loop.
+Sequence_Count :: struct {
+	name: [64]utf8
+	count: i64
+	looping: i64
+}
+
+tally_sequence :: fun(counts: ^[]Sequence_Count, name: []utf8, looping: bool) {
+	for &entry in counts {
+		if compare_folded(entry.name[:], name) == 0 {
+			entry.count += 1
+			if looping do entry.looping += 1
+			return
+		}
+	}
+	if counts.len == counts.cap do return
+	entry := next(counts)
+	entry.name.len = 0
+	&entry.name + name[0 : min(name.len, entry.name.cap)]
+	entry.count = 1
+	entry.looping = if looping do 1 else 0
+}
+
 // The record whose editor id is name (any letter case): its form id; false
 // when there's none. (Every record is looked at.)
 find_by_editor_id :: fun(plugin: ^Plugin, name: []utf8, scratch: ^[]byte) -> u32, bool {
@@ -1612,7 +1774,8 @@ command_door :: fun(what: []utf8) {
 		}
 		start, stop := sequence_span(&mesh, sequence)
 		tracks : [8]Track
-		read_tracks(&mesh, sequence, &tracks)
+		track_room : [4 * MB]byte
+		read_tracks(&mesh, sequence, &tracks, &track_room)
 		print("%: from % to % s, % tracks", name, start, stop, tracks.len)
 		match mesh.blocks[sequence] {
 		Sequence played
@@ -2266,6 +2429,8 @@ main :: (args: [][]utf8) {
 		command_find(args[2])
 	elif command == "door" and args.len > 2
 		command_door(args[2])
+	elif command == "anim" and args.len > 2
+		command_anim(args[2])
 	elif command == "collision" and args.len > 2
 		command_collision(args[2])
 	elif command == "grass" and args.len > 4

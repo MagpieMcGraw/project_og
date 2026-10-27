@@ -992,6 +992,11 @@ Instance :: struct {
 	center: Vec3           // a sphere around it, in the world
 	radius: f32
 	lights: [LIGHTS_PER_OBJECT!]u16   // the scene's lights that reach it, nearest first; NO_LIGHT after
+	// A piece of a model that moves by itself: its kind and piece (the
+	// scene's), and its object's place, its world posed from that; -1 for none.
+	moving_kind: i32
+	moving_piece: i32
+	placement: Mat4
 }
 
 // A cell's land on the card: where on the grid, its slot in the land
@@ -2685,7 +2690,10 @@ place_instance :: fun(gpu: Gpu_Model, model_index: i64, placement: Mat4, referen
 		center = Vec3{placed.x, placed.y, placed.z},
 		radius = gpu.radius * scale,
 		reference = reference,
-		lights = []}
+		lights = [],
+		moving_kind = -1,
+		moving_piece = 0,
+		placement = placement}
 	for k in 0:LIGHTS_PER_OBJECT do instance.lights[k] = NO_LIGHT
 	return instance
 }
