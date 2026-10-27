@@ -87,15 +87,21 @@ command_tree_picture :: fun(name: []utf8, out_path: []utf8, seed_text: []utf8) {
 	// The billboard: its size fits the tree, and it's drawn beside it.
 	billboard_file : [4 * MB]byte
 	billboard_pixels : [8 * MB]byte
-	billboard, billboard_error := paint_texture(&archives, look.billboard[:], &billboard_file, &billboard_pixels)
-	fit := Tree_Fit{width = 0, height = 0, leaf_fill = 0}
+	billboard, billboard_error := paint_texture(&archives, look.billboard[:], 0, &billboard_file, &billboard_pixels)
 	if billboard_error do print("couldn't read %: %", look.billboard, billboard_error)
-	else do fit = billboard_fit(billboard.pixels, billboard.width, billboard.height, look.width, look.height)
-	leaf_file : [4 * MB]byte
-	leaf_pixels : [8 * MB]byte
-	leaf_texture, leaf_error := paint_texture(&archives, look.leaves[:], &leaf_file, &leaf_pixels)
-	if leaf_error do print("couldn't read %: %", look.leaves, leaf_error)
-	else do fit.leaf_fill = leaf_fill(leaf_texture.pixels)
+	// The fit as the scene finds it: from mipmaps at least 64 wide.
+	fit := Tree_Fit{width = 0, height = 0, leaf_fill = 0}
+	small_file : [4 * MB]byte
+	small_pixels : [1 * MB]byte
+	small_billboard, small_billboard_error := paint_texture(&archives, look.billboard[:], 64, &small_file, &small_pixels)
+	if not small_billboard_error {
+		fit = billboard_fit(small_billboard.pixels, small_billboard.width, small_billboard.height, look.width, look.height)
+	}
+	small_file.len = 0
+	small_pixels.len = 0
+	small_leaves, small_leaves_error := paint_texture(&archives, look.leaves[:], 64, &small_file, &small_pixels)
+	if small_leaves_error do print("couldn't read %: %", look.leaves, small_leaves_error)
+	else do fit.leaf_fill = leaf_fill(small_leaves.pixels)
 	grown, report, grow_error := grow_tree(&tree, seed, look.leaves[:], fit, &model_storage)
 	if grow_error {
 		print("couldn't grow %: %", look.model, grow_error)
@@ -124,7 +130,7 @@ command_tree_picture :: fun(name: []utf8, out_path: []utf8, seed_text: []utf8) {
 	for &part in grown.parts {
 		file_storage.len = 0
 		texture_storage.len = 0
-		painted, texture_error := paint_texture(&archives, part.texture[:], &file_storage, &texture_storage)
+		painted, texture_error := paint_texture(&archives, part.texture[:], 0, &file_storage, &texture_storage)
 		if texture_error {
 			print("couldn't read %: %", part.texture, texture_error)
 			continue
@@ -146,14 +152,17 @@ command_tree_picture :: fun(name: []utf8, out_path: []utf8, seed_text: []utf8) {
 		grown.bounds_max.z, fit.width, fit.height, out_path)
 }
 
-// A texture from the archives, decoded (its largest mipmap) into pixels.
-paint_texture :: fun(archives: ^Archives, path: []utf8, file_storage: ^[]byte, pixels: ^[]byte) -> Painted_Texture, err {
+// A texture from the archives, decoded into pixels: its smallest mipmap at
+// least smallest_width wide (0: its largest).
+paint_texture :: fun(archives: ^Archives, path: []utf8, smallest_width: i64, file_storage: ^[]byte, pixels: ^[]byte) -> Painted_Texture, err {
 	found, in_archives := find_archived(archives, path)
 	if not in_archives do return Painted_Texture{0}, Not_In_Archive
 	data := read_archived(archives, found, file_storage)?
 	texture := read_texture(data)?
-	decoded := decode_rgba(texture, 0, pixels)?
-	return Painted_Texture{pixels = decoded, width = texture.mips[0].width, height = texture.mips[0].height}
+	mip : i64 = 0
+	for smallest_width > 0 and mip + 1 < texture.mips.len and texture.mips[mip + 1].width >= smallest_width do mip += 1
+	decoded := decode_rgba(texture, mip, pixels)?
+	return Painted_Texture{pixels = decoded, width = texture.mips[mip].width, height = texture.mips[mip].height}
 }
 
 // A part of a tree drawn from the front (looking along +y: x across, z up)

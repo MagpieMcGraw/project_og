@@ -2452,8 +2452,6 @@ setup_grass_buffers :: fun(renderer: ^Renderer) {
 	VertexAttribPointer(2, 2, FLOAT, 0, stride, 24)   // uv
 	EnableVertexAttribArray(3)
 	VertexAttribPointer(3, 4, FLOAT, 0, stride, 32)   // color
-	EnableVertexAttribArray(15)
-	VertexAttribPointer(15, 4, FLOAT, 0, stride, 48)  // tangent
 	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.mesh_index_buffer)
 
 	GenBuffers(1, &renderer.grass_instance_buffer)
@@ -2658,6 +2656,8 @@ setup_mesh_buffers :: fun(renderer: ^Renderer) {
 	VertexAttribPointer(2, 2, FLOAT, 0, stride, 24)   // uv
 	EnableVertexAttribArray(3)
 	VertexAttribPointer(3, 4, FLOAT, 0, stride, 32)   // color
+	EnableVertexAttribArray(15)
+	VertexAttribPointer(15, 4, FLOAT, 0, stride, 48)  // tangent (normal maps; leaf cards' corners)
 
 	GenBuffers(1, &renderer.mesh_index_buffer)
 	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.mesh_index_buffer)
