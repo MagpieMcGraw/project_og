@@ -31,6 +31,7 @@ use collision
 use animation
 use particles
 use audio
+use mp3
 render :: use render
 use mara.math
 use sdl_platform
@@ -2431,7 +2432,109 @@ usage :: fun() {
 	print("sooblivion esm [plugin]            what a plugin holds, by record type")
 	print("sooblivion bsa <archive>           an archive's folders and files")
 	print("sooblivion bsa <archive> <file>    one file from an archive, unpacked")
+	print("sooblivion mp3 <file> [raw]        decodes an MP3 (into raw floats, if given)")
+	print("sooblivion music <kind> [raw]      a kind's first track through the mix, no sound device (explore, public, dungeon)")
 	print("sooblivion help                    this")
+}
+
+// `sooblivion mp3 <file> [raw]`: decodes an MP3 file (a path, or one in
+// the data folder), saying its channels and rate, how long it is and how
+// long decoding took; its samples into raw, if given (32-bit floats, the
+// channels interleaved).
+command_mp3 :: fun(name: []utf8, raw_path: []utf8) {
+	path := data_path(name)
+	storage : [64 * MB]byte
+	data, read_error := read_entire_file(path, &storage)
+	if read_error {
+		print("couldn't read %: %", path, read_error)
+		return
+	}
+	decoder := Mp3_Decoder{0}
+	pcm : [512 * MB]byte
+	start := time_now()
+	start_error := mp3_start(&decoder, data)
+	if start_error {
+		print("couldn't decode %: %", path, start_error)
+		return
+	}
+	written : i64 = 0
+	frames : i64 = 0
+	more := true
+	for more {
+		decoded, frame_error := mp3_next_frame(&decoder)
+		if frame_error {
+			print("stopped at frame %: %", frames, frame_error)
+			break
+		}
+		more = decoded
+		if not decoded do break
+		frames += 1
+		if raw_path.len == 0 do continue
+		for sample in decoder.samples {
+			if written + 4 > pcm.cap do break
+			pcm[written] = sample
+			written += 4
+		}
+	}
+	seconds := f64(frames * FRAME_SAMPLES) / f64(decoder.sample_rate)
+	print("% channels at % Hz: % frames, % s of sound, decoded in % ms", decoder.channels, decoder.sample_rate, frames, seconds, elapsed_ms(start))
+	if raw_path.len == 0 do return
+	pcm.len = written
+	write_error := write_bytes(raw_path, pcm[:])
+	if write_error do print("couldn't write %: %", raw_path, write_error)
+}
+
+// `sooblivion music <explore | public | dungeon> [raw]`: plays a kind of
+// music through the mix without opening the sound device, as the viewer
+// would: its first track whole, saying which it was and how long mixing
+// it took; the mix into raw, if given (32-bit floats, stereo).
+command_music :: fun(kind_name: []utf8, raw_path: []utf8) {
+	kind := MUSIC_EXPLORE
+	if kind_name == "public" do kind = MUSIC_PUBLIC
+	elif kind_name == "dungeon" do kind = MUSIC_DUNGEON
+	room : [1 * MB]byte
+	mixer : Mixer
+	audio_init(&mixer, 64 * KB, &room)
+	music_folder := data_path("Music")
+	music_open(&mixer, music_folder[:])
+	want_music(&mixer, kind)
+	pcm : [512 * MB]byte
+	written : i64 = 0
+	start := time_now()
+	blocks : i64 = 0
+	for mixer.music.tracks_started < 2 and mixer.failures == 0 {
+		mixer.mix.len = AHEAD * 2
+		for k in 0:mixer.mix.len do mixer.mix[k] = 0
+		mix_music(&mixer, AHEAD)
+		blocks += 1
+		if mixer.music.tracks_started == 1 and blocks == 1 do print("track: %", mixer.music.track)
+		if mixer.music.tracks_started >= 2 do break
+		if raw_path.len == 0 do continue
+		for sample in mixer.mix {
+			if written + 4 > pcm.cap do break
+			pcm[written] = sample
+			written += 4
+		}
+	}
+	if mixer.failures > 0 do print("couldn't play %: %", mixer.first_failure, mixer.first_failure_reason)
+	print("% s mixed in % ms", f64(blocks * AHEAD) / MIX_RATE, elapsed_ms(start))
+	stop_track(&mixer.music)
+	if raw_path.len == 0 do return
+	pcm.len = written
+	write_error := write_bytes(raw_path, pcm[:])
+	if write_error do print("couldn't write %: %", raw_path, write_error)
+}
+
+// Writes bytes to a file, all of them.
+write_bytes :: fun(path: []utf8, data: []byte) -> err {
+	file := file_open_write(path)?
+	defer file_close(file)
+	rest := data
+	for rest.len > 0 {
+		count := file_write(file, &rest)?
+		if count <= 0 do return Write_Failed
+		rest = rest[count : rest.len]
+	}
 }
 
 // Keeps the console open until Enter is pressed (or its input ends).
@@ -2527,6 +2630,10 @@ main :: (args: [][]utf8) {
 		command_textures(if args.len > 2 do args[2] else "Oblivion - Textures - Compressed.bsa")
 	elif command == "sounds"
 		command_sounds()
+	elif command == "music" and args.len > 2
+		command_music(args[2], if args.len > 3 do args[3] else "")
+	elif command == "mp3" and args.len > 2
+		command_mp3(args[2], if args.len > 3 do args[3] else "")
 	elif command == "sound" and args.len > 2
 		command_sound(args[2])
 	elif command == "nifs"

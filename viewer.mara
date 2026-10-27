@@ -169,6 +169,7 @@ Viewer :: struct {
 	// The sound: the archive of its files, and what plays them.
 	sounds: Archive
 	audio: Mixer
+	told_tracks: i64    // the music's tracks the journal has been told of
 
 	// Since the last summary: frames, refreshes missed, the longest, and
 	// the CPU's and card's time in all, in nanoseconds.
@@ -200,6 +201,9 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.sounds = open_archive(data_path("Oblivion - Sounds.bsa"), directory_storage)?
 	viewer.platform = platform_open("sooblivion", 1280, 720)?
 	audio_init(&viewer.audio, SOUND_ROOM, table_storage)
+	music_folder := data_path("Music")
+	music_open(&viewer.audio, music_folder[:])
+	viewer.told_tracks = 0
 	audio_error := audio_open(&viewer.audio)
 	if audio_error {
 		note(&viewer.journal, "no sound: ")
@@ -448,6 +452,13 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	}
 	hear_finish(&viewer.audio)
 	mix_ahead(&viewer.audio)
+	music := &viewer.audio.music
+	if music.tracks_started != viewer.told_tracks {
+		viewer.told_tracks = music.tracks_started
+		note(&viewer.journal, "music: ")
+		note(&viewer.journal, music.track[:])
+		note_end(&viewer.journal)
+	}
 	card_start := time_now()
 	viewer.drawing_time = card_start - drawing_start
 	wait_for_card()
@@ -1196,6 +1207,7 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 			x, y := grid_of(viewer.camera.position)
 			start := time_now()
 			show_error := show_exterior(&viewer.shown, plugin, viewer.shown.world, x, y)
+			choose_music(viewer, plugin, exterior_cell(plugin, viewer.shown.world, x, y), viewer.shown.world)
 			// Into another region: its weather soon.
 			if weathers_at_camera(viewer, plugin) do viewer.weather_hours_left = min(viewer.weather_hours_left, 0.1)
 			note(journal, "into ")
@@ -1249,6 +1261,7 @@ go_inside :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
 	shown := &viewer.shown
 	start := time_now()
 	show_error := show_interior(shown, plugin, cell, viewer_loader(viewer))
+	choose_music(viewer, plugin, cell, 0)
 	viewer.speed = 400
 	name := record_name(plugin, cell)
 	set_place(viewer, name[:])
@@ -1310,6 +1323,7 @@ go_outside :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32, place: Vec3) 
 	}
 	x, y := grid_of(place)
 	show_error := show_exterior(shown, plugin, world_id, x, y)
+	choose_music(viewer, plugin, exterior_cell(plugin, world_id, x, y), world_id)
 	_ = load_waiting(shown, plugin, viewer_loader(viewer), 0xFFFFFFFFFFFFFFFF)
 	viewer.camera.position = place
 	viewer.speed = 1500
@@ -1342,6 +1356,19 @@ go_outside :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32, place: Vec3) 
 	note_end(journal)
 	note_failures(viewer)
 	viewer.frame_start = time_now()
+}
+
+// Wants the music of a place: a cell (0 for none) in a world (0 inside).
+choose_music :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32, world_id: u32) {
+	scratch : [1 * MB]byte
+	kind, music_error := place_music(plugin, cell, world_id, &scratch)
+	if music_error {
+		note(&viewer.journal, "couldn't tell the music here: ")
+		note_error(&viewer.journal, music_error)
+		note_end(&viewer.journal)
+		kind = MUSIC_EXPLORE
+	}
+	want_music(&viewer.audio, kind)
 }
 
 // A record's name for people (FULL), else its editor id.

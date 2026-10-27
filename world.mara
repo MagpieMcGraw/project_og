@@ -525,6 +525,40 @@ sound_kind_of :: fun(base: Record) -> Sound_Kind, bool {
 	return kind, true
 }
 
+// The kind of music a place wants (0 exploring, 1 public, 2 dungeon): a
+// cell's own (XCMT; 0 or none is the default); outside, for a cell with the
+// default (or no cell), its world's (SNAM), then its regions' (RDMD, among
+// their sounds); else exploring.
+place_music :: fun(plugin: ^Plugin, cell: u32, world_id: u32, scratch: ^[]byte) -> i64, err {
+	regions : [16]u32
+	if cell != 0 {
+		cell_record := find_record(plugin, cell, scratch)?
+		own, has_own := find_field(cell_record.data, "XCMT")
+		if has_own and own.len > 0 and own[0] != 0 do return i64(own[0])
+		region_ids, has_regions := find_field(cell_record.data, "XCLR")
+		if has_regions {
+			for k in 0:min(region_ids.len / 4, regions.cap) {
+				region : u32 = region_ids[k * 4]
+				&regions + region
+			}
+		}
+	}
+	if world_id == 0 do return 0
+	world_record := find_record(plugin, world_id, scratch)?
+	world_music, has_world_music := form_field(world_record.data, "SNAM")
+	if has_world_music and world_music != 0 do return i64(world_music)
+	for region in regions {
+		region_scratch : [65536]byte
+		record := find_record(plugin, region, &region_scratch)?
+		field, found := find_field(record.data, "RDMD")
+		if found and field.len >= 4 {
+			music : u32 = field[0]
+			if music != 0 do return i64(music)
+		}
+	}
+	return 0
+}
+
 // A form id field of a record (SNAM, ANAM…), and false when it has none.
 form_field :: fun(data: []byte, kind: []utf8) -> u32, bool {
 	field, found := find_field(data, kind)

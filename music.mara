@@ -1,0 +1,268 @@
+// The game's music: the MP3 tracks in Data\Music by kind — Explore (out in
+// the world), Public (towns, inns, shops) and Dungeon — one played at a
+// time, streamed from its file and decoded a frame at a time as the mix
+// needs it. When the place wants another kind, the track fades out and one
+// of that kind starts; a track that ends is followed by another of its
+// kind (not the same one again, where its folder has others).
+module audio
+
+use mara.core
+use mara.math
+use mara.os
+use mara.string
+use mp3
+
+// The kinds of music, numbered as the cells' XCMT and the worlds' SNAM
+// number them; none, for silence.
+MUSIC_NONE :: -1
+MUSIC_EXPLORE :: 0
+MUSIC_PUBLIC :: 1
+MUSIC_DUNGEON :: 2
+
+// How loud the music is beside the other sounds, as Oblivion.ini has them
+// (fDefaultMusicVolume 0.3 to fDefaultEffectsVolume 0.8).
+MUSIC_VOLUME :: 0.375
+// How many seconds a track takes to fade out, for another kind.
+MUSIC_FADE :: 2
+// How much of a track's file is held at once; it's read on when less than
+// MUSIC_REFILL bytes are left past the frame decoding is at (a frame is
+// 1441 bytes at most).
+MUSIC_BUFFER :: 65536
+MUSIC_REFILL :: 8192
+// Files listed in a kind's folder, at most.
+MUSIC_LISTING :: 65536
+
+// The music: where the kinds' folders are; the track's file and the part of
+// it being decoded (buffer: from where the decoder's data starts); the
+// decoder; whether a track plays, of which kind, the kind the place wants,
+// and the track's loudness now (0 to 1, fading); the next frame of the
+// decoder's samples to mix. The track last started (its name, a hash of
+// it, and how many have started: for the journal); a kind whose track
+// couldn't be played (not tried again until another is wanted).
+Music :: struct {
+	folder: Path
+	file: File_Id
+	file_open: bool
+	file_ended: bool
+	buffer: [MUSIC_BUFFER]byte
+	decoder: Mp3_Decoder
+	playing: bool
+	kind: i64
+	wanted: i64
+	volume: f32
+	at: i64
+	track: [160]utf8
+	track_hash: u64
+	tracks_started: i64
+	failed_kind: i64
+}
+
+// The music silent: no folder yet, nothing wanted.
+music_reset :: fun(music: ^Music) {
+	music.folder.len = 0
+	music.file_open = false
+	music.file_ended = true
+	music.buffer.len = 0
+	music.playing = false
+	music.kind = MUSIC_NONE
+	music.wanted = MUSIC_NONE
+	music.volume = 0
+	music.at = 0
+	music.track.len = 0
+	music.track_hash = 0
+	music.tracks_started = 0
+	music.failed_kind = MUSIC_NONE
+}
+
+// Where the music's kinds' folders are: Data\Music.
+music_open :: fun(audio: ^Mixer, folder: []utf8) {
+	audio.music.folder.len = 0
+	&audio.music.folder + folder
+}
+
+// The kind of music the place wants (MUSIC_NONE: none).
+want_music :: fun(audio: ^Mixer, kind: i64) {
+	if audio.music.wanted != kind do audio.music.failed_kind = MUSIC_NONE
+	audio.music.wanted = kind
+}
+
+// The folder of a kind of music, in Data\Music.
+music_folder_name :: fun(kind: i64) -> str64 {
+	if kind == MUSIC_PUBLIC do return "Public"
+	if kind == MUSIC_DUNGEON do return "Dungeon"
+	return "Explore"
+}
+
+// Adds the music's next frames to the mix (mix_ahead calls it): the track
+// decoded a frame at a time, fading out while another kind is wanted (and
+// back in, if its kind is wanted again first). With none playing, a track
+// of the wanted kind starts.
+mix_music :: fun(audio: ^Mixer, frames: i64) {
+	music := &audio.music
+	if not music.playing {
+		if music.wanted == MUSIC_NONE or music.wanted == music.failed_kind or music.folder.len == 0 do return
+		start_error := start_track(music, &audio.seed)
+		if start_error {
+			note_music_failure(audio, start_error)
+			music.failed_kind = music.wanted
+			stop_track(music)
+			return
+		}
+	}
+	fade_step := f32(1) / (MUSIC_FADE * MIX_RATE)
+	for k in 0:frames {
+		channels := music.decoder.channels
+		if music.at * channels >= music.decoder.samples.len {
+			if not next_music_frame(audio) {
+				stop_track(music)
+				return
+			}
+			music.at = 0
+			channels = music.decoder.channels
+		}
+		if music.kind != music.wanted {
+			music.volume -= fade_step
+			if music.volume <= 0 {
+				stop_track(music)
+				return
+			}
+		elif music.volume < 1
+			// (Wanted again while fading out: back up.)
+			music.volume = min(1, music.volume + fade_step)
+		}
+		left := music.decoder.samples[music.at * channels]
+		right := music.decoder.samples[music.at * channels + channels - 1]
+		gain := music.volume * MUSIC_VOLUME
+		audio.mix[k * 2] += left * gain
+		audio.mix[k * 2 + 1] += right * gain
+		music.at += 1
+	}
+}
+
+// Decodes the track's next frame (its file read on as it's needed): false
+// at its end, or when it couldn't be (the reason told as a failure).
+next_music_frame :: fun(audio: ^Mixer) -> bool {
+	music := &audio.music
+	read_error := read_on(music)
+	if read_error {
+		note_music_failure(audio, read_error)
+		return false
+	}
+	decoded, frame_error := mp3_next_frame(&music.decoder)
+	if frame_error {
+		note_music_failure(audio, frame_error)
+		music.failed_kind = music.kind
+		return false
+	}
+	return decoded
+}
+
+// Starts a track of the wanted kind: one of its folder's MP3 files at
+// random (not the one before, where there are others), its file opened and
+// its start read.
+start_track :: fun(music: ^Music, seed: ^u64) -> err {
+	stop_track(music)
+	folder : Path
+	&folder + music.folder[:]
+	&folder + "\\"
+	kind_folder := music_folder_name(music.wanted)
+	&folder + kind_folder[:]
+	music.track.len = 0
+	&music.track + kind_folder[:]
+	listing : [MUSIC_LISTING]byte
+	entries := dir_read(folder[:], &listing)?
+	tracks : i64 = 0
+	for entry in entries {
+		if is_track(entry) do tracks += 1
+	}
+	if tracks == 0 do return Empty_Folder
+	pick := i64(next_random(seed) % u64(tracks))
+	for round in 0:2 {
+		chosen := nth_track(entries, pick)
+		if tracks == 1 or path_hash(chosen[:]) != music.track_hash do break
+		pick = (pick + 1) % tracks
+	}
+	name := nth_track(entries, pick)
+	path : Path
+	&path + folder[:]
+	&path + "\\"
+	&path + name[:]
+	&music.track + "\\"
+	&music.track + name[:]
+
+	music.file = file_open_read(path[:])?
+	music.file_open = true
+	music.file_ended = false
+	music.buffer.len = 0
+	fill_buffer(music)?
+	mp3_start(&music.decoder, music.buffer[0 : music.buffer.len])?
+	if music.decoder.sample_rate != MIX_RATE do return Wrong_Rate
+	music.playing = true
+	music.kind = music.wanted
+	music.volume = 1
+	music.at = 0
+	music.track_hash = path_hash(name[:])
+	music.tracks_started += 1
+}
+
+// Whether a folder's entry is a track: an MP3 file.
+is_track :: fun(entry: Dir_Entry) -> bool {
+	return not entry.dir and (ends_with(entry.name[:], ".mp3") or ends_with(entry.name[:], ".MP3"))
+}
+
+// The name of a listing's nth track.
+nth_track :: fun(entries: []Dir_Entry, n: i64) -> [260]utf8 {
+	name : [260]utf8
+	seen : i64 = 0
+	for entry in entries {
+		if not is_track(entry) do continue
+		if seen == n {
+			&name + entry.name[:]
+			break
+		}
+		seen += 1
+	}
+	return name
+}
+
+// Reads the track's file into the buffer's room, after what it holds.
+fill_buffer :: fun(music: ^Music) -> err {
+	for not music.file_ended and music.buffer.len < music.buffer.cap {
+		room := music.buffer[music.buffer.len : music.buffer.cap]
+		file_read(music.file, &room)?
+		if room.len == 0 do music.file_ended = true
+		music.buffer.len += room.len
+	}
+}
+
+// Keeps MUSIC_REFILL bytes or more of the file ahead of the decoder: what
+// it hasn't come to moves to the buffer's front, more of the file after it.
+read_on :: fun(music: ^Music) -> err {
+	ahead := music.buffer.len - music.decoder.at
+	if music.file_ended or ahead >= MUSIC_REFILL do return
+	from := music.decoder.at
+	for k in 0:ahead do music.buffer[k] = music.buffer[from + k]
+	music.buffer.len = ahead
+	fill_buffer(music)?
+	music.decoder.data = music.buffer[0 : music.buffer.len]
+	music.decoder.at = 0
+}
+
+// Stops the track, closing its file.
+stop_track :: fun(music: ^Music) {
+	if music.file_open do file_close(music.file)
+	music.file_open = false
+	music.playing = false
+}
+
+// Remembers that the music couldn't play (the track, and why), as a sound
+// that couldn't (for the journal).
+note_music_failure :: fun(audio: ^Mixer, reason: err) {
+	audio.failures += 1
+	if audio.failures == 1 {
+		audio.first_failure.len = 0
+		&audio.first_failure + "music "
+		&audio.first_failure + audio.music.track[:]
+		audio.first_failure_reason = reason
+	}
+}

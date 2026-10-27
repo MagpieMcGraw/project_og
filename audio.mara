@@ -7,6 +7,7 @@
 // The scene's placed sounds (heard), one-shots (play_once): a looping
 // sound is played while it's in hearing range, faded in and out at the
 // edge; a placed sound that doesn't loop is played again after a pause.
+// The music (music.mara) is mixed in with them.
 module audio
 
 use mara.core
@@ -41,6 +42,7 @@ Audio_Error :: error {
 	Empty_Folder      // a sound naming a folder with no files
 	No_Room_For_Sound // the clips' room is full
 	No_Sound_File     // no file (or folder) of the path in the archive
+	Wrong_Rate        // music at a rate other than the mix's
 }
 
 // A sound file loaded: its samples (16-bit, the channels interleaved, a
@@ -85,6 +87,7 @@ Mixer :: struct {
 	failures: i64
 	first_failure: [160]utf8
 	first_failure_reason: err
+	music: Music
 }
 
 // Sets the audio up, closed: no clips, no voices; the clips' room (room_size
@@ -98,6 +101,7 @@ audio_init :: fun(audio: ^Mixer, room_size: i64, storage: ^[]byte) {
 	audio.first_failure.len = 0
 	audio.clip_index = key_index(MAX_CLIPS * 2, storage)
 	audio.clip_room = slice([:room_size]byte, storage)
+	music_reset(&audio.music)
 }
 
 // Starts SDL's audio and opens the default device for a stereo mix.
@@ -111,6 +115,7 @@ audio_open :: fun(audio: ^Mixer) -> err {
 }
 
 audio_close :: fun(audio: ^Mixer) {
+	stop_track(&audio.music)
 	if audio.open do sdl.DestroyAudioStream(audio.stream)
 	audio.open = false
 }
@@ -371,6 +376,7 @@ mix_ahead :: fun(audio: ^Mixer) {
 	audio.mix.len = frames * 2
 	for k in 0:audio.mix.len do audio.mix[k] = 0
 	for &voice in audio.voices do mix_voice(audio, voice, frames)
+	mix_music(audio, frames)
 	for k in 0:audio.mix.len do audio.mix[k] = max(-1, min(1, audio.mix[k] * MASTER_VOLUME))
 	_ = sdl.PutAudioStreamData(audio.stream, audio.mix[:])
 

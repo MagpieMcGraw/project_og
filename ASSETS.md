@@ -27,6 +27,10 @@ Oblivion.esm and the base game's archives; sizes are as stored.
 - **Land normal maps:** each layer's `_n`, blended as its colors are.
 - **Sound:** WAV files, SOUN records, placed sounds, light and activator
   sounds, door sounds.
+- **Music:** `Data\Music`'s Explore, Public and Dungeon tracks (MP3,
+  decoded by mp3.mara), by the place's kind: an interior cell's XCMT, a
+  world's SNAM (the cities public, Oblivion's planes dungeon), a region's
+  RDMD.
 - **Animation:** Idle sequences' movement, scrolling textures, glow and
   opacity changes (see below for what's left).
 
@@ -43,7 +47,7 @@ Oblivion.esm and the base game's archives; sizes are as stored.
 | Worn clothing, armor | ARMO 996, CLOT 604 (their worn models, male and female) | only their ground models are drawn now |
 | Creatures | ACRE 1,473 placed; CREA 914; 34 creature folders | none drawn |
 | Animations | `.kf` 1,843 (creatures 1,068, characters 775); IDLE 650 | idles, walking; needs skinning first |
-| Voices | Voices1/2 BSAs: 38,898 `.mp3` + `.lip`, 1.7 GB; DIAL 3,817, INFO 19,278 | MP3 decoding; `.lip` drives FaceGen mouth morphs |
+| Voices | Voices1/2 BSAs: 38,898 `.mp3` + `.lip`, 1.7 GB; DIAL 3,817, INFO 19,278 | mp3.mara decodes them (checked against ffmpeg); `.lip` drives FaceGen mouth morphs |
 
 ### World and sky
 
@@ -59,7 +63,7 @@ lightning) and the regions' sounds (birds, insects, wind).
 | Sunbeams | `sunbeam01–03.nif` | |
 | HDR (eye adapting, bloom) | WTHR HNAM | |
 | Water reflections | — | framebuffers are in now; left for later earlier |
-| Region music, region map colors | RDMD, RCLR | music needs MP3 |
+| Region map colors | RCLR | |
 | Rain kept off under roofs | — | it falls through them now |
 | `.cmp` files | 55 in `distantlod` | purpose not known yet |
 
@@ -99,7 +103,7 @@ glow or opacity — their own, or an Idle's.
 
 | What | Data | Notes |
 |---|---|---|
-| Music | `Data\Music`: 28 `.mp3` (Explore, Public, Dungeon, Battle, Special) | needs an MP3 decoder (shared with voices) |
+| Battle and special music | `Data\Music\Battle` 8, `Special` 3 (title, death, success) | with combat and menus |
 | Footsteps | — | by surface material |
 | Creature, magic, menu sounds | CREA sound lists; MGEF sounds; 12 menu SOUNs | with actors and UI |
 
@@ -143,6 +147,10 @@ guesses for now.
 - Point lights' falloff (the game reads a lookup texture), and the mist
   near ruin lamps looking brighter than remembered.
 - Placed sounds that don't loop (played again after 6 to 12 s here).
+- Music: what an interior cell of the default type plays (Explore here);
+  how loud it is beside the sounds (the Oblivion.ini here: 0.3 to 0.8);
+  whether tracks have pauses between them (none here), and how a change
+  of kind fades (2 s out, then the next starts).
 
 ### Probably left alone (gameplay)
 
