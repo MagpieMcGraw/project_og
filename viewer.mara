@@ -1473,7 +1473,7 @@ ground_height :: fun(plugin: ^Plugin, world_id: u32, place: Vec3, scratch: ^[]by
 	record, record_error := record_at(plugin, land_at, scratch)
 	if record_error do return 0
 	cell_land : Land
-	read_land(record.data, &cell_land)
+	read_land(plugin, record, &cell_land)
 	column := i64((place.x - f32(x * CELL_SIZE)) / LAND_SPACING + 0.5)
 	row := i64((place.y - f32(y * CELL_SIZE)) / LAND_SPACING + 0.5)
 	return cell_land.heights[row * LAND_SIDE + column]

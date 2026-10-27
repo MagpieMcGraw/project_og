@@ -44,8 +44,10 @@ Land :: struct {
 	quadrants: [4!]Land_Quadrant
 }
 
-// Reads a LAND record's fields into land.
-read_land :: fun(data: []byte, land: ^Land) {
+// Reads a LAND record's fields into land (its textures' form ids as the
+// game numbers them).
+read_land :: fun(plugin: ^Plugin, record: Record, land: ^Land) {
+	data := record.data
 	for i in 0:LAND_SIDE * LAND_SIDE {
 		land.heights[i] = 0
 		land.normals[i] = Vec3{0, 0, 1}
@@ -75,7 +77,7 @@ read_land :: fun(data: []byte, land: ^Land) {
 		elif kind == "BTXT" and bytes.len >= 8
 			texture : u32 = bytes[0]
 			quadrant : u8 = bytes[4]
-			if quadrant < 4 do land.quadrants[i64(quadrant)].base = texture
+			if quadrant < 4 do land.quadrants[i64(quadrant)].base = record_form(plugin, record, texture)
 		elif kind == "ATXT" and bytes.len >= 8
 			texture : u32 = bytes[0]
 			quadrant : u8 = bytes[4]
@@ -84,7 +86,7 @@ read_land :: fun(data: []byte, land: ^Land) {
 			if quadrant < 4 and layers.len < layers.cap {
 				layer_quadrant = i64(quadrant)
 				layer := next(layers)
-				layer.texture = texture
+				layer.texture = record_form(plugin, record, texture)
 				for k in 0:289 do layer.opacity[k] = 0
 			}
 		elif kind == "VTXT" and layer_quadrant >= 0
@@ -137,22 +139,26 @@ shown_land :: fun(plugin: ^Plugin, world_id: u32, parent_id: u32, x: i64, y: i64
 	return find_land(plugin, cell)
 }
 
-// The LAND record of an exterior cell: its place in the plugin's data, and
-// false when the cell has none.
+// The LAND record of an exterior cell: its place in the plugins' data, and
+// false when the cell has none. As the last plugin file to have it has it:
+// the files' groups for the cell are looked in from the last.
 find_land :: fun(plugin: ^Plugin, cell: u32) -> i64, bool {
-	group_at, found := index_get(&plugin.cell_children, u64(cell))
-	if not found do return 0, false
-	group_header : Group_Header = plugin.data[group_at]
-	end := group_at + i64(group_header.size)
-	at := group_at + HEADER_SIZE
-	for at < end {
-		header : Record_Header = plugin.data[at]
-		if header.kind == "GRUP" {
-			at += HEADER_SIZE
-			continue
+	for back in 1..plugin.files.len {
+		file := plugin.files.len - back
+		group_at, found := index_get(&plugin.cell_children, cell_group_key(file, cell))
+		if not found do continue
+		group_header : Group_Header = plugin.data[group_at]
+		end := group_at + i64(group_header.size)
+		at := group_at + HEADER_SIZE
+		for at < end {
+			header : Record_Header = plugin.data[at]
+			if header.kind == "GRUP" {
+				at += HEADER_SIZE
+				continue
+			}
+			if header.kind == "LAND" and winning_copy(plugin, file, header, at) do return at, true
+			at += HEADER_SIZE + i64(header.size)
 		}
-		if header.kind == "LAND" do return at, true
-		at += HEADER_SIZE + i64(header.size)
 	}
 	return 0, false
 }

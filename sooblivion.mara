@@ -637,14 +637,30 @@ command_model :: fun(what: []utf8, name: []utf8) {
 	}
 }
 
-// The game's master plugin, read and indexed: what the cell commands start from.
+// The game's plugins (Oblivion.esm and the downloaded content, in the
+// game's order), read one after another into data_storage and indexed into
+// index_storage: what the viewer and the cell commands start from.
 load_oblivion :: fun(data_storage: ^[]byte, index_storage: ^[]byte) -> Plugin, err {
-	path := data_path("Oblivion.esm")
 	start := time_now()
-	data := read_entire_file(path, data_storage)?
-	plugin := index_plugin(data, index_storage)?
-	print("indexed % records of % in % ms: % cells with references, % exterior cells, % worlds with persistent cells",
-		plugin.records.count, path, elapsed_ms(start), plugin.cell_children.count, plugin.exterior_cells.count, plugin.persistent_cells.count)
+	order : Load_Order
+	read_load_order(&order)?
+	plugin := Plugin{0}
+	first := data_storage.len
+	for &file, k in order.plugins {
+		at := data_storage.len - first
+		path := data_path(file.name[:])
+		data := read_entire_file(path[:], data_storage)?
+		span := Plugin_Span{0}
+		&span.name + file.name[:]
+		span.start = at
+		span.end = at + data.len
+		span.own_index = u32(k)
+		&plugin.files + span
+	}
+	plugin.data = data_storage[first : data_storage.len]
+	index_plugin(&plugin, index_storage)?
+	print("indexed % records of % plugins in % ms: % cells' groups, % exterior cells, % worlds with persistent cells",
+		plugin.records.count, plugin.files.len, elapsed_ms(start), plugin.cell_children.count, plugin.exterior_cells.count, plugin.persistent_cells.count)
 	return plugin
 }
 
@@ -658,25 +674,27 @@ command_cells :: fun(word: []utf8) {
 		return
 	}
 	scratch : [16 * MB]byte
-	at := plugin.interior_cells_at
 	shown : i64 = 0
-	for at < plugin.interior_cells_end {
-		header : Record_Header = plugin.data[at]
-		if header.kind == "GRUP" {
-			at += HEADER_SIZE
-			continue
-		}
-		if header.kind == "CELL" {
-			record, record_error := record_at(&plugin, at, &scratch)
-			if not record_error {
-				name := editor_id(record.data)
-				if contains_folded(name, word) {
-					print("  %", name)
-					shown += 1
+	for &span in plugin.files {
+		at := span.interior_cells_at
+		for at < span.interior_cells_end {
+			header : Record_Header = plugin.data[at]
+			if header.kind == "GRUP" {
+				at += HEADER_SIZE
+				continue
+			}
+			if header.kind == "CELL" {
+				record, record_error := record_at(&plugin, at, &scratch)
+				if not record_error {
+					name := editor_id(record.data)
+					if contains_folded(name, word) {
+						print("  % (%)", name, span.name)
+						shown += 1
+					}
 				}
 			}
+			at += HEADER_SIZE + i64(header.size)
 		}
-		at += HEADER_SIZE + i64(header.size)
 	}
 	print("% cells", shown)
 }
@@ -742,9 +760,13 @@ command_cell :: fun(name: []utf8, every_one: bool) {
 	// Every mesh the cell needs, read and made a model, as the viewer
 	// would (without the graphics card).
 	directory_storage : [64 * MB]byte
-	meshes, meshes_error := open_archive(data_path("Oblivion - Meshes.bsa"), &directory_storage)
-	if meshes_error do return
-	defer close_archive(&meshes)
+	archives : Archives
+	archives_error := open_all_archives(&archives, &directory_storage)
+	if archives_error {
+		print("couldn't open the archives: %", archives_error)
+		return
+	}
+	defer close_archives(&archives)
 	file_room : [64 * MB]byte
 	block_room : [16 * MB]byte
 	model_room : [64 * MB]byte
@@ -754,13 +776,13 @@ command_cell :: fun(name: []utf8, every_one: bool) {
 		if base_error do continue
 		path := model_path(base)
 		if path.len == 0 or is_marker(path[:]) do continue
-		index, found := find_file(&meshes, path[:])
+		mesh_file, found := find_archived(&archives, path[:])
 		if not found {
 			print("  missing mesh %", path)
 			continue
 		}
 		file_room.len = 0
-		data, read_error := read_file(&meshes, index, &file_room)
+		data, read_error := read_archived(&archives, mesh_file, &file_room)
 		if read_error {
 			print("  couldn't read %: %", path, read_error)
 			continue
@@ -871,7 +893,7 @@ command_map :: fun(name: []utf8) {
 			scratch.len = 0
 			record, record_error := record_at(&plugin, land_at, &scratch)
 			if record_error do continue
-			read_land(record.data, &cell_land)
+			read_land(&plugin, record, &cell_land)
 			lands += 1
 			for row in 0:PIXELS_PER_CELL {
 				for column in 0:PIXELS_PER_CELL {
@@ -948,7 +970,7 @@ command_area :: fun(name: []utf8, x: i64, y: i64) {
 			scratch.len = 0
 			record, record_error := record_at(&plugin, land_at, &scratch)
 			if record_error do continue
-			read_land(record.data, &cell_land)
+			read_land(&plugin, record, &cell_land)
 			build_land_mesh(&plugin, &cell_land, cell_x, cell_y, &land_mesh)
 			land_cells += 1
 			for q in 0:4 {
@@ -1129,7 +1151,7 @@ command_walk :: fun(name: []utf8, x: i64, y: i64, steps: i64) {
 			file_room.len = 0
 			record, record_error := record_at(&plugin, land_at, &file_room)
 			if record_error do continue
-			read_land(record.data, &cell_land)
+			read_land(&plugin, record, &cell_land)
 			build_land_mesh(&plugin, &cell_land, item.x, item.y, &land_mesh)
 			// (On the card it'd be in a slot; here it's only remembered.)
 			&walked.grounds + Gpu_Land{x = item.x, y = item.y, slot = free_land_slot(&walked), center = land_mesh.center, radius = land_mesh.radius}
@@ -1541,7 +1563,7 @@ command_sounds :: fun() {
 			}
 			continue
 		}
-		_, has_sound := form_field(record.data, "SNAM")
+		_, has_sound := form_field(&plugin, record, "SNAM")
 		if header.kind == "LIGH" and has_sound do lights_with_sound += 1
 		if header.kind == "DOOR" and has_sound do doors_with_sound += 1
 		if header.kind == "ACTI" and has_sound do activators_with_sound += 1
@@ -2077,7 +2099,7 @@ command_grass :: fun(name: []utf8, x: i64, y: i64) {
 		return
 	}
 	cell_land : Land
-	read_land(record.data, &cell_land)
+	read_land(&plugin, record, &cell_land)
 
 	// The land's textures and their grasses, as the scene reads them.
 	kinds : [256]Grass_Kind
@@ -2351,7 +2373,7 @@ command_lod :: fun(name: []utf8, x: i64, y: i64) {
 		return
 	}
 	cell_land : Land
-	read_land(record.data, &cell_land)
+	read_land(&plugin, record, &cell_land)
 	piece_size := f32(LOD_CELLS * CELL_SIZE)
 	for point in [[4, 4], [16, 16], [28, 8], [8, 28], [20, 30]] {
 		column := point[0]

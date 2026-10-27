@@ -30,6 +30,14 @@ Oblivion.esm and the base game's archives; sizes are as stored.
 - **Land normal maps:** each layer's `_n`, blended as its colors are.
 - **Sound:** WAV files, SOUN records, placed sounds, light and activator
   sounds, door sounds.
+- **Plugins:** Oblivion.esm and the downloaded content DLCList.txt names
+  (Knights of the Nine, Battlehorn Castle, Frostcrag Spire, Thieves' Den,
+  Vile Lair, the Orrery, Mehrunes' Razor, the Spell Tomes, Horse Armor),
+  in the game's order (by when each file was written): their records over
+  the master's, form ids by place in the load order, a cell's references
+  from each file that places some. Their archives with the game's; the
+  Shivering Isles, already merged into this Oblivion.esm (its esp is
+  empty), take their meshes, textures and sounds from theirs.
 - **Music:** `Data\Music`'s Explore, Public and Dungeon tracks (MP3,
   decoded by mp3.mara), by the place's kind: an interior cell's XCMT, a
   world's SNAM (the cities public, Oblivion's planes dungeon), a region's
@@ -122,16 +130,12 @@ glow or opacity — their own, or an Idle's.
 | Item icons | ICON fields; `textures\menus\icons` (~1,160, each in three sizes) | |
 | Video | 9 Bink `.bik` | a closed codec; likely left out |
 
-### Plugins not loaded
+### Plugins and archives not used
 
-| What | Data |
-|---|---|
-| Shivering Isles | DLCShiveringIsles.esp; Meshes 3,017 files, Textures 1,869, Sounds 499, Voices 19,089 (430 MB) |
-| Knights of the Nine | Knights.esp/.bsa: 4,810 files (mostly voices) |
-| Small DLC | Battlehorn Castle, Frostcrag Spire, Thieves Den, Vile Lair, Orrery, Horse Armor, Mehrunes Razor, Spell Tomes |
-
-Loading these means plugins over the master: overriding records and new
-forms (load-order form ids), and their archives.
+| What | Data | Notes |
+|---|---|---|
+| The player's chosen plugins | `Plugins.txt` in their local app data | sooblivion loads what DLCList.txt names (all the DLC here); the path needs an environment variable Mara can't read yet |
+| Loose files | `Data\Textures` and the like | the game takes them over the archives' |
 
 ### To check against the game (a decompile, later)
 
@@ -161,6 +165,8 @@ guesses for now.
 - The weather through a gate: it goes on into a world of the same
   climate here (a city has its parent Tamriel's); another climate's
   world (an Oblivion realm) starts its own at once.
+- Which archive's file wins where two have one: the plugins' own here,
+  the last loaded first, then the master's.
 - Music: what an interior cell of the default type plays (Explore here);
   how loud it is beside the sounds (the Oblivion.ini here: 0.3 to 0.8);
   whether tracks have pauses between them (none here), and how a change
