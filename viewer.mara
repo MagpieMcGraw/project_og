@@ -29,6 +29,7 @@ use logging
 use mara.string
 use sdl_platform
 use audio
+use particles
 gl :: use mara.open_gl
 render :: use render
 
@@ -199,7 +200,7 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.weather_due = false
 	viewer.weather_seed = time_now() | 1
 	viewer.look = Sky_Look{state = Sky_State{0}, cloud_lower = 0, cloud_upper = 0, cloud_lower_last = 0, cloud_upper_last = 0,
-		weather_share = 1, sun = 0,
+		weather_share = 1, sun = 0, precipitation = [], last_precipitation = [],
 		cloud_lower_offset = 0, cloud_upper_offset = 0, outside = false, time = 0, water = DEFAULT_WATER, wind = 0}
 	viewer.water = DEFAULT_WATER
 	viewer.frame_start = time_now()
@@ -664,8 +665,8 @@ weathers_at_camera :: fun(viewer: ^Viewer, plugin: ^Plugin) -> bool {
 	if found.len == 0 do found = viewer.climate.weathers
 	same := found.len == viewer.weathers_here.len
 	if same {
-		for chance, k in found {
-			if chance.weather != viewer.weathers_here[k].weather do same = false
+		for possible, k in found {
+			if possible.weather != viewer.weathers_here[k].weather do same = false
 		}
 	}
 	viewer.weathers_here = found
@@ -692,6 +693,15 @@ change_weather :: fun(viewer: ^Viewer, plugin: ^Plugin, at_once: bool) {
 	viewer.last_weather = if at_once do weather else viewer.weather
 	look.cloud_lower_last = look.cloud_lower
 	look.cloud_upper_last = look.cloud_upper
+	look.last_precipitation = look.precipitation
+	rain_error := precipitation_of(viewer, &weather, &look.precipitation)
+	if rain_error {
+		note(&viewer.journal, "couldn't read a weather's rain or snow: ")
+		note_error(&viewer.journal, rain_error)
+		note_end(&viewer.journal)
+		look.precipitation.len = 0
+	}
+	if at_once do look.last_precipitation.len = 0
 	viewer.weather = weather
 	viewer.weather_share = if at_once do 1 else 0
 	look.cloud_lower = texture_for(&viewer.renderer, &viewer.textures, weather.cloud_lower[:], &room.texture)
@@ -704,6 +714,42 @@ change_weather :: fun(viewer: ^Viewer, plugin: ^Plugin, at_once: bool) {
 	note(&viewer.journal, editor_id_of(plugin, chosen)[:])
 	note(&viewer.journal, if at_once do "" else ", coming in")
 	note_end(&viewer.journal)
+}
+
+// A weather's rain or snow: its precipitation mesh's particle systems that
+// fall (sent downward), each as drops falling through a box round the
+// camera — as many as fall at once, at the system's speed, from its
+// emitter's height, as far as they fall in their life. Into layers.
+precipitation_of :: fun(viewer: ^Viewer, weather: ^Weather, layers: ^[]Precipitation_Layer) -> err {
+	layers.len = 0
+	if weather.precipitation.len == 0 do return
+	room := &viewer.room
+	index, found := find_file(&viewer.meshes, weather.precipitation[:])
+	if not found do return Not_In_Archive
+	room.file.len = 0
+	data := read_file(&viewer.meshes, index, &room.file)?
+	room.blocks.len = 0
+	failure := Nif_Failure{block = 0, type_name = room.file[0:0]}
+	mesh := read_nif(data, &room.blocks, &failure)?
+	room.model.len = 0
+	built := build_model(&mesh, &room.model)?
+	for &system in built.particles {
+		if layers.len == layers.cap do break
+		emitter := system.emitter
+		// (Only what falls: not the splashes and mist sent up.)
+		if emitter.declination < 2 or emitter.speed <= 0 or emitter.life_span <= 0 do continue
+		layer := next(layers)
+		layer.count = min(i64(fastest_birth_rate(system) * emitter.life_span), MAX_DROPS)
+		layer.width = max(emitter.size.x, emitter.size.y)
+		layer.top = system.emitter_place[3][2]
+		layer.speed = emitter.speed
+		layer.speed_variation = emitter.speed_variation
+		layer.fall = emitter.speed * emitter.life_span
+		layer.size = max(emitter.radius, 1)
+		layer.streak = emitter.speed > 400
+		layer.light = system.look.emissive
+		layer.texture = texture_for(&viewer.renderer, &viewer.textures, system.look.texture[:], &room.texture, system.look.clamp_mode)
+	}
 }
 
 // Where the camera hears from: its place, and its right.

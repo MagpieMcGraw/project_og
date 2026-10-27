@@ -376,6 +376,95 @@ void main() {
 }
 "
 
+// Rain and snow: each drop a square made from its number alone — where it
+// is across the box round the camera (fixed in the world, the pattern
+// repeating every box side, so the box follows the camera), how far it has
+// fallen (round and round, at its speed), its streak or flake — faded toward
+// the box's sides and ends. No vertices are read.
+PRECIPITATION_VERTEX_SHADER :: "
+uniform mat4 view_projection;
+uniform vec3 camera_position;
+uniform vec3 camera_right;
+uniform vec3 camera_up;
+uniform float time;
+uniform vec3 box;          // its side, how high above the camera drops start, how far they fall
+uniform float speed;       // how fast they fall
+uniform vec3 drop;         // how far off that a drop's speed may be, a drop's size, streaks (1) or flakes (0)
+
+out vec2 texture_uv;
+out float fade;
+out vec3 world_position;
+
+// A number from 0 up to 1 for a drop and which of its values.
+float chance(uint index, uint which) {
+	uint n = index * 4u + which;
+	n = (n ^ 61u) ^ (n >> 16u);
+	n *= 9u;
+	n = n ^ (n >> 4u);
+	n *= 0x27d4eb2du;
+	n = n ^ (n >> 15u);
+	return float(n & 0xFFFFFFu) / 16777216.0;
+}
+
+const vec2 corners[6] = vec2[6](vec2(-1.0, -1.0), vec2(1.0, -1.0), vec2(1.0, 1.0), vec2(-1.0, -1.0), vec2(1.0, 1.0), vec2(-1.0, 1.0));
+
+void main() {
+	uint index = uint(gl_VertexID / 6);
+	vec2 corner = corners[gl_VertexID % 6];
+	float its_speed = speed + drop.x * (chance(index, 3u) * 2.0 - 1.0);
+	vec2 across = vec2(chance(index, 0u), chance(index, 1u)) * box.x;
+	vec2 near = mod(across - camera_position.xy, box.x) - box.x * 0.5;
+	float fallen = mod(chance(index, 2u) * box.z + time * its_speed, box.z);
+	vec3 center = vec3(camera_position.xy + near, camera_position.z + box.y - fallen);
+	vec3 right;
+	vec3 up;
+	if (drop.z > 0.5) {
+		// A streak: upright, facing the eye about its fall, as long as it
+		// falls in a fortieth of a second.
+		vec3 side = cross(vec3(0.0, 0.0, 1.0), camera_position - center);
+		right = (length(side) > 0.001 ? normalize(side) : camera_right) * drop.y;
+		up = vec3(0.0, 0.0, max(its_speed / 40.0, drop.y));
+	} else {
+		// A flake: facing the camera, drifting.
+		center.xy += vec2(sin(time * 0.9 + chance(index, 0u) * 40.0), cos(time * 0.7 + chance(index, 1u) * 40.0)) * 12.0;
+		right = camera_right * drop.y;
+		up = camera_up * drop.y;
+	}
+	world_position = center + right * corner.x + up * corner.y;
+	texture_uv = corner * vec2(0.5, -0.5) + 0.5;
+	fade = (1.0 - smoothstep(0.3, 0.5, length(near) / box.x)) * smoothstep(0.0, 0.1, fallen / box.z)
+		* (1.0 - smoothstep(0.85, 1.0, fallen / box.z));
+	gl_Position = view_projection * vec4(world_position, 1.0);
+}
+"
+
+PRECIPITATION_FRAGMENT_SHADER :: "
+in vec2 texture_uv;
+in float fade;
+in vec3 world_position;
+
+uniform sampler2D drop_texture;
+uniform vec3 light;        // what it's lit by, its own light with the ambient
+uniform float strength;    // how much of it falls now, as its weather comes in or goes
+uniform vec3 camera_position;
+uniform vec3 fog_color;
+uniform float fog_near;
+uniform float fog_far;
+
+out vec4 fragment_color;
+
+void main() {
+	vec4 color = texture(drop_texture, texture_uv);
+	color.rgb *= light;
+	color.a *= fade * strength;
+	if (fog_far > fog_near) {
+		float fog = clamp((length(world_position - camera_position) - fog_near) / (fog_far - fog_near), 0.0, 1.0);
+		color.rgb = mix(color.rgb, fog_color, fog);
+	}
+	fragment_color = color;
+}
+"
+
 LAND_VERTEX_SHADER :: "
 layout(location = 0) in vec3 position;
 layout(location = 1) in vec3 normal;
@@ -988,6 +1077,43 @@ Particle_Run :: struct {
 	square_count: i64
 }
 
+// Rain or snow round the camera, as one of a weather's precipitation
+// mesh's particle systems has it: drops falling through a box that follows
+// the camera — how many, the box's side, how high above the camera they
+// start and how far they fall, how fast (and how far off that a drop may
+// be), how big; drawn as streaks along their fall (rain) or as flakes
+// facing the camera (snow); their texture and own light.
+Precipitation_Layer :: struct {
+	texture: i64
+	count: i64
+	width: f32
+	top: f32
+	fall: f32
+	speed: f32
+	speed_variation: f32
+	size: f32
+	streak: bool
+	light: Vec3
+}
+
+// A weather's precipitation layers, at most; a layer's drops, at most.
+PRECIPITATION_LAYERS :: 3
+MAX_DROPS :: 24000
+
+// The precipitation program, and where its uniforms are.
+Precipitation_Program :: struct {
+	program: u32
+	shared: Shared_Uniforms
+	camera_right_at: i32
+	camera_up_at: i32
+	time_at: i32
+	box_at: i32
+	speed_at: i32
+	drop_at: i32
+	light_at: i32
+	strength_at: i32
+}
+
 // The particle program, and where its uniforms are.
 Particle_Program :: struct {
 	program: u32
@@ -1060,6 +1186,9 @@ Sky_Look :: struct {
 	cloud_upper_last: i64
 	weather_share: f32
 	sun: i64
+	// The coming weather's rain or snow, and the last one's, going.
+	precipitation: [PRECIPITATION_LAYERS]Precipitation_Layer
+	last_precipitation: [PRECIPITATION_LAYERS]Precipitation_Layer
 	cloud_lower_offset: f32
 	cloud_upper_offset: f32
 	outside: bool        // the sky is drawn only outside
@@ -1339,6 +1468,7 @@ Renderer :: struct {
 	sky_program: Sky_Program
 	water_program: Water_Program
 	particle_program: Particle_Program
+	precipitation_program: Precipitation_Program
 	anisotropy: f32
 
 	// The sky's triangle reads nothing but needs a vertex array; the water's
@@ -1483,6 +1613,7 @@ renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
 	make_tree_program(&renderer.tree_programs[0], false)?
 	make_grass_program(&renderer.grass_programs[0], false)?
 	make_particle_program(&renderer.particle_program)?
+	make_precipitation_program(&renderer.precipitation_program)?
 	if renderer.bindless_available {
 		make_tree_program(&renderer.tree_programs[1], true)?
 		make_grass_program(&renderer.grass_programs[1], true)?
@@ -1623,6 +1754,20 @@ make_particle_program :: fun(made: ^Particle_Program) -> err {
 	made.depth_range_at = GetUniformLocation(made.program, "depth_range")
 	UseProgram(made.program)
 	Uniform1i(GetUniformLocation(made.program, "scene_depth"), 2)
+}
+
+make_precipitation_program :: fun(made: ^Precipitation_Program) -> err {
+	made.program = compile_program(PRECIPITATION_VERTEX_SHADER, PRECIPITATION_FRAGMENT_SHADER, false)?
+	program := made.program
+	made.shared = find_shared_uniforms(program)
+	made.camera_right_at = GetUniformLocation(program, "camera_right")
+	made.camera_up_at = GetUniformLocation(program, "camera_up")
+	made.time_at = GetUniformLocation(program, "time")
+	made.box_at = GetUniformLocation(program, "box")
+	made.speed_at = GetUniformLocation(program, "speed")
+	made.drop_at = GetUniformLocation(program, "drop")
+	made.light_at = GetUniformLocation(program, "light")
+	made.strength_at = GetUniformLocation(program, "strength")
 }
 
 make_land_program :: fun(made: ^Land_Program, bindless: bool) -> err {
@@ -3000,6 +3145,7 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 	if waters.len > 0 do draw_water(renderer, waters, &planes, look, view_projection, lighting, camera, &stats)
 	draw_mesh_runs(renderer, view_projection, lighting, sun, camera, true, soft, &stats)
 	draw_particles(renderer, models, instances, view_projection, lighting, sun, camera, look.time, soft, &stats)
+	if look.outside do draw_precipitation(renderer, look, view_projection, lighting, sun, camera, &stats)
 
 	DepthMask(1)
 	Disable(BLEND)
@@ -3569,6 +3715,46 @@ draw_particles :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]I
 	DepthMask(1)
 	Disable(BLEND)
 	Enable(CULL_FACE)
+}
+
+// Draws the rain or snow round the camera: the last weather's, going, and
+// the coming one's, coming in (by how far the weather has come).
+draw_precipitation :: fun(renderer: ^Renderer, look: ^Sky_Look, view_projection: Mat4, lighting: Cell_Lighting, sun: Vec3,
+	camera: Camera, stats: ^Frame_Stats)
+{
+	if look.precipitation.len == 0 and look.last_precipitation.len == 0 do return
+	made := &renderer.precipitation_program
+	UseProgram(made.program)
+	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
+	_, camera_right, camera_up := camera_axes(camera)
+	Uniform3f(made.camera_right_at, camera_right.x, camera_right.y, camera_right.z)
+	Uniform3f(made.camera_up_at, camera_up.x, camera_up.y, camera_up.z)
+	Uniform1f(made.time_at, look.time)
+	BindVertexArray(renderer.empty_vertex_array)
+	Enable(BLEND)
+	BlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
+	DepthMask(0)
+	Disable(CULL_FACE)
+	ActiveTexture(TEXTURE0)
+	for layer in look.last_precipitation do draw_precipitation_layer(renderer, layer, 1 - look.weather_share, lighting, stats)
+	for layer in look.precipitation do draw_precipitation_layer(renderer, layer, look.weather_share, lighting, stats)
+	DepthMask(1)
+	Disable(BLEND)
+	Enable(CULL_FACE)
+}
+
+draw_precipitation_layer :: fun(renderer: ^Renderer, layer: Precipitation_Layer, strength: f32, lighting: Cell_Lighting, stats: ^Frame_Stats) {
+	if strength <= 0.001 or layer.count == 0 do return
+	made := &renderer.precipitation_program
+	Uniform3f(made.box_at, layer.width, layer.top, layer.fall)
+	Uniform1f(made.speed_at, layer.speed)
+	Uniform3f(made.drop_at, layer.speed_variation, layer.size, if layer.streak do 1 else 0)
+	light := layer.light + lighting.ambient
+	Uniform3f(made.light_at, light.x, light.y, light.z)
+	Uniform1f(made.strength_at, strength)
+	BindTexture(TEXTURE_2D, renderer.textures[layer.texture].id)
+	DrawArrays(TRIANGLES, 0, i32(layer.count * 6))
+	stats.draw_calls += 1
 }
 
 // Sorts keys, smallest first (Shell's sort: a few thousand at most).
