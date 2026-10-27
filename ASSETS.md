@@ -47,15 +47,20 @@ Oblivion.esm and the base game's archives; sizes are as stored.
 
 ### World and sky
 
+Played now: weathers chosen by region (the cell's XCLR) or climate,
+changing over game hours and blending in; rain and snow from the
+weathers' precipitation meshes; stars, nebula, Masser and Secunda in
+their phases, the sun's glare; weather sounds (rain, wind, thunder with
+lightning) and the regions' sounds (birds, insects, wind).
+
 | What | Data | Notes |
 |---|---|---|
-| 3D trees | 113 SpeedTree `.spt`; `textures\trees\branches` 90, `leaves` 78 | near trees are billboards now |
-| Regions | REGN 211 | ambient sounds, per-region weather chances, map colors |
-| Weather changes | CLMT weather lists, WTHR transitions | only the likeliest weather is shown, never changing |
-| Rain, snow, lightning | `meshes\sky\rainheavy`, `rainlight`, `snow`; WTHR precipitation, lightning, thunder | |
-| Stars, moons, sun glare, sunbeams | `meshes\sky\stars.nif`, moon textures, CLMT sun glare, `sunbeam01–03.nif` | |
-| Weather sounds, HDR | WTHR SNAM; WTHR HNAM | |
+| 3D trees | 113 SpeedTree `.spt`; `textures	reesranches` 90, `leaves` 78 | near trees are billboards now |
+| Sunbeams | `sunbeam01–03.nif` | |
+| HDR (eye adapting, bloom) | WTHR HNAM | |
 | Water reflections | — | framebuffers are in now; left for later earlier |
+| Region music, region map colors | RDMD, RCLR | music needs MP3 |
+| Rain kept off under roofs | — | it falls through them now |
 | `.cmp` files | 55 in `distantlod` | purpose not known yet |
 
 ### Animation on objects
@@ -95,7 +100,6 @@ glow or opacity — their own, or an Idle's.
 | What | Data | Notes |
 |---|---|---|
 | Music | `Data\Music`: 28 `.mp3` (Explore, Public, Dungeon, Battle, Special) | needs an MP3 decoder (shared with voices) |
-| Outdoor ambience | REGN sound lists | wind, birds, insects by region, weather and time |
 | Footsteps | — | by surface material |
 | Creature, magic, menu sounds | CREA sound lists; MGEF sounds; 12 menu SOUNs | with actors and UI |
 

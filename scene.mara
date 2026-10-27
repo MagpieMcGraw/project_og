@@ -397,12 +397,20 @@ scene_sound_kind :: fun(scene: ^Scene, plugin: ^Plugin, form_id: u32) -> i64 {
 	return index
 }
 
+// The kind of sound a SOUN record makes, if it has been read: its index in
+// the scene's sound kinds; -1 when it hasn't, or it's none.
+scene_sound_kind_known :: fun(scene: ^Scene, form_id: u32) -> i64 {
+	known, found := index_get(&scene.sound_kind_index, u64(form_id))
+	if not found do return -1
+	return known - 1
+}
+
 // A sound placed where a reference is: the sound of a SOUN record.
 add_placed_sound :: fun(scene: ^Scene, plugin: ^Plugin, sound: u32, reference: Reference) {
 	kind := scene_sound_kind(scene, plugin, sound)
 	if kind < 0 or scene.sounds.len == scene.sounds.cap do return
 	&scene.sounds + Placed_Sound{kind = scene.sound_kinds[kind], position = reference.position,
-		key = u64(reference.form_id), next_play = 0}
+		key = u64(reference.form_id), next_play = 0, volume = 1}
 }
 
 // The sounds a door makes opening (its SNAM) and closing (ANAM), if any.

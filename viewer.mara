@@ -69,6 +69,17 @@ HURRIED_TIME_SCALE :: 2000
 // The room the sounds' clips are loaded into.
 SOUND_ROOM :: 64 * MB
 
+// Region sounds are tried this often (seconds); thunder's chance each
+// second, by the weather's (0 to 1); a lightning flash fades this fast.
+REGION_SOUND_TRY :: 2
+THUNDER_CHANCE :: 0.25
+LIGHTNING_FADE :: 4
+
+// Weather sounds' keys: high bits no reference's form id has; the last
+// weather's apart from the coming one's.
+WEATHER_SOUND_KEY :: 0x7000000000000000
+LAST_WEATHER_BIT :: 0x0100000000000000
+
 // The moons' sizes on the sky (across, as a share of the way to the
 // horizon); the days the stars take to turn round.
 MASSER_SIZE :: 0.3
@@ -116,6 +127,17 @@ Viewer :: struct {
 	weather_seed: u64
 	day: i64            // the game's days gone, for the moons' phases
 	moon_phase: i64     // the phase whose pictures are on the card (-1: none yet)
+	// The weather's sounds: its rain's and wind's loops (heard everywhere,
+	// as loud as the weather has come in), and the last weather's, going;
+	// the sounds the regions here make now and then (birds, insects), and
+	// when they're next tried (the mix's seconds); when thunder's next tried,
+	// and a lightning flash's brightness now, fading.
+	weather_sounds: [8]Placed_Sound
+	last_weather_sounds: [8]Placed_Sound
+	region_sounds: [32]Region_Sound
+	region_sounds_tried: f64
+	thunder_tried: f64
+	lightning: f32
 	sky_world: u32      // the world they're of, 0 for none yet
 	hour: f32
 	look: Sky_Look
@@ -209,6 +231,12 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.weather_seed = time_now() | 1
 	viewer.day = 0
 	viewer.moon_phase = -1
+	viewer.weather_sounds.len = 0
+	viewer.last_weather_sounds.len = 0
+	viewer.region_sounds.len = 0
+	viewer.region_sounds_tried = 0
+	viewer.thunder_tried = 0
+	viewer.lightning = 0
 	viewer.look = Sky_Look{state = Sky_State{0}, cloud_lower = 0, cloud_upper = 0, cloud_lower_last = 0, cloud_upper_last = 0,
 		weather_share = 1, sun = 0, precipitation = [], last_precipitation = [],
 		stars = 0, nebula = 0, stars_turn = 0, masser = 0, secunda = 0, masser_direction = Vec3{0, 0, -1},
@@ -407,7 +435,18 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		viewer.told_framebuffer = true
 	}
 	draw_reticle(platform.width, platform.height, usable)
-	hear(&viewer.audio, &viewer.sounds, &shown.sounds, listener_of(camera^), viewer.hour, f64(time_now()) / 1000000000)
+	heard_at := f64(time_now()) / 1000000000
+	listener := listener_of(camera^)
+	hear_start(&viewer.audio)
+	hear_sounds(&viewer.audio, &viewer.sounds, &shown.sounds, listener, viewer.hour, heard_at)
+	if viewer.look.outside {
+		for &sound in viewer.weather_sounds do sound.volume = viewer.weather_share
+		for &sound in viewer.last_weather_sounds do sound.volume = 1 - viewer.weather_share
+		hear_sounds(&viewer.audio, &viewer.sounds, &viewer.weather_sounds, listener, viewer.hour, heard_at)
+		hear_sounds(&viewer.audio, &viewer.sounds, &viewer.last_weather_sounds, listener, viewer.hour, heard_at)
+		outdoor_sounds(viewer, listener, heard_at)
+	}
+	hear_finish(&viewer.audio)
 	mix_ahead(&viewer.audio)
 	card_start := time_now()
 	viewer.drawing_time = card_start - drawing_start
@@ -611,9 +650,80 @@ pass_time :: fun(viewer: ^Viewer, seconds: f32, hurried: bool) {
 	look.wind = mix_number(viewer.last_weather.wind_speed, viewer.weather.wind_speed, viewer.weather_share)
 	look.cloud_lower_offset += seconds * scale / TIME_SCALE * viewer.weather.cloud_speed_lower
 	look.cloud_upper_offset += seconds * scale / TIME_SCALE * viewer.weather.cloud_speed_upper
+	// A lightning flash, in its color, fading.
+	if viewer.lightning > 0 {
+		flash := viewer.weather.lightning_color * viewer.lightning
+		look.state.upper = look.state.upper + flash * 0.6
+		look.state.lower = look.state.lower + flash * 0.4
+		look.state.horizon = look.state.horizon + flash * 0.5
+		look.state.cloud_lower_color = look.state.cloud_lower_color + flash * 0.7
+		look.state.cloud_upper_color = look.state.cloud_upper_color + flash * 0.7
+		look.state.lighting.ambient = look.state.lighting.ambient + flash * 0.35
+		viewer.lightning = max(0, viewer.lightning - seconds * LIGHTNING_FADE)
+	}
 	shown.lighting = look.state.lighting
 	look.water = lit_water(viewer.water, look.state.lighting.ambient + look.state.lighting.directional * 0.6)
 	move_night_sky(viewer)
+}
+
+// Outside, what's heard now and then: the regions' sounds, each tried every
+// REGION_SOUND_TRY seconds by its chance (in the weathers it's for, within
+// its hours), from somewhere round the camera; and thunder, as often as
+// the weather has it once it has mostly come in, with a lightning flash.
+outdoor_sounds :: fun(viewer: ^Viewer, listener: Listener, now: f64) {
+	shown := &viewer.shown
+	if now >= viewer.region_sounds_tried + REGION_SOUND_TRY {
+		viewer.region_sounds_tried = now
+		for &region_sound in viewer.region_sounds {
+			if viewer.weather.classification & region_sound.weathers == 0 do continue
+			if random_share(&viewer.weather_seed) >= region_sound.chance do continue
+			// (Its kind was read when the regions were: in the scene's kinds.)
+			kind_index := scene_sound_kind_known(shown, region_sound.sound)
+			if kind_index < 0 do continue
+			kind := &shown.sound_kinds[kind_index]
+			if not plays_at_hour(kind, viewer.hour) do continue
+			turn := random_share(&viewer.weather_seed) * 6.2831853
+			away := 300 + random_share(&viewer.weather_seed) * 1200
+			place := listener.position + Vec3{cos_f32(turn) * away, sin_f32(turn) * away, random_share(&viewer.weather_seed) * 400}
+			play_once(&viewer.audio, &viewer.sounds, kind, place, listener)
+		}
+	}
+	if viewer.weather.thunder > 0 and viewer.weather_share > 0.5 and now >= viewer.thunder_tried + 1 {
+		viewer.thunder_tried = now
+		if random_share(&viewer.weather_seed) < viewer.weather.thunder * THUNDER_CHANCE {
+			viewer.lightning = 1
+			for sound in viewer.weather.sounds {
+				if sound.role != WEATHER_SOUND_THUNDER do continue
+				kind_index := scene_sound_kind_known(shown, sound.sound)
+				if kind_index < 0 do continue
+				thunder := shown.sound_kinds[kind_index]
+				thunder.flags |= SOUND_2D
+				play_once(&viewer.audio, &viewer.sounds, &thunder, listener.position, listener)
+				break
+			}
+		}
+	}
+}
+
+// The weather sounds a weather makes all along: its rain's and wind's,
+// heard everywhere (whatever their own flags say). Into sounds; their
+// kinds read into the scene's.
+weather_sound_list :: fun(viewer: ^Viewer, plugin: ^Plugin, weather: ^Weather, sounds: ^[]Placed_Sound, list_bit: u64) {
+	sounds.len = 0
+	for sound in weather.sounds {
+		if sound.role != WEATHER_SOUND_PRECIPITATION and sound.role != WEATHER_SOUND_WIND do continue
+		kind_index := scene_sound_kind(&viewer.shown, plugin, sound.sound)
+		if kind_index < 0 or sounds.len == sounds.cap do continue
+		kind := viewer.shown.sound_kinds[kind_index]
+		kind.flags |= SOUND_2D
+		// (Keys apart from the references': a weather's own.)
+		sounds + Placed_Sound{kind = kind, position = Vec3{0, 0, 0}, key = WEATHER_SOUND_KEY | list_bit | u64(sound.sound),
+			next_play = 0, volume = 0}
+	}
+	// Its thunder's kinds, read now so the thunder needs no reading.
+	for sound in weather.sounds {
+		if sound.role == WEATHER_SOUND_THUNDER do _ = scene_sound_kind(&viewer.shown, plugin, sound.sound)
+	}
 }
 
 // The moons' phases, in turn, by their pictures' names.
@@ -750,6 +860,15 @@ weathers_at_camera :: fun(viewer: ^Viewer, plugin: ^Plugin) -> bool {
 		found.len = 0
 	}
 	if found.len == 0 do found = viewer.climate.weathers
+	// The regions' sounds here, their kinds read.
+	sounds_error := cell_region_sounds(plugin, viewer.shown.world, x, y, &viewer.region_sounds, &scratch)
+	if sounds_error {
+		note(&viewer.journal, "couldn't read the regions' sounds here: ")
+		note_error(&viewer.journal, sounds_error)
+		note_end(&viewer.journal)
+		viewer.region_sounds.len = 0
+	}
+	for &region_sound in viewer.region_sounds do _ = scene_sound_kind(&viewer.shown, plugin, region_sound.sound)
 	same := found.len == viewer.weathers_here.len
 	if same {
 		for possible, k in found {
@@ -781,6 +900,10 @@ change_weather :: fun(viewer: ^Viewer, plugin: ^Plugin, at_once: bool) {
 	look.cloud_lower_last = look.cloud_lower
 	look.cloud_upper_last = look.cloud_upper
 	look.last_precipitation = look.precipitation
+	viewer.last_weather_sounds = viewer.weather_sounds
+	for &sound in viewer.last_weather_sounds do sound.key |= LAST_WEATHER_BIT
+	weather_sound_list(viewer, plugin, &weather, &viewer.weather_sounds, 0)
+	if at_once do viewer.last_weather_sounds.len = 0
 	rain_error := precipitation_of(viewer, &weather, &look.precipitation)
 	if rain_error {
 		note(&viewer.journal, "couldn't read a weather's rain or snow: ")

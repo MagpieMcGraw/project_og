@@ -297,25 +297,39 @@ play_once :: fun(audio: ^Mixer, archive: ^Archive, kind: ^Sound_Kind, position: 
 }
 
 // A sound placed in the scene, as the audio hears it: what it is, where, its
-// key (the voice playing it is found by it), and when it next plays (a sound
-// that doesn't loop: in the mix's seconds).
+// key (the voice playing it is found by it), when it next plays (a sound
+// that doesn't loop: in the mix's seconds), and how loud it is now (a
+// share of its loudness: a weather's rain as the weather comes in).
 Placed_Sound :: struct {
 	kind: Sound_Kind
 	position: Vec3
 	key: u64
 	next_play: f64
+	volume: f32
 }
 
-// Hears the placed sounds from the listener at an hour: starts the loops
-// in hearing range (and the others when their pause is over), moves the
-// playing ones' gains to where they are now, and fades out the voices whose
-// sound is gone or out of range. The time is the mix's, in seconds.
-hear :: fun(audio: ^Mixer, archive: ^Archive, sounds: ^[]Placed_Sound, listener: Listener, hour: f32, now: f64) {
-	if not audio.open do return
+// Hearing a frame's sounds: hear_start, then hear_sounds for each list of
+// them, then hear_finish fades out the voices whose sound is gone or out
+// of range.
+hear_start :: fun(audio: ^Mixer) {
 	for &voice in audio.voices do voice.wanted = voice.source == 0
+}
+
+hear_finish :: fun(audio: ^Mixer) {
+	for &voice in audio.voices {
+		if not voice.wanted do voice.targets = [0, 0]
+	}
+}
+
+// Hears placed sounds from the listener at an hour: starts the loops in
+// hearing range (and the others when their pause is over), and moves the
+// playing ones' gains to where they are now. The time is the mix's, in
+// seconds.
+hear_sounds :: fun(audio: ^Mixer, archive: ^Archive, sounds: ^[]Placed_Sound, listener: Listener, hour: f32, now: f64) {
+	if not audio.open do return
 	for &sound in sounds {
 		loud : f32 = 0
-		if plays_at_hour(&sound.kind, hour) do loud = loudness(&sound.kind, vec3_length(sound.position - listener.position))
+		if plays_at_hour(&sound.kind, hour) do loud = loudness(&sound.kind, vec3_length(sound.position - listener.position)) * sound.volume
 		if loud <= 0.001 do continue
 		gains := side_gains(&sound.kind, sound.position, listener, loud)
 		playing : i64 = -1
@@ -342,9 +356,6 @@ hear :: fun(audio: ^Mixer, archive: ^Archive, sounds: ^[]Placed_Sound, listener:
 			continue
 		}
 		_ = start_voice(audio, &sound.kind, clip_index, sound.key, gains, looping)
-	}
-	for &voice in audio.voices {
-		if not voice.wanted do voice.targets = [0, 0]
 	}
 }
 

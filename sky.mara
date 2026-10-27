@@ -219,6 +219,42 @@ region_weather_priority :: fun(plugin: ^Plugin, region: u32) -> i64, err {
 	return -1
 }
 
+// A sound a region makes now and then: which (its form id), in what
+// weathers (WEATHER_* bits), how likely each try (0 to 1).
+Region_Sound :: struct {
+	sound: u32
+	weathers: u32
+	chance: f32
+}
+
+// The sounds an exterior cell's regions make now and then (their RDSD
+// lists: each a sound, its weathers, its chance in ten-millionths of a
+// try), into sounds.
+cell_region_sounds :: fun(plugin: ^Plugin, world_id: u32, x: i64, y: i64, sounds: ^[]Region_Sound, scratch: ^[]byte) -> err {
+	sounds.len = 0
+	cell := exterior_cell(plugin, world_id, x, y)
+	if cell == 0 do return
+	cell_record := find_record(plugin, cell, scratch)?
+	regions, has_regions := find_field(cell_record.data, "XCLR")
+	if not has_regions do return
+	for k in 0:regions.len / 4 {
+		region : u32 = regions[k * 4]
+		region_scratch : [65536]byte
+		record := find_record(plugin, region, &region_scratch)?
+		fields := Fields{data = record.data, at = 0, broken = false}
+		for field in next_field(&fields) {
+			if field.kind != "RDSD" do continue
+			for e in 0:field.data.len / 12 {
+				if sounds.len == sounds.cap do return
+				sound : u32 = field.data[e * 12]
+				weathers : u32 = field.data[e * 12 + 4]
+				chance : u32 = field.data[e * 12 + 8]
+				sounds + Region_Sound{sound = sound, weathers = weathers, chance = f32(chance) / 10000000}
+			}
+		}
+	}
+}
+
 // A mesh's archive path from a record's: meshes\…, lower case.
 mesh_path_of :: fun(name: []utf8, path: ^[160]utf8) {
 	path.len = 0

@@ -1701,6 +1701,20 @@ command_sky :: fun(name: []utf8) {
 		if region_error do print("  at %: couldn't read its regions: %", place, region_error)
 		elif chances.len == 0 do print("  at %: the climate's", place)
 		else do print("  at %: %", place, line)
+		sounds : [32]Region_Sound
+		sounds_error := cell_region_sounds(&plugin, world_id, place[0], place[1], &sounds, &scratch)
+		if sounds_error do print("    couldn't read its sounds: %", sounds_error)
+		sound_line : str1024
+		for sound in sounds {
+			&sound_line + editor_id_of(&plugin, sound.sound)[:]
+			&sound_line + " ("
+			&sound_line + int_text(i64(sound.weathers))[:]
+			&sound_line + ", "
+			&sound_line + int_text(i64(sound.chance * 100))[:]
+			&sound_line + "%)  "
+			if sound_line.len > 900 do break
+		}
+		print("    sounds: %", sound_line)
 	}
 	for hour in [0, 5, 7, 8, 9, 12, 16, 17, 18, 19, 21] {
 		state := sky_at(climate, &weather, f32(hour), 10240)
