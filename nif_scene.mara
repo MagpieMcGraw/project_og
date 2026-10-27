@@ -192,29 +192,70 @@ read_tri_strips_data :: fun(reader: ^Nif_Reader) -> Block {
 
 // NiSkinInstance: which bones a skinned mesh follows.
 read_skin_instance :: fun(reader: ^Nif_Reader) -> Block {
-	_ = read_ref(reader)   // skin data
+	data := read_ref(reader)
 	if reader.version >= VERSION_10_1_0_101 do _ = read_ref(reader)   // skin partition
 	_ = read_ref(reader)   // skeleton root
-	skip_refs(reader)      // bones
-	return .Other
+	bones := read_refs(reader)
+	return Skin_Instance{data = data, bones = bones}
 }
 
-// A transform as NiSkinData writes it: rotation, translation, scale.
+// A transform as NiSkinData writes it: rotation (9 floats, row by row),
+// translation, scale.
 TRANSFORM_SIZE :: 52
 
 // NiSkinData: each bone's place, and the vertices it moves by how much.
 read_skin_data :: fun(reader: ^Nif_Reader) -> Block {
+	transform_at := reader.at
 	skip(reader, TRANSFORM_SIZE)   // the skin's transform
 	bone_count := i64(read_u32(reader))
 	if reader.version <= VERSION_10_1_0_0 do _ = read_ref(reader)   // skin partition
 	has_weights := read_bool(reader)
+	bones_at := reader.at
 	for b in 0:bone_count {
 		skip(reader, TRANSFORM_SIZE)   // the bone's transform
 		skip(reader, 16)               // a sphere around its vertices
 		vertex_count := i64(read_u16(reader))
 		if has_weights do skip(reader, vertex_count * 6)   // vertex index u16, weight f32
 	}
-	return .Other
+	if reader.broken do return .Other
+	return Skin_Data{transform = transform_at_bytes(reader.data, transform_at), bone_count = bone_count,
+		has_weights = has_weights, bones = reader.data[bones_at : reader.at]}
+}
+
+// A NiTransform in bytes (as NiSkinData has them) as a matrix: turned,
+// scaled, then moved.
+transform_at_bytes :: fun(data: []byte, at: i64) -> Mat4 {
+	m := mat4_identity()
+	scale : f32 = data[at + 48]
+	for column in 0:3 {
+		for row in 0:3 {
+			value : f32 = data[at + (row * 3 + column) * 4]
+			m[column][row] = value * scale
+		}
+	}
+	translation : Vec3 = data[at + 36]
+	m.w.x = translation.x
+	m.w.y = translation.y
+	m.w.z = translation.z
+	return m
+}
+
+// One bone of a skin's data: its transform from the skin's space into
+// its own, and its vertices' weights (each a vertex index, u16, and a
+// weight, f32), from where the bone's bytes start in Skin_Data.bones;
+// where the next bone's start.
+Skin_Bone :: struct {
+	transform: Mat4
+	weights: []byte
+	next_at: i64
+}
+
+skin_bone_at :: fun(bones: []byte, at: i64, has_weights: bool) -> Skin_Bone {
+	transform := transform_at_bytes(bones, at)
+	vertex_count : u16 = bones[at + TRANSFORM_SIZE + 16]
+	weights_at := at + TRANSFORM_SIZE + 18
+	size := if has_weights do i64(vertex_count) * 6 else 0
+	return Skin_Bone{transform = transform, weights = bones[weights_at : weights_at + size], next_at = weights_at + size}
 }
 
 // NiSkinPartition: a skinned mesh cut into parts that each need few bones.

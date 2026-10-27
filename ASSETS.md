@@ -30,6 +30,13 @@ Oblivion.esm and the base game's archives; sizes are as stored.
 - **Land normal maps:** each layer's `_n`, blended as its colors are.
 - **Sound:** WAV files, SOUN records, placed sounds, light and activator
   sounds, door sounds.
+- **NPCs, standing:** the people placed (ACHR), each put together from
+  their race's body (its textures on the shared meshes) and head parts,
+  their eyes and hair (tinted by their hair color), a tail for the beast
+  races, and what they wear (the clothes and armor they carry, leveled
+  lists taken at level 10, one item to a slot) — skinned to their skeleton
+  (NiSkinInstance, NiSkinData) and posed as `idle.kf` starts (its B-spline
+  keys read), as tall as their race.
 - **Plugins:** Oblivion.esm and the downloaded content DLCList.txt names
   (Knights of the Nine, Battlehorn Castle, Frostcrag Spire, Thieves' Den,
   Vile Lair, the Orrery, Mehrunes' Razor, the Spell Tomes, Horse Armor),
@@ -51,13 +58,11 @@ Oblivion.esm and the base game's archives; sizes are as stored.
 
 | What | Data | Notes |
 |---|---|---|
-| NPCs placed | ACHR 2,190; NPC_ 2,482 | none drawn |
-| Bodies and skinning | NiSkinInstance/Data/Partition in 731 meshes; `meshes\characters` | skinned meshes need a skeleton and bone matrices |
+| NPCs moving | IDLE 650, AI packages | they stand in their idle's first pose |
 | Heads (FaceGen) | `.egm` 141, `.tri` 85, `.egt` 20; `textures\faces` 3,854 (each NPC's face tint) | morphs per NPC from NPC_ FaceGen data |
-| Hair, eyes | HAIR 57, EYES 13, RACE 15 | |
-| Worn clothing, armor | ARMO 996, CLOT 604 (their worn models, male and female) | only their ground models are drawn now |
+| Weapons and shields worn | WEAP, their models on the back or side | |
 | Creatures | ACRE 1,473 placed; CREA 914; 34 creature folders | none drawn |
-| Animations | `.kf` 1,843 (creatures 1,068, characters 775); IDLE 650 | idles, walking; needs skinning first |
+| Animations | `.kf` 1,843 (creatures 1,068, characters 775); IDLE 650 | read (B-splines too); NPCs posed by idle.kf's start, nothing plays yet |
 | Voices | Voices1/2 BSAs: 38,898 `.mp3` + `.lip`, 1.7 GB; DIAL 3,817, INFO 19,278 | mp3.mara decodes them (checked against ffmpeg); `.lip` drives FaceGen mouth morphs |
 
 ### World and sky
@@ -169,6 +174,10 @@ guesses for now.
   behind a wall's collision (the castles' tower walls close their
   collision over their load doors' doorways). The game may aim at what's
   drawn instead.
+- NPCs' gear: leveled lists taken at level 10 here, one entry picked by
+  the NPC and the list (the game picks at random by the player's level);
+  enable parents (XESP) aren't followed, so NPCs a quest brings in later
+  stand there already.
 - Which archive's file wins where two have one: the plugins' own here,
   the last loaded first, then the master's.
 - Music: what an interior cell of the default type plays (Explore here);

@@ -1,0 +1,522 @@
+// NPCs: the people placed in cells (ACHR), each put together as the game
+// does — their race's body and head, their hair and eyes, what they wear —
+// skinned to their skeleton and posed as its idle animation starts, then
+// made one model, which every placement of the NPC shares.
+//
+// Not yet: their faces' own shapes and tints (FaceGen), hair colors, and
+// moving.
+module scene
+
+use mara.core
+use mara.math
+use mara.string
+use mara.memory
+use bsa
+use nif
+use model
+use render
+use world
+use esm
+use animation
+
+// The animation every NPC is posed by: its first pose.
+IDLE_ANIMATION :: "meshes/characters/_male/idle.kf"
+
+// The body's meshes, shared by every race (whose textures they're drawn
+// with): 0 the upper body, 1 the legs, 2 the hands, 3 the feet; a man's or
+// a woman's.
+body_mesh :: fun(part: i64, female: bool) -> str64 {
+	if female {
+		if part == 0 do return "meshes/characters/_male/femaleupperbody.nif"
+		if part == 1 do return "meshes/characters/_male/femalelowerbody.nif"
+		if part == 2 do return "meshes/characters/_male/femalehand.nif"
+		return "meshes/characters/_male/femalefoot.nif"
+	}
+	if part == 0 do return "meshes/characters/_male/upperbody.nif"
+	if part == 1 do return "meshes/characters/_male/lowerbody.nif"
+	if part == 2 do return "meshes/characters/_male/hand.nif"
+	return "meshes/characters/_male/foot.nif"
+}
+
+// What a worn item covers (its BMDT), the slots the body has parts for:
+// the head, the hair, the upper body, the legs, the hands, the feet.
+SLOT_HEAD :: 0x1
+SLOT_HAIR :: 0x2
+SLOT_UPPER_BODY :: 0x4
+SLOT_LOWER_BODY :: 0x8
+SLOT_HAND :: 0x10
+SLOT_FOOT :: 0x20
+SLOT_TAIL :: 0x8000
+
+// The player's level leveled lists of gear are taken at: a middling one's.
+GEAR_LEVEL :: 10
+
+// The bone the head's parts (eyes, ears, mouth…) and hair hang from.
+HEAD_BONE :: "Bip01 Head"
+
+// A key in the scene's paths for an NPC's model: the NPC's form id, and
+// a bit no text's hash sets.
+NPC_MODEL_KEY :: 0x8000000000000000
+
+// Parts an NPC is made of, at most; shapes its model has, at most.
+NPC_PARTS :: 32
+NPC_MODEL_PARTS :: 128
+
+// One mesh an NPC is put together from: the texture its shapes are drawn
+// with in place of their own (empty: their own), the bone it hangs from if
+// it isn't skinned (empty: the one it names, Prn, else none), and a color
+// it's drawn tinted by (hair's grey textures take the NPC's hair color).
+Npc_Part :: struct {
+	mesh: [256]utf8
+	texture: [256]utf8
+	bone: [64]utf8
+	tint: Vec3
+}
+
+// What an NPC is put together from: whether she's a woman, how tall (a
+// share of the skeleton's height: the race's), the skeleton, the parts.
+Npc_Look :: struct {
+	female: bool
+	height: f32
+	skeleton: [256]utf8
+	parts: [NPC_PARTS]Npc_Part
+}
+
+// A skeleton's pose, kept: its path, and its bones posed.
+Npc_Skeleton :: struct {
+	path: [256]utf8
+	bones: [MAX_POSE_BONES]Pose_Bone
+}
+
+// The bones a skeleton has, at most.
+MAX_POSE_BONES :: 128
+
+// What an NPC looks like, from its NPC_ record and its race's: into look.
+read_npc_look :: fun(plugin: ^Plugin, npc_id: u32, look: ^Npc_Look) -> err {
+	look.parts.len = 0
+	look.female = false
+	look.height = 1
+	look.skeleton.len = 0
+	scratch : [256 * KB]byte
+	npc := find_record(plugin, npc_id, &scratch)?
+	race_id : u32 = 0
+	hair_id : u32 = 0
+	eyes_id : u32 = 0
+	hair_color := Vec3{1, 1, 1}
+	carried : [64]u32
+	fields := Fields{data = npc.data, at = 0, broken = false}
+	for field in next_field(&fields) {
+		if field.kind == "ACBS" and field.data.len >= 4 {
+			flags : u32 = field.data[0]
+			look.female = flags & 1 != 0
+		elif field.kind == "MODL"
+			archive_path_under("meshes\\", field_text(field.data), &look.skeleton)
+		elif field.kind == "RNAM" and field.data.len >= 4
+			raw : u32 = field.data[0]
+			race_id = record_form(plugin, npc, raw)
+		elif field.kind == "HNAM" and field.data.len >= 4
+			raw : u32 = field.data[0]
+			hair_id = record_form(plugin, npc, raw)
+		elif field.kind == "ENAM" and field.data.len >= 4
+			raw : u32 = field.data[0]
+			eyes_id = record_form(plugin, npc, raw)
+		elif field.kind == "HCLR" and field.data.len >= 3
+			hair_color = byte_color(field.data, 0)
+		elif field.kind == "CNTO" and field.data.len >= 4 and carried.len < carried.cap
+			raw : u32 = field.data[0]
+			&carried + record_form(plugin, npc, raw)
+		}
+	}
+
+	// What it wears: each clothing or armor it carries (leveled lists
+	// taken at GEAR_LEVEL) whose slots aren't taken yet, in the order carried.
+	taken : u32 = 0
+	for item in carried {
+		worn_id := level_item(plugin, item, npc_id, 0)
+		if worn_id == 0 do continue
+		worn_scratch : [64 * KB]byte
+		worn, worn_error := find_record(plugin, worn_id, &worn_scratch)
+		if worn_error or (worn.header.kind != "CLOT" and worn.header.kind != "ARMO") do continue
+		slots_field, has_slots := find_field(worn.data, "BMDT")
+		if not has_slots or slots_field.len < 2 do continue
+		slots_word : u16 = slots_field[0]
+		slots := u32(slots_word)
+		if slots & taken != 0 do continue
+		// A woman's model (MOD3), else the one model there is (MODL).
+		model_field, has_model := find_field(worn.data, if look.female do "MOD3" else "MODL")
+		if not has_model {
+			male_field, has_male := find_field(worn.data, "MODL")
+			if not has_male do continue
+			model_field = male_field
+		}
+		taken |= slots
+		add_npc_part(look, field_text(model_field), "", "")
+	}
+
+	// The race's body where nothing's worn, its head, and how tall.
+	race_scratch : [256 * KB]byte
+	race := find_record(plugin, race_id, &race_scratch)?
+	head_meshes : [9!][128]utf8
+	head_textures : [9!][128]utf8
+	body_textures : [4!][128]utf8
+	for k in 0:9 {
+		head_meshes[k].len = 0
+		head_textures[k].len = 0
+	}
+	for k in 0:4 do body_textures[k].len = 0
+	tail_mesh : [128]utf8
+	tail_texture : [128]utf8
+	// Its parts' fields come in sections: NAM0 the head's, NAM1 the body's
+	// (MNAM a man's, FNAM a woman's: a tail's mesh first, if it has one),
+	// each part by its INDX (a tail's texture at 4).
+	section : i64 = 0   // 1 head, 2 a man's body, 3 a woman's
+	index : i64 = -1
+	race_fields := Fields{data = race.data, at = 0, broken = false}
+	for field in next_field(&race_fields) {
+		kind := field.kind
+		if kind == "NAM0" {
+			section = 1
+			index = -1
+		elif kind == "NAM1"
+			section = 2
+			index = -1
+		elif kind == "MNAM" and section >= 2
+			section = 2
+			index = -1
+		elif kind == "FNAM" and section >= 2
+			section = 3
+			index = -1
+		elif kind == "INDX" and field.data.len >= 4
+			value : u32 = field.data[0]
+			index = i64(value)
+		elif kind == "MODL" and section == 1 and index >= 0 and index < 9
+			&head_meshes[index] + field_text(field.data)
+		elif kind == "ICON" and section == 1 and index >= 0 and index < 9
+			&head_textures[index] + field_text(field.data)
+		elif kind == "ICON" and index >= 0 and index < 4 and own_body_section(section, look.female)
+			&body_textures[index] + field_text(field.data)
+		elif kind == "ICON" and index == 4 and own_body_section(section, look.female)
+			&tail_texture + field_text(field.data)
+		elif kind == "MODL" and own_body_section(section, look.female)
+			&tail_mesh + field_text(field.data)
+		elif kind == "DATA" and field.data.len >= 24 and section == 0
+			height : f32 = field.data[if look.female do 20 else 16]
+			if height > 0 do look.height = height
+		}
+	}
+	for k in 0:4 {
+		slot : u32 = SLOT_UPPER_BODY << u32(k)
+		if taken & slot != 0 do continue
+		mesh := body_mesh(k, look.female)
+		add_npc_part(look, mesh[:], body_textures[k][:], "")
+	}
+	if tail_mesh.len > 0 and taken & SLOT_TAIL == 0 do add_npc_part(look, tail_mesh[:], tail_texture[:], "")
+	// The head's parts: the head, ears (a man's, a woman's), mouth, lower
+	// and upper teeth, tongue, left and right eyes (drawn with its eyes').
+	eyes_texture : [128]utf8
+	if eyes_id != 0 {
+		eyes_scratch : [16 * KB]byte
+		eyes, eyes_error := find_record(plugin, eyes_id, &eyes_scratch)
+		if not eyes_error {
+			icon, has_icon := find_field(eyes.data, "ICON")
+			if has_icon do &eyes_texture + field_text(icon)
+		}
+	}
+	for k in 0:9 {
+		if k == 1 and look.female do continue
+		if k == 2 and not look.female do continue
+		if head_meshes[k].len == 0 do continue
+		texture := if k >= 7 and eyes_texture.len > 0 do eyes_texture[:] else head_textures[k][:]
+		add_npc_part(look, head_meshes[k][:], texture, HEAD_BONE)
+	}
+	// Its hair, unless something worn covers it.
+	if hair_id != 0 and taken & SLOT_HAIR == 0 {
+		hair_scratch : [16 * KB]byte
+		hair, hair_error := find_record(plugin, hair_id, &hair_scratch)
+		if not hair_error {
+			hair_model, has_hair_model := find_field(hair.data, "MODL")
+			hair_texture, has_hair_texture := find_field(hair.data, "ICON")
+			if has_hair_model {
+				add_npc_part(look, field_text(hair_model), if has_hair_texture do field_text(hair_texture) else "", HEAD_BONE)
+				look.parts[look.parts.len - 1].tint = hair_color
+			}
+		}
+	}
+}
+
+// Whether a race's body section (2 a man's, 3 a woman's) is the one for
+// an NPC.
+own_body_section :: fun(section: i64, female: bool) -> bool {
+	return (section == 2 and not female) or (section == 3 and female)
+}
+
+// Adds a part to a look: its mesh and texture as the records name them
+// (under meshes\ and textures\), the bone it hangs from.
+add_npc_part :: fun(look: ^Npc_Look, mesh: []utf8, texture: []utf8, bone: []utf8) {
+	if mesh.len == 0 or look.parts.len == look.parts.cap do return
+	part := next(&look.parts)
+	part.mesh.len = 0
+	part.texture.len = 0
+	part.bone.len = 0
+	part.tint = Vec3{1, 1, 1}
+	archive_path_under("meshes\\", mesh, &part.mesh)
+	if texture.len > 0 do archive_path_under("textures\\", texture, &part.texture)
+	&part.bone + bone
+}
+
+// A path as the records write it, as the archives have it: under a folder
+// (unless it's there already), lower case, '\' between its parts.
+archive_path_under :: fun(folder: []utf8, name: []utf8, path: ^[256]utf8) {
+	path.len = 0
+	if name.len == 0 do return
+	cleaned : [256]utf8
+	for c in name {
+		if cleaned.len == cleaned.cap do break
+		if c == '/' do &cleaned + '\\'
+		else do &cleaned + lower(c)
+	}
+	if not starts_with(cleaned[:], folder) do path + folder
+	for c in cleaned {
+		if path.len == path.cap do break
+		path + c
+	}
+}
+
+// What an item an NPC carries comes to: itself, or for a leveled list
+// (LVLI), one of its entries at GEAR_LEVEL — of those at the highest level
+// it reaches, or of all it reaches (its flag 1), picked by a number from
+// the NPC and the list (the same each time) — itself resolved; 0 for none.
+level_item :: fun(plugin: ^Plugin, item: u32, npc_id: u32, depth: i64) -> u32 {
+	if depth > 4 do return 0
+	scratch : [64 * KB]byte
+	record, record_error := find_record(plugin, item, &scratch)
+	if record_error do return 0
+	if record.header.kind != "LVLI" do return item
+	flags : u8 = 0
+	chance_none : u8 = 0
+	best_level : i64 = -1
+	count : i64 = 0
+	fields := Fields{data = record.data, at = 0, broken = false}
+	for field in next_field(&fields) {
+		if field.kind == "LVLF" and field.data.len >= 1 do flags = field.data[0]
+		if field.kind == "LVLD" and field.data.len >= 1 do chance_none = field.data[0]
+	}
+	every_level := flags & 1 != 0
+	// The entries that count: their levels, then their number.
+	fields = Fields{data = record.data, at = 0, broken = false}
+	for field in next_field(&fields) {
+		if field.kind != "LVLO" or field.data.len < 8 do continue
+		level : i16 = field.data[0]
+		if i64(level) > GEAR_LEVEL do continue
+		if every_level {
+			count += 1
+		elif i64(level) > best_level
+			best_level = i64(level)
+			count = 1
+		elif i64(level) == best_level
+			count += 1
+		}
+	}
+	if count == 0 do return 0
+	pick := (u64(npc_id) *% 0x9E3779B97F4A7C15 + u64(item)) *% 0xBF58476D1CE4E5B9
+	if i64((pick >> 33) % 100) < i64(chance_none) do return 0
+	chosen := i64((pick >> 17) % u64(count))
+	seen : i64 = 0
+	fields = Fields{data = record.data, at = 0, broken = false}
+	for field in next_field(&fields) {
+		if field.kind != "LVLO" or field.data.len < 8 do continue
+		level : i16 = field.data[0]
+		if i64(level) > GEAR_LEVEL or (not every_level and i64(level) != best_level) do continue
+		if seen == chosen {
+			raw : u32 = field.data[4]
+			return level_item(plugin, record_form(plugin, record, raw), npc_id, depth + 1)
+		}
+		seen += 1
+	}
+	return 0
+}
+
+// The pose of a skeleton (its path), as its idle animation starts: read
+// the first time it's asked for, then kept. Empty when it can't be read.
+skeleton_pose :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> []Pose_Bone {
+	for &kept in scene.npc_skeletons {
+		if kept.path[:] == path do return kept.bones[:]
+	}
+	if scene.npc_skeletons.len == scene.npc_skeletons.cap do return scene.npc_skeletons[0].bones[0:0]
+	kept := next(&scene.npc_skeletons)
+	kept.path.len = 0
+	&kept.path + path
+	pose_error := read_skeleton_pose(loader.archives, loader.room, path, &kept.bones)
+	if pose_error do note_failure(scene, path, pose_error)
+	return kept.bones[:]
+}
+
+// A skeleton's pose as its idle animation (IDLE_ANIMATION) starts: its
+// bones' places, into bones. (The idle read first, its tracks copied out of
+// the file, then the skeleton, into room.)
+read_skeleton_pose :: fun(archives: ^Archives, room: ^Load_Room, path: []utf8, bones: ^[]Pose_Bone) -> err {
+	bones.len = 0
+	tracks : [256]Track
+	track_room : [1 * MB]byte
+	room.file.len = 0
+	room.blocks.len = 0
+	idle := read_archived_nif(archives, IDLE_ANIMATION, &room.file, &room.blocks)?
+	for &block, index in idle.blocks {
+		match block^ {
+		Sequence sequence
+			read_tracks(&idle, index, &tracks, &track_room, true)
+			break
+		else
+		}
+	}
+	room.file.len = 0
+	room.blocks.len = 0
+	skeleton := read_archived_nif(archives, path, &room.file, &room.blocks)?
+	pose_nodes(&skeleton, &tracks, 0, bones)
+}
+
+// A NIF from the archives, read: its file into file_storage, its blocks
+// into nif_storage.
+read_archived_nif :: fun(archives: ^Archives, path: []utf8, file_storage: ^[]byte, nif_storage: ^[]byte) -> Nif, err {
+	found, in_archives := find_archived(archives, path)
+	if not in_archives do return Nif{0}, Not_In_Archive
+	data := read_archived(archives, found, file_storage)?
+	failure := Nif_Failure{block = 0, type_name = file_storage[0:0]}
+	return read_nif(data, nif_storage, &failure)
+}
+
+// The model of an NPC: put together the first time it's asked for (see the
+// top), then kept; -1 when it can't be.
+npc_model :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, npc_id: u32) -> i64 {
+	key := u64(npc_id) | NPC_MODEL_KEY
+	known, found := index_get(&scene.paths, key)
+	if found do return known - 1
+	model_index, build_error := build_npc_model(scene, plugin, loader, npc_id)
+	if build_error {
+		note_failure(scene, "an NPC", build_error)
+		model_index = -1
+	}
+	_ = index_put(&scene.paths, key, model_index + 1)
+	return model_index
+}
+
+// Puts an NPC together (see the top) and on the card: its model's index.
+build_npc_model :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, npc_id: u32) -> i64, err {
+	if scene.models.len == scene.models.cap do return -1, No_Room_For_Models
+	look : Npc_Look
+	read_npc_look(plugin, npc_id, &look)?
+	pose := skeleton_pose(scene, loader, look.skeleton[:])
+	report := Npc_Report{failures = 0, first = [], reason = Not_In_Archive}
+	whole := assemble_npc(loader.archives, loader.room, &look, pose, &report)
+	if report.failures > 0 do note_failure(scene, report.first[:], report.reason)
+	gpu := upload_model(loader.renderer, &whole, loader.archives, &loader.room.texture)?
+	// (No collision: walking goes through people for now.)
+	&scene.model_collision + Collision_Range{first = scene.collision_points.len, count = 0}
+	&scene.models + gpu
+	return scene.models.len - 1
+}
+
+// What couldn't go into an NPC's model: how many parts, the first's mesh
+// and why.
+Npc_Report :: struct {
+	failures: i64
+	first: [256]utf8
+	reason: err
+}
+
+// An NPC's model, its parts posed and put together (see the top), made in
+// room's model room (len set to 0 first). The parts that can't be made
+// left out, into report.
+assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose: []Pose_Bone, report: ^Npc_Report) -> Model {
+	room.model.len = 0
+	// (The parts' list in the model's room, as their vertices are.)
+	built := slice([:NPC_MODEL_PARTS]Model_Part, &room.model)
+	low := Vec3{1000000, 1000000, 1000000}
+	high := Vec3{-1000000, -1000000, -1000000}
+	for &part in look.parts {
+		room.file.len = 0
+		room.blocks.len = 0
+		mesh, mesh_error := read_archived_nif(archives, part.mesh[:], &room.file, &room.blocks)
+		if mesh_error {
+			note_npc_failure(report, part.mesh[:], mesh_error)
+			continue
+		}
+		// Hung from its bone, unless it's skinned (then its bones place it).
+		hang := mat4_identity()
+		if not skinned_mesh(&mesh) {
+			bone := part.bone[:]
+			parent := hanging_bone(&mesh)
+			if parent.len > 0 do bone = parent
+			if bone.len > 0 {
+				place, posed := pose_place(pose, bone)
+				if posed do hang = place
+			}
+		}
+		made, model_error := build_posed_model(&mesh, pose, hang, &room.model)
+		if model_error {
+			note_npc_failure(report, part.mesh[:], model_error)
+			continue
+		}
+		for &made_part in made.parts {
+			if built.len == built.cap do break
+			if part.texture.len > 0 {
+				made_part.texture.len = 0
+				&made_part.texture + part.texture[0 : min(part.texture.len, made_part.texture.cap)]
+			}
+			if part.tint.x != 1 or part.tint.y != 1 or part.tint.z != 1 {
+				for &vertex in made_part.vertices {
+					vertex.color[0] *= part.tint.x
+					vertex.color[1] *= part.tint.y
+					vertex.color[2] *= part.tint.z
+				}
+			}
+			&built + made_part^
+		}
+		for axis in 0:3 {
+			low[axis] = min(low[axis], made.bounds_min[axis])
+			high[axis] = max(high[axis], made.bounds_max[axis])
+		}
+	}
+	// As tall as its race is.
+	if look.height != 1 {
+		for &made_part in built {
+			for &vertex in made_part.vertices do vertex.position = vertex.position * look.height
+		}
+		low = low * look.height
+		high = high * look.height
+	}
+	return Model{parts = built[:], flips = [], particles = [], motions = [], bounds_min = low, bounds_max = high}
+}
+
+note_npc_failure :: fun(report: ^Npc_Report, path: []utf8, reason: err) {
+	report.failures += 1
+	if report.failures == 1 {
+		report.first.len = 0
+		&report.first + path
+		report.reason = reason
+	}
+}
+
+// Whether a NIF has a skinned shape.
+skinned_mesh :: fun(mesh: ^Nif) -> bool {
+	for &block in mesh.blocks {
+		match block^ {
+		Shape shape
+			if shape.skin >= 0 do return true
+		else
+		}
+	}
+	return false
+}
+
+// The bone a NIF says it hangs from (its Prn string), or empty.
+hanging_bone :: fun(mesh: ^Nif) -> []utf8 {
+	for &block in mesh.blocks {
+		match block^ {
+		String_Extra extra
+			if compare_folded(extra.name, "Prn") == 0 do return extra.value
+		else
+		}
+	}
+	return mesh.header.type_names[0][0:0]
+}

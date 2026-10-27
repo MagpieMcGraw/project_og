@@ -69,8 +69,9 @@ sequence_span :: fun(mesh: ^Nif, sequence_index: i64) -> f32, f32 {
 }
 
 // The tracks of a sequence: each node it moves by a transform
-// interpolator, its keys copied out of the file into room. Into tracks.
-read_tracks :: fun(mesh: ^Nif, sequence_index: i64, tracks: ^[]Track, room: ^[]byte) {
+// interpolator (with still_too, also each it holds still: a pose needs
+// them), its keys copied out of the file into room. Into tracks.
+read_tracks :: fun(mesh: ^Nif, sequence_index: i64, tracks: ^[]Track, room: ^[]byte, still_too: bool) {
 	match mesh.blocks[sequence_index] {
 	Sequence sequence
 		for b in 0:sequence.block_count {
@@ -94,7 +95,7 @@ read_tracks :: fun(mesh: ^Nif, sequence_index: i64, tracks: ^[]Track, room: ^[]b
 			palette_name(mesh, i64(palette), i64(name_offset), &track.node_name)
 			read_track_keys(mesh, i64(interpolator), track, room)
 			// A node it doesn't move (one held still, as a root is): not a track.
-			if not track_moves(track) do tracks.len -= 1
+			if not still_too and not track_moves(track) do tracks.len -= 1
 		}
 	else
 	}
@@ -122,6 +123,8 @@ palette_name :: fun(mesh: ^Nif, palette_index: i64, offset: i64, name: ^[64]utf8
 read_track_keys :: fun(mesh: ^Nif, interpolator_index: i64, track: ^Track, room: ^[]byte) {
 	if interpolator_index >= mesh.blocks.len do return
 	match mesh.blocks[interpolator_index] {
+	Spline_Interpolator interpolator
+		read_spline_keys(mesh, interpolator.spline, track, room)
 	Transform_Interpolator interpolator
 		rotation_count : i64 = 0
 		translation_count : i64 = 0
@@ -171,6 +174,118 @@ read_track_keys :: fun(mesh: ^Nif, interpolator_index: i64, track: ^Track, room:
 		}
 	else
 	}
+}
+
+// How often a spline is sampled into keys, a second (and at least once
+// for each of its control points).
+SPLINE_SAMPLES :: 30
+
+// A spline interpolator's movement as keys: its rotation and translation
+// splines sampled from its start to its stop (a part without one: the
+// interpolator's own pose), copied into room.
+read_spline_keys :: fun(mesh: ^Nif, spline: Spline_Transform, track: ^Track, room: ^[]byte) {
+	control_points : i64 = 0
+	data := Spline_Points{floats = [], shorts = []}
+	if spline.basis_data >= 0 and spline.basis_data < mesh.blocks.len {
+		match mesh.blocks[spline.basis_data] {
+		Spline_Basis basis
+			control_points = basis.control_points
+		else
+		}
+	}
+	if spline.spline_data >= 0 and spline.spline_data < mesh.blocks.len {
+		match mesh.blocks[spline.spline_data] {
+		Spline_Data found
+			data = found.points
+		else
+		}
+	}
+	duration := spline.stop_time - spline.start_time
+	samples := max(max(i64(duration * SPLINE_SAMPLES) + 1, control_points), 2)
+	moving := control_points >= 4 and duration > 0
+	rotating := moving and spline.handles[1] != SPLINE_NONE
+	shifting := moving and spline.handles[0] != SPLINE_NONE
+	track.rotation_times = key_times_room(room, if rotating do samples else 1)
+	track.rotations = rotations_room(room, if rotating do samples else 1)
+	track.translation_times = key_times_room(room, if shifting do samples else 1)
+	track.translations = translations_room(room, if shifting do samples else 1)
+	// (Without a spline, its own pose: unless that's unset too.)
+	if not rotating and abs_f32(spline.rotation[0]) < UNSET_BEYOND {
+		&track.rotation_times + spline.start_time
+		&track.rotations + spline.rotation
+	}
+	if not shifting and abs_f32(spline.translation.x) < UNSET_BEYOND {
+		&track.translation_times + spline.start_time
+		&track.translations + spline.translation
+	}
+	for s in 0:samples {
+		share := f32(s) / f32(samples - 1)
+		time := spline.start_time + duration * share
+		if rotating and track.rotations.len < track.rotations.cap {
+			q := spline_value(spline, data, control_points, 1, 4, share)
+			size := sqrt_f32(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3])
+			if size > 0 {
+				for c in 0:4 do q[c] /= size
+			}
+			&track.rotation_times + time
+			&track.rotations + q
+		}
+		if shifting and track.translations.len < track.translations.cap {
+			p := spline_value(spline, data, control_points, 0, 3, share)
+			&track.translation_times + time
+			&track.translations + Vec3{p[0], p[1], p[2]}
+		}
+	}
+}
+
+// A spline's value (components of up to 4 for each control point) at a
+// share of its length (0 to 1): a cubic B-spline over control_points
+// points, its knots uniform and clamped at the ends (it starts at its
+// first point and stops at its last), worked out by de Boor's steps.
+// part: 0 translation, 1 rotation, 2 scale.
+spline_value :: fun(spline: Spline_Transform, data: Spline_Points, control_points: i64, part: i64, components: i64, share: f32) -> [4!]f32 {
+	// The parameter runs 0 to n - 3; knot j is j - 3, held to that range.
+	n := control_points
+	t := max(0, min(1, share)) * f32(n - 3)
+	span := min(i64(t), n - 4)
+	points : [4!][4!]f32
+	for j in 0:4 do points[j] = spline_point(spline, data, part, components, span + j)
+	for r in 1..3 {
+		j : i64 = 3
+		for j >= r {
+			i := span + j
+			low := knot(i, n)
+			high := knot(i + 4 - r, n)
+			alpha : f32 = 0
+			if high > low do alpha = (t - low) / (high - low)
+			for c in 0:4 do points[j][c] = (1 - alpha) * points[j - 1][c] + alpha * points[j][c]
+			j -= 1
+		}
+	}
+	return points[3]
+}
+
+// A clamped uniform cubic B-spline's knot j, for n control points.
+knot :: fun(j: i64, n: i64) -> f32 {
+	return f32(max(0, min(j - 3, n - 3)))
+}
+
+// A control point of one of a spline interpolator's splines.
+spline_point :: fun(spline: Spline_Transform, data: Spline_Points, part: i64, components: i64, point: i64) -> [4!]f32 {
+	value : [4!]f32 = [0, 0, 0, 0]
+	at := i64(spline.handles[part]) + point * components
+	for c in 0:components {
+		if spline.compressed {
+			if (at + c + 1) * 2 > data.shorts.len do continue
+			short : i16 = data.shorts[(at + c) * 2]
+			value[c] = spline.offsets[part] + spline.half_ranges[part] * f32(short) / 32767
+		else
+			if (at + c + 1) * 4 > data.floats.len do continue
+			point_value : f32 = data.floats[(at + c) * 4]
+			value[c] = point_value
+		}
+	}
+	return value
 }
 
 // The three angles' tracks of a rotation (KEY_XYZ), as the file has

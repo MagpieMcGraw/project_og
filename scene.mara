@@ -80,6 +80,7 @@ Waiting_Instance :: struct {
 	world: Mat4
 	reference: u32
 	door: bool         // a door that doesn't lead anywhere: it may open in place
+	npc: u32           // an NPC's form id: its model put together (npc_model), not read from path
 }
 
 // Doors that open in place: kinds of them loaded, the moving pieces a
@@ -279,6 +280,8 @@ Scene :: struct {
 	waiting_next: i64
 	waiting_land: [64]Waiting_Land
 	waiting_land_next: i64
+	// Skeletons NPCs are posed on (npc_model), their poses kept.
+	npc_skeletons: [4]Npc_Skeleton
 }
 
 // A kind of tree: its look, its billboard's texture slot.
@@ -324,6 +327,7 @@ scene_clear :: fun(scene: ^Scene, storage: ^[]byte) {
 	scene.grounds.len = 0
 	scene.world = 0
 	scene.grows_grass = true
+	scene.npc_skeletons.len = 0
 	scene.parent_world = 0
 	scene.tree_kinds = key_index(1 << 11, storage)
 	scene.kinds.len = 0
@@ -600,6 +604,18 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, plac
 
 		// (Trees are drawn as billboards, each cell's at once: load_trees.)
 		if base.header.kind == "TREE" do continue
+		// An NPC: put together when it's loaded.
+		if base.header.kind == "NPC_" {
+			if scene.waiting.len < scene.waiting.cap {
+				waiting := next(&scene.waiting)
+				waiting.reference = reference.form_id
+				waiting.door = false
+				waiting.npc = reference.base
+				waiting.path.len = 0
+				waiting.world = reference_transform(reference)
+			}
+			continue
+		}
 		path := model_path(base)
 		if path.len == 0 or is_marker(path[:]) do continue
 		// A door that opens in place, of a kind loaded: its pieces.
@@ -613,6 +629,7 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, plac
 				waiting := next(&scene.waiting)
 				waiting.reference = reference.form_id
 				waiting.door = true
+				waiting.npc = 0
 				waiting.path.len = 0
 				&waiting.path + path[:]
 				waiting.world = reference_transform(reference)
@@ -626,6 +643,7 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, plac
 			waiting := next(&scene.waiting)
 			waiting.reference = reference.form_id
 			waiting.door = false
+			waiting.npc = 0
 			waiting.path.len = 0
 			&waiting.path + path[:]
 			waiting.world = reference_transform(reference)
@@ -658,6 +676,11 @@ load_waiting :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, budget: u64)
 				place_door(scene, kind_index, item.world, item.reference)
 				continue
 			}
+		}
+		if item.npc != 0 {
+			npc_index := npc_model(scene, plugin, loader, item.npc)
+			if npc_index >= 0 do add_instance(scene, npc_index, item.world, item.reference)
+			continue
 		}
 		model_index := scene_model(scene, loader, item.path[:])
 		if model_index >= 0 do place_model(scene, model_index, item.path[:], item.world, item.reference)
@@ -1025,8 +1048,8 @@ load_door_kind :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, path: []ut
 	if open < 0 or close < 0 do return -1
 	opening : [DOOR_PIECES]Track
 	closing : [DOOR_PIECES]Track
-	read_tracks(&mesh, open, &opening, &scene.track_room)
-	read_tracks(&mesh, close, &closing, &scene.track_room)
+	read_tracks(&mesh, open, &opening, &scene.track_room, false)
+	read_tracks(&mesh, close, &closing, &scene.track_room, false)
 	// The nodes they move, each found, its rest taken.
 	moving : [DOOR_PIECES]i64
 	for &track in opening {
@@ -1094,7 +1117,7 @@ add_moving_kind :: fun(scene: ^Scene, loader: Loader, mesh: ^Nif, path: []utf8) 
 	if idle < 0 do idle = find_sequence(mesh, "SpecialIdle")
 	if idle < 0 or scene.moving_kinds.len == scene.moving_kinds.cap do return -1, false
 	tracks : [MOVING_PIECES]Track
-	read_tracks(mesh, idle, &tracks, &scene.track_room)
+	read_tracks(mesh, idle, &tracks, &scene.track_room, false)
 	// The nodes they move, each found, its rest taken.
 	kept : [MOVING_PIECES]Track
 	moving : [MOVING_PIECES]i64

@@ -11,6 +11,7 @@ use mara.core
 use mara.math
 use mara.string
 use nif
+use animation
 
 // One vertex as the renderer draws it: 48 bytes.
 Vertex :: struct {
@@ -204,13 +205,26 @@ inherit :: fun(mesh: ^Nif, parent: Inherited, properties: Refs) -> Inherited {
 // Makes a model of a NIF: its parts' vertices and indexes, and the parts
 // themselves, carved from storage.
 build_model :: fun(mesh: ^Nif, storage: ^[]byte) -> Model, err {
-	return build_model_part(mesh, -1, [], storage)
+	return build_model_with(mesh, -1, [], [], mat4_identity(), storage)
 }
 
 // Makes a model of part of a NIF: the objects under a node, in the node's
 // own space (as if it were the model's origin, unturned); or, for node -1,
 // the whole tree but for what's under the nodes left out.
 build_model_part :: fun(mesh: ^Nif, node: i64, left_out: []i64, storage: ^[]byte) -> Model, err {
+	return build_model_with(mesh, node, left_out, [], mat4_identity(), storage)
+}
+
+// Makes a model of a NIF posed: its skinned shapes moved with their bones
+// as the pose has them (into the skeleton's space); the rest placed by
+// root (where they hang: a bone's place).
+build_posed_model :: fun(mesh: ^Nif, pose: []Pose_Bone, root: Mat4, storage: ^[]byte) -> Model, err {
+	return build_model_with(mesh, -1, [], pose, root, storage)
+}
+
+// Makes a model of a NIF, or part of one (see build_model_part), posed
+// (see build_posed_model; an empty pose: as the file has it).
+build_model_with :: fun(mesh: ^Nif, node: i64, left_out: []i64, pose: []Pose_Bone, root: Mat4, storage: ^[]byte) -> Model, err {
 	// One part for each shape at most.
 	shape_count : i64 = 0
 	for block in mesh.blocks {
@@ -250,22 +264,24 @@ build_model_part :: fun(mesh: ^Nif, node: i64, left_out: []i64, storage: ^[]byte
 			properties := inherit(mesh, none, part_node.object.properties)
 			for k in 0:part_node.children.count {
 				child := part_node.children.at(k)
-				if child >= 0 do add_object(mesh, child, mat4_identity(), properties, &model, storage, left_out)?
+				if child >= 0 do add_object(mesh, child, root, properties, &model, storage, left_out, pose)?
 			}
 		else
 		}
 		return model
 	}
 	for k in 0:mesh.roots.count {
-		root := mesh.roots.at(k)
-		if root >= 0 do add_object(mesh, root, mat4_identity(), none, &model, storage, left_out)?
+		root_object := mesh.roots.at(k)
+		if root_object >= 0 do add_object(mesh, root_object, root, none, &model, storage, left_out, pose)?
 	}
 	return model
 }
 
 // Adds an object of the tree to the model: a node's children, or a shape;
-// nothing under the nodes left out.
-add_object :: fun(mesh: ^Nif, index: i64, parent: Mat4, inherited: Inherited, model: ^Model, storage: ^[]byte, left_out: []i64) -> err {
+// nothing under the nodes left out. Skinned shapes posed by pose.
+add_object :: fun(mesh: ^Nif, index: i64, parent: Mat4, inherited: Inherited, model: ^Model, storage: ^[]byte, left_out: []i64,
+	pose: []Pose_Bone) -> err
+{
 	for out in left_out {
 		if out == index do return
 	}
@@ -281,7 +297,7 @@ add_object :: fun(mesh: ^Nif, index: i64, parent: Mat4, inherited: Inherited, mo
 		}
 		for k in 0:node.children.count {
 			child := node.children.at(k)
-			if child >= 0 do add_object(mesh, child, transform, properties, model, storage, left_out)?
+			if child >= 0 do add_object(mesh, child, transform, properties, model, storage, left_out, pose)?
 		}
 	Shape shape
 		if shape.object.flags & 1 != 0 do return
@@ -290,7 +306,7 @@ add_object :: fun(mesh: ^Nif, index: i64, parent: Mat4, inherited: Inherited, mo
 		properties := inherit(mesh, inherited, shape.object.properties)
 		match mesh.blocks[shape.data] {
 		Shape_Data data
-			add_shape(mesh, data.geometry, shape.object.extra_data, transform, properties, model, storage)?
+			add_shape(mesh, data.geometry, shape.object.extra_data, transform, properties, model, storage, shape.skin, pose)?
 		else
 		}
 	Particle_System system
@@ -301,13 +317,15 @@ add_object :: fun(mesh: ^Nif, index: i64, parent: Mat4, inherited: Inherited, mo
 	}
 }
 
-// Adds a shape's geometry to the model as a part.
+// Adds a shape's geometry to the model as a part: skinned (skin its skin
+// instance) and posed, if the pose has bones.
 add_shape :: fun(mesh: ^Nif, geometry: Geometry, extra_data: Refs, transform: Mat4, properties: Inherited, model: ^Model,
-	storage: ^[]byte) -> err
+	storage: ^[]byte, skin: i64, pose: []Pose_Bone) -> err
 {
 	count := geometry.vertex_count
 	if count == 0 or geometry.vertices.len == 0 do return
 	if model.parts.len == model.parts.cap do return Too_Many_Parts
+	skinned := skin >= 0 and pose.len > 0
 
 	// The vertices, into the model's space. Normals turn with the shape;
 	// its scale is taken out of them by normalizing.
@@ -329,7 +347,11 @@ add_shape :: fun(mesh: ^Nif, geometry: Geometry, extra_data: Refs, transform: Ma
 		if geometry.uv_set_count > 0 do vertex.uv = geometry.uvs[i * 8]
 		if geometry.colors.len != 0 do vertex.color = geometry.colors[i * 16]
 		&vertices + vertex
-		grow_bounds(model, vertex.position)
+		if not skinned do grow_bounds(model, vertex.position)
+	}
+	if skinned {
+		skin_vertices(mesh, skin, geometry, pose, &vertices, storage)
+		for &vertex in vertices do grow_bounds(model, vertex.position)
 	}
 
 	// The triangles: as they are, or made from the strips.
@@ -371,6 +393,133 @@ add_shape :: fun(mesh: ^Nif, geometry: Geometry, extra_data: Refs, transform: Ma
 			}
 			vertex.color[3] *= part.alpha
 		}
+	}
+}
+
+// ---- poses and skins --------------------------------------------------------------
+
+// A bone of a posed skeleton: its name, and its place in the skeleton's
+// space (the model's).
+Pose_Bone :: struct {
+	name: [64]utf8
+	place: Mat4
+}
+
+// A bone's place in a pose (its name in any letter case), and false when
+// the pose hasn't it.
+pose_place :: fun(pose: []Pose_Bone, name: []utf8) -> Mat4, bool {
+	for bone in pose {
+		if compare_folded(bone.name[:], name) == 0 do return bone.place, true
+	}
+	return mat4_identity(), false
+}
+
+// The pose a NIF's nodes are in: each node's place in the model, those
+// tracks move by their tracks at a time (no tracks: as the file has them).
+// Into pose.
+pose_nodes :: fun(mesh: ^Nif, tracks: ^[]Track, time: f32, pose: ^[]Pose_Bone) {
+	pose.len = 0
+	for k in 0:mesh.roots.count {
+		root_object := mesh.roots.at(k)
+		if root_object >= 0 do pose_node(mesh, root_object, mat4_identity(), tracks, time, pose)
+	}
+}
+
+pose_node :: fun(mesh: ^Nif, index: i64, parent: Mat4, tracks: ^[]Track, time: f32, pose: ^[]Pose_Bone) {
+	match mesh.blocks[index] {
+	Node node
+		local := local_transform(node.object)
+		for k in 0:tracks.len {
+			if compare_folded(tracks[k].node_name[:], node.object.name) == 0 {
+				// (What its keys don't say, as the node is.)
+				tracks[k].rest = local
+				local = track_pose(&tracks[k], time)
+				break
+			}
+		}
+		place := mat4_mul(parent, local)
+		if pose.len < pose.cap {
+			bone := next(pose)
+			bone.name.len = 0
+			&bone.name + node.object.name[0 : min(node.object.name.len, 64)]
+			bone.place = place
+		}
+		for k in 0:node.children.count {
+			child := node.children.at(k)
+			if child >= 0 do pose_node(mesh, child, place, tracks, time, pose)
+		}
+	else
+	}
+}
+
+// A node's name; empty for a block that isn't a node.
+node_name :: fun(mesh: ^Nif, index: i64) -> []utf8 {
+	match mesh.blocks[index] {
+	Node node
+		return node.object.name
+	else
+	}
+	return mesh.header.type_names[0][0:0]
+}
+
+// Moves a skinned shape's vertices (and normals) to where its bones are in
+// the pose: each the sum of where each of its bones takes it, by its
+// weight. What its bones don't move all the way (a bone the pose hasn't)
+// stays that much where it was. Room for the sums carved from storage.
+skin_vertices :: fun(mesh: ^Nif, skin: i64, geometry: Geometry, pose: []Pose_Bone, vertices: ^[]Vertex, storage: ^[]byte) {
+	data_index : i64 = -1
+	bones := Refs{count = 0, data = geometry.vertices[0:0]}
+	match mesh.blocks[skin] {
+	Skin_Instance instance
+		data_index = instance.data
+		bones = instance.bones
+	else
+	}
+	if data_index < 0 do return
+	match mesh.blocks[data_index] {
+	Skin_Data data
+		if not data.has_weights do return
+		count := vertices.len
+		moved := slice([:count]Vec3, storage)
+		turned := slice([:count]Vec3, storage)
+		totals := slice([:count]f32, storage)
+		for k in 0:count {
+			&moved + Vec3{0, 0, 0}
+			&turned + Vec3{0, 0, 0}
+			&totals + f32(0)
+		}
+		at : i64 = 0
+		for b in 0:data.bone_count {
+			bone := skin_bone_at(data.bones, at, true)
+			at = bone.next_at
+			if b >= bones.count do continue
+			node := bones.at(b)
+			if node < 0 do continue
+			place, found := pose_place(pose, node_name(mesh, node))
+			if not found do continue
+			moving := mat4_mul(place, bone.transform)
+			for w in 0:bone.weights.len / 6 {
+				index : u16 = bone.weights[w * 6]
+				weight : f32 = bone.weights[w * 6 + 2]
+				v := i64(index)
+				if v >= count do continue
+				raw : Vec3 = geometry.vertices[v * 12]
+				position := mat4_mul_vec4(moving, Vec4{raw.x, raw.y, raw.z, 1})
+				moved[v] = moved[v] + Vec3{position.x, position.y, position.z} * weight
+				if geometry.normals.len != 0 {
+					raw_normal : Vec3 = geometry.normals[v * 12]
+					normal := mat4_mul_vec4(moving, Vec4{raw_normal.x, raw_normal.y, raw_normal.z, 0})
+					turned[v] = turned[v] + Vec3{normal.x, normal.y, normal.z} * weight
+				}
+				totals[v] += weight
+			}
+		}
+		for k in 0:count {
+			rest := max(0, 1 - totals[k])
+			vertices[k].position = moved[k] + vertices[k].position * rest
+			if geometry.normals.len != 0 do vertices[k].normal = vec3_normalize(turned[k] + vertices[k].normal * rest)
+		}
+	else
 	}
 }
 

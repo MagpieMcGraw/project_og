@@ -323,7 +323,7 @@ Reference :: struct {
 	flags: u32         // RECORD_*: disabled, persistent…
 }
 
-// The references in a cell (REFR records; actors aren't yet), into
+// The references in a cell (REFR records, and the NPCs placed, ACHR), into
 // references: from each plugin file's group for the cell, each reference
 // as the last file to have it has it (a later one may move it to another
 // cell, or delete it).
@@ -342,7 +342,8 @@ cell_references :: fun(plugin: ^Plugin, cell: u32, references: ^[]Reference) -> 
 			}
 			next_at := at + HEADER_SIZE + i64(header.size)
 			if next_at > end do return Broken_Group
-			if header.kind == "REFR" and references.len < references.cap and winning_copy(plugin, file, header, at) {
+			placed := header.kind == "REFR" or header.kind == "ACHR"
+			if placed and references.len < references.cap and winning_copy(plugin, file, header, at) {
 				body := plugin.data[at + HEADER_SIZE : next_at]
 				references + read_reference(plugin, file, header, body)
 			}

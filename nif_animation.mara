@@ -155,6 +155,41 @@ read_transform_interpolator :: fun(reader: ^Nif_Reader) -> Block {
 }
 
 // NiPathInterpolator: moves an object along a path.
+// A spline interpolator's handle for a part it has no spline for.
+SPLINE_NONE :: 0xFFFF
+
+read_spline_interpolator :: fun(reader: ^Nif_Reader, compressed: bool) -> Block {
+	start_time := read_f32(reader)
+	stop_time := read_f32(reader)
+	spline_data := read_ref(reader)
+	basis_data := read_ref(reader)
+	translation := read_vec3(reader)
+	rotation : [4!]f32
+	for k in 0:4 do rotation[k] = read_f32(reader)
+	scale := read_f32(reader)
+	handles : [3!]u32
+	for k in 0:3 do handles[k] = read_u32(reader)
+	offsets : [3!]f32 = [0, 0, 0]
+	half_ranges : [3!]f32 = [0, 0, 0]
+	if compressed {
+		for k in 0:3 {
+			offsets[k] = read_f32(reader)
+			half_ranges[k] = read_f32(reader)
+		}
+	}
+	return Spline_Interpolator{spline = Spline_Transform{start_time = start_time, stop_time = stop_time, spline_data = spline_data,
+		basis_data = basis_data, translation = translation, rotation = rotation, scale = scale, handles = handles,
+		compressed = compressed, offsets = offsets, half_ranges = half_ranges}}
+}
+
+read_spline_data :: fun(reader: ^Nif_Reader) -> Block {
+	float_count := i64(read_u32(reader))
+	floats := read_view(reader, float_count * 4)
+	short_count := i64(read_u32(reader))
+	shorts := read_view(reader, short_count * 2)
+	return Spline_Data{points = Spline_Points{floats = floats, shorts = shorts}}
+}
+
 read_path_interpolator :: fun(reader: ^Nif_Reader) -> Block {
 	skip(reader, 2)    // flags
 	skip(reader, 4)    // bank direction

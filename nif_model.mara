@@ -70,6 +70,10 @@ Block_Type :: union {
 	NiBoolTimelineInterpolator
 	NiPoint3Interpolator
 	NiTransformInterpolator
+	NiBSplineTransformInterpolator
+	NiBSplineCompTransformInterpolator
+	NiBSplineData
+	NiBSplineBasisData
 	NiPathInterpolator
 	NiBlendBoolInterpolator
 	NiBlendFloatInterpolator
@@ -230,6 +234,27 @@ Av_Object :: struct {
 	collision: i64
 }
 
+// A spline interpolator's fields (see Block.Spline_Interpolator).
+Spline_Transform :: struct {
+	start_time: f32
+	stop_time: f32
+	spline_data: i64
+	basis_data: i64
+	translation: Vec3
+	rotation: [4!]f32     // a quaternion: w, x, y, z
+	scale: f32
+	handles: [3!]u32      // translation, rotation, scale
+	compressed: bool
+	offsets: [3!]f32      // compressed: a value is offset + half range * point / 32767
+	half_ranges: [3!]f32
+}
+
+// A spline data's control points: as floats, and as compressed i16s.
+Spline_Points :: struct {
+	floats: []byte
+	shorts: []byte
+}
+
 // One of a texturing property's textures.
 Texture_Slot :: struct {
 	used: bool
@@ -285,6 +310,22 @@ Block :: union {
 	}
 	Shape_Data {
 		geometry: Geometry
+	}
+	// NiSkinInstance: the bones a skinned shape follows (nodes of its NIF),
+	// in the order its skin data has them.
+	Skin_Instance {
+		data: i64
+		bones: Refs
+	}
+	// NiSkinData: the skin's transform, and for each bone (bone_count) its
+	// transform from the skin's space into the bone's (as the bind pose
+	// has it) and the vertices it moves, by how much — as the file has
+	// them, in bones (see skin_bone_at).
+	Skin_Data {
+		transform: Mat4
+		bone_count: i64
+		has_weights: bool
+		bones: []byte
 	}
 	Texturing {
 		apply_mode: u32
@@ -540,6 +581,22 @@ Block :: union {
 		scale: f32
 		data: i64
 	}
+	// NiBSplineTransformInterpolator, NiBSplineCompTransformInterpolator: an
+	// object's movement as cubic B-splines over control points (in its
+	// spline data: floats, or compressed to i16s), from start_time to
+	// stop_time. Its translation, rotation and scale each have their own,
+	// from its handle in the data (SPLINE_NONE: none, its pose here for it).
+	Spline_Interpolator {
+		spline: Spline_Transform
+	}
+	// NiBSplineData: control points, as floats and as compressed i16s.
+	Spline_Data {
+		points: Spline_Points
+	}
+	// NiBSplineBasisData: how many control points each spline has.
+	Spline_Basis {
+		control_points: i64
+	}
 	// NiTransformData, NiKeyframeData: keys over time. Each group: its
 	// type (KEY_*), its count, the keys as the file has them.
 	Transform_Data {
@@ -719,6 +776,14 @@ read_block :: fun(reader: ^Nif_Reader, block_type: Block_Type) -> Block {
 		return read_value_interpolator(reader, 12)
 	NiTransformInterpolator
 		return read_transform_interpolator(reader)
+	NiBSplineTransformInterpolator
+		return read_spline_interpolator(reader, false)
+	NiBSplineCompTransformInterpolator
+		return read_spline_interpolator(reader, true)
+	NiBSplineData
+		return read_spline_data(reader)
+	NiBSplineBasisData
+		return Spline_Basis{control_points = i64(read_u32(reader))}
 	NiPathInterpolator
 		return read_path_interpolator(reader)
 	NiBlendBoolInterpolator

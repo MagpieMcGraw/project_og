@@ -1420,7 +1420,7 @@ command_anim :: fun(what: []utf8) {
 	if idle < 0 do return
 	tracks : [8]Track
 	track_room : [4 * MB]byte
-	read_tracks(&mesh, idle, &tracks, &track_room)
+	read_tracks(&mesh, idle, &tracks, &track_room, false)
 	start, stop := sequence_span(&mesh, idle)
 	for &track in tracks {
 		node := find_node(&mesh, track.node_name[:])
@@ -1851,7 +1851,7 @@ command_door :: fun(what: []utf8) {
 		start, stop := sequence_span(&mesh, sequence)
 		tracks : [8]Track
 		track_room : [4 * MB]byte
-		read_tracks(&mesh, sequence, &tracks, &track_room)
+		read_tracks(&mesh, sequence, &tracks, &track_room, false)
 		print("%: from % to % s, % tracks", name, start, stop, tracks.len)
 		match mesh.blocks[sequence] {
 		Sequence played
@@ -2557,6 +2557,131 @@ command_mp3 :: fun(name: []utf8, raw_path: []utf8) {
 	if write_error do print("couldn't write %: %", raw_path, write_error)
 }
 
+// `sooblivion skin <mesh> [animation]`: a skinned mesh posed — by its own
+// bones as the file has them (its bind pose: its vertices should stay where
+// they are), then by the skeleton (characters\_male\skeleton.nif) as the
+// animation (characters\_male\idle.kf) has it at its start: how far the
+// vertices move, and the box round them each way.
+command_skin :: fun(what: []utf8, animation_path: []utf8) {
+	directory_storage : [64 * MB]byte
+	archives : Archives
+	open_error := open_all_archives(&archives, &directory_storage)
+	if open_error {
+		print("couldn't open the archives: %", open_error)
+		return
+	}
+	defer close_archives(&archives)
+	file_storage : [16 * MB]byte
+	nif_storage : [16 * MB]byte
+	mesh, mesh_error := read_archived_nif(&archives, what, &file_storage, &nif_storage)
+	if mesh_error {
+		print("couldn't read %: %", what, mesh_error)
+		return
+	}
+	model_storage : [64 * MB]byte
+	unposed, unposed_error := build_model(&mesh, &model_storage)
+	if unposed_error {
+		print("couldn't make a model of it: %", unposed_error)
+		return
+	}
+	no_tracks : [0]Track
+	bind : [128]Pose_Bone
+	pose_nodes(&mesh, &no_tracks, 0, &bind)
+	in_bind, bind_error := build_posed_model(&mesh, bind[:], mat4_identity(), &model_storage)
+	if bind_error {
+		print("couldn't pose it: %", bind_error)
+		return
+	}
+	farthest : f32 = 0
+	for &part, p in unposed.parts {
+		for &vertex, v in part.vertices {
+			farthest = max(farthest, vec3_length(in_bind.parts[p].vertices[v].position - vertex.position))
+		}
+	}
+	print("% bones in its own pose; posed by them, its vertices move % at most", bind.len, farthest)
+	print("  unposed: from % to %", unposed.bounds_min, unposed.bounds_max)
+
+	skeleton_storage : [16 * MB]byte
+	skeleton_nif : [16 * MB]byte
+	skeleton, skeleton_error := read_archived_nif(&archives, "meshes/characters/_male/skeleton.nif", &skeleton_storage, &skeleton_nif)
+	animation_storage : [16 * MB]byte
+	animation_nif : [16 * MB]byte
+	motion, animation_error := read_archived_nif(&archives, animation_path, &animation_storage, &animation_nif)
+	if skeleton_error or animation_error {
+		print("couldn't read the skeleton or the animation: % %", skeleton_error, animation_error)
+		return
+	}
+	tracks : [256]Track
+	track_room : [4 * MB]byte
+	for &block, index in motion.blocks {
+		match block^ {
+		Sequence sequence
+			read_tracks(&motion, index, &tracks, &track_room, true)
+			print("% tracks of sequence %", tracks.len, sequence.name)
+			break
+		else
+		}
+	}
+	posed_bones : [128]Pose_Bone
+	pose_nodes(&skeleton, &tracks, 0, &posed_bones)
+	posed, posed_error := build_posed_model(&mesh, posed_bones[:], mat4_identity(), &model_storage)
+	if posed_error {
+		print("couldn't pose it: %", posed_error)
+		return
+	}
+	print("  posed by the skeleton (% bones): from % to %", posed_bones.len, posed.bounds_min, posed.bounds_max)
+}
+
+// `sooblivion npc <editor id>`: an NPC as the viewer puts it together: its
+// parts (each mesh, the texture it's drawn with, the bone it hangs from),
+// then its model made (no window): how many shapes, the box round them.
+command_npc :: fun(name: []utf8) {
+	data_storage : [400 * MB]byte
+	index_storage : [96 * MB]byte
+	plugin, load_error := load_oblivion(&data_storage, &index_storage)
+	if load_error {
+		print("couldn't load the plugins: %", load_error)
+		return
+	}
+	scratch : [1 * MB]byte
+	npc_id, found := find_by_editor_id(&plugin, name, &scratch)
+	if not found {
+		print("no record %", name)
+		return
+	}
+	look : Npc_Look
+	look_error := read_npc_look(&plugin, npc_id, &look)
+	if look_error {
+		print("couldn't read its look: %", look_error)
+		return
+	}
+	print("% (%), skeleton %, height %", name, if look.female do "a woman" else "a man", look.skeleton, look.height)
+	for &part in look.parts do print("  % % %", part.mesh, part.texture, part.bone)
+	directory_storage : [64 * MB]byte
+	archives : Archives
+	open_error := open_all_archives(&archives, &directory_storage)
+	if open_error {
+		print("couldn't open the archives: %", open_error)
+		return
+	}
+	defer close_archives(&archives)
+	file_room : [16 * MB]byte
+	block_room : [16 * MB]byte
+	model_room : [64 * MB]byte
+	texture_room : [1 * KB]byte
+	room := load_room(&file_room, &block_room, &model_room, &texture_room)
+	bones : [MAX_POSE_BONES]Pose_Bone
+	pose_error := read_skeleton_pose(&archives, &room, look.skeleton[:], &bones)
+	if pose_error {
+		print("couldn't pose its skeleton: %", pose_error)
+		return
+	}
+	report := Npc_Report{failures = 0, first = [], reason = Not_In_Archive}
+	whole := assemble_npc(&archives, &room, &look, bones[:], &report)
+	print("% shapes, from % to %", whole.parts.len, whole.bounds_min, whole.bounds_max)
+	if report.failures > 0 do print("% parts left out; the first: %, %", report.failures, report.first, report.reason)
+}
+
 // `sooblivion plugins`: the plugins the game loads, in its order, and its
 // archives in the order a file is looked for in them.
 command_plugins :: fun() {
@@ -2720,6 +2845,10 @@ main :: (args: [][]utf8) {
 		command_sounds()
 	elif command == "plugins"
 		command_plugins()
+	elif command == "npc" and args.len > 2
+		command_npc(args[2])
+	elif command == "skin" and args.len > 2
+		command_skin(args[2], if args.len > 3 do args[3] else "meshes/characters/_male/idle.kf")
 	elif command == "music" and args.len > 2
 		command_music(args[2], if args.len > 3 do args[3] else "")
 	elif command == "mp3" and args.len > 2
