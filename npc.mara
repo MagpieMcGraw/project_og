@@ -66,11 +66,18 @@ NPC_MODEL_PARTS :: 128
 // with in place of their own (empty: their own), the bone it hangs from if
 // it isn't skinned (empty: the one it names, Prn, else none), and a color
 // it's drawn tinted by (hair's grey textures take the NPC's hair color).
+// Hung from a bone, a part's coordinates are the bone's own axes (a shield
+// on the forearm), except from the head: there the model's axes moved to
+// the head (eyes, ears, hair, hats: hang_place) — but for the mouth, teeth
+// and tongue (in_bone_frame). Their files' coordinates say so (a helmet is
+// even in the model's x, the mouth's width runs along the head bone's z),
+// nothing else in them does; FaceGen's own files may explain it.
 Npc_Part :: struct {
 	mesh: [256]utf8
 	texture: [256]utf8
 	bone: [64]utf8
 	tint: Vec3
+	in_bone_frame: bool
 }
 
 // What an NPC is put together from: whether she's a woman, how tall (a
@@ -228,6 +235,7 @@ read_npc_look :: fun(plugin: ^Plugin, npc_id: u32, look: ^Npc_Look) -> err {
 		if head_meshes[k].len == 0 do continue
 		texture := if k >= 7 and eyes_texture.len > 0 do eyes_texture[:] else head_textures[k][:]
 		add_npc_part(look, head_meshes[k][:], texture, HEAD_BONE)
+		look.parts[look.parts.len - 1].in_bone_frame = k >= 3 and k <= 6
 	}
 	// Its hair, unless something worn covers it.
 	if hair_id != 0 and taken & SLOT_HAIR == 0 {
@@ -259,6 +267,7 @@ add_npc_part :: fun(look: ^Npc_Look, mesh: []utf8, texture: []utf8, bone: []utf8
 	part.texture.len = 0
 	part.bone.len = 0
 	part.tint = Vec3{1, 1, 1}
+	part.in_bone_frame = false
 	archive_path_under("meshes\\", mesh, &part.mesh)
 	if texture.len > 0 do archive_path_under("textures\\", texture, &part.texture)
 	&part.bone + bone
@@ -449,6 +458,8 @@ assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose
 			if parent.len > 0 do bone = parent
 			if bone.len > 0 {
 				place, posed := pose_place(pose, bone)
+				on_head := compare_folded(bone, HEAD_BONE) == 0
+				if on_head and not part.in_bone_frame do place, posed = hang_place(pose, bone)
 				if posed do hang = place
 			}
 		}

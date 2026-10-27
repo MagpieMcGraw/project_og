@@ -398,11 +398,28 @@ add_shape :: fun(mesh: ^Nif, geometry: Geometry, extra_data: Refs, transform: Ma
 
 // ---- poses and skins --------------------------------------------------------------
 
-// A bone of a posed skeleton: its name, and its place in the skeleton's
-// space (the model's).
+// A bone of a posed skeleton: its name, its place in the skeleton's space
+// (the model's), and its place as the skeleton rests (no track moving it).
 Pose_Bone :: struct {
 	name: [64]utf8
 	place: Mat4
+	rest: Mat4
+}
+
+// Where something hung from a bone goes (a hat, hair, eyes): its own
+// coordinates are the model's axes moved to the bone as the skeleton rests,
+// so it goes with the bone's place now, the bone's turn at rest undone.
+// False when the pose hasn't the bone.
+hang_place :: fun(pose: []Pose_Bone, name: []utf8) -> Mat4, bool {
+	for bone in pose {
+		if compare_folded(bone.name[:], name) != 0 do continue
+		resting_turn := bone.rest
+		resting_turn.w.x = 0
+		resting_turn.w.y = 0
+		resting_turn.w.z = 0
+		return mat4_mul(bone.place, mat4_inverse(resting_turn)), true
+	}
+	return mat4_identity(), false
 }
 
 // A bone's place in a pose (its name in any letter case), and false when
@@ -421,14 +438,15 @@ pose_nodes :: fun(mesh: ^Nif, tracks: ^[]Track, time: f32, pose: ^[]Pose_Bone) {
 	pose.len = 0
 	for k in 0:mesh.roots.count {
 		root_object := mesh.roots.at(k)
-		if root_object >= 0 do pose_node(mesh, root_object, mat4_identity(), tracks, time, pose)
+		if root_object >= 0 do pose_node(mesh, root_object, mat4_identity(), mat4_identity(), tracks, time, pose)
 	}
 }
 
-pose_node :: fun(mesh: ^Nif, index: i64, parent: Mat4, tracks: ^[]Track, time: f32, pose: ^[]Pose_Bone) {
+pose_node :: fun(mesh: ^Nif, index: i64, parent: Mat4, parent_rest: Mat4, tracks: ^[]Track, time: f32, pose: ^[]Pose_Bone) {
 	match mesh.blocks[index] {
 	Node node
 		local := local_transform(node.object)
+		rest := mat4_mul(parent_rest, local)
 		for k in 0:tracks.len {
 			if compare_folded(tracks[k].node_name[:], node.object.name) == 0 {
 				// (What its keys don't say, as the node is.)
@@ -443,10 +461,11 @@ pose_node :: fun(mesh: ^Nif, index: i64, parent: Mat4, tracks: ^[]Track, time: f
 			bone.name.len = 0
 			&bone.name + node.object.name[0 : min(node.object.name.len, 64)]
 			bone.place = place
+			bone.rest = rest
 		}
 		for k in 0:node.children.count {
 			child := node.children.at(k)
-			if child >= 0 do pose_node(mesh, child, place, tracks, time, pose)
+			if child >= 0 do pose_node(mesh, child, place, rest, tracks, time, pose)
 		}
 	else
 	}
