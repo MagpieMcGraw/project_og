@@ -7,43 +7,6 @@ against Mara at the time written. When one is fixed, move it to Fixed
 
 ## Open
 
-- An if-expression choosing between a text literal and a longer slice
-  stops the program: its value seems to go into a list of room 64.
-
-  ```
-  line : str1024
-  &line + "one two three four five six seven eight nine ten eleven twelve thirteen"
-  print("%", if line.len == 0 do "none" else line[:])
-  ```
-
-  stops with `runtime error: 71 items into a list with room for 64` at
-  the print. Expected: the slice printed (the literal's room shouldn't
-  bound the other side's), or a build error if the two can't share a
-  type. sooblivion writes the two prints apart (sooblivion.mara,
-  command_sky).
-
-- mara.open_gl has Uniform1f, Uniform2f and Uniform3f but no Uniform4f
-  (nor glUniform4f in its foreign block, and GL's functions come through
-  gl_load, so a program can't declare its own). sooblivion passes a
-  moon's direction and size as a vec3 and a float (render.mara, the sky
-  program).
-
-- A cast assigned into an f32 place lets the place's type through to
-  what's cast: an untyped constant inside it becomes f32, and a dispatch
-  on it can't choose.
-
-  ```
-  table : [4!]f32
-  for i in 0:4 do table[i] = f32(cos(PI / 72 * f64(i)))
-  ```
-
-  fails with `ambiguous dispatch 'cos' — matches multiple overloads:
-  cos_f32, cos_f64` and `mismatched types in arithmetic: f32 and f64`,
-  while `z := f32(cos(PI / 72 * f64(i)))` builds and prints 0.991445.
-  Expected: the cast's operand typed on its own (f64 here, from
-  `f64(i)`), as it is when declaring. sooblivion puts the f64 first and
-  calls cos_f64/sin_f64 (mp3.mara, build_tables).
-
 - There's no way to read an environment variable on Windows: mara.os
   declares `getenv` only in its Linux foreign block (file-private), and
   nothing public wraps it or GetEnvironmentVariable. sooblivion wants
@@ -61,6 +24,18 @@ against Mara at the time written. When one is fixed, move it to Fixed
   add_shape).
 
 ## Fixed
+
+- An if-expression choosing between a text literal and a longer slice
+  stopped the program (its value went into a list of room 64) — 29e2911:
+  an if-expression of an array and a slice is the slice. sooblivion's two
+  prints in command_sky can be one again once its compiler copy has it.
+- mara.open_gl had no Uniform4f — 95bb037. sooblivion's sky program
+  still passes a moon as a vec3 and a float, until its compiler copy has
+  it.
+- A cast assigned into an f32 place let the place's type through to what
+  was cast (`table[i] = f32(cos(PI / 72 * f64(i)))` couldn't choose a
+  cos) — 1626ed5: a cast's operand is typed on its own. mp3.mara's
+  explicit cos_f64/sin_f64 can go once sooblivion's compiler copy has it.
 
 - A variable named `all` was accepted, then `if x or all {` read `all {`
   as a broadcast, the errors landing on the next line — b3661d1: `all` is
