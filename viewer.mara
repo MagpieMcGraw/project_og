@@ -30,73 +30,102 @@ use mara.string
 use sdl_platform
 use audio
 use particles
+use game_files
 gl :: use mara.open_gl
+
 render :: use render
+
 
 // How fast a walker goes, walking and running (Shift), units a second.
 WALK_SPEED :: 220
+
 RUN_SPEED :: 500
+
 // The longest frame a walker moves through at once, in seconds: a frame
 // that took longer (loading) doesn't throw it through a wall.
 LONGEST_STEP :: 0.05
+
 // How quickly the eyes catch up with the feet over steps: the share of
 // the way a second (as a rate; a frame takes its part).
 EYES_CATCH_UP :: 12
 
+
 // How high above the floor the camera is when arriving: a person's eyes,
 // in Oblivion's units.
 EYE_HEIGHT :: 120
+
 // How near a door must be to use it: how far the eyes reach.
 DOOR_REACH :: 300
+
 // How far behind a wall's collision a door may be set and still be used:
 // some walls' collision runs straight across a load door's doorway (the
 // castles' tower walls, 19 units in front of their doors), the doorway and
 // the door in its recess drawn behind it.
 DOOR_RECESS :: 48
+
 // Without vsync, frames are kept to this many a second at most: the game
 // has to feel good at 60.
 MOST_FRAMES_A_SECOND :: 60
+
 // How long a frame may spend loading what's waiting, in nanoseconds.
 LOAD_BUDGET :: 6000000
+
 // A frame longer than this (in nanoseconds) missed a refresh at 60 a
 // second (the next one is 33 ms on), and goes in the journal with where its
 // time went. (With vsync, frames come 15 to 18 ms apart as the system
 // shows them: that's not slow.)
 SLOW_FRAME :: 25000000
+
 // How often the journal gets a summary of the frames since the last.
 SUMMARY_EVERY :: 10000000000
+
 // Where the viewer's journal goes, in the folder it's run from.
 LOG_PATH :: "sooblivion.log"
+
 // How much faster than ours the game's day goes (Oblivion's own), and,
 // with T held, how much faster again.
 TIME_SCALE :: 30
+
 HURRIED_TIME_SCALE :: 2000
+
 // The room the sounds' clips are loaded into.
 SOUND_ROOM :: 64 * MB
+
 
 // Region sounds are tried this often (seconds); thunder's chance each
 // second, by the weather's (0 to 1); a lightning flash fades this fast.
 REGION_SOUND_TRY :: 2
+
 THUNDER_CHANCE :: 0.25
+
 LIGHTNING_FADE :: 4
+
 
 // Weather sounds' keys: high bits no reference's form id has; the last
 // weather's apart from the coming one's.
 WEATHER_SOUND_KEY :: 0x7000000000000000
+
 LAST_WEATHER_BIT :: 0x0100000000000000
+
 
 // The moons' sizes on the sky (across, as a share of the way to the
 // horizon); the days the stars take to turn round.
 MASSER_SIZE :: 0.3
+
 SECUNDA_SIZE :: 0.12
+
 STARS_TURN_DAYS :: 2
+
 
 // How long a weather stays before the next is chosen, in the game's hours.
 WEATHER_LEAST_HOURS :: 4
+
 WEATHER_MOST_HOURS :: 8
+
 
 // The hour the viewer starts at.
 START_HOUR :: 10
+
 
 // What the viewer commands share: the game's plugins in their order and its
 // archives, the window, drawing, what's drawn, the keyboard and mouse, and
@@ -194,6 +223,7 @@ Viewer :: struct {
 	gl_errors_seen: [16]u32
 }
 
+
 // What happened in a frame that the command has to answer.
 View_Event :: union {
 	nothing = 0
@@ -201,6 +231,7 @@ View_Event :: union {
 	door        // E was pressed near a door: viewer.chosen_door
 	crossed     // outside, the camera went into another cell
 }
+
 
 // Opens the archives (their directories into directory_storage), the
 // window (with vsync) and the journal, and sets up drawing, into viewer;
@@ -297,6 +328,7 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.gl_errors_seen.len = 0
 }
 
+
 viewer_close :: fun(viewer: ^Viewer) {
 	audio_close(&viewer.audio)
 	platform_close(&viewer.platform)
@@ -304,20 +336,12 @@ viewer_close :: fun(viewer: ^Viewer) {
 	journal_close(&viewer.journal)
 }
 
-// The rooms loading uses, as views of storages the caller keeps: each up
-// to its cap ( would stop at its len, 0 here).
-load_room :: fun(file_room: ^[]byte, block_room: ^[]byte, model_room: ^[]byte, texture_room: ^[]byte) -> Load_Room {
-	return Load_Room{
-		file = file_room[0 : file_room.cap],
-		blocks = block_room[0 : block_room.cap],
-		model = model_room[0 : model_room.cap],
-		texture = texture_room[0 : texture_room.cap]}
-}
 
 // Where the viewer's scene loads models from.
 viewer_loader :: fun(viewer: ^Viewer) -> Loader {
 	return Loader{renderer = &viewer.renderer, archives = &viewer.archives, room = &viewer.room}
 }
+
 
 // Shows what's shown, how many frames a second, whether vsync is on, and
 // what the last frame drew in the window's title: "Inn of Ill Omen — 60
@@ -349,12 +373,14 @@ update_title :: fun(viewer: ^Viewer) {
 	_ = SetWindowTitle(viewer.platform.window, title)   // (the list: a 0 follows the title in its room)
 }
 
+
 // Names what's shown, in the title.
 set_place :: fun(viewer: ^Viewer, place: []utf8) {
 	viewer.place.len = 0
 	&viewer.place + place
 	update_title(viewer)
 }
+
 
 // One frame: reads the keyboard and mouse, moves the camera, draws the
 // scene from it. Tells what happened that the command has to answer.
@@ -516,6 +542,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	return .nothing
 }
 
+
 // Without vsync: waits for the next frame's time. Frames are due on a
 // schedule, a 60th of a second apart, so a wait that runs late is made up
 // by the next one's being shorter. Most of the wait sleeps; the last
@@ -534,6 +561,7 @@ wait_for_next_frame :: fun(viewer: ^Viewer) {
 	for time_now() < viewer.next_frame {}
 }
 
+
 // Starts counting frames for the next summary.
 start_summary :: fun(viewer: ^Viewer) {
 	viewer.summary_since = time_now()
@@ -543,6 +571,7 @@ start_summary :: fun(viewer: ^Viewer) {
 	viewer.summary_drawing = 0
 	viewer.summary_card = 0
 }
+
 
 // Counts the frame just past, which took frame_length nanoseconds from its
 // start to the next's: noted when it missed a refresh; every
@@ -577,6 +606,7 @@ add_to_summary :: fun(viewer: ^Viewer, frame_length: u64) {
 	start_summary(viewer)
 }
 
+
 // Notes nanoseconds as milliseconds to a hundredth: "2.41".
 note_milliseconds :: fun(journal: ^Journal, nanoseconds: u64) {
 	hundredths := i64(nanoseconds / 10000)
@@ -585,6 +615,7 @@ note_milliseconds :: fun(journal: ^Journal, nanoseconds: u64) {
 	if hundredths % 100 < 10 do note(journal, "0")
 	note(journal, hundredths % 100)
 }
+
 
 // Notes a frame that missed a refresh, and where its time went: drawing
 // (the CPU's), the card's, waiting to show it (the swap and vsync),
@@ -621,6 +652,7 @@ note_slow_frame :: fun(viewer: ^Viewer, frame_length: u64) {
 	note_end(journal)
 }
 
+
 // Notes what OpenGL says went wrong, if anything: each kind of error the
 // first time only, so a frame's mistake isn't noted sixty times a second.
 note_gl_errors :: fun(viewer: ^Viewer) {
@@ -636,11 +668,13 @@ note_gl_errors :: fun(viewer: ^Viewer) {
 	}
 }
 
+
 // Whether the world shown has its distant land on the card.
 has_distant_land :: fun(viewer: ^Viewer) -> bool {
 	renderer := &viewer.renderer
 	return renderer.distant_pieces.len > 0 and renderer.distant_world == viewer.shown.world
 }
+
 
 // Walks (on foot, from where the camera's eyes are) or flies.
 set_walking :: fun(viewer: ^Viewer, on: bool) {
@@ -651,11 +685,13 @@ set_walking :: fun(viewer: ^Viewer, on: bool) {
 	update_title(viewer)
 }
 
+
 // Puts the walker's feet under the camera, standing still.
 place_walker :: fun(viewer: ^Viewer) {
 	viewer.walker = Walker{position = viewer.camera.position - Vec3{0, 0, EYE_HEIGHT}, rising = 0, on_ground = false}
 	viewer.eyes = viewer.camera.position.z
 }
+
 
 // Moves the game's day on by a frame's seconds (much faster when hurried),
 // and outside, the sky with it: its colors, the clouds' drift, the light
@@ -710,6 +746,7 @@ pass_time :: fun(viewer: ^Viewer, seconds: f32, hurried: bool) {
 	move_night_sky(viewer)
 }
 
+
 // Outside, what's heard now and then: the regions' sounds, each tried every
 // REGION_SOUND_TRY seconds by its chance (in the weathers it's for, within
 // its hours), from somewhere round the camera; and thunder, as often as
@@ -749,6 +786,7 @@ outdoor_sounds :: fun(viewer: ^Viewer, listener: Listener, now: f64) {
 	}
 }
 
+
 // The weather sounds a weather makes all along: its rain's and wind's,
 // heard everywhere (whatever their own flags say). Into sounds; their
 // kinds read into the scene's.
@@ -770,8 +808,10 @@ weather_sound_list :: fun(viewer: ^Viewer, plugin: ^Plugin, weather: ^Weather, s
 	}
 }
 
+
 // The moons' phases, in turn, by their pictures' names.
 MOON_PHASES :: ["full", "three_wan", "half_wan", "one_wan", "new", "one_wax", "half_wax", "three_wax"]
+
 
 // The night sky at the hour: the stars turned with it; the moons across
 // it, from dusk to the next morning (Secunda a little ahead and faster),
@@ -812,6 +852,7 @@ move_night_sky :: fun(viewer: ^Viewer) {
 	look.sun_glare_strength = glare * look.state.daylight * min(1, max(0, look.state.sun_direction.z * 4))
 }
 
+
 // The night sky's textures: its stars' and nebula's (the climate's night
 // sky mesh's first two parts'), and the sun's glare's.
 night_sky_textures :: fun(viewer: ^Viewer) -> err {
@@ -835,6 +876,7 @@ night_sky_textures :: fun(viewer: ^Viewer) -> err {
 	if built.parts.len > 1 do look.nebula = texture_for(&viewer.renderer, &viewer.archives, built.parts[1].texture, &room.texture)
 }
 
+
 // Water whose colors are lit by a light: dim at night, its own by day.
 lit_water :: fun(water: Water_Type, light: Vec3) -> Water_Type {
 	lit := water
@@ -844,10 +886,12 @@ lit_water :: fun(water: Water_Type, light: Vec3) -> Water_Type {
 	return lit
 }
 
+
 // A number between two, by a share (0: the first, 1: the second).
 mix_number :: fun(from: f32, to: f32, share: f32) -> f32 {
 	return from + (to - from) * share
 }
+
 
 // Takes a world's sky when the viewer goes out into a world it wasn't in:
 // its climate (see use_climate) and water.
@@ -870,6 +914,7 @@ take_sky :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32) {
 	}
 	use_climate(viewer, plugin, &climate)
 }
+
 
 // In an interior that behaves like an exterior (the Temple of the One, the
 // Arena, Oblivion's towers), the sky lights it and shows through it: its own
@@ -902,6 +947,7 @@ take_cell_sky :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
 	use_climate(viewer, plugin, &climate)
 }
 
+
 // Takes a climate: its sun and night sky on the card, the weathers that may
 // come where the camera is. The weather is the sky's, not the world's: it
 // goes on under the same climate (from Tamriel into a city, and back); a
@@ -931,6 +977,7 @@ use_climate :: fun(viewer: ^Viewer, plugin: ^Plugin, climate: ^Climate) {
 	_ = weathers_at_camera(viewer, plugin)
 	if not same do change_weather(viewer, plugin, true)
 }
+
 
 // The weathers that may come where the camera is: its cell's regions', or
 // the climate's. True when they're not the ones that could before.
@@ -964,6 +1011,7 @@ weathers_at_camera :: fun(viewer: ^Viewer, plugin: ^Plugin) -> bool {
 	viewer.weathers_here = found
 	return not same
 }
+
 
 // Brings in the next weather, chosen by its chance among those that may
 // come here: at once, or over its coming-in time. Its clouds go on the card.
@@ -1012,6 +1060,7 @@ change_weather :: fun(viewer: ^Viewer, plugin: ^Plugin, at_once: bool) {
 	note_end(&viewer.journal)
 }
 
+
 // A weather's rain or snow: its precipitation mesh's particle systems that
 // fall (sent downward), each as drops falling through a box round the
 // camera — as many as fall at once, at the system's speed, from its
@@ -1048,11 +1097,13 @@ precipitation_of :: fun(viewer: ^Viewer, weather: ^Weather, layers: ^[]Precipita
 	}
 }
 
+
 // Where the camera hears from: its place, and its right.
 listener_of :: fun(camera: render.Camera) -> Listener {
 	_, right, _ := camera_axes(camera)
 	return Listener{position = camera.position, right = right}
 }
+
 
 // Tells the journal what loading couldn't do since it last did: what the
 // scene left out, the textures drawn white and the sounds not played, how
@@ -1094,14 +1145,6 @@ note_failures :: fun(viewer: ^Viewer) {
 	}
 }
 
-// A record's editor id, as text kept by value.
-editor_id_of :: fun(plugin: ^Plugin, form_id: u32) -> str256 {
-	scratch : [1 * MB]byte
-	name : str256
-	record, record_error := find_record(plugin, form_id, &scratch)
-	if not record_error do &name + editor_id(record.data)
-	return name
-}
 
 // Counts a frame drawn; each second, the count goes in the title.
 count_frame :: fun(viewer: ^Viewer) {
@@ -1114,6 +1157,7 @@ count_frame :: fun(viewer: ^Viewer) {
 		update_title(viewer)
 	}
 }
+
 
 // Loads some of what's waiting, if anything is: a frame's budget of it.
 // Notes how long catching up took once it's done.
@@ -1138,6 +1182,7 @@ load_some :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	}
 }
 
+
 // What the reticle is on, within reach: the first thing the eyes meet
 // (a wall between hides what's behind it), its reference; 0 for none.
 targeted_reference :: fun(shown: ^Scene, camera: render.Camera) -> u32 {
@@ -1153,6 +1198,7 @@ targeted_reference :: fun(shown: ^Scene, camera: render.Camera) -> u32 {
 	}
 	return 0
 }
+
 
 // Tells the journal what E was pressed at that it couldn't use: nothing
 // within reach, or what the reticle was on.
@@ -1178,6 +1224,7 @@ note_missed :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	note_end(journal)
 }
 
+
 // A reference's door that leads somewhere: its index in the scene's
 // doors, -1 when it isn't one.
 leading_door :: fun(shown: ^Scene, reference: u32) -> i64 {
@@ -1187,6 +1234,7 @@ leading_door :: fun(shown: ^Scene, reference: u32) -> i64 {
 	}
 	return -1
 }
+
 
 // `sooblivion view <mesh>`: shows a mesh in the window.
 command_view :: fun(what: []utf8) {
@@ -1220,6 +1268,7 @@ command_view :: fun(what: []utf8) {
 	viewer.speed = gpu_model.radius
 	for view_frame(&viewer) != .quit {}
 }
+
 
 // `sooblivion view-cell <editor id>`: shows an interior cell in the
 // window; its doors lead on, inside and out. When it can't, it says why
@@ -1258,6 +1307,7 @@ command_view_cell :: fun(name: []utf8) -> err {
 	explore(&viewer, &plugin)
 }
 
+
 // `sooblivion view-world [world] [x y]`: shows a world's land and what's
 // on it around the cell at x, y on its grid.
 command_view_world :: fun(name: []utf8, x: i64, y: i64) {
@@ -1295,6 +1345,7 @@ command_view_world :: fun(name: []utf8, x: i64, y: i64) {
 	go_outside(&viewer, &plugin, world_id, middle)
 	explore(&viewer, &plugin)
 }
+
 
 // Flies around until the viewer quits: through doors when E is pressed at
 // one, and outside, into the cells around the camera as it moves — what
@@ -1372,6 +1423,7 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	}
 }
 
+
 // Shows an interior cell, all of it loaded, its name in the window's title.
 go_inside :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
 	shown := &viewer.shown
@@ -1404,6 +1456,7 @@ go_inside :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
 	note_failures(viewer)
 	viewer.frame_start = time_now()
 }
+
 
 // Shows a world's cells around a place in it, all of them loaded, the
 // world's name in the window's title, the camera there.
@@ -1475,6 +1528,7 @@ go_outside :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32, place: Vec3) 
 	viewer.frame_start = time_now()
 }
 
+
 // Wants the music of a place: a cell (0 for none) in a world (0 inside).
 choose_music :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32, world_id: u32) {
 	scratch : [1 * MB]byte
@@ -1488,6 +1542,7 @@ choose_music :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32, world_id: u32) 
 	want_music(&viewer.audio, kind)
 }
 
+
 // A record's name for people (FULL), else its editor id.
 record_name :: fun(plugin: ^Plugin, form_id: u32) -> str256 {
 	scratch : [1 * MB]byte
@@ -1499,6 +1554,7 @@ record_name :: fun(plugin: ^Plugin, form_id: u32) -> str256 {
 	else do &name + editor_id(record.data)
 	return name
 }
+
 
 // Puts the camera where one arrives in the scene's cell through a door;
 // failing that, in the middle of what's placed.
@@ -1522,20 +1578,3 @@ start_in_cell :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	viewer.camera.position = (low + high) * 0.5
 }
 
-// The height of the land a world shows under a place: its nearest vertex's.
-// 0 where there's no land.
-ground_height :: fun(plugin: ^Plugin, world_id: u32, place: Vec3, scratch: ^[]byte) -> f32 {
-	x, y := grid_of(place)
-	parent, parent_error := world_parent(plugin, world_id, scratch)
-	if parent_error do parent = 0
-	land_at, found := shown_land(plugin, world_id, parent, x, y)
-	if not found do return 0
-	scratch.len = 0
-	record, record_error := record_at(plugin, land_at, scratch)
-	if record_error do return 0
-	cell_land : Land
-	read_land(plugin, record, &cell_land)
-	column := i64((place.x - f32(x * CELL_SIZE)) / LAND_SPACING + 0.5)
-	row := i64((place.y - f32(y * CELL_SIZE)) / LAND_SPACING + 0.5)
-	return cell_land.heights[row * LAND_SIDE + column]
-}

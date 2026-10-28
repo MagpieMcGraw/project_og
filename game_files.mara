@@ -2,13 +2,19 @@
 // and their archives — the master's (Oblivion.ini's SArchiveList) and each
 // plugin's own, named after it (Knights.bsa; "DLCShiveringIsles -
 // Meshes.bsa").
-module sooblivion
+module game_files
 
 use mara.core
 use mara.os
 use mara.memory
 use mara.string
+use mara.time
+use mara.math
 use bsa
+use esm
+use world
+use land
+use scene
 
 // The plugins loaded, at most.
 MAX_PLUGINS :: 16
@@ -160,4 +166,122 @@ open_one_archive :: fun(archives: ^Archives, name: []utf8, storage: ^[]byte) -> 
 
 Game_Files_Error :: error {
 	Too_Many_Archives   // more archives than MAX_ARCHIVES
+}
+
+// Where the game's data is, unless a command is given a path.
+DATA_FOLDER :: "D:/SteamLibrary/steamapps/common/Oblivion/Data/"
+
+// A path given on the command line, or a file in the data folder.
+data_path :: fun(name: []utf8) -> Path {
+	path : Path
+	if contains_separator(name) {
+		&path + name
+	else
+		&path + DATA_FOLDER
+		&path + name
+	}
+	return path
+}
+
+contains_separator :: fun(name: []utf8) -> bool {
+	for c in name {
+		if path_separator(c) or c == ':' do return true
+	}
+	return false
+}
+
+// Writes data to a new file at path (or over the one there).
+write_entire_file :: fun(path: []utf8, data: []byte) -> err {
+	file := file_open_write(path)?
+	defer file_close(file)
+	rest := data
+	for rest.len > 0 {
+		written := file_write(file, rest)?
+		if written <= 0 do return Write_Failed
+		rest = rest[written : rest.len]
+	}
+}
+
+// The game's plugins (Oblivion.esm and the downloaded content, in the
+// game's order), read one after another into data_storage and indexed into
+// index_storage: what the viewer and the cell commands start from.
+load_oblivion :: fun(data_storage: ^[]byte, index_storage: ^[]byte) -> Plugin, err {
+	start := time_now()
+	order : Load_Order
+	read_load_order(&order)?
+	plugin := Plugin{0}
+	first := data_storage.len
+	for &file, k in order.plugins {
+		at := data_storage.len - first
+		path := data_path(file.name)
+		data := read_entire_file(path, data_storage)?
+		span := Plugin_Span{0}
+		&span.name + file.name
+		span.start = at
+		span.end = at + data.len
+		span.own_index = u32(k)
+		&plugin.files + span
+	}
+	plugin.data = data_storage[first : data_storage.len]
+	index_plugin(&plugin, index_storage)?
+	print("indexed % records of % plugins in % ms: % cells' groups, % exterior cells, % worlds with persistent cells",
+		plugin.records.count, plugin.files.len, elapsed_ms(start), plugin.cell_children.count, plugin.exterior_cells.count, plugin.persistent_cells.count)
+	return plugin
+}
+
+// The record whose editor id is name (any letter case): its form id; false
+// when there's none. (Every record is looked at.)
+find_by_editor_id :: fun(plugin: ^Plugin, name: []utf8, scratch: ^[]byte) -> u32, bool {
+	for key, slot in plugin.records.keys {
+		if key == 0 do continue
+		scratch.len = 0
+		record, record_error := record_at(plugin, i64(plugin.records.values[slot]), scratch)
+		if record_error do continue
+		if compare_folded(editor_id(record.data), name) == 0 do return u32(key), true
+	}
+	return 0, false
+}
+
+// Milliseconds since start, a time_now.
+elapsed_ms :: fun(start: u64) -> i64 {
+	return i64((time_now() - start) / 1000000)
+}
+
+// The rooms loading uses, as views of storages the caller keeps: each up
+// to its cap ( would stop at its len, 0 here).
+load_room :: fun(file_room: ^[]byte, block_room: ^[]byte, model_room: ^[]byte, texture_room: ^[]byte) -> Load_Room {
+	return Load_Room{
+		file = file_room[0 : file_room.cap],
+		blocks = block_room[0 : block_room.cap],
+		model = model_room[0 : model_room.cap],
+		texture = texture_room[0 : texture_room.cap]}
+}
+
+
+// A record's editor id, as text kept by value.
+editor_id_of :: fun(plugin: ^Plugin, form_id: u32) -> str256 {
+	scratch : [1 * MB]byte
+	name : str256
+	record, record_error := find_record(plugin, form_id, &scratch)
+	if not record_error do &name + editor_id(record.data)
+	return name
+}
+
+
+// The height of the land a world shows under a place: its nearest vertex's.
+// 0 where there's no land.
+ground_height :: fun(plugin: ^Plugin, world_id: u32, place: Vec3, scratch: ^[]byte) -> f32 {
+	x, y := grid_of(place)
+	parent, parent_error := world_parent(plugin, world_id, scratch)
+	if parent_error do parent = 0
+	land_at, found := shown_land(plugin, world_id, parent, x, y)
+	if not found do return 0
+	scratch.len = 0
+	record, record_error := record_at(plugin, land_at, scratch)
+	if record_error do return 0
+	cell_land : Land
+	read_land(plugin, record, &cell_land)
+	column := i64((place.x - f32(x * CELL_SIZE)) / LAND_SPACING + 0.5)
+	row := i64((place.y - f32(y * CELL_SIZE)) / LAND_SPACING + 0.5)
+	return cell_land.heights[row * LAND_SIDE + column]
 }
