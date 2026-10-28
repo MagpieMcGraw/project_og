@@ -279,26 +279,28 @@ build_posed_model :: fun(mesh: ^Nif, pose: []Pose_Bone, root: Mat4, storage: ^[]
 // Makes a model of a NIF posed (see build_posed_model), its first shape's
 // vertices moved before anything else is done with them: each as far as
 // moves says (a face's shape: facegen.mara), where there's a move for each.
-build_shaped_model :: fun(mesh: ^Nif, pose: []Pose_Bone, root: Mat4, moves: []Vec3, storage: ^[]byte) -> Model, err {
+build_shaped_model :: fun(mesh: ^Nif, pose: []Pose_Bone, root: Mat4, moves: []Vec3, storage: ^[]byte, left_out: []i64 = []) -> Model, err {
 	how := plain_build()
 	how.pose = pose
 	how.root = root
 	how.moves = moves
-	return build_model_with(mesh, -1, [], how, storage)
+	return build_model_with(mesh, -1, left_out, how, storage)
 }
 
 // Makes a model of a NIF rigged to a pose (Build_Options): for the card to
 // move with the pose's bones. Its first shape's vertices moved first (see
 // build_shaped_model); an unskinned shape moved by hang_bone from
-// hang_offset.
-build_rigged_model :: fun(mesh: ^Nif, pose: []Pose_Bone, moves: []Vec3, hang_bone: i64, hang_offset: Mat4, storage: ^[]byte) -> Model, err {
+// hang_offset. What's under the nodes left out isn't in it.
+build_rigged_model :: fun(mesh: ^Nif, pose: []Pose_Bone, moves: []Vec3, hang_bone: i64, hang_offset: Mat4, storage: ^[]byte,
+	left_out: []i64 = []) -> Model, err
+{
 	how := plain_build()
 	how.pose = pose
 	how.moves = moves
 	how.rigged = true
 	how.hang_bone = hang_bone
 	how.hang_offset = hang_offset
-	return build_model_with(mesh, -1, [], how, storage)
+	return build_model_with(mesh, -1, left_out, how, storage)
 }
 
 // Makes a model of a NIF, or part of one (see build_model_part), as how

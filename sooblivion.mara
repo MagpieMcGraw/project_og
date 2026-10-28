@@ -1383,6 +1383,24 @@ command_anim :: fun(what: []utf8) {
 		Sequence sequence
 			print("sequence %: % to % s, cycle %, frequency %, % blocks", sequence.name, sequence.start_time, sequence.stop_time,
 				sequence.cycle, sequence.frequency, sequence.block_count)
+			// Its text keys: what happens when.
+			if sequence.text_keys >= 0 and sequence.text_keys < mesh.blocks.len {
+				match mesh.blocks[sequence.text_keys] {
+				Text_Keys text_keys
+					line : str1024
+					at : i64 = 0
+					for k in 0:text_keys.count {
+						key_time, text, next_at := next_text_key(text_keys.keys, at)
+						at = next_at
+						&line + "  "
+						float_text(key_time, &line)
+						&line + " "
+						add_what_fits(&line, text)
+					}
+					print("  keys:%", line)
+				else
+				}
+			}
 			for k in 0:sequence.block_count {
 				if sequence.blocks.len < (k + 1) * CONTROLLED_BLOCK_SIZE do break
 				at := k * CONTROLLED_BLOCK_SIZE
@@ -2511,7 +2529,7 @@ usage :: fun() {
 	print("sooblivion view-cell <editor id>   an interior cell; its doors lead on, inside and out")
 	print("sooblivion view-world [world x y]  a world's exterior from a cell (Tamriel 0 0)")
 	print("sooblivion view <mesh>             one mesh")
-	print("sooblivion picture <out.png> <view | view-cell | view-world> ... [at x y z yaw pitch]")
+	print("sooblivion picture <out.png> <view | view-cell | view-world> ... [at x y z yaw pitch] [held <idle|right|left> <s>]")
 	print("                                   what that view shows, drawn by the game in a hidden window, into a PNG")
 	print("sooblivion esm [plugin]            what a plugin holds, by record type")
 	print("sooblivion bsa <archive>           an archive's folders and files")
@@ -2531,14 +2549,29 @@ usage :: fun() {
 }
 
 // `sooblivion picture <out.png> <view | view-cell | view-world> … [at x y
-// z yaw pitch]`: what the view command shows, drawn by the game's renderer
-// in a window kept hidden, without sound, once it's loaded; written to
-// out.png. `at` places the camera: where, and turned (degrees: yaw from
-// north toward east, pitch up).
+// z yaw pitch] [held <idle | right | left> <seconds>]`: what the view
+// command shows, drawn by the game's renderer in a window kept hidden,
+// without sound, once it's loaded; written to out.png. `at` places the
+// camera: where, and turned (degrees: yaw from north toward east, pitch
+// up). `held` holds the first-person arms in an animation (the idle, the
+// attack from the right or from the left) at a time in it.
 command_picture :: fun(args: [][]utf8) {
 	picture := no_picture()
 	&picture.path + args[0]
 	view := args[1 : args.len]
+	if view.len >= 4 and view[view.len - 3] == "held" {
+		which := view[view.len - 2]
+		picture.held = HELD_IDLE
+		if which == "right" do picture.held = HELD_ATTACK_RIGHT
+		if which == "left" do picture.held = HELD_ATTACK_LEFT
+		seconds, is_number := parse_number(view[view.len - 1])
+		if not is_number {
+			usage()
+			return
+		}
+		picture.held_at = f32(seconds)
+		view = view[0 : view.len - 3]
+	}
 	if view.len >= 7 and view[view.len - 6] == "at" {
 		numbers : [5!]f32
 		for k in 0:5 {

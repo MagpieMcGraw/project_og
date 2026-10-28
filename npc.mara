@@ -78,6 +78,8 @@ Npc_Part :: struct {
 	bone: [64]utf8
 	tint: Vec3
 	face_index: i64   // its place among the race's head parts (0 the head, 1 and 2 the ears...); -1 for none
+	slots: u32        // what of the body it covers (SLOT_*); 0 for none (what's held)
+	without: [16]utf8 // a node of its mesh left out, empty for none (a drawn weapon's scabbard: Scb)
 }
 
 // What an NPC is put together from: whether she's a woman, how tall (a
@@ -224,7 +226,7 @@ read_npc_look :: fun(plugin: ^Plugin, npc_id: u32, look: ^Npc_Look) -> err {
 			model_field = male_field
 		}
 		taken |= slots
-		add_npc_part(look, field_text(model_field), "", "")
+		add_npc_part(look, field_text(model_field), "", "", slots)
 	}
 
 	// The race's body where nothing's worn, its head, and how tall.
@@ -282,9 +284,9 @@ read_npc_look :: fun(plugin: ^Plugin, npc_id: u32, look: ^Npc_Look) -> err {
 		slot : u32 = SLOT_UPPER_BODY << u32(k)
 		if taken & slot != 0 do continue
 		mesh := body_mesh(k, look.female)
-		add_npc_part(look, mesh, body_textures[k], "")
+		add_npc_part(look, mesh, body_textures[k], "", slot)
 	}
-	if tail_mesh.len > 0 and taken & SLOT_TAIL == 0 do add_npc_part(look, tail_mesh, tail_texture, "")
+	if tail_mesh.len > 0 and taken & SLOT_TAIL == 0 do add_npc_part(look, tail_mesh, tail_texture, "", SLOT_TAIL)
 	// The head's parts: the head, ears (a man's, a woman's), mouth, lower
 	// and upper teeth, tongue, left and right eyes (drawn with its eyes').
 	eyes_texture : [128]utf8
@@ -301,7 +303,7 @@ read_npc_look :: fun(plugin: ^Plugin, npc_id: u32, look: ^Npc_Look) -> err {
 		if k == 2 and not look.female do continue
 		if head_meshes[k].len == 0 do continue
 		texture := if k >= 7 and eyes_texture.len > 0 do eyes_texture else head_textures[k]
-		add_npc_part(look, head_meshes[k], texture, HEAD_BONE)
+		add_npc_part(look, head_meshes[k], texture, HEAD_BONE, SLOT_HEAD)
 		look.parts[look.parts.len - 1].face_index = k
 	}
 	// Its hair, unless something worn covers it.
@@ -312,7 +314,7 @@ read_npc_look :: fun(plugin: ^Plugin, npc_id: u32, look: ^Npc_Look) -> err {
 			hair_model, has_hair_model := find_field(hair.data, "MODL")
 			hair_texture, has_hair_texture := find_field(hair.data, "ICON")
 			if has_hair_model {
-				add_npc_part(look, field_text(hair_model), if has_hair_texture do field_text(hair_texture) else "", HEAD_BONE)
+				add_npc_part(look, field_text(hair_model), if has_hair_texture do field_text(hair_texture) else "", HEAD_BONE, SLOT_HAIR)
 				look.parts[look.parts.len - 1].tint = hair_color
 			}
 		}
@@ -326,8 +328,9 @@ own_body_section :: fun(section: i64, female: bool) -> bool {
 }
 
 // Adds a part to a look: its mesh and texture as the records name them
-// (under meshes\ and textures\), the bone it hangs from.
-add_npc_part :: fun(look: ^Npc_Look, mesh: []utf8, texture: []utf8, bone: []utf8) {
+// (under meshes\ and textures\), the bone it hangs from, what of the body
+// it covers (SLOT_*).
+add_npc_part :: fun(look: ^Npc_Look, mesh: []utf8, texture: []utf8, bone: []utf8, slots: u32) {
 	if mesh.len == 0 or not fits(look.parts.len + 1, look.parts.cap) do return
 	part := next(&look.parts)
 	part.mesh.len = 0
@@ -335,6 +338,8 @@ add_npc_part :: fun(look: ^Npc_Look, mesh: []utf8, texture: []utf8, bone: []utf8
 	part.bone.len = 0
 	part.tint = Vec3{1, 1, 1}
 	part.face_index = -1
+	part.slots = slots
+	part.without.len = 0
 	archive_path_under("meshes\\", mesh, &part.mesh)
 	if texture.len > 0 do archive_path_under("textures\\", texture, &part.texture)
 	&part.bone + bone
@@ -465,9 +470,9 @@ read_skeleton :: fun(archives: ^Archives, room: ^Load_Room, path: []utf8, skelet
 
 // Poses each NPC as its idle has it at a time (seconds; each NPC's own
 // time is put off by up to IDLE_SPREAD, by its reference): its palette
-// made, into the renderer's, and the instance pointed at it.
+// made, added to the renderer's, and the instance pointed at it. (The
+// palette is started and put on the card by the caller: upload_palette.)
 pose_npcs :: fun(scene: ^Scene, renderer: ^Renderer, time: f32) {
-	renderer.palette.len = 0
 	places : [MAX_POSE_BONES]Mat4
 	for &instance in scene.instances {
 		instance.palette_base = -1
@@ -491,7 +496,6 @@ pose_npcs :: fun(scene: ^Scene, renderer: ^Renderer, time: f32) {
 			&renderer.palette + mat4_mul(height, moving)
 		}
 	}
-	upload_palette(renderer)
 }
 
 // A NIF from the archives, read: its file into file_storage, its blocks
@@ -599,9 +603,10 @@ assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose
 		hang := mat4_identity()
 		hang_bone : i64 = -1
 		if not skinned_mesh(&mesh) {
+			// The bone the part names, else the one the mesh does (a weapon's
+			// names where it's sheathed: drawn, the part says the hand).
 			bone := part.bone[:]
-			parent := hanging_bone(&mesh)
-			if parent.len > 0 do bone = parent
+			if bone.len == 0 do bone = hanging_bone(&mesh)
 			if bone.len > 0 {
 				place, posed := pose_place(pose, bone)
 				if compare_folded(bone, HEAD_BONE) == 0 do place, posed = head_hang(&mesh, pose)
@@ -613,12 +618,18 @@ assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose
 		// place undone.)
 		hang_offset := hang
 		if hang_bone >= 0 do hang_offset = mat4_mul(mat4_inverse(pose[hang_bone].place), hang)
+		// What of its mesh the part leaves out.
+		left_out : [1]i64
+		if part.without.len > 0 {
+			without := find_node(&mesh, part.without)
+			if without >= 0 do &left_out + without
+		}
 		made : Model
 		model_error : err
 		if rigged {
-			made, model_error = build_rigged_model(&mesh, pose, moves, hang_bone, hang_offset, &room.model)
+			made, model_error = build_rigged_model(&mesh, pose, moves, hang_bone, hang_offset, &room.model, left_out)
 		else
-			made, model_error = build_shaped_model(&mesh, pose, hang, moves, &room.model)
+			made, model_error = build_shaped_model(&mesh, pose, hang, moves, &room.model, left_out)
 		}
 		if model_error {
 			note_npc_failure(report, part.mesh, model_error)

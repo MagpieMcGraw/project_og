@@ -1,0 +1,335 @@
+// The player as they see themself: their arms and what they hold, on the
+// first-person skeleton, posed by its animations. The idle plays while
+// nothing else does; a left click starts an attack, and a click from its
+// `a:L` or `a:R` key on has the other follow it. At an attack's Hit key,
+// what's in reach is struck. Drawn with the camera, its eyes on the
+// camera's, in its own depth (draw_frame's held).
+module sooblivion
+
+use mara.core
+use mara.math
+use mara.memory
+use mara.string
+use bsa
+use nif
+use model
+use world
+use scene
+use animation
+use walking
+use logging
+render :: use render
+
+FIRST_PERSON_SKELETON :: "meshes\\characters\\_1stperson\\skeleton.nif"
+// The player's record (their race: its body), and what they hold for now.
+PLAYER_NPC :: 0x00000007
+PLAYER_WEAPON :: "WeapIronLongsword"
+// The first-person skeleton's bones a weapon hangs from, and its eyes.
+WEAPON_BONE :: "Weapon"
+// A weapon's scabbard, in its mesh: shown only while it's sheathed.
+SCABBARD_NODE :: "Scb"
+EYE_BONE :: "Camera01"
+// How far a blow reaches (units), and how a person is met by it: an
+// upright cylinder from where they stand, as wide and tall as one.
+STRIKE_REACH :: 160
+PERSON_RADIUS :: 28
+PERSON_HEIGHT :: 128
+
+// The first-person animations (held_animation_path).
+HELD_IDLE :: 0
+HELD_ATTACK_RIGHT :: 1
+HELD_ATTACK_LEFT :: 2
+HELD_ANIMATIONS :: 3
+
+// A first-person animation, read: its tracks (their keys in track_room),
+// the skeleton rigged to them, its span, whether it loops, and its keys'
+// times (in its span): its blow, and from when another attack may follow
+// it; -1 for none.
+Held_Animation :: struct {
+	rig: [MAX_POSE_BONES]Rig_Bone
+	tracks: [256]Track
+	track_room: [1 * MB]byte
+	start: f32
+	stop: f32
+	looped: bool
+	hit: f32
+	follow: f32
+}
+
+// The player's first-person model and how it's posed now: the scene's
+// model and its palette's entries; where its eyes are (as the idle
+// starts, in its own space); the animation playing, since when (the
+// look's time), where in it now, the attack to follow it (-1 for none),
+// whether its blow is struck yet. A blow struck since the viewer last told
+// of it: swung, and whom it met (a reference; 0 for no one). What's drawn
+// with the camera: instances (none till it's made: ready).
+First_Person :: struct {
+	ready: bool
+	model: i64
+	gpu: render.Gpu_Model
+	bones: [MAX_POSE_BONES]Pose_Bone
+	entries: [NPC_PALETTE]Palette_Entry
+	eye: Vec3
+	animations: [HELD_ANIMATIONS!]Held_Animation
+	playing: i64
+	started: f32
+	at: f32
+	following: i64
+	struck: bool
+	swung: bool
+	struck_reference: u32
+	instances: [1]render.Instance
+}
+
+// An animation's file (HELD_*).
+held_animation_path :: fun(which: i64) -> [64]utf8 {
+	if which == HELD_ATTACK_RIGHT do return "meshes\\characters\\_1stperson\\onehandattackright.kf"
+	if which == HELD_ATTACK_LEFT do return "meshes\\characters\\_1stperson\\onehandattackleft.kf"
+	return "meshes\\characters\\_1stperson\\onehandidle.kf"
+}
+
+// Makes the player's first-person model: what of their race's body covers
+// the upper body and hands (what they wear there, else the race's own),
+// and the weapon in the right hand, on the first-person skeleton as its
+// idle starts; its animations read; put on the card, into the scene's
+// models.
+make_first_person :: fun(viewer: ^Viewer, plugin: ^Plugin) -> err {
+	held := &viewer.held
+	held.ready = false
+	held.instances.len = 0
+	shown := &viewer.shown
+	loader := viewer_loader(viewer)
+	look : Npc_Look
+	read_npc_look(plugin, u32(PLAYER_NPC), &look)?
+	kept : i64 = 0
+	for k in 0:look.parts.len {
+		if look.parts[k].slots & (SLOT_UPPER_BODY | SLOT_HAND) == 0 do continue
+		look.parts[kept] = look.parts[k]
+		kept += 1
+	}
+	look.parts.len = kept
+	look.has_face = false
+	scratch : [256 * KB]byte
+	weapon_id, has_weapon := find_by_editor_id(plugin, PLAYER_WEAPON, &scratch)
+	if has_weapon {
+		weapon, weapon_error := find_record(plugin, weapon_id, &scratch)
+		if not weapon_error {
+			weapon_model, has_model := find_field(weapon.data, "MODL")
+			if has_model {
+				add_npc_part(&look, field_text(weapon_model), "", WEAPON_BONE, 0)
+				// Drawn: its scabbard left in the sheath.
+				&look.parts[look.parts.len - 1].without + SCABBARD_NODE
+			}
+		}
+	}
+
+	// Its animations; the idle's first pose is what its parts are rigged to.
+	other_bones : [MAX_POSE_BONES]Pose_Bone
+	for k in 0:HELD_ANIMATIONS {
+		bones := if k == HELD_IDLE do &held.bones else &other_bones
+		read_held_animation(loader.archives, loader.room, held_animation_path(k), &held.animations[k], bones)?
+	}
+	report := Npc_Report{failures = 0, first = [], reason = Not_In_Archive}
+	skins : [4]Face_Skin
+	skin_storage : [256 * KB]byte
+	whole := assemble_npc(loader.archives, loader.room, &look, held.bones, true, &report, &skins, &skin_storage)
+	if report.failures > 0 do note_failure(shown, report.first, report.reason)
+	if not fits(shown.models.len + 1, shown.models.cap) do return No_Room_For_Models
+	held.gpu = render.upload_model(loader.renderer, &whole, loader.archives, &loader.room.texture)?
+	held.entries.len = 0
+	for entry in whole.palette {
+		if fits(held.entries.len + 1, held.entries.cap) do &held.entries + entry
+	}
+	held.model = shown.models.len
+	&shown.models + held.gpu
+	&shown.model_collision + Collision_Range{first = shown.collision_points.len, count = 0}
+	held.eye = Vec3{0, 0, EYE_HEIGHT}
+	eye := pose_index(held.bones, EYE_BONE)
+	if eye >= 0 {
+		place := held.bones[eye].place
+		held.eye = Vec3{place[3][0], place[3][1], place[3][2]}
+	}
+	start_held(held, HELD_IDLE, viewer.look.time)
+	held.swung = false
+	held.struck_reference = 0
+	held.ready = true
+}
+
+// A first-person animation (at path) read into animation: its tracks,
+// span and keys, then the first-person skeleton rigged to it, and posed
+// as it starts into bones. (Their files go through room.)
+read_held_animation :: fun(archives: ^Archives, room: ^Load_Room, path: []utf8, held_animation: ^Held_Animation, bones: ^[]Pose_Bone) -> err {
+	held_animation.rig.len = 0
+	held_animation.tracks.len = 0
+	held_animation.track_room.len = 0
+	held_animation.start = 0
+	held_animation.stop = 0
+	held_animation.looped = true
+	held_animation.hit = -1
+	held_animation.follow = -1
+	room.file.len = 0
+	room.blocks.len = 0
+	kf := read_archived_nif(archives, path, &room.file, &room.blocks)?
+	for &block, index in kf.blocks {
+		match block^ {
+		Sequence sequence
+			read_tracks(&kf, index, &held_animation.tracks, &held_animation.track_room, true)
+			held_animation.start, held_animation.stop = sequence_span(&kf, index)
+			held_animation.looped = sequence.cycle == CYCLE_LOOP
+			read_held_keys(&kf, sequence.text_keys, held_animation)
+			break
+		else
+		}
+	}
+	room.file.len = 0
+	room.blocks.len = 0
+	skeleton := read_archived_nif(archives, FIRST_PERSON_SKELETON, &room.file, &room.blocks)?
+	bones.len = 0
+	pose_nodes(&skeleton, &held_animation.tracks, held_animation.start, bones)
+	rig_nodes(&skeleton, &held_animation.tracks, &held_animation.rig)
+}
+
+// An animation's keys that say when it strikes (Hit) and from when
+// another attack may follow (a:L, a:R): their times, into it.
+read_held_keys :: fun(kf: ^Nif, text_keys: i64, held_animation: ^Held_Animation) {
+	if text_keys < 0 or text_keys >= kf.blocks.len do return
+	match kf.blocks[text_keys] {
+	Text_Keys keys
+		at : i64 = 0
+		for k in 0:keys.count {
+			key_time, text, next_at := next_text_key(keys.keys, at)
+			at = next_at
+			if compare_folded(text, "hit") == 0 do held_animation.hit = key_time
+			if compare_folded(text, "a:l") == 0 or compare_folded(text, "a:r") == 0 do held_animation.follow = key_time
+		}
+	else
+	}
+}
+
+// Starts an animation (HELD_*) at a time: nothing to follow it, its blow
+// not struck.
+start_held :: fun(held: ^First_Person, which: i64, now: f32) {
+	held.playing = which
+	held.started = now
+	held.at = held.animations[which].start
+	held.following = -1
+	held.struck = false
+}
+
+// Moves the first-person animations on to the look's time: a click starts
+// an attack from the idle, or has the other follow the one playing (from
+// its follow key on); an attack strikes at its Hit key and at its end
+// gives way to the one following, or the idle; the idle loops.
+step_first_person :: fun(viewer: ^Viewer, clicked: bool) {
+	held := &viewer.held
+	if not held.ready do return
+	now := viewer.look.time
+	// A picture's: one animation held at a time, its blow struck once past its hit.
+	if viewer.picture.held >= 0 {
+		which := viewer.picture.held
+		if held.playing != which do start_held(held, which, now)
+		held.at = min_f32(held.animations[which].start + viewer.picture.held_at, held.animations[which].stop)
+		if not held.struck and held.animations[which].hit >= 0 and held.at >= held.animations[which].hit {
+			held.struck = true
+			held.swung = true
+			held.struck_reference = strike(&viewer.shown, viewer.camera)
+		}
+		return
+	}
+	if clicked {
+		held_animation := &held.animations[held.playing]
+		at := held_animation.start + (now - held.started)
+		if held.playing == HELD_IDLE {
+			start_held(held, HELD_ATTACK_RIGHT, now)
+		elif held.following < 0 and held_animation.follow >= 0 and at >= held_animation.follow
+			held.following = if held.playing == HELD_ATTACK_RIGHT do HELD_ATTACK_LEFT else HELD_ATTACK_RIGHT
+		}
+	}
+	held_animation := &held.animations[held.playing]
+	at := held_animation.start + (now - held.started)
+	if held.playing != HELD_IDLE {
+		if not held.struck and held_animation.hit >= 0 and at >= held_animation.hit {
+			held.struck = true
+			held.swung = true
+			held.struck_reference = strike(&viewer.shown, viewer.camera)
+		}
+		if at >= held_animation.stop {
+			start_held(held, if held.following >= 0 do held.following else HELD_IDLE, now)
+			held_animation = &held.animations[held.playing]
+			at = held_animation.start
+		}
+	}
+	span := held_animation.stop - held_animation.start
+	if held_animation.looped and span > 0 do at = held_animation.start + (at - held_animation.start) - floor_f32((at - held_animation.start) / span) * span
+	held.at = min_f32(at, held_animation.stop)
+}
+
+// Poses the first-person model as its animation has it now: its palette
+// added to the renderer's; placed with its eyes on the camera's, looking
+// its way; lit by the scene's lights near it. Drawn from held.instances.
+pose_first_person :: fun(viewer: ^Viewer) {
+	held := &viewer.held
+	held.instances.len = 0
+	if not held.ready do return
+	palette := &viewer.renderer.palette
+	if not fits(palette.len + held.entries.len, palette.cap) do return
+	held_animation := &held.animations[held.playing]
+	places : [MAX_POSE_BONES]Mat4
+	pose_rig(held_animation.rig, &held_animation.tracks, held.at, &places)
+	palette_base := palette.len
+	for entry in held.entries {
+		moving := entry.offset
+		if entry.bone >= 0 and entry.bone < places.len do moving = mat4_mul(places[entry.bone], entry.offset)
+		palette + moving
+	}
+	// Its own axes: x the camera's right, y ahead, z up.
+	forward, right, up := render.camera_axes(viewer.camera)
+	turn := mat4_identity()
+	for axis in 0:3 {
+		turn[0][axis] = right[axis]
+		turn[1][axis] = forward[axis]
+		turn[2][axis] = up[axis]
+	}
+	placement := mat4_mul(mat4_translate(viewer.camera.position), mat4_mul(turn, mat4_translate(Vec3{0, 0, 0} - held.eye)))
+	instance := render.place_instance(held.gpu, held.model, placement)
+	instance.palette_base = palette_base
+	render.choose_lights(&instance, &viewer.shown.lights)
+	&held.instances + instance
+}
+
+// Who a blow from the camera meets within STRIKE_REACH, short of a wall:
+// the nearest person (an NPC, as an upright cylinder PERSON_RADIUS wide and
+// PERSON_HEIGHT tall from where they stand); their reference, 0 for no one.
+strike :: fun(shown: ^Scene, camera: render.Camera) -> u32 {
+	forward, _, _ := render.camera_axes(camera)
+	reach : f32 = STRIKE_REACH
+	_, wall, hit_wall := pick(shown, camera.position, forward, reach)
+	if hit_wall do reach = wall
+	struck : u32 = 0
+	for &instance in shown.instances {
+		_, is_person := index_get(&shown.model_rigs, u64(instance.model + 1))
+		if not is_person do continue
+		feet := Vec3{instance.placement[3][0], instance.placement[3][1], instance.placement[3][2]}
+		// Where the line enters the cylinder, across (x and y): the nearer
+		// root of |from + t way| = radius; 0 from inside it.
+		from_x := camera.position.x - feet.x
+		from_y := camera.position.y - feet.y
+		a := forward.x * forward.x + forward.y * forward.y
+		b := 2 * (from_x * forward.x + from_y * forward.y)
+		c := from_x * from_x + from_y * from_y - PERSON_RADIUS * PERSON_RADIUS
+		t : f32 = 0
+		if c > 0 {
+			if a < 0.000001 do continue
+			room := b * b - 4 * a * c
+			if room < 0 do continue
+			t = (0 - b - sqrt_f32(room)) / (2 * a)
+			if t < 0 do continue
+		}
+		if t > reach do continue
+		height := camera.position.z + forward.z * t - feet.z
+		if height < 0 or height > PERSON_HEIGHT do continue
+		reach = t
+		struck = instance.reference
+	}
+	return struck
+}

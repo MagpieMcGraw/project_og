@@ -77,20 +77,24 @@ PICTURE_LOG_PATH :: "picture.log"
 // PICTURE_SETTLE frames more (textures, weather), the frame drawn is
 // written to path as a PNG and the viewer quits; after
 // PICTURE_MOST_FRAMES, whatever's loaded by then. Placed, the camera
-// starts at position, turned by yaw and pitch (radians).
+// starts at position, turned by yaw and pitch (radians). The first-person
+// arms are held in one animation (HELD_*; -1: as they'd play) at a time
+// in it (seconds), past its hit striking once.
 Picture :: struct {
 	path: [260]utf8      // empty: no picture, the window shown
 	placed: bool
 	position: Vec3
 	yaw: f32
 	pitch: f32
+	held: i64
+	held_at: f32
 }
 PICTURE_SETTLE :: 3
 PICTURE_MOST_FRAMES :: 6000
 
 // No picture: the window shown, as usual.
 no_picture :: fun() -> Picture {
-	return Picture{path = [], placed = false, position = Vec3{0, 0, 0}, yaw = 0, pitch = 0}
+	return Picture{path = [], placed = false, position = Vec3{0, 0, 0}, yaw = 0, pitch = 0, held = -1, held_at = 0}
 }
 // How much faster than ours the game's day goes (Oblivion's own), and,
 // with T held, how much faster again.
@@ -222,6 +226,8 @@ Viewer :: struct {
 	picture: Picture
 	picture_frames: i64
 	picture_settled: i64
+	// The player's arms and what they hold, drawn with the camera.
+	held: First_Person
 }
 
 // What happened in a frame that the command has to answer.
@@ -277,6 +283,8 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	set_vsync(&viewer.platform, not taking_picture)
 	viewer.picture_frames = 0
 	viewer.picture_settled = 0
+	viewer.held.ready = false
+	viewer.held.instances.len = 0
 	renderer_init(&viewer.renderer, table_storage)?
 	note(&viewer.journal, if viewer.renderer.bindless_available do "the card draws bindless" else "the card can't draw bindless: textures are bound")
 	note(&viewer.journal, "; anisotropy ")
@@ -488,7 +496,12 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	noises : [16]Door_Noise
 	swing_doors(shown, f32(seconds), &noises)
 	move_pieces(shown, viewer.look.time)
+	// The people posed, the player's arms too: a left click swings.
+	step_first_person(viewer, input.mouse_pressed[1])
+	viewer.renderer.palette.len = 0
 	pose_npcs(shown, &viewer.renderer, viewer.look.time)
+	pose_first_person(viewer)
+	upload_palette(&viewer.renderer)
 	for &noise in noises do play_once(&viewer.audio, &viewer.archives, &shown.sound_kinds[noise.sound], noise.position, listener_of(camera^))
 	if change_lights(shown, f32(seconds)) do shown.lights_changed = true
 	drawing_start := time_now()
@@ -501,7 +514,8 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		shown.lights_changed = false
 	}
 	drawn, framebuffer_error := draw_frame(&viewer.renderer, &shown.models, &shown.instances, &shown.distant_instances, &shown.grounds,
-		&shown.waters, &shown.tree_cells, &shown.grass_cells, &viewer.look, shown.lighting, camera^, platform.width, platform.height)
+		&shown.waters, &shown.tree_cells, &shown.grass_cells, &viewer.held.instances, &viewer.look, shown.lighting, camera^,
+		platform.width, platform.height)
 	viewer.drawn = drawn
 	if framebuffer_error and not viewer.told_framebuffer {
 		// Said once: the frames are drawn into the window from here, as well
@@ -611,6 +625,41 @@ take_picture :: fun(viewer: ^Viewer) {
 	note(journal, viewer.picture_frames)
 	note(journal, " frames, into ")
 	note(journal, viewer.picture.path)
+	note_end(journal)
+}
+
+// Makes the player's first-person model (make_first_person); the journal
+// says why, when it can't be.
+take_first_person :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	held_error := make_first_person(viewer, plugin)
+	if held_error {
+		note(&viewer.journal, "no first-person arms: ")
+		note_error(&viewer.journal, held_error)
+		note_end(&viewer.journal)
+	}
+}
+
+// Tells the journal what a blow met: whom (their name), or no one.
+note_blow :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	journal := &viewer.journal
+	struck := viewer.held.struck_reference
+	if struck == 0 {
+		note(journal, "swung at no one")
+		note_end(journal)
+		return
+	}
+	scratch : [64 * KB]byte
+	name : str256
+	reference, reference_error := find_record(plugin, struck, &scratch)
+	if not reference_error {
+		base, has_base := find_field(reference.data, "NAME")
+		if has_base and base.len >= 4 {
+			raw : u32 = base[0]
+			name = record_name(plugin, record_form(plugin, reference, raw))
+		}
+	}
+	note(journal, "struck ")
+	note(journal, if name.len > 0 do name[:] else "someone")
 	note_end(journal)
 }
 
@@ -1364,6 +1413,7 @@ command_view_cell :: fun(name: []utf8, picture: Picture) -> err {
 	go_inside(&viewer, &plugin, cell)
 	start_in_cell(&viewer, &plugin)
 	if picture.placed do place_camera(&viewer, picture)
+	take_first_person(&viewer, &plugin)
 	explore(&viewer, &plugin)
 }
 
@@ -1405,6 +1455,7 @@ command_view_world :: fun(name: []utf8, x: i64, y: i64, picture: Picture) {
 	if picture.placed do middle = picture.position
 	go_outside(&viewer, &plugin, world_id, middle)
 	if picture.placed do place_camera(&viewer, picture)
+	take_first_person(&viewer, &plugin)
 	explore(&viewer, &plugin)
 }
 
@@ -1472,6 +1523,10 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 			viewer.camera.yaw = there.rotation.z
 			viewer.camera.pitch = 0
 			place_walker(viewer)
+		}
+		if viewer.held.swung {
+			note_blow(viewer, plugin)
+			viewer.held.swung = false
 		}
 		if viewer.missed {
 			note_missed(viewer, plugin)

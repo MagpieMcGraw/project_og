@@ -54,6 +54,9 @@ NO_LIGHT :: 0xFFFF
 // Room in the shared mesh buffers: vertices (48 bytes each) and indexes.
 MESH_VERTEX_ROOM :: 4194304
 MESH_INDEX_ROOM :: 33554432
+// What's held in view is drawn between these (draw_frame's held).
+HELD_NEAR :: 1
+HELD_FAR :: 1000
 // Room for rigged parts' vertices' bones and weights (16 bytes each), and
 // for the matrices they're posed with each frame (the palette).
 INFLUENCE_ROOM :: 2097152
@@ -3335,7 +3338,7 @@ sphere_in_view :: fun(planes: ^View_Planes, center: Vec3, radius: f32) -> bool {
 // (its effects cut off where they meet what's behind them), and why is
 // given back.
 draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, distant_instances: ^[]Instance, grounds: ^[]Gpu_Land,
-	waters: ^[]Water_Cell, tree_cells: ^[]Gpu_Trees, grass_cells: ^[]Gpu_Grass, look: ^Sky_Look, lighting: Cell_Lighting,
+	waters: ^[]Water_Cell, tree_cells: ^[]Gpu_Trees, grass_cells: ^[]Gpu_Grass, held: ^[]Instance, look: ^Sky_Look, lighting: Cell_Lighting,
 	camera: Camera, width: i64, height: i64) -> Frame_Stats, err
 {
 	stats := Frame_Stats{instances = instances.len, visible = 0, drawn_parts = 0, draw_calls = 0, land_cells = 0}
@@ -3399,6 +3402,19 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 	draw_mesh_runs(renderer, view_projection, lighting, sun, camera, true, soft, &stats)
 	draw_particles(renderer, models, instances, view_projection, lighting, sun, camera, look.time, soft, &stats)
 	if look.outside do draw_precipitation(renderer, look, view_projection, lighting, sun, camera, &stats)
+	// What's held in view (the first-person arms and weapon): last, in a
+	// depth of its own from a nearer near plane, so no wall cuts into it.
+	if held.len > 0 {
+		DepthMask(1)
+		Clear(DEPTH_BUFFER_BIT)
+		held_projection := mat4_perspective(camera.field_of_view, f32(width) / f32(height), HELD_NEAR, HELD_FAR)
+		held_view_projection := mat4_mul(held_projection, view_matrix(camera))
+		held_planes := view_planes(held_view_projection)
+		nothing_hidden := hidden_around(camera.position)
+		gather_meshes(renderer, models, held, &held_planes, &nothing_hidden, camera, look.time, &stats)
+		draw_mesh_runs(renderer, held_view_projection, lighting, sun, camera, false, false, &stats)
+		draw_mesh_runs(renderer, held_view_projection, lighting, sun, camera, true, false, &stats)
+	}
 
 	DepthMask(1)
 	Disable(BLEND)
