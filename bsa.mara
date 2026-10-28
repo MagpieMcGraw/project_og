@@ -296,8 +296,10 @@ search_files :: fun(files: []Archive_File, hash: u64) -> i64, bool {
 }
 
 // Reads a file of the archive into storage, after what it holds (its len
-// moved past it), unpacked: the file's bytes, a view of storage.
-read_file :: fun(archive: ^Archive, index: i64, storage: ^[]byte) -> []byte, err {
+// moved past it), unpacked: the file's bytes, a view of storage. A packed
+// file's checksum is checked only if checked: the archives are the game's
+// own, read often, and a stream that's been spoiled rarely unpacks at all.
+read_file :: fun(archive: ^Archive, index: i64, storage: ^[]byte, checked := false) -> []byte, err {
 	entry := archive.files[index]
 	start := storage.len
 	none := storage[start : start]
@@ -319,7 +321,7 @@ read_file :: fun(archive: ^Archive, index: i64, storage: ^[]byte) -> []byte, err
 	if start + i64(unpacked_size) > storage.cap - entry.size do return none, No_Room
 	output := storage[start : start + i64(unpacked_size)]
 	output.len = 0
-	unzip(packed[4 : packed.len], &output)?
+	unzip(packed[4 : packed.len], &output, checked)?
 	storage.len = start + output.len
 	return storage[start : start + output.len]
 }

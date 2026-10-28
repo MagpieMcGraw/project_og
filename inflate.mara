@@ -25,8 +25,8 @@ Inflate_Error :: error {
 // The longest code deflate uses, in bits.
 MAX_CODE_BITS :: 15
 // Codes this long or shorter are found with one look in a table.
-FAST_BITS :: 9
-FAST_SIZE :: 512   // 1 << FAST_BITS
+FAST_BITS :: 10
+FAST_SIZE :: 1024   // 1 << FAST_BITS
 
 // The match lengths symbols 257 to 285 stand for: the shortest of each, and
 // how many extra bits follow the symbol to add to it.
@@ -105,7 +105,8 @@ overran :: fun(bits: ^Bits) -> bool {
 // length's codes follow on from the last of the length before, doubled.
 Huffman :: struct {
 	// Indexed by the next FAST_BITS bits of input: the symbol whose code
-	// they start with, as symbol | length << 9; 0 when its code is longer.
+	// they start with, as symbol | length << 9 (a symbol takes 9 bits, a
+	// length 4); 0 when its code is longer.
 	fast: [FAST_SIZE!]u16
 	counts: [16!]i64     // how many codes there are of each length
 	symbols: [288!]u16   // the symbols in code order: shortest codes first
@@ -282,34 +283,108 @@ stored_block :: fun(bits: ^Bits, output: ^[]byte) -> err {
 
 // A block packed with Huffman codes: literal bytes, and matches — a length
 // and a distance back, copying what's there — up to the end-of-block symbol.
+// (This is where unpacking spends its time: the bits held and the output's
+// length are kept in locals, put back for decode's longer codes and when
+// it's done, and the short codes are looked up here.)
 packed_block :: fun(bits: ^Bits, output: ^[]byte, literals: ^Huffman, distances: ^Huffman) -> err {
+	room := output[0 : output.cap]
+	written := output.len
+	held := bits.held
+	count := bits.count
+	// (Failing too: unzip asks whether the input ran out first.)
+	defer {
+		bits.held = held
+		bits.count = count
+	}
 	for true {
-		symbol := decode(bits, literals)?
+		// Bits enough for a whole match: a length's code and extra bits, a
+		// distance's (15 + 5 + 15 + 13).
+		if count < 48 {
+			if bits.at + 8 <= bits.input.len {
+				chunk : u64 = bits.input[bits.at]
+				held |= chunk << u64(count)
+				taken := (63 - count) / 8
+				bits.at += taken
+				count += taken * 8
+			else
+				bits.held = held
+				bits.count = count
+				fill(bits)
+				held = bits.held
+				count = bits.count
+			}
+		}
+		symbol : i64 = 0
+		entry := literals.fast[i64(held & (FAST_SIZE - 1))]
+		if entry != 0 {
+			code_length := i64(entry >> 9)
+			held >>= u64(code_length)
+			count -= code_length
+			symbol = i64(entry & 511)
+		else
+			bits.held = held
+			bits.count = count
+			symbol = decode(bits, literals)?
+			held = bits.held
+			count = bits.count
+		}
 		// Past the input's end the bits are zeros, which decode as symbols
 		// like any others: a stream cut off mid-block would fill the output
 		// with them. (padding is 0 but near the end, so this costs a compare.)
-		if bits.padding != 0 and overran(bits) do return Input_Ended
+		if bits.padding != 0 {
+			bits.held = held
+			bits.count = count
+			if overran(bits) do return Input_Ended
+		}
 		if symbol < 256 {
-			if output.len == output.cap do return Output_Full
-			output[output.len] = u8(symbol)
-			output.len += 1
+			if written == room.len do return Output_Full
+			room[written] = u8(symbol)
+			written += 1
 			continue
 		}
-		if symbol == 256 do return
+		if symbol == 256 {
+			output.len = written
+			return
+		}
 
 		which := symbol - 257
 		if which >= 29 do return Bad_Code
-		length := LENGTH_BASE[which] + take(bits, LENGTH_EXTRA[which])
-		place := decode(bits, distances)?
-		if place >= 30 do return Bad_Distance
-		distance := DISTANCE_BASE[place] + take(bits, DISTANCE_EXTRA[place])
-		if distance > output.len do return Bad_Distance
-		if output.len + length > output.cap do return Output_Full
+		length_extra := LENGTH_EXTRA[which]
+		length := LENGTH_BASE[which] + i64(held & ((u64(1) << u64(length_extra)) - 1))
+		held >>= u64(length_extra)
+		count -= length_extra
 
-		// Byte by byte: a match can overlap what it writes (a run).
-		from := output.len - distance
-		for i in 0:length do output[output.len + i] = output[from + i]
-		output.len += length
+		place : i64 = 0
+		distance_entry := distances.fast[i64(held & (FAST_SIZE - 1))]
+		if distance_entry != 0 {
+			code_length := i64(distance_entry >> 9)
+			held >>= u64(code_length)
+			count -= code_length
+			place = i64(distance_entry & 511)
+		else
+			bits.held = held
+			bits.count = count
+			place = decode(bits, distances)?
+			held = bits.held
+			count = bits.count
+		}
+		if place >= 30 do return Bad_Distance
+		distance_extra := DISTANCE_EXTRA[place]
+		distance := DISTANCE_BASE[place] + i64(held & ((u64(1) << u64(distance_extra)) - 1))
+		held >>= u64(distance_extra)
+		count -= distance_extra
+		if distance > written do return Bad_Distance
+		if written + length > room.len do return Output_Full
+
+		// At once when it's all behind; byte by byte when it overlaps what it
+		// writes (a run).
+		from := written - distance
+		if distance >= length {
+			room[written : written + length] = room[from : from + length]
+		else
+			for i in 0:length do room[written + i] = room[from + i]
+		}
+		written += length
 	}
 }
 
@@ -350,8 +425,9 @@ adler32 :: fun(data: []byte) -> u32 {
 
 // Unpacks the zlib stream in input into output, after what output holds:
 // output.len moves past what it unpacked. Output_Full when that is more
-// than output has room for; the checksum at its end is checked.
-unzip :: fun(input: []byte, output: ^[]byte) -> err {
+// than output has room for. The checksum at its end is checked, if checked
+// (it takes a tenth of the time of unpacking).
+unzip :: fun(input: []byte, output: ^[]byte, checked := true) -> err {
 	if input.len < 6 do return Input_Ended
 	compression : u8 = input[0]
 	flags : u8 = input[1]
@@ -388,7 +464,7 @@ unzip :: fun(input: []byte, output: ^[]byte) -> err {
 	b2 : u8 = input[end + 2]
 	b3 : u8 = input[end + 3]
 	expected := (u32(b0) << 24) | (u32(b1) << 16) | (u32(b2) << 8) | u32(b3)
-	if adler32(room[0 : room.len]) != expected do return Bad_Checksum
+	if checked and adler32(room[0 : room.len]) != expected do return Bad_Checksum
 
 	output.len = start + room.len
 }

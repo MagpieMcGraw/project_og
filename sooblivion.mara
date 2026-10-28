@@ -128,7 +128,7 @@ command_bsa :: fun(name: []utf8, what: []utf8) {
 		total : i64 = 0
 		for file, i in archive.files {
 			storage.len = 0
-			data, read_error := read_file(&archive, i, &storage)
+			data, read_error := read_file(&archive, i, &storage, true)
 			if read_error {
 				failed += 1
 				if failed <= 10 do print("  % failed: %", file_name(&archive, file), read_error)
