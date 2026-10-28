@@ -31,8 +31,6 @@ DEFAULT_PORT :: 27100
 AF_INET :: 2
 SOCK_STREAM :: 1
 IPPROTO_TCP :: 6
-SOL_SOCKET :: 0xFFFF
-SO_REUSEADDR :: 4
 TCP_NODELAY :: 1
 FIONBIO :: 0x8004667E
 WSAEWOULDBLOCK :: 10035
@@ -106,15 +104,13 @@ socket_quick :: fun(id: u64) {
 	_ = setsockopt(id, IPPROTO_TCP, TCP_NODELAY, &flag[0], 4)
 }
 
-// A socket listening on a port: on every address the machine has (others
-// may connect: Windows' firewall asks whether they may, the first time),
-// or on this machine's own (127.0.0.1) only.
+// A socket listening on a port (one another program has: Bind_Failed —
+// asked to reuse it, Windows would share it): on every address the
+// machine has (others may connect: Windows' firewall asks whether they
+// may, the first time), or on this machine's own (127.0.0.1) only.
 net_listen :: fun(port: i64, everywhere: bool) -> u64, err {
 	id := socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
 	if id == NO_SOCKET do return NO_SOCKET, Socket_Failed
-	again : [4!]byte
-	again[0] = u32(1)
-	_ = setsockopt(id, SOL_SOCKET, SO_REUSEADDR, &again[0], 4)
 	numbers : [4!]u8 = if everywhere do [0, 0, 0, 0] else [127, 0, 0, 1]
 	address := socket_address(numbers, port)
 	if bind(id, &address[0], 16) == SOCKET_ERROR {

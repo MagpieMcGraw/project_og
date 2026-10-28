@@ -41,7 +41,8 @@ WORLD_DOORS :: 1024
 
 // A player, as their client reports them: their number (0: no one in this
 // slot), the world they're in (0 inside), where their feet are, which way
-// they face (radians from north toward east), whether they hurry time; the
+// they face (radians from north toward east), how fast they're going
+// (units a second, across), whether they hurry time; the
 // place they're in — an interior (place_cell), or a world's cells round
 // place_x, place_y (place_world) — and the people in it (NPCs placed,
 // ACHR), as they stand now: where, turned how, how big.
@@ -50,6 +51,7 @@ Player_State :: struct {
 	world: u32
 	feet: Vec3
 	yaw: f32
+	speed: f32
 	hurried: bool
 	place_world: u32
 	place_cell: u32
@@ -67,6 +69,9 @@ Door_State :: struct {
 }
 
 World_State :: struct {
+	// What every chance its players roll alike is rolled from (chance_at:
+	// the birds they hear, thunder).
+	seed: u64
 	// The clock: the game's hour (0 to 24) and its days gone; how long the
 	// world has run (seconds of real time), in ticks; whether time's
 	// hurried (the player holds T).
@@ -113,7 +118,8 @@ world_start :: fun(state: ^World_State) {
 	state.weather_share = 1
 	state.weather_transition = 1
 	state.weather_hours_left = 0
-	state.weather_seed = time_now() | 1
+	state.seed = time_now() | 1
+	state.weather_seed = state.seed
 	for &player in state.players do player_clear(player, 0)
 	state.doors.len = 0
 }
@@ -162,6 +168,7 @@ player_clear :: fun(player: ^Player_State, id: i64) {
 	player.world = 0
 	player.feet = Vec3{0, 0, 0}
 	player.yaw = 0
+	player.speed = 0
 	player.hurried = false
 	player.place_world = 0
 	player.place_cell = 0

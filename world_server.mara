@@ -144,7 +144,7 @@ server_run :: fun(server: ^World_Server, plugin: ^Plugin) {
 	for &client, slot in server.clients {
 		if not client.here do continue
 		if server.clock_due {
-			wire_put(&client.to_client, MESSAGE_CLOCK, Clock_Message{hour = state.hour, day = state.day, seconds = state.seconds,
+			wire_put(&client.to_client, MESSAGE_CLOCK, Clock_Message{seed = state.seed, hour = state.hour, day = state.day, seconds = state.seconds,
 				hurried = state.hurried, climate = state.climate.form_id, sky_taken = state.sky_taken, weather = state.weather,
 				last_weather = state.last_weather, weather_share = state.weather_share})
 		}
@@ -153,6 +153,16 @@ server_run :: fun(server: ^World_Server, plugin: ^Plugin) {
 			client.people_due = false
 		}
 		if server.doors_due do wire_put_list(&client.to_client, MESSAGE_DOORS, state.doors)
+		// The others, with the clock.
+		if server.clock_due {
+			others : [MAX_PLAYERS]Other_Player
+			for &player, other_slot in state.players {
+				if player.id == 0 or other_slot == slot do continue
+				&others + Other_Player{id = player.id, world = player.world, cell = if player.world == 0 do player.place_cell else 0,
+					feet = player.feet, yaw = player.yaw, speed = player.speed}
+			}
+			wire_put_list(&client.to_client, MESSAGE_PLAYERS, others)
+		}
 		if client.connection != NO_SOCKET {
 			send_error := wire_send(&client.to_client, client.connection)
 			if send_error do server_leave(server, slot, send_error)
@@ -168,11 +178,12 @@ server_take :: fun(server: ^World_Server, plugin: ^Plugin, slot: i64, message: W
 	state := &server.state
 	player := &state.players[slot]
 	if message.kind == MESSAGE_PLAYER {
-		told, whole := wire_value(message, Player_Message{world_id = 0, feet = Vec3{0, 0, 0}, yaw = 0, hurried = false})
+		told, whole := wire_value(message, Player_Message{world_id = 0, feet = Vec3{0, 0, 0}, yaw = 0, speed = 0, hurried = false})
 		if not whole do return
 		player.world = told.world_id
 		player.feet = told.feet
 		player.yaw = told.yaw
+		player.speed = told.speed
 		player.hurried = told.hurried
 	elif message.kind == MESSAGE_PLACE
 		place, whole := wire_value(message, Place_Message{world_id = 0, cell = 0, x = 0, y = 0, feet = Vec3{0, 0, 0}})

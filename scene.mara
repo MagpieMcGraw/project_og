@@ -631,6 +631,17 @@ add_instance :: fun(scene: ^Scene, model_index: i64, placement: Mat4, reference:
 	choose_lights(instance, &scene.lights)
 }
 
+// Lets go of the instances of a reference.
+remove_instances :: fun(scene: ^Scene, reference: u32) {
+	kept : i64 = 0
+	for k in 0:scene.instances.len {
+		if scene.instances[k].reference == reference do continue
+		if kept != k do scene.instances[kept] = scene.instances[k]
+		kept += 1
+	}
+	scene.instances.len = kept
+}
+
 // Chooses every instance's lights again: after a cell's lights are all known.
 choose_all_lights :: fun(scene: ^Scene) {
 	for &instance in scene.instances do choose_lights(instance, &scene.lights)

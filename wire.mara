@@ -31,14 +31,29 @@ MESSAGE_CLOCK :: 10       // the clock and the sky (Clock_Message)
 MESSAGE_PEOPLE :: 11      // the people in the player's place (a list of References)
 MESSAGE_DOORS :: 12       // the doors opened or shut (a list of Door_States)
 MESSAGE_NOTE :: 13        // something to tell the player's journal (Note_Message)
+MESSAGE_PLAYERS :: 14     // the other players (a list of Other_Players)
 
 // Where a client's player is now: the world they're in (0 inside), their
-// feet, which way they face, whether they hurry time.
+// feet, which way they face, how fast they're going (units a second,
+// across), whether they hurry time.
 Player_Message :: struct {
 	world_id: u32
 	feet: Vec3
 	yaw: f32
+	speed: f32
 	hurried: bool
+}
+
+// Another player, as a server tells a client of them: their number, the
+// world they're in (0 inside) and the interior (0 outside), their feet,
+// which way they face, how fast they're going.
+Other_Player :: struct {
+	id: i64
+	world: u32
+	cell: u32
+	feet: Vec3
+	yaw: f32
+	speed: f32
 }
 
 // The place a client's player has come into: an interior (cell), or a
@@ -52,11 +67,13 @@ Place_Message :: struct {
 	feet: Vec3
 }
 
-// The clock and the sky, as a server tells its clients: the game's hour
-// and days gone, the seconds the world's run, whether time's hurried; the
-// climate (its form id; 0 the default) and whether there's one yet; the
-// weathers coming in and going out (form ids), how far in.
+// The clock and the sky, as a server tells its clients: the world's seed
+// (for chance its players roll alike); the game's hour and days gone, the
+// seconds the world's run, whether time's hurried; the climate (its form
+// id; 0 the default) and whether there's one yet; the weathers coming in
+// and going out (form ids), how far in.
 Clock_Message :: struct {
+	seed: u64
 	hour: f32
 	day: i64
 	seconds: f64

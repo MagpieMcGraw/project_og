@@ -118,9 +118,14 @@ no_picture :: fun() -> Picture {
 // The room the sounds' clips are loaded into.
 SOUND_ROOM :: 64 * MB
 
-// Region sounds are tried this often (seconds); thunder's chance each
-// second, by the weather's (0 to 1); a lightning flash fades this fast.
+// Region sounds are tried this often (seconds), at each spot round the
+// player (SOUND_SPOT units square: the 3 by 3 round theirs); thunder's
+// chance each second, by the weather's (0 to 1); a lightning flash fades
+// this fast.
 REGION_SOUND_TRY :: 2
+SOUND_SPOT :: 1024
+// What thunder's chance is rolled for (chance_at), apart from the regions' sounds.
+THUNDER_KEY :: 0x7400000000000000
 THUNDER_CHANCE :: 0.25
 LIGHTNING_FADE :: 4
 
@@ -173,27 +178,33 @@ Viewer :: struct {
 	from_server: Wire_Queue
 	server_lost: bool
 	seen: World_Copy
+	// The interior the player's in (0 outside); where their feet were when
+	// last told the server (for how fast they're going); the other players
+	// shown here.
+	inside_cell: u32
+	reported_feet: Vec3
+	others: [MAX_PLAYERS]Other_Shown
 	// The sky as shown: the climate the server says the sky's under, read
 	// (its sun, moons, night sky); the records of the weathers (the one
 	// coming in, the last one going out: show_weather reads them), what's
 	// seen and
-	// heard by chance rolled from the viewer's own seed (the regions'
-	// sounds, thunder), the moons' phase on the card (-1: none yet).
+	// heard by chance — the regions' sounds, thunder — rolled alike by every
+	// player (chance_at), the moons' phase on the card (-1: none yet).
 	climate: Climate
 	weather: Weather
 	last_weather: Weather
-	chance_seed: u64
 	moon_phase: i64
 	// The weather's sounds: its rain's and wind's loops (heard everywhere,
 	// as loud as the weather has come in), and the last weather's, going;
 	// the sounds the regions here make now and then (birds, insects), and
-	// when they're next tried (the mix's seconds); when thunder's next tried,
-	// and a lightning flash's brightness now, fading.
+	// the slot of the world's time they were last tried in (REGION_SOUND_TRY
+	// seconds each); the second thunder was last tried in, and a lightning
+	// flash's brightness now, fading.
 	weather_sounds: [8]Placed_Sound
 	last_weather_sounds: [8]Placed_Sound
 	region_sounds: [REGION_SOUNDS]Region_Sound
-	region_sounds_tried: f64
-	thunder_tried: f64
+	region_slot: i64
+	thunder_second: i64
 	lightning: f32
 	sky_world: u32      // the world they're of, 0 for none yet (or an interior's own)
 	sky_inside: bool    // in an interior that behaves like an exterior: lit by the sky
@@ -378,16 +389,18 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.sky_inside = false
 	open_link(viewer)?
 	copy_start(&viewer.seen)
+	viewer.inside_cell = 0
+	viewer.reported_feet = Vec3{0, 0, 0}
+	viewer.others.len = 0
 	viewer.climate = default_climate()
 	viewer.weather = default_weather()
 	viewer.last_weather = default_weather()
-	viewer.chance_seed = time_now() | 1
 	viewer.moon_phase = -1
 	viewer.weather_sounds.len = 0
 	viewer.last_weather_sounds.len = 0
 	viewer.region_sounds.len = 0
-	viewer.region_sounds_tried = 0
-	viewer.thunder_tried = 0
+	viewer.region_slot = -1
+	viewer.thunder_second = -1
 	viewer.lightning = 0
 	viewer.look = Sky_Look{state = Sky_State{0}, cloud_lower = 0, cloud_upper = 0, cloud_lower_last = 0, cloud_upper_last = 0,
 		weather_share = 1, sun = 0, precipitation = [], last_precipitation = [],
@@ -613,7 +626,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		if input.held[A] do camera.position = camera.position - right * step
 	}
 
-	report_player(viewer, input.held[T])
+	report_player(viewer, input.held[T], f32(seconds))
 	show_time(viewer, f32(seconds))
 	noises : [16]Door_Noise
 	follow_doors(viewer)
@@ -623,7 +636,9 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	step_first_person(viewer, input.mouse_pressed[1])
 	viewer.renderer.palette.len = 0
 	follow_actors(viewer)
-	pose_npcs(shown, &viewer.renderer, viewer.look.time)
+	movers : [MAX_PLAYERS]Npc_Mover
+	follow_others(viewer, f32(seconds), &movers)
+	pose_npcs(shown, &viewer.renderer, viewer.look.time, movers)
 	pose_first_person(viewer)
 	upload_palette(&viewer.renderer)
 	for &noise in noises do play_once(&viewer.audio, &viewer.archives, &shown.sound_kinds[noise.sound], noise.position, listener_of(camera^))
@@ -1072,9 +1087,122 @@ place_walker :: fun(viewer: ^Viewer) {
 }
 
 // Tells the server where the player is: their place and feet, which way
-// they face; and whether they hurry time (T held).
-report_player :: fun(viewer: ^Viewer, hurried: bool) {
-	send_player(outgoing(viewer), viewer.shown.world, player_feet(viewer), viewer.camera.yaw, hurried)
+// they face, how fast they've gone across since last told (over seconds);
+// and whether they hurry time (T held).
+report_player :: fun(viewer: ^Viewer, hurried: bool, seconds: f32) {
+	feet := player_feet(viewer)
+	across := Vec3{feet.x - viewer.reported_feet.x, feet.y - viewer.reported_feet.y, 0}
+	speed := if seconds > 0 do vec3_length(across) / seconds else 0
+	viewer.reported_feet = feet
+	send_player(outgoing(viewer), viewer.shown.world, feet, viewer.camera.yaw, speed, hurried)
+}
+
+// Another player shown here, as a body: their number and their body's
+// reference (OTHER_PLAYER_KEY and the number); where the server last said
+// they are (feet, facing, how fast they're going), and where they're shown
+// — eased there over a few frames — and how far they've walked (their
+// steps go by it).
+Other_Shown :: struct {
+	id: i64
+	reference: u32
+	told: Other_Player
+	feet: Vec3
+	yaw: f32
+	way: f32
+}
+
+// The references other players' bodies are placed with: a top byte no
+// plugin's form id has, and their number.
+OTHER_PLAYER_KEY :: 0xFE000000
+
+// Shows the other players the server's told of that are here (in the same
+// world, or the same interior), each as a body (the player's own record's,
+// put together: npc_model); the bodies of those gone, or not here, let go.
+place_others :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	shown := &viewer.shown
+	// Those gone, or not here: let go.
+	kept : i64 = 0
+	for k in 0:viewer.others.len {
+		other := viewer.others[k]
+		told, still := seen_other(&viewer.seen, other.id)
+		if still and other_here(viewer, told) {
+			viewer.others[kept] = other
+			viewer.others[kept].told = told
+			kept += 1
+		else
+			remove_instances(shown, other.reference)
+		}
+	}
+	viewer.others.len = kept
+	// Those come, or come here: shown where they are.
+	for told in viewer.seen.others {
+		if not other_here(viewer, told) do continue
+		known := false
+		for &other in viewer.others {
+			if other.id == told.id do known = true
+		}
+		if known or not fits(viewer.others.len + 1, viewer.others.cap) do continue
+		&viewer.others + Other_Shown{id = told.id, reference = OTHER_PLAYER_KEY | u32(told.id & 0xFFFFFF), told = told,
+			feet = told.feet, yaw = told.yaw, way = 0}
+	}
+	// Each one's body: there, or put together and placed.
+	for &other in viewer.others {
+		placed := false
+		for &instance in shown.instances {
+			if instance.reference == other.reference do placed = true
+		}
+		if placed do continue
+		body := npc_model(shown, plugin, viewer_loader(viewer), PLAYER_NPC)
+		if body >= 0 do add_instance(shown, body, other_placement(other), other.reference)
+	}
+}
+
+// The server's word on another player, by their number; false when it's
+// told of none.
+seen_other :: fun(seen: ^World_Copy, id: i64) -> Other_Player, bool {
+	for told in seen.others {
+		if told.id == id do return told, true
+	}
+	return Other_Player{id = 0, world = 0, cell = 0, feet = Vec3{0, 0, 0}, yaw = 0, speed = 0}, false
+}
+
+// Whether another player's here: in this world, or in this interior.
+other_here :: fun(viewer: ^Viewer, told: Other_Player) -> bool {
+	if told.world != viewer.shown.world do return false
+	return told.world != 0 or told.cell == viewer.inside_cell
+}
+
+// Where another player's body is placed: at their feet, turned their way.
+other_placement :: fun(other: ^Other_Shown) -> Mat4 {
+	return reference_transform(Reference{form_id = other.reference, base = PLAYER_NPC, position = other.feet,
+		rotation = Vec3{0, 0, other.yaw}, scale = 1, flags = 0})
+}
+
+// Moves the other players' bodies a frame on (seconds): eased toward where
+// the server last said they are (put there at once from far off), turned
+// their way, their steps counted; into movers, for posing them walking.
+follow_others :: fun(viewer: ^Viewer, seconds: f32, movers: ^[]Npc_Mover) {
+	shown := &viewer.shown
+	for &other in viewer.others {
+		before := other.feet
+		away := other.told.feet - other.feet
+		if vec3_length(away) > 500 do other.feet = other.told.feet
+		else do other.feet = other.feet + away * min_f32(1, seconds * 12)
+		turn := other.told.yaw - other.yaw
+		for turn > PI do turn -= 2 * PI
+		for turn < -PI do turn += 2 * PI
+		other.yaw += turn * min_f32(1, seconds * 12)
+		step := Vec3{other.feet.x - before.x, other.feet.y - before.y, 0}
+		other.way += vec3_length(step)
+		for &instance in shown.instances {
+			if instance.reference != other.reference do continue
+			moved := place_instance(shown.models[instance.model], instance.model, other_placement(other), instance.reference)
+			instance.world = moved.world
+			instance.center = moved.center
+			instance.radius = moved.radius
+		}
+		if fits(movers.len + 1, movers.cap) do movers + Npc_Mover{reference = other.reference, speed = other.told.speed, way = other.way}
+	}
 }
 
 // Where the player's feet are: the walker's, or flying, below the camera.
@@ -1199,6 +1327,7 @@ run_link :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 		seen.people_changed = false
 		queue_actors(&viewer.shown, seen.actors)
 	}
+	place_others(viewer, plugin)
 }
 
 // Shows the world's time by a frame's seconds: outside, the sky at its
@@ -1245,31 +1374,45 @@ show_time :: fun(viewer: ^Viewer, seconds: f32) {
 	move_night_sky(viewer)
 }
 
-// Outside, what's heard now and then: the regions' sounds, each tried every
-// REGION_SOUND_TRY seconds by its chance (in the weathers it's for, within
-// its hours), from somewhere round the camera; and thunder, as often as
-// the weather has it once it has mostly come in, with a lightning flash.
+// Outside, what's heard now and then, the same for every player: rolled
+// from the world's seed, its time and where (chance_at), not each player's
+// own. The regions' sounds: in each REGION_SOUND_TRY seconds of the world's
+// time, at each spot round the player (the 3 by 3 SOUND_SPOT squares round
+// theirs), each sound by its chance, a ninth at a spot (in the weathers
+// it's for, within its hours), somewhere in it. Thunder: tried each second
+// of the world's, as often as the weather has it once it's mostly come in,
+// with a lightning flash.
 outdoor_sounds :: fun(viewer: ^Viewer, listener: Listener, now: f64) {
 	shown := &viewer.shown
-	if now >= viewer.region_sounds_tried + REGION_SOUND_TRY {
-		viewer.region_sounds_tried = now
-		for &region_sound in viewer.region_sounds {
-			if viewer.weather.classification & region_sound.weathers == 0 do continue
-			if random_share(&viewer.chance_seed) >= region_sound.chance do continue
-			// (Its kind was read when the regions were: in the scene's kinds.)
-			kind_index := scene_sound_kind_known(shown, region_sound.sound)
-			if kind_index < 0 do continue
-			kind := &shown.sound_kinds[kind_index]
-			if not plays_at_hour(kind, viewer.seen.hour) do continue
-			turn := random_share(&viewer.chance_seed) * 6.2831853
-			away := 300 + random_share(&viewer.chance_seed) * 1200
-			place := listener.position + Vec3{cos_f32(turn) * away, sin_f32(turn) * away, random_share(&viewer.chance_seed) * 400}
-			play_once(&viewer.audio, &viewer.archives, kind, place, listener)
+	seen := &viewer.seen
+	slot := i64(seen.seconds / REGION_SOUND_TRY)
+	if slot != viewer.region_slot {
+		viewer.region_slot = slot
+		spot_x := i64(floor_f32(listener.position.x / SOUND_SPOT))
+		spot_y := i64(floor_f32(listener.position.y / SOUND_SPOT))
+		for y in spot_y - 1..spot_y + 1 {
+			for x in spot_x - 1..spot_x + 1 {
+				for &region_sound in viewer.region_sounds {
+					if viewer.weather.classification & region_sound.weathers == 0 do continue
+					sound := u64(region_sound.sound) << 2
+					if chance_at(seen.seed, slot, x, y, sound) >= region_sound.chance / 9 do continue
+					// (Its kind was read when the regions were: in the scene's kinds.)
+					kind_index := scene_sound_kind_known(shown, region_sound.sound)
+					if kind_index < 0 do continue
+					kind := &shown.sound_kinds[kind_index]
+					if not plays_at_hour(kind, seen.hour) do continue
+					place := Vec3{(f32(x) + chance_at(seen.seed, slot, x, y, sound + 1)) * SOUND_SPOT,
+						(f32(y) + chance_at(seen.seed, slot, x, y, sound + 2)) * SOUND_SPOT,
+						listener.position.z + chance_at(seen.seed, slot, x, y, sound + 3) * 400}
+					play_once(&viewer.audio, &viewer.archives, kind, place, listener)
+				}
+			}
 		}
 	}
-	if viewer.weather.thunder > 0 and viewer.seen.weather_share > 0.5 and now >= viewer.thunder_tried + 1 {
-		viewer.thunder_tried = now
-		if random_share(&viewer.chance_seed) < viewer.weather.thunder * THUNDER_CHANCE {
+	second := i64(seen.seconds)
+	if viewer.weather.thunder > 0 and seen.weather_share > 0.5 and second != viewer.thunder_second {
+		viewer.thunder_second = second
+		if chance_at(seen.seed, second, 0, 0, THUNDER_KEY) < viewer.weather.thunder * THUNDER_CHANCE {
 			viewer.lightning = 1
 			for sound in viewer.weather.sounds {
 				if sound.role != WEATHER_SOUND_THUNDER do continue
@@ -2054,6 +2197,7 @@ ready_exit :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 go_inside :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
 	shown := &viewer.shown
 	start := time_now()
+	viewer.inside_cell = cell
 	viewer.exit_readied = false
 	viewer.exit_door = -1
 	show_error := show_interior(shown, plugin, cell, viewer_loader(viewer))
@@ -2094,6 +2238,7 @@ go_inside :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
 go_outside :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32, place: Vec3) {
 	shown := &viewer.shown
 	start := time_now()
+	viewer.inside_cell = 0
 	take_sky(viewer, plugin, world_id)
 	if viewer.renderer.distant_world != world_id do begin_distant_land(&viewer.renderer, world_id)
 	if viewer.shown.distant_world != world_id do begin_distant_objects(&viewer.shown, world_id)

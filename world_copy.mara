@@ -12,6 +12,7 @@ use logging
 
 World_Copy :: struct {
 	// The clock and the sky, as the server last told them (Clock_Message).
+	seed: u64
 	hour: f32
 	day: i64
 	seconds: f64
@@ -25,6 +26,8 @@ World_Copy :: struct {
 	// shut.
 	actors: [WORLD_ACTORS]Reference
 	doors: [WORLD_DOORS]Door_State
+	// The other players, where they are.
+	others: [MAX_PLAYERS]Other_Player
 	// Since the viewer last looked (it clears them): whether the people were
 	// told anew; the server's notes for its journal.
 	people_changed: bool
@@ -33,6 +36,7 @@ World_Copy :: struct {
 
 // A copy before the server's told it anything: the world as it starts.
 copy_start :: fun(copy: ^World_Copy) {
+	copy.seed = 1
 	copy.hour = START_HOUR
 	copy.day = 0
 	copy.seconds = 0
@@ -44,6 +48,7 @@ copy_start :: fun(copy: ^World_Copy) {
 	copy.weather_share = 1
 	copy.actors.len = 0
 	copy.doors.len = 0
+	copy.others.len = 0
 	copy.people_changed = false
 	copy.notes.len = 0
 }
@@ -55,9 +60,10 @@ copy_take :: fun(copy: ^World_Copy, queue: ^Wire_Queue) {
 		message, has_message := wire_take(queue)
 		if not has_message do break
 		if message.kind == MESSAGE_CLOCK {
-			clock, whole := wire_value(message, Clock_Message{hour = 0, day = 0, seconds = 0, hurried = false, climate = 0,
+			clock, whole := wire_value(message, Clock_Message{seed = 0, hour = 0, day = 0, seconds = 0, hurried = false, climate = 0,
 				sky_taken = false, weather = 0, last_weather = 0, weather_share = 0})
 			if not whole do continue
+			copy.seed = clock.seed
 			copy.hour = clock.hour
 			copy.day = clock.day
 			copy.seconds = clock.seconds
@@ -84,6 +90,14 @@ copy_take :: fun(copy: ^World_Copy, queue: ^Wire_Queue) {
 				door : Door_State = message.body[8 + k * size_of(Door_State)]
 				&copy.doors + door
 			}
+		elif message.kind == MESSAGE_PLAYERS
+			count, whole := wire_count(message, size_of(Other_Player), copy.others.cap)
+			if not whole do continue
+			copy.others.len = 0
+			for k in 0:count {
+				other : Other_Player = message.body[8 + k * size_of(Other_Player)]
+				&copy.others + other
+			}
 		elif message.kind == MESSAGE_NOTE
 			told, whole := wire_value(message, Note_Message{text = []})
 			if whole and fits(copy.notes.len + 1, copy.notes.cap) do &copy.notes + told
@@ -109,9 +123,9 @@ copy_door_open :: fun(copy: ^World_Copy, reference: u32) -> bool {
 	return false
 }
 
-// Tells the server where the player is now.
-send_player :: fun(queue: ^Wire_Queue, world_id: u32, feet: Vec3, yaw: f32, hurried: bool) {
-	wire_put(queue, MESSAGE_PLAYER, Player_Message{world_id = world_id, feet = feet, yaw = yaw, hurried = hurried})
+// Tells the server where the player is now, and how fast they're going.
+send_player :: fun(queue: ^Wire_Queue, world_id: u32, feet: Vec3, yaw: f32, speed: f32, hurried: bool) {
+	wire_put(queue, MESSAGE_PLAYER, Player_Message{world_id = world_id, feet = feet, yaw = yaw, speed = speed, hurried = hurried})
 }
 
 // Tells the server the player's come into a place: an interior (cell), or a
