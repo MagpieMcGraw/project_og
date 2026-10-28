@@ -39,6 +39,8 @@ Kept_Span :: struct {
 	master_count: i64
 	interior_cells_at: i64
 	interior_cells_end: i64
+	sounds_at: i64
+	sounds_end: i64
 }
 
 // A stamp of the plugin files in the load order (names, sizes, times
@@ -89,6 +91,8 @@ read_index_file :: fun(file: File_Id, plugin: ^Plugin, stamp: u64, storage: ^[]b
 		span.master_count = kept.master_count
 		span.interior_cells_at = kept.interior_cells_at
 		span.interior_cells_end = kept.interior_cells_end
+		span.sounds_at = kept.sounds_at
+		span.sounds_end = kept.sounds_end
 	}
 
 	read_table(file, &plugin.records, RECORD_SLOTS, storage)?
@@ -128,7 +132,8 @@ write_plugin_index :: fun(plugin: ^Plugin, stamp: u64) -> err {
 	chunk[0] = header
 	for &span in plugin.files {
 		kept := Kept_Span{masters = span.masters, master_count = span.master_count,
-			interior_cells_at = span.interior_cells_at, interior_cells_end = span.interior_cells_end}
+			interior_cells_at = span.interior_cells_at, interior_cells_end = span.interior_cells_end,
+			sounds_at = span.sounds_at, sounds_end = span.sounds_end}
 		at := chunk.len
 		chunk.len += size_of(Kept_Span)
 		chunk[at] = kept

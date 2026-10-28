@@ -98,6 +98,8 @@ Plugin_Span :: struct {
 	master_count: i64
 	interior_cells_at: i64
 	interior_cells_end: i64
+	sounds_at: i64           // its group of sounds (SOUN): where its records start and end
+	sounds_end: i64
 }
 
 // The game's plugins read into memory, one file after another (the master
@@ -147,6 +149,8 @@ read_masters :: fun(plugin: ^Plugin, file: i64) -> err {
 	span.master_count = 0
 	span.interior_cells_at = 0
 	span.interior_cells_end = 0
+	span.sounds_at = 0
+	span.sounds_end = 0
 	header : Record_Header = plugin.data[span.start]
 	if header.kind != "TES4" do return Not_A_Plugin
 	body := plugin.data[span.start + HEADER_SIZE : span.start + HEADER_SIZE + i64(header.size)]
@@ -198,6 +202,10 @@ index_file :: fun(plugin: ^Plugin, file: i64) -> err {
 				if label == "CELL" {
 					span.interior_cells_at = at + HEADER_SIZE
 					span.interior_cells_end = at + i64(group_header.size)
+				}
+				if label == "SOUN" {
+					span.sounds_at = at + HEADER_SIZE
+					span.sounds_end = at + i64(group_header.size)
 				}
 			}
 			at += HEADER_SIZE

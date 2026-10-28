@@ -802,7 +802,8 @@ take_first_person :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	}
 	held_at := time_now()
 	// The HUD too, with the weapon's icon.
-	scratch : [32 * MB]byte
+	scratch : [32 * MB]byte = void
+	scratch.len = 0
 	hud_error := book_open(&viewer.book, &viewer.renderer, &viewer.archives, &scratch)
 	book_at := time_now()
 	if not hud_error do hud_error = load_hud(&viewer.hud, &viewer.book, &viewer.archives, viewer.held.weapon_icon, &scratch)
@@ -1636,8 +1637,10 @@ leading_door :: fun(shown: ^Scene, reference: u32) -> i64 {
 
 // `sooblivion view <mesh>`: shows a mesh in the window.
 command_view :: fun(what: []utf8, picture: Picture) {
-	directory_storage : [64 * MB]byte
-	table_storage : [SOUND_ROOM + 8 * MB]byte
+	directory_storage : [64 * MB]byte = void
+	directory_storage.len = 0
+	table_storage : [SOUND_ROOM + 8 * MB]byte = void
+	table_storage.len = 0
 	viewer : Viewer
 	viewer.picture = picture
 	open_error := viewer_open(&viewer, &directory_storage, &table_storage)
@@ -1646,10 +1649,14 @@ command_view :: fun(what: []utf8, picture: Picture) {
 		return
 	}
 	defer viewer_close(&viewer)
-	file_room : [64 * MB]byte
-	block_room : [16 * MB]byte
-	model_room : [64 * MB]byte
-	texture_room : [64 * MB]byte
+	file_room : [64 * MB]byte = void
+	file_room.len = 0
+	block_room : [16 * MB]byte = void
+	block_room.len = 0
+	model_room : [64 * MB]byte = void
+	model_room.len = 0
+	texture_room : [64 * MB]byte = void
+	texture_room.len = 0
 	viewer.room = load_room(&file_room, &block_room, &model_room, &texture_room)
 
 	shown := &viewer.shown
@@ -1673,21 +1680,26 @@ command_view :: fun(what: []utf8, picture: Picture) {
 // window; its doors lead on, inside and out. When it can't, it says why
 // on the console, and gives the reason back.
 command_view_cell :: fun(name: []utf8, picture: Picture) -> err {
-	data_storage : [400 * MB]byte
-	index_storage : [96 * MB]byte
+	data_storage : [400 * MB]byte = void
+	data_storage.len = 0
+	index_storage : [96 * MB]byte = void
+	index_storage.len = 0
 	plugin, load_error := load_oblivion(&data_storage, &index_storage)
 	if load_error {
 		print("couldn't load the plugin: %", load_error)
 		return load_error
 	}
-	scratch : [16 * MB]byte
+	scratch : [16 * MB]byte = void
+	scratch.len = 0
 	cell, cell_error := find_interior_cell(&plugin, name, &scratch)
 	if cell_error {
 		print("no interior cell %", name)
 		return cell_error
 	}
-	directory_storage : [64 * MB]byte
-	table_storage : [SOUND_ROOM + 8 * MB]byte
+	directory_storage : [64 * MB]byte = void
+	directory_storage.len = 0
+	table_storage : [SOUND_ROOM + 8 * MB]byte = void
+	table_storage.len = 0
 	viewer : Viewer
 	viewer.picture = picture
 	open_error := viewer_open(&viewer, &directory_storage, &table_storage)
@@ -1696,10 +1708,14 @@ command_view_cell :: fun(name: []utf8, picture: Picture) -> err {
 		return open_error
 	}
 	defer viewer_close(&viewer)
-	file_room : [64 * MB]byte
-	block_room : [16 * MB]byte
-	model_room : [64 * MB]byte
-	texture_room : [64 * MB]byte
+	file_room : [64 * MB]byte = void
+	file_room.len = 0
+	block_room : [16 * MB]byte = void
+	block_room.len = 0
+	model_room : [64 * MB]byte = void
+	model_room.len = 0
+	texture_room : [64 * MB]byte = void
+	texture_room.len = 0
 	viewer.room = load_room(&file_room, &block_room, &model_room, &texture_room)
 
 	go_inside(&viewer, &plugin, cell)
@@ -1712,21 +1728,26 @@ command_view_cell :: fun(name: []utf8, picture: Picture) -> err {
 // `sooblivion view-world [world] [x y]`: shows a world's land and what's
 // on it around the cell at x, y on its grid.
 command_view_world :: fun(name: []utf8, x: i64, y: i64, picture: Picture) {
-	data_storage : [400 * MB]byte
-	index_storage : [96 * MB]byte
+	data_storage : [400 * MB]byte = void
+	data_storage.len = 0
+	index_storage : [96 * MB]byte = void
+	index_storage.len = 0
 	plugin, load_error := load_oblivion(&data_storage, &index_storage)
 	if load_error {
 		print("couldn't load the plugin: %", load_error)
 		return
 	}
-	scratch : [16 * MB]byte
+	scratch : [16 * MB]byte = void
+	scratch.len = 0
 	world_id := find_world(&plugin, name, &scratch)
 	if world_id == 0 {
 		print("no world %", name)
 		return
 	}
-	directory_storage : [64 * MB]byte
-	table_storage : [SOUND_ROOM + 8 * MB]byte
+	directory_storage : [64 * MB]byte = void
+	directory_storage.len = 0
+	table_storage : [SOUND_ROOM + 8 * MB]byte = void
+	table_storage.len = 0
 	viewer : Viewer
 	viewer.picture = picture
 	open_error := viewer_open(&viewer, &directory_storage, &table_storage)
@@ -1735,10 +1756,14 @@ command_view_world :: fun(name: []utf8, x: i64, y: i64, picture: Picture) {
 		return
 	}
 	defer viewer_close(&viewer)
-	file_room : [64 * MB]byte
-	block_room : [16 * MB]byte
-	model_room : [64 * MB]byte
-	texture_room : [64 * MB]byte
+	file_room : [64 * MB]byte = void
+	file_room.len = 0
+	block_room : [16 * MB]byte = void
+	block_room.len = 0
+	model_room : [64 * MB]byte = void
+	model_room.len = 0
+	texture_room : [64 * MB]byte = void
+	texture_room.len = 0
 	viewer.room = load_room(&file_room, &block_room, &model_room, &texture_room)
 
 	// In the middle of the cell, high enough to be over its land.
@@ -1755,7 +1780,8 @@ command_view_world :: fun(name: []utf8, x: i64, y: i64, picture: Picture) {
 // one, and outside, into the cells around the camera as it moves — what
 // they need loaded a little each frame.
 explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
-	scratch : [16 * MB]byte
+	scratch : [16 * MB]byte = void
+	scratch.len = 0
 	journal := &viewer.journal
 	for true {
 		placed_this_frame := false

@@ -2200,9 +2200,10 @@ setup_water_buffers :: fun(renderer: ^Renderer) {
 // (The game made its ripples on the card each frame; this stands in.)
 make_ripple_texture :: fun(renderer: ^Renderer) {
 	WAVES :: 48
-	directions_x : [WAVES!]f32
-	directions_y : [WAVES!]f32
-	phases : [WAVES!]f32
+	directions_x : [WAVES!]i64
+	directions_y : [WAVES!]i64
+	phase_cosines : [WAVES!]f32
+	phase_sines : [WAVES!]f32
 	heights : [WAVES!]f32
 	seed : u64 = 0x2545F4914F6CDD1D
 	for w in 0:WAVES {
@@ -2213,11 +2214,23 @@ make_ripple_texture :: fun(renderer: ^Renderer) {
 		y := i64((seed >> 33) % 29) - 14
 		if x * x + y * y < 4 do x = 2 + w % 3
 		seed = seed *% 6364136223846793005 +% 1442695040888963407
-		phases[w] = f32((seed >> 33) % 10000) / 10000 * 6.2831853
-		directions_x[w] = f32(x)
-		directions_y[w] = f32(y)
+		phase := f32((seed >> 33) % 10000) / 10000 * 6.2831853
+		phase_cosines[w] = cos_f32(phase)
+		phase_sines[w] = sin_f32(phase)
+		directions_x[w] = x
+		directions_y[w] = y
 		lengths := sqrt_f32(f32(x * x + y * y))
 		heights[w] = 1 / (lengths * sqrt_f32(lengths))
+	}
+	// A wave's whole lengths across the texture put each texel at one of
+	// RIPPLE_SIZE places along it: the cosine and sine of each, looked up
+	// (cos(place + phase) = cos place cos phase - sin place sin phase).
+	cosines : [RIPPLE_SIZE!]f32
+	sines : [RIPPLE_SIZE!]f32
+	for k in 0:RIPPLE_SIZE {
+		angle := f32(k) / RIPPLE_SIZE * 6.2831853
+		cosines[k] = cos_f32(angle)
+		sines[k] = sin_f32(angle)
 	}
 	pixels : [RIPPLE_SIZE * RIPPLE_SIZE * 4]u8
 	pixels.len = pixels.cap
@@ -2226,12 +2239,11 @@ make_ripple_texture :: fun(renderer: ^Renderer) {
 			// The height's slope here: each wave's.
 			slope_x : f32 = 0
 			slope_y : f32 = 0
-			u := f32(px) / RIPPLE_SIZE * 6.2831853
-			v := f32(py) / RIPPLE_SIZE * 6.2831853
 			for w in 0:WAVES {
-				change := cos_f32(directions_x[w] * u + directions_y[w] * v + phases[w]) * heights[w]
-				slope_x += change * directions_x[w]
-				slope_y += change * directions_y[w]
+				place := (directions_x[w] * px + directions_y[w] * py) & (RIPPLE_SIZE - 1)
+				change := (cosines[place] * phase_cosines[w] - sines[place] * phase_sines[w]) * heights[w]
+				slope_x += change * f32(directions_x[w])
+				slope_y += change * f32(directions_y[w])
 			}
 			normal := vec3_normalize(Vec3{-slope_x * 0.35, -slope_y * 0.35, 1})
 			at := (py * RIPPLE_SIZE + px) * 4
