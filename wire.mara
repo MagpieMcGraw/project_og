@@ -5,14 +5,17 @@
 // its items'.
 //
 // What's taken off a queue is checked before it's used: a message that
-// doesn't fit the queue, or a list that doesn't fit its message, isn't
-// read (from a network it may be anything).
+// says it's bigger than a queue holds breaks the queue (its connection's
+// let go), a list that doesn't fit its message isn't read — from a network
+// it may be anything. Off a network a message may come in parts: one not
+// all come yet waits for the rest (wire_receive, wire_send).
 module wire
 
 use mara.core
 use mara.math
 use mara.memory
 use logging
+use net
 
 // A queue's room: what can wait in it at once.
 WIRE_ROOM :: 1 * MB
@@ -70,10 +73,12 @@ Note_Message :: struct {
 	text: [200]utf8
 }
 
-// Messages waiting, from read_at to len.
+// Messages waiting, from read_at to len; whether what's come can't be
+// messages (broken: from a network, its connection's to go).
 Wire_Queue :: struct {
 	bytes: [WIRE_ROOM]byte
 	read_at: i64
+	broken: bool
 }
 
 // A message taken off a queue: its kind, and its body (a view of the queue:
@@ -87,6 +92,7 @@ Wire_Message :: struct {
 wire_start :: fun(queue: ^Wire_Queue) {
 	queue.bytes.len = 0
 	queue.read_at = 0
+	queue.broken = false
 }
 
 // Puts a message of a kind on a queue: a value's bytes for its body. (A
@@ -117,24 +123,63 @@ wire_head :: fun(queue: ^Wire_Queue, kind: u32, size: i64) -> i64 {
 	return at + WIRE_HEAD
 }
 
-// The next message on a queue, taken off it; false when there's none (or
-// what's there isn't a whole message: then it's all let go). Once all
-// are taken the queue is empty again.
+// The next message on a queue, taken off it; false when there's none whole
+// yet (the rest of one may come: it waits), or the queue's broken. Once
+// all are taken the queue is empty again (the last one's body still there
+// till the next take).
 wire_take :: fun(queue: ^Wire_Queue) -> Wire_Message, bool {
 	none := Wire_Message{kind = 0, body = queue.bytes[0:0]}
-	if queue.read_at + WIRE_HEAD > queue.bytes.len {
-		wire_start(queue)
+	if queue.broken do return none, false
+	if queue.read_at == queue.bytes.len {
+		queue.bytes.len = 0
+		queue.read_at = 0
 		return none, false
 	}
+	if queue.read_at + WIRE_HEAD > queue.bytes.len do return none, false
 	kind : u32 = queue.bytes[queue.read_at]
 	size : u32 = queue.bytes[queue.read_at + 4]
-	body_at := queue.read_at + WIRE_HEAD
-	if body_at + i64(size) > queue.bytes.len {
-		wire_start(queue)
+	if i64(size) > WIRE_ROOM - WIRE_HEAD {
+		queue.broken = true
 		return none, false
 	}
+	body_at := queue.read_at + WIRE_HEAD
+	if body_at + i64(size) > queue.bytes.len do return none, false
 	queue.read_at = body_at + i64(size)
 	return Wire_Message{kind = kind, body = queue.bytes[body_at : body_at + i64(size)]}, true
+}
+
+// Moves what's still to be read to the front of a queue, for more to come
+// in after it.
+wire_compact :: fun(queue: ^Wire_Queue) {
+	if queue.read_at == 0 do return
+	left := queue.bytes.len - queue.read_at
+	for k in 0:left do queue.bytes[k] = queue.bytes[queue.read_at + k]
+	queue.bytes.len = left
+	queue.read_at = 0
+}
+
+// Takes in what's come over a connection, after what's waiting. Closed when
+// the other side's gone (or what's come can't be messages: Bad_Messages).
+wire_receive :: fun(queue: ^Wire_Queue, connection: u64) -> err {
+	if queue.broken do return Bad_Messages
+	wire_compact(queue)
+	net_receive(connection, &queue.bytes)?
+}
+
+// Sends what's waiting over a connection, as much as goes now (the rest
+// waits). Closed when the other side's gone.
+wire_send :: fun(queue: ^Wire_Queue, connection: u64) -> err {
+	if queue.read_at == queue.bytes.len do return
+	sent := net_send(connection, queue.bytes[queue.read_at : queue.bytes.len])?
+	queue.read_at += sent
+	if queue.read_at == queue.bytes.len {
+		queue.bytes.len = 0
+		queue.read_at = 0
+	}
+}
+
+Wire_Error :: error {
+	Bad_Messages    // what's come over a connection can't be messages
 }
 
 // A message's body as a value of a type; false when it's too short to be one.

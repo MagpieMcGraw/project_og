@@ -1,8 +1,8 @@
 // A world's server: the world's state (World_State), stepped on its ticks,
-// its client's messages taken in and the world told back to it (wire.mara).
-// For now it runs in the player's own program — the host — its one client
-// that player, the messages passed in queues; over the network, it'll be
-// the same.
+// its clients' messages taken in and the world told back to them
+// (wire.mara). A client's the host's own (in the same program: its queues
+// passed to it directly), or one connected over the network (net.mara):
+// for the server they're the same, but for how their messages travel.
 module world_server
 
 use mara.core
@@ -14,40 +14,111 @@ use world
 use sky
 use world_state
 use wire
+use net
 use logging
+
+// A client of the server, in a slot by its player's (the world's players):
+// whether one's here; its connection (NO_SOCKET: the host's own); what it's
+// said, and what it's to be told; whether its place's people are to be told.
+Server_Client :: struct {
+	here: bool
+	connection: u64
+	from_client: Wire_Queue
+	to_client: Wire_Queue
+	people_due: bool
+}
 
 World_Server :: struct {
 	state: World_State
-	from_client: Wire_Queue
-	to_client: Wire_Queue
+	clients: [MAX_PLAYERS!]Server_Client
+	listener: u64         // where others connect (NO_SOCKET: none: only the host plays)
+	next_id: i64          // the next player's number
 	ticked_at: u64        // when its last tick was due
-	// What the client's to be told: the clock (after ticks, or a place
-	// taken), the place's people, the doors.
+	// What every client's to be told: the clock (after ticks, or a place
+	// taken), the doors.
 	clock_due: bool
-	people_due: bool
 	doors_due: bool
 }
 
-// A server starting: its world (world_start), its queues empty.
+// A server starting: its world (world_start), no clients, not listening.
 server_start :: fun(server: ^World_Server) {
 	world_start(&server.state)
-	wire_start(&server.from_client)
-	wire_start(&server.to_client)
+	for &client in server.clients {
+		client.here = false
+		client.connection = NO_SOCKET
+		wire_start(&client.from_client)
+		wire_start(&client.to_client)
+		client.people_due = false
+	}
+	server.listener = NO_SOCKET
+	server.next_id = 1
 	server.ticked_at = time_now()
 	server.clock_due = true
-	server.people_due = false
 	server.doors_due = false
 }
 
-// Runs the server as far as now: what its client's said taken in, the
-// world's ticks due by now stepped (WORLD_TICK each; MOST_TICKS_AT_ONCE at
-// most, the rest let go), and the client told what's changed — the clock
-// and the sky, the place's people, the doors.
+// A client joining, on a connection (NO_SOCKET: the host's own): its slot,
+// -1 when they're all taken. Its player's nowhere till it says (its place).
+server_join :: fun(server: ^World_Server, connection: u64) -> i64 {
+	for &client, k in server.clients {
+		if client.here do continue
+		client.here = true
+		client.connection = connection
+		wire_start(&client.from_client)
+		wire_start(&client.to_client)
+		client.people_due = false
+		player_clear(&server.state.players[k], server.next_id)
+		server.next_id += 1
+		server.clock_due = true
+		server.doors_due = true
+		return k
+	}
+	return -1
+}
+
+// A client gone (its connection closed), and why; its player with it.
+server_leave :: fun(server: ^World_Server, slot: i64, reason: err) {
+	client := &server.clients[slot]
+	print("player % left: %", server.state.players[slot].id, reason)
+	net_close(client.connection)
+	client.here = false
+	client.connection = NO_SOCKET
+	player_clear(&server.state.players[slot], 0)
+}
+
+// Runs the server as far as now: the connections made taken in, what its
+// clients have said taken in, the world's ticks due by now stepped
+// (WORLD_TICK each; MOST_TICKS_AT_ONCE at most, the rest let go), and each
+// client told what's changed — the clock and the sky, its place's people,
+// the doors — and sent what's waiting for it.
 server_run :: fun(server: ^World_Server, plugin: ^Plugin) {
-	for true {
-		message, has_message := wire_take(&server.from_client)
-		if not has_message do break
-		server_take(server, plugin, message)
+	if server.listener != NO_SOCKET {
+		for true {
+			connection, connected := net_accept(server.listener)
+			if not connected do break
+			slot := server_join(server, connection)
+			if slot < 0 {
+				print("a player couldn't join: the server's full")
+				net_close(connection)
+				continue
+			}
+			print("player % joined", server.state.players[slot].id)
+		}
+	}
+	for &client, slot in server.clients {
+		if not client.here do continue
+		if client.connection != NO_SOCKET {
+			receive_error := wire_receive(&client.from_client, client.connection)
+			if receive_error {
+				server_leave(server, slot, receive_error)
+				continue
+			}
+		}
+		for true {
+			message, has_message := wire_take(&client.from_client)
+			if not has_message do break
+			server_take(server, plugin, slot, message)
+		}
 	}
 	tick := u64(WORLD_TICK * 1000000000)
 	now := time_now()
@@ -57,43 +128,55 @@ server_run :: fun(server: ^World_Server, plugin: ^Plugin) {
 			server.ticked_at = now
 			break
 		}
-		step_error := world_step(&server.state, plugin)
-		if step_error do server_note(server, "couldn't read the next weather: the default's coming in; ", step_error)
+		// (Time's hurried while any player hurries it.)
+		state := &server.state
+		state.hurried = false
+		for &player in state.players {
+			if player.id != 0 and player.hurried do state.hurried = true
+		}
+		step_error := world_step(state, plugin)
+		if step_error do server_note_all(server, "couldn't read the next weather: the default's coming in; ", step_error)
 		server.ticked_at += tick
 		ticks += 1
 		server.clock_due = true
 	}
 	state := &server.state
-	if server.clock_due {
-		wire_put(&server.to_client, MESSAGE_CLOCK, Clock_Message{hour = state.hour, day = state.day, seconds = state.seconds,
-			hurried = state.hurried, climate = state.climate.form_id, sky_taken = state.sky_taken, weather = state.weather,
-			last_weather = state.last_weather, weather_share = state.weather_share})
-		server.clock_due = false
+	for &client, slot in server.clients {
+		if not client.here do continue
+		if server.clock_due {
+			wire_put(&client.to_client, MESSAGE_CLOCK, Clock_Message{hour = state.hour, day = state.day, seconds = state.seconds,
+				hurried = state.hurried, climate = state.climate.form_id, sky_taken = state.sky_taken, weather = state.weather,
+				last_weather = state.last_weather, weather_share = state.weather_share})
+		}
+		if client.people_due {
+			wire_put_list(&client.to_client, MESSAGE_PEOPLE, state.players[slot].actors)
+			client.people_due = false
+		}
+		if server.doors_due do wire_put_list(&client.to_client, MESSAGE_DOORS, state.doors)
+		if client.connection != NO_SOCKET {
+			send_error := wire_send(&client.to_client, client.connection)
+			if send_error do server_leave(server, slot, send_error)
+		}
 	}
-	if server.people_due {
-		wire_put_list(&server.to_client, MESSAGE_PEOPLE, state.actors)
-		server.people_due = false
-	}
-	if server.doors_due {
-		wire_put_list(&server.to_client, MESSAGE_DOORS, state.doors)
-		server.doors_due = false
-	}
+	server.clock_due = false
+	server.doors_due = false
 }
 
-// Takes in a message from the client (one the server doesn't take, or that
+// Takes in a message from a client (one the server doesn't take, or that
 // isn't whole, is let go).
-server_take :: fun(server: ^World_Server, plugin: ^Plugin, message: Wire_Message) {
+server_take :: fun(server: ^World_Server, plugin: ^Plugin, slot: i64, message: Wire_Message) {
 	state := &server.state
+	player := &state.players[slot]
 	if message.kind == MESSAGE_PLAYER {
-		player, whole := wire_value(message, Player_Message{world_id = 0, feet = Vec3{0, 0, 0}, yaw = 0, hurried = false})
+		told, whole := wire_value(message, Player_Message{world_id = 0, feet = Vec3{0, 0, 0}, yaw = 0, hurried = false})
 		if not whole do return
-		state.player_world = player.world_id
-		state.player_feet = player.feet
-		state.player_yaw = player.yaw
-		state.hurried = player.hurried
+		player.world = told.world_id
+		player.feet = told.feet
+		player.yaw = told.yaw
+		player.hurried = told.hurried
 	elif message.kind == MESSAGE_PLACE
 		place, whole := wire_value(message, Place_Message{world_id = 0, cell = 0, x = 0, y = 0, feet = Vec3{0, 0, 0}})
-		if whole do server_take_place(server, plugin, place)
+		if whole do server_take_place(server, plugin, slot, place)
 	elif message.kind == MESSAGE_USE_DOOR
 		reference, whole := wire_value(message, u32(0))
 		if not whole do return
@@ -102,57 +185,71 @@ server_take :: fun(server: ^World_Server, plugin: ^Plugin, message: Wire_Message
 	}
 }
 
-// The client's player has come into a place: the world takes it (its
-// people) and its sky — a world's climate as they come into it, again its
-// regions' weathers as they cross into other cells; an interior lit by the
-// sky, its own climate or the one outside's (a first sky: the fallback).
-server_take_place :: fun(server: ^World_Server, plugin: ^Plugin, place: Place_Message) {
+// A client's player has come into a place: the world takes it for them
+// (its people) and its sky — a world's climate as they come into it, again
+// its regions' weathers as they cross into other cells; an interior lit by
+// the sky, its own climate or the one outside's (a first sky: the fallback).
+server_take_place :: fun(server: ^World_Server, plugin: ^Plugin, slot: i64, place: Place_Message) {
 	state := &server.state
+	player := &state.players[slot]
 	scratch : [4 * MB]byte = void
 	scratch.len = 0
-	state.player_feet = place.feet
+	player.feet = place.feet
 	if place.world_id != 0 {
-		into_world := state.place_world != place.world_id or state.place_cell != 0
-		state.player_world = place.world_id
+		into_world := player.place_world != place.world_id or player.place_cell != 0
+		player.world = place.world_id
 		if into_world {
 			climate, climate_error := world_climate(plugin, place.world_id, &scratch)
 			if climate_error {
-				server_note(server, "couldn't read the world's climate: the default instead; ", climate_error)
+				server_note(server, slot, "couldn't read the world's climate: the default instead; ", climate_error)
 				climate = default_climate()
 			}
-			sky_error := world_take_climate(state, plugin, &climate)
-			if sky_error do server_note(server, "couldn't read the regions here or a weather: the climate's or the default instead; ", sky_error)
+			sky_error := world_take_climate(state, plugin, &climate, player)
+			if sky_error do server_note(server, slot, "couldn't read the regions here or a weather: the climate's or the default instead; ", sky_error)
 		else
-			crossed_error := world_player_crossed(state, plugin)
-			if crossed_error do server_note(server, "couldn't read the regions here: the climate's weathers instead; ", crossed_error)
+			crossed_error := world_player_crossed(state, plugin, player)
+			if crossed_error do server_note(server, slot, "couldn't read the regions here: the climate's weathers instead; ", crossed_error)
 		}
-		people_error := world_take_area(state, plugin, place.world_id, place.x, place.y)
-		if people_error do server_note(server, "couldn't read all of the place's people: ", people_error)
+		people_error := player_take_area(player, plugin, place.world_id, place.x, place.y)
+		if people_error do server_note(server, slot, "couldn't read all of the place's people: ", people_error)
 	else
-		state.player_world = 0
-		people_error := world_take_interior(state, plugin, place.cell)
-		if people_error do server_note(server, "couldn't read all of the place's people: ", people_error)
+		player.world = 0
+		people_error := player_take_interior(player, plugin, place.cell)
+		if people_error do server_note(server, slot, "couldn't read all of the place's people: ", people_error)
 		behaves, climate_id, cell_error := cell_sky(plugin, place.cell, &scratch)
-		if cell_error do server_note(server, "couldn't tell whether the cell is lit by the sky: ", cell_error)
+		if cell_error do server_note(server, slot, "couldn't tell whether the cell is lit by the sky: ", cell_error)
 		if behaves and not cell_error {
 			if climate_id == 0 and not state.sky_taken do climate_id = fallback_climate(plugin, &scratch)
 			if climate_id != 0 {
 				climate, climate_error := read_climate(plugin, climate_id, &scratch)
 				if climate_error {
-					server_note(server, "couldn't read the cell's climate: the default instead; ", climate_error)
+					server_note(server, slot, "couldn't read the cell's climate: the default instead; ", climate_error)
 					climate = default_climate()
 				}
-				sky_error := world_take_climate(state, plugin, &climate)
-				if sky_error do server_note(server, "couldn't read the regions here or a weather: the climate's or the default instead; ", sky_error)
+				sky_error := world_take_climate(state, plugin, &climate, player)
+				if sky_error do server_note(server, slot, "couldn't read the regions here or a weather: the climate's or the default instead; ", sky_error)
 			}
 		}
 	}
-	server.people_due = true
+	server.clients[slot].people_due = true
 	server.clock_due = true
 }
 
-// Tells the client's journal of a failure: what, and why.
-server_note :: fun(server: ^World_Server, what: []utf8, reason: err) {
+// Tells a client's journal of a failure: what, and why.
+server_note :: fun(server: ^World_Server, slot: i64, what: []utf8, reason: err) {
+	wire_put(&server.clients[slot].to_client, MESSAGE_NOTE, note_message(what, reason))
+}
+
+// Tells every client's journal of a failure.
+server_note_all :: fun(server: ^World_Server, what: []utf8, reason: err) {
+	told := note_message(what, reason)
+	for &client in server.clients {
+		if client.here do wire_put(&client.to_client, MESSAGE_NOTE, told)
+	}
+}
+
+// A note of a failure: what, and why (and where, if it's known).
+note_message :: fun(what: []utf8, reason: err) -> Note_Message {
 	told := Note_Message{text = []}
 	add_what_fits(&told.text, what)
 	add_what_fits(&told.text, reason.text())
@@ -162,5 +259,5 @@ server_note :: fun(server: ^World_Server, what: []utf8, reason: err) {
 		add_what_fits(&told.text, place)
 		add_what_fits(&told.text, ")")
 	}
-	wire_put(&server.to_client, MESSAGE_NOTE, told)
+	return told
 }

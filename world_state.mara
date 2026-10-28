@@ -4,9 +4,10 @@
 //
 // For now: its clock; its sky's climate and weather (by form id: what a
 // weather looks and sounds like is the viewer's to read), rolled from the
-// world's own seed; where the player is, as their client reports it; the
-// people in the place they're in, as they stand; the doors that open in
-// place, open or shut.
+// world's own seed; its players — where each is, as their client reports
+// it, the place they're in and the people in it, as they stand; the doors
+// that open in place, open or shut. (The sky's one for all the players:
+// the climate of the world the last came into.)
 module world_state
 
 use mara.core
@@ -32,9 +33,30 @@ WEATHER_LEAST_HOURS :: 4
 WEATHER_MOST_HOURS :: 8
 // The hour the world starts at.
 START_HOUR :: 10
-// The people and the doors the world keeps, at most.
+// The players, the people in a player's place, and the doors the world
+// keeps, at most.
+MAX_PLAYERS :: 8
 WORLD_ACTORS :: 512
 WORLD_DOORS :: 1024
+
+// A player, as their client reports them: their number (0: no one in this
+// slot), the world they're in (0 inside), where their feet are, which way
+// they face (radians from north toward east), whether they hurry time; the
+// place they're in — an interior (place_cell), or a world's cells round
+// place_x, place_y (place_world) — and the people in it (NPCs placed,
+// ACHR), as they stand now: where, turned how, how big.
+Player_State :: struct {
+	id: i64
+	world: u32
+	feet: Vec3
+	yaw: f32
+	hurried: bool
+	place_world: u32
+	place_cell: u32
+	place_x: i64
+	place_y: i64
+	actors: [WORLD_ACTORS]Reference
+}
 
 // A door that opens in place, as the world has it: open or shut, and when
 // it last changed (the world's seconds). One the world hasn't is shut.
@@ -69,20 +91,8 @@ World_State :: struct {
 	weather_transition: f32
 	weather_hours_left: f32
 	weather_seed: u64
-	// The player, as their client reports them: the world they're in (0
-	// inside), where their feet are, which way they face (radians from
-	// north toward east).
-	player_world: u32
-	player_feet: Vec3
-	player_yaw: f32
-	// The place the player's in: an interior (place_cell), or a world's
-	// cells round place_x, place_y (place_world); the people in it (NPCs
-	// placed, ACHR), as they stand now: where, turned how, how big.
-	place_world: u32
-	place_cell: u32
-	place_x: i64
-	place_y: i64
-	actors: [WORLD_ACTORS]Reference
+	// The players: a slot for each that may join.
+	players: [MAX_PLAYERS!]Player_State
 	// The doors that open in place that have been opened (or shut again).
 	doors: [WORLD_DOORS]Door_State
 }
@@ -104,14 +114,7 @@ world_start :: fun(state: ^World_State) {
 	state.weather_transition = 1
 	state.weather_hours_left = 0
 	state.weather_seed = time_now() | 1
-	state.player_world = 0
-	state.player_feet = Vec3{0, 0, 0}
-	state.player_yaw = 0
-	state.place_world = 0
-	state.place_cell = 0
-	state.place_x = 0
-	state.place_y = 0
-	state.actors.len = 0
+	for &player in state.players do player_clear(player, 0)
 	state.doors.len = 0
 }
 
@@ -153,28 +156,42 @@ world_tick_hours :: fun(state: ^World_State) -> f32 {
 	return WORLD_TICK * scale / 3600
 }
 
-// Takes a climate for the sky: the weathers that may come where the player
+// A player's slot made empty, or theirs (id) from the start: nowhere yet.
+player_clear :: fun(player: ^Player_State, id: i64) {
+	player.id = id
+	player.world = 0
+	player.feet = Vec3{0, 0, 0}
+	player.yaw = 0
+	player.hurried = false
+	player.place_world = 0
+	player.place_cell = 0
+	player.place_x = 0
+	player.place_y = 0
+	player.actors.len = 0
+}
+
+// Takes a climate for the sky: the weathers that may come where a player
 // is. The weather goes on under the same climate (from Tamriel into a
 // city, and back); a first climate, or another, starts one of its own at
 // once. Taken whatever fails (the first failure given back).
-world_take_climate :: fun(state: ^World_State, plugin: ^Plugin, climate: ^Climate) -> err {
+world_take_climate :: fun(state: ^World_State, plugin: ^Plugin, climate: ^Climate, player: ^Player_State) -> err {
 	same := state.sky_taken and climate.form_id == state.climate.form_id
 	state.climate = climate^
 	state.sky_taken = true
-	_, regions_error := world_weathers_here(state, plugin)
+	_, regions_error := world_weathers_here(state, plugin, player)
 	weather_error : err
 	if not same do weather_error = world_change_weather(state, plugin, true)
 	return if regions_error do regions_error else weather_error
 }
 
-// The weathers that may come where the player is: their cell's regions',
-// or the climate's (those too where the regions can't be read: why given
+// The weathers that may come where a player is: their cell's regions', or
+// the climate's (those too where the regions can't be read: why given
 // back). True when they're not the ones that could before.
-world_weathers_here :: fun(state: ^World_State, plugin: ^Plugin) -> bool, err {
+world_weathers_here :: fun(state: ^World_State, plugin: ^Plugin, player: ^Player_State) -> bool, err {
 	scratch : [256 * KB]byte
-	x, y := grid_of(state.player_feet)
+	x, y := grid_of(player.feet)
 	found : [16]Weather_Chance
-	region_error := cell_weathers(plugin, state.player_world, x, y, &found, &scratch)
+	region_error := cell_weathers(plugin, player.world, x, y, &found, &scratch)
 	if region_error do found.len = 0
 	if found.len == 0 do found = state.climate.weathers
 	same := found.len == state.weathers_here.len
@@ -207,58 +224,58 @@ world_change_weather :: fun(state: ^World_State, plugin: ^Plugin, at_once: bool)
 
 // ---- the people, the doors -------------------------------------------------------
 
-// Takes an interior as the place the player's in: the people in it.
-world_take_interior :: fun(state: ^World_State, plugin: ^Plugin, cell: u32) -> err {
-	state.place_world = 0
-	state.place_cell = cell
-	state.actors.len = 0
-	add_actors(state, plugin, cell, EVERYWHERE, NOWHERE)?
+// Takes an interior as the place a player's in: the people in it.
+player_take_interior :: fun(player: ^Player_State, plugin: ^Plugin, cell: u32) -> err {
+	player.place_world = 0
+	player.place_cell = cell
+	player.actors.len = 0
+	add_actors(player, plugin, cell, EVERYWHERE, NOWHERE)?
 }
 
-// Takes a world's cells round the one at x, y as the place the player's
+// Takes a world's cells round the one at x, y as the place a player's
 // in: the people in them and in the world's persistent cell there. Moving
 // within the world, those still in it stay as they are, those out of it
 // go, and only the cells come into it are read. All its cells are read
 // whatever fails (the first failure given back).
-world_take_area :: fun(state: ^World_State, plugin: ^Plugin, world_id: u32, x: i64, y: i64) -> err {
+player_take_area :: fun(player: ^Player_State, plugin: ^Plugin, world_id: u32, x: i64, y: i64) -> err {
 	area := area_around(x, y)
 	kept := NOWHERE
-	if state.place_world == world_id and state.place_cell == 0 {
-		kept = area_around(state.place_x, state.place_y)
+	if player.place_world == world_id and player.place_cell == 0 {
+		kept = area_around(player.place_x, player.place_y)
 		staying : i64 = 0
-		for k in 0:state.actors.len {
-			if not area_holds(area, state.actors[k].position) do continue
-			state.actors[staying] = state.actors[k]
+		for k in 0:player.actors.len {
+			if not area_holds(area, player.actors[k].position) do continue
+			player.actors[staying] = player.actors[k]
 			staying += 1
 		}
-		state.actors.len = staying
+		player.actors.len = staying
 	else
-		state.actors.len = 0
+		player.actors.len = 0
 	}
-	state.place_world = world_id
-	state.place_cell = 0
-	state.place_x = x
-	state.place_y = y
+	player.place_world = world_id
+	player.place_cell = 0
+	player.place_x = x
+	player.place_y = y
 	first_error : err
 	for cell_y in area.low_y..area.high_y {
 		for cell_x in area.low_x..area.high_x {
 			if cell_x >= kept.low_x and cell_x <= kept.high_x and cell_y >= kept.low_y and cell_y <= kept.high_y do continue
 			cell := exterior_cell(plugin, world_id, cell_x, cell_y)
 			if cell == 0 do continue
-			cell_error := add_actors(state, plugin, cell, EVERYWHERE, NOWHERE)
+			cell_error := add_actors(player, plugin, cell, EVERYWHERE, NOWHERE)
 			if cell_error and not first_error do first_error = cell_error
 		}
 	}
 	persistent := persistent_cell(plugin, world_id)
 	if persistent != 0 {
-		persistent_error := add_actors(state, plugin, persistent, area, kept)
+		persistent_error := add_actors(player, plugin, persistent, area, kept)
 		if persistent_error and not first_error do first_error = persistent_error
 	}
 	return first_error
 }
 
 // Adds a cell's people (those not disabled) in an area and not in kept.
-add_actors :: fun(state: ^World_State, plugin: ^Plugin, cell: u32, area: Grid_Area, kept: Grid_Area) -> err {
+add_actors :: fun(player: ^Player_State, plugin: ^Plugin, cell: u32, area: Grid_Area, kept: Grid_Area) -> err {
 	references : [16384]Reference = void
 	references.len = 0
 	cell_references(plugin, cell, &references)?
@@ -267,18 +284,9 @@ add_actors :: fun(state: ^World_State, plugin: ^Plugin, cell: u32, area: Grid_Ar
 		if not area_holds(area, reference.position) or area_holds(kept, reference.position) do continue
 		base_at, found := index_get(&plugin.records, u64(reference.base))
 		if not found or record_header_at(plugin, base_at).kind != "NPC_" do continue
-		if not fits(state.actors.len + 1, state.actors.cap) do break
-		&state.actors + reference
+		if not fits(player.actors.len + 1, player.actors.cap) do break
+		&player.actors + reference
 	}
-}
-
-// One of the people in the place the player's in, by their reference; false
-// when they aren't.
-world_actor :: fun(state: ^World_State, reference: u32) -> Reference, bool {
-	for actor in state.actors {
-		if actor.form_id == reference do return actor, true
-	}
-	return Reference{0}, false
 }
 
 // Opens a shut door that opens in place, or shuts an open one, now (the
@@ -303,10 +311,10 @@ world_door_open :: fun(state: ^World_State, reference: u32) -> bool {
 	return false
 }
 
-// The player moved into other cells: the weathers that may come there,
-// and if they're others, the next soon.
-world_player_crossed :: fun(state: ^World_State, plugin: ^Plugin) -> err {
-	others, regions_error := world_weathers_here(state, plugin)
+// A player moved into other cells: the weathers that may come there, and
+// if they're others, the next soon.
+world_player_crossed :: fun(state: ^World_State, plugin: ^Plugin, player: ^Player_State) -> err {
+	others, regions_error := world_weathers_here(state, plugin, player)
 	if others do state.weather_hours_left = min(state.weather_hours_left, 0.1)
 	return regions_error
 }

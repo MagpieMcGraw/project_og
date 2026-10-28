@@ -25,6 +25,7 @@ use world_state
 use world_server
 use world_copy
 use wire
+use net
 use land
 use scene
 use sky
@@ -158,11 +159,19 @@ Viewer :: struct {
 	walker: Walker
 	eyes: f32           // how high the walker's eyes are: smoothed over steps
 
-	// The world's server, run here (this player hosts it: run_host), and the
-	// world as this player's client knows it — what the server's told it:
-	// all that's shown is from this copy, all the player does is told the
-	// server (wire.mara).
+	// The world's server, and this player's link to it: run here (hosting:
+	// this player its first client, their queues passed it directly), or
+	// elsewhere, over a connection (server_address, set before viewer_open:
+	// empty to host); whether it's been lost. The world as this player's
+	// client knows it — what the server's told it: all that's shown is from
+	// this copy, all the player does is told the server (wire.mara).
+	hosting: bool
 	server: World_Server
+	server_address: [64]utf8
+	connection: u64
+	to_server: Wire_Queue
+	from_server: Wire_Queue
+	server_lost: bool
 	seen: World_Copy
 	// The sky as shown: the climate the server says the sky's under, read
 	// (its sun, moons, night sky); the records of the weathers (the one
@@ -367,7 +376,7 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.eyes = 0
 	viewer.sky_world = 0
 	viewer.sky_inside = false
-	server_start(&viewer.server)
+	open_link(viewer)?
 	copy_start(&viewer.seen)
 	viewer.climate = default_climate()
 	viewer.weather = default_weather()
@@ -407,6 +416,7 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 }
 
 viewer_close :: fun(viewer: ^Viewer) {
+	net_close(viewer.connection)
 	audio_close(&viewer.audio)
 	platform_close(&viewer.platform)
 	note_cache(viewer)
@@ -549,7 +559,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 			return .door
 		}
 		// (Asked of the server: the door swings when it says, follow_doors.)
-		send_use_door(&viewer.server.from_client, targeted)
+		send_use_door(outgoing(viewer), targeted)
 	}
 	if input.pressed[E] and not usable {
 		viewer.missed = true
@@ -1064,7 +1074,7 @@ place_walker :: fun(viewer: ^Viewer) {
 // Tells the server where the player is: their place and feet, which way
 // they face; and whether they hurry time (T held).
 report_player :: fun(viewer: ^Viewer, hurried: bool) {
-	send_player(&viewer.server.from_client, viewer.shown.world, player_feet(viewer), viewer.camera.yaw, hurried)
+	send_player(outgoing(viewer), viewer.shown.world, player_feet(viewer), viewer.camera.yaw, hurried)
 }
 
 // Where the player's feet are: the walker's, or flying, below the camera.
@@ -1108,17 +1118,76 @@ follow_actors :: fun(viewer: ^Viewer) {
 // a world's cells round x, y; their feet there. (Its people come when it
 // says who they are: run_host.)
 take_place :: fun(viewer: ^Viewer, world_id: u32, cell: u32, x: i64, y: i64, feet: Vec3) {
-	send_place(&viewer.server.from_client, world_id, cell, x, y, feet)
+	send_place(outgoing(viewer), world_id, cell, x, y, feet)
 }
 
-// Runs the server this player hosts as far as now (server_run), then takes
-// in what it's told and shows what's changed: its notes in the journal,
-// the sky's climate and weather, the place's people (those not shown yet
-// waiting to be).
-run_host :: fun(viewer: ^Viewer, plugin: ^Plugin) {
-	server_run(&viewer.server, plugin)
+// Opens this player's link to the world's server: hosting it (the server
+// started, this player its first client), or connecting to it at the
+// address set (a.b.c.d, or localhost; :port, else DEFAULT_PORT).
+open_link :: fun(viewer: ^Viewer) -> err {
+	viewer.connection = NO_SOCKET
+	viewer.server_lost = false
+	wire_start(&viewer.to_server)
+	wire_start(&viewer.from_server)
+	viewer.hosting = viewer.server_address.len == 0
+	if viewer.hosting {
+		server_start(&viewer.server)
+		_ = server_join(&viewer.server, NO_SOCKET)
+		return
+	}
+	address := viewer.server_address[:]
+	port : i64 = DEFAULT_PORT
+	for c, k in address {
+		if c != ':' do continue
+		number, is_number := parse_number(address[k + 1 : address.len])
+		if is_number do port = i64(number)
+		address = address[0:k]
+		break
+	}
+	net_start()?
+	// (A server just started may not be listening yet: tried for 2 seconds.)
+	connect_error : err
+	for try in 0:20 {
+		viewer.connection, connect_error = net_connect(address, port)
+		if not connect_error do break
+		sleep_ms(100)
+	}
+	if connect_error do return connect_error
+	note(&viewer.journal, "connected to the server at ")
+	note(&viewer.journal, viewer.server_address)
+	note_end(&viewer.journal)
+}
+
+// Where this player's messages to the server go, and where its come.
+outgoing :: fun(viewer: ^Viewer) -> ^Wire_Queue {
+	if viewer.hosting do return &viewer.server.clients[0].from_client
+	return &viewer.to_server
+}
+incoming :: fun(viewer: ^Viewer) -> ^Wire_Queue {
+	if viewer.hosting do return &viewer.server.clients[0].to_client
+	return &viewer.from_server
+}
+
+// Runs this player's link to the world's server as far as now: hosting,
+// the server itself (server_run); else what's waiting for the server sent
+// and what it's sent taken in. Then what it's told is shown: its notes in
+// the journal, the sky's climate and weather, the place's people (those
+// not shown yet waiting to be).
+run_link :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	if viewer.hosting {
+		server_run(&viewer.server, plugin)
+	elif not viewer.server_lost
+		link_error := wire_send(&viewer.to_server, viewer.connection)
+		if not link_error do link_error = wire_receive(&viewer.from_server, viewer.connection)
+		if link_error {
+			note(&viewer.journal, "lost the server: ")
+			note_error(&viewer.journal, link_error)
+			note_end(&viewer.journal)
+			viewer.server_lost = true
+		}
+	}
 	seen := &viewer.seen
-	copy_take(seen, &viewer.server.to_client)
+	copy_take(seen, incoming(viewer))
 	for told in seen.notes {
 		note(&viewer.journal, told.text)
 		note_end(&viewer.journal)
@@ -1700,6 +1769,7 @@ command_view :: fun(what: []utf8, picture: Picture) {
 	table_storage.len = 0
 	viewer : Viewer
 	viewer.picture = picture
+	viewer.server_address.len = 0
 	open_error := viewer_open(&viewer, &directory_storage, &table_storage)
 	if open_error {
 		print("couldn't open the viewer: %", open_error)
@@ -1736,7 +1806,7 @@ command_view :: fun(what: []utf8, picture: Picture) {
 // `sooblivion view-cell <editor id>`: shows an interior cell in the
 // window; its doors lead on, inside and out. When it can't, it says why
 // on the console, and gives the reason back.
-command_view_cell :: fun(name: []utf8, picture: Picture) -> err {
+command_view_cell :: fun(name: []utf8, picture: Picture, server_address: []utf8 = "") -> err {
 	index_storage : [96 * MB]byte = void
 	index_storage.len = 0
 	plugin, load_error := load_oblivion(&index_storage)
@@ -1757,6 +1827,7 @@ command_view_cell :: fun(name: []utf8, picture: Picture) -> err {
 	table_storage.len = 0
 	viewer : Viewer
 	viewer.picture = picture
+	add_what_fits(&viewer.server_address, server_address)
 	open_error := viewer_open(&viewer, &directory_storage, &table_storage)
 	if open_error {
 		print("couldn't open the viewer: %", open_error)
@@ -1782,7 +1853,7 @@ command_view_cell :: fun(name: []utf8, picture: Picture) -> err {
 
 // `sooblivion view-world [world] [x y]`: shows a world's land and what's
 // on it around the cell at x, y on its grid.
-command_view_world :: fun(name: []utf8, x: i64, y: i64, picture: Picture) {
+command_view_world :: fun(name: []utf8, x: i64, y: i64, picture: Picture, server_address: []utf8 = "") {
 	index_storage : [96 * MB]byte = void
 	index_storage.len = 0
 	plugin, load_error := load_oblivion(&index_storage)
@@ -1803,6 +1874,7 @@ command_view_world :: fun(name: []utf8, x: i64, y: i64, picture: Picture) {
 	table_storage.len = 0
 	viewer : Viewer
 	viewer.picture = picture
+	add_what_fits(&viewer.server_address, server_address)
 	open_error := viewer_open(&viewer, &directory_storage, &table_storage)
 	if open_error {
 		print("couldn't open the viewer: %", open_error)
@@ -1840,7 +1912,7 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	journal := &viewer.journal
 	for true {
 		placed_this_frame := false
-		run_host(viewer, plugin)
+		run_link(viewer, plugin)
 		match view_frame(viewer) {
 		nothing
 		quit

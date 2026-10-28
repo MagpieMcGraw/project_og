@@ -24,6 +24,8 @@ use png
 use model
 use world
 use world_state
+use world_server
+use net
 use scene
 use land
 use sky
@@ -1112,8 +1114,8 @@ command_walk :: fun(name: []utf8, x: i64, y: i64, steps: i64) {
 	block_room : [16 * MB]byte
 	model_room : [64 * MB]byte
 	texture_room : [64 * MB]byte
-	state : World_State
-	world_start(&state)
+	player : Player_State
+	player_clear(&player, 1)
 
 	for step in 0..steps {
 		cell_x := x + step
@@ -1121,9 +1123,9 @@ command_walk :: fun(name: []utf8, x: i64, y: i64, steps: i64) {
 		show_error := show_exterior(&walked, &plugin, world_id, cell_x, y)
 		if show_error do print("  placing the cells around % % stopped early: %", cell_x, y, show_error)
 		// The world's people there, waiting with the rest.
-		people_error := world_take_area(&state, &plugin, world_id, cell_x, y)
+		people_error := player_take_area(&player, &plugin, world_id, cell_x, y)
 		if people_error do print("  couldn't read all of the people around % %: %", cell_x, y, people_error)
-		queue_actors(&walked, state.actors)
+		queue_actors(&walked, player.actors)
 		place_ms := elapsed_ms(place_start)
 
 		// What's waiting, read as loading would: the meshes and their
@@ -1764,21 +1766,21 @@ command_walk_check :: fun(name: []utf8, start: Vec3, yaw_degrees: f32, seconds: 
 
 	load_start := time_now()
 	// The place, and the world's people in it.
-	state : World_State
-	world_start(&state)
+	player : Player_State
+	player_clear(&player, 1)
 	x, y := grid_of(start)
 	show_error : err
 	take_error : err
 	if world_id != 0 {
 		show_error = show_exterior(&place, &plugin, world_id, x, y)
-		take_error = world_take_area(&state, &plugin, world_id, x, y)
+		take_error = player_take_area(&player, &plugin, world_id, x, y)
 	else
 		show_error = show_interior(&place, &plugin, cell, loader)
-		take_error = world_take_interior(&state, &plugin, cell)
+		take_error = player_take_interior(&player, &plugin, cell)
 	}
 	if show_error do print("placing the place stopped early: %", show_error)
 	if take_error do print("couldn't read all of the place's people: %", take_error)
-	queue_actors(&place, state.actors)
+	queue_actors(&place, player.actors)
 	for not load_waiting(&place, &plugin, loader, 0xFFFFFFFFFFFFFFFF, start) {}
 	solid : i64 = 0
 	for &instance in place.instances {
@@ -1786,7 +1788,7 @@ command_walk_check :: fun(name: []utf8, start: Vec3, yaw_degrees: f32, seconds: 
 		if range.count > 0 or range.upright > 0 do solid += 1
 	}
 	print("loaded without drawing in % ms: % things placed, % walked into (% triangles), % land cells, % people",
-		elapsed_ms(load_start), place.instances.len, solid, place.collision_points.len / 3, place.grounds.len, state.actors.len)
+		elapsed_ms(load_start), place.instances.len, solid, place.collision_points.len / 3, place.grounds.len, player.actors.len)
 
 	feet := start - Vec3{0, 0, EYE_HEIGHT}
 	walker := Walker{position = feet, rising = 0, on_ground = false}
@@ -1799,6 +1801,41 @@ command_walk_check :: fun(name: []utf8, start: Vec3, yaw_degrees: f32, seconds: 
 	across := sqrt_f32(moved.x * moved.x + moved.y * moved.y)
 	print("walked % s at % degrees: its eyes from % to %; % units across of %", seconds, yaw_degrees, start,
 		walker.position + Vec3{0, 0, EYE_HEIGHT}, across, WALK_SPEED * f32(steps) * step)
+}
+
+// `sooblivion serve [port] [seconds] [open]`: the world run as a server,
+// with no window, players connecting to it (`sooblivion connect`): on this
+// machine's own address only, or open to others; for that many seconds
+// (0: till it's stopped). Who joins and leaves is told.
+command_serve :: fun(port: i64, seconds: f64, open: bool) {
+	index_storage : [96 * MB]byte = void
+	index_storage.len = 0
+	plugin, load_error := load_oblivion(&index_storage)
+	if load_error {
+		print("couldn't load the plugin: %", load_error)
+		return
+	}
+	start_error := net_start()
+	if start_error {
+		print("couldn't start the network: %", start_error)
+		return
+	}
+	listener, listen_error := net_listen(port, open)
+	if listen_error {
+		print("couldn't listen on port %: %", port, listen_error)
+		return
+	}
+	defer net_close(listener)
+	server : World_Server
+	server_start(&server)
+	server.listener = listener
+	print("serving the world on port % (%)", port, if open do "open to others" else "this machine's only")
+	start := time_now()
+	for seconds <= 0 or f64(time_now() - start) / 1000000000 < seconds {
+		server_run(&server, &plugin)
+		sleep_ms(2)
+	}
+	print("served % ticks", server.state.ticks)
 }
 
 // `sooblivion world-run <world> <hours>`: the world's state run as a server
@@ -1825,10 +1862,12 @@ command_world_run :: fun(name: []utf8, hours: f32) {
 	if climate_error do climate = default_climate()
 	state : World_State
 	world_start(&state)
-	state.player_world = world_id
+	player := &state.players[0]
+	player_clear(player, 1)
+	player.world = world_id
 	state.hurried = true
 	start := time_now()
-	take_error := world_take_climate(&state, &plugin, &climate)
+	take_error := world_take_climate(&state, &plugin, &climate, player)
 	if take_error do print("couldn't read the regions or a weather: %", take_error)
 	print("climate %, % of day %: % comes in at once", editor_id_of(&plugin, climate.form_id), clock_text(state.hour), state.day,
 		editor_id_of(&plugin, state.weather))
@@ -2677,6 +2716,10 @@ usage :: fun() {
 	print("sooblivion bsa <archive>           an archive's folders and files")
 	print("sooblivion bsa <archive> <file>    one file from an archive, unpacked")
 	print("sooblivion plugins                 the plugins loaded, in order, and the archives")
+	print("sooblivion serve [port] [seconds] [open]")
+	print("                                   the world run as a server, no window; open: to other machines")
+	print("sooblivion connect <address[:port]> [view-cell <id> | view-world <world> <x> <y>]")
+	print("                                   play in a world served elsewhere")
 	print("sooblivion walk-check <world | cell> <x> <y> <z> <yaw> <seconds>")
 	print("                                   a walker walked forward in a place loaded without drawing")
 	print("sooblivion world-run <world> <hours>")
@@ -2708,6 +2751,12 @@ command_picture :: fun(args: [][]utf8) {
 	picture := no_picture()
 	&picture.path + args[0]
 	view := args[1 : args.len]
+	// (Connected to a server elsewhere: `connect <address>` first.)
+	server_address := args[0][0:0]
+	if view.len > 2 and view[0] == "connect" {
+		server_address = view[1]
+		view = view[2 : view.len]
+	}
 	if view.len >= 3 and view[view.len - 2] == "walk" {
 		seconds, is_number := parse_number(view[view.len - 1])
 		if not is_number {
@@ -2774,11 +2823,11 @@ command_picture :: fun(args: [][]utf8) {
 	if view[0] == "view" and view.len > 1 {
 		command_view(view[1], picture)
 	elif view[0] == "view-cell" and view.len > 1
-		_ = command_view_cell(view[1], picture)
+		_ = command_view_cell(view[1], picture, server_address)
 	elif view[0] == "view-world" and view.len > 3
 		x, x_ok := parse_number(view[2])
 		y, y_ok := parse_number(view[3])
-		if x_ok and y_ok do command_view_world(view[1], i64(x), i64(y), picture)
+		if x_ok and y_ok do command_view_world(view[1], i64(x), i64(y), picture, server_address)
 		else do usage()
 	else
 		usage()
@@ -3473,6 +3522,34 @@ main :: (args: [][]utf8) {
 		}
 		if all_numbers do command_walk_check(args[2], Vec3{numbers[0], numbers[1], numbers[2]}, numbers[3], numbers[4])
 		else do usage()
+	elif command == "serve"
+		port : i64 = DEFAULT_PORT
+		seconds : f64 = 0
+		open := false
+		for k in 2:args.len {
+			if args[k] == "open" {
+				open = true
+				continue
+			}
+			number, is_number := parse_number(args[k])
+			if not is_number do continue
+			if k == 2 do port = i64(number)
+			else do seconds = number
+		}
+		command_serve(port, seconds, open)
+	elif command == "connect" and args.len > 2
+		// Playing in a world served elsewhere: from a place as the view
+		// commands start, the Inn of Ill Omen without one.
+		if args.len > 4 and args[3] == "view-cell" {
+			_ = command_view_cell(args[4], no_picture(), args[2])
+		elif args.len > 6 and args[3] == "view-world"
+			x, x_ok := parse_number(args[5])
+			y, y_ok := parse_number(args[6])
+			if x_ok and y_ok do command_view_world(args[4], i64(x), i64(y), no_picture(), args[2])
+			else do usage()
+		else
+			_ = command_view_cell(START_CELL, no_picture(), args[2])
+		}
 	elif command == "world-run" and args.len > 3
 		hours, is_number := parse_number(args[3])
 		if is_number do command_world_run(args[2], f32(hours))
