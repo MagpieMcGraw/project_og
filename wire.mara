@@ -1,0 +1,154 @@
+// Messages between a world's server and its clients, as bytes: in a queue
+// in one program for now (Wire_Queue: the host's own player), over the
+// network later. A message is its kind and its body's size (u32 each),
+// then its body: a plain value's bytes, or a list's count (i64) and then
+// its items'.
+//
+// What's taken off a queue is checked before it's used: a message that
+// doesn't fit the queue, or a list that doesn't fit its message, isn't
+// read (from a network it may be anything).
+module wire
+
+use mara.core
+use mara.math
+use mara.memory
+use logging
+
+// A queue's room: what can wait in it at once.
+WIRE_ROOM :: 1 * MB
+// A message's head: its kind and its body's size.
+WIRE_HEAD :: 8
+
+// From a client to its server.
+MESSAGE_PLAYER :: 1       // where the player is now (Player_Message)
+MESSAGE_PLACE :: 2        // the place the player's come into (Place_Message)
+MESSAGE_USE_DOOR :: 3     // a door that opens in place, opened or shut (its reference, u32)
+// From a server to its clients.
+MESSAGE_CLOCK :: 10       // the clock and the sky (Clock_Message)
+MESSAGE_PEOPLE :: 11      // the people in the player's place (a list of References)
+MESSAGE_DOORS :: 12       // the doors opened or shut (a list of Door_States)
+MESSAGE_NOTE :: 13        // something to tell the player's journal (Note_Message)
+
+// Where a client's player is now: the world they're in (0 inside), their
+// feet, which way they face, whether they hurry time.
+Player_Message :: struct {
+	world_id: u32
+	feet: Vec3
+	yaw: f32
+	hurried: bool
+}
+
+// The place a client's player has come into: an interior (cell), or a
+// world's cells round x, y (world_id; told again as they cross into
+// others); where their feet are there.
+Place_Message :: struct {
+	world_id: u32
+	cell: u32
+	x: i64
+	y: i64
+	feet: Vec3
+}
+
+// The clock and the sky, as a server tells its clients: the game's hour
+// and days gone, the seconds the world's run, whether time's hurried; the
+// climate (its form id; 0 the default) and whether there's one yet; the
+// weathers coming in and going out (form ids), how far in.
+Clock_Message :: struct {
+	hour: f32
+	day: i64
+	seconds: f64
+	hurried: bool
+	climate: u32
+	sky_taken: bool
+	weather: u32
+	last_weather: u32
+	weather_share: f32
+}
+
+// Something a server tells a client's journal: what failed, and why.
+Note_Message :: struct {
+	text: [200]utf8
+}
+
+// Messages waiting, from read_at to len.
+Wire_Queue :: struct {
+	bytes: [WIRE_ROOM]byte
+	read_at: i64
+}
+
+// A message taken off a queue: its kind, and its body (a view of the queue:
+// read it before putting more).
+Wire_Message :: struct {
+	kind: u32
+	body: []byte
+}
+
+// An empty queue.
+wire_start :: fun(queue: ^Wire_Queue) {
+	queue.bytes.len = 0
+	queue.read_at = 0
+}
+
+// Puts a message of a kind on a queue: a value's bytes for its body. (A
+// queue that's full drops it, the full log told.)
+wire_put :: fun(queue: ^Wire_Queue, kind: u32, value: $T) {
+	at := wire_head(queue, kind, size_of(T))
+	if at < 0 do return
+	queue.bytes[at] = value
+}
+
+// Puts a message of a kind on a queue: a list for its body, its count then
+// its items.
+wire_put_list :: fun(queue: ^Wire_Queue, kind: u32, items: []$T) {
+	at := wire_head(queue, kind, 8 + items.len * size_of(T))
+	if at < 0 do return
+	queue.bytes[at] = items.len
+	for item, k in items do queue.bytes[at + 8 + k * size_of(T)] = item
+}
+
+// Makes room on a queue for a message's head and a body of size bytes,
+// the head written: where the body goes; -1 when there's no room.
+wire_head :: fun(queue: ^Wire_Queue, kind: u32, size: i64) -> i64 {
+	if not fits(queue.bytes.len + WIRE_HEAD + size, queue.bytes.cap) do return -1
+	at := queue.bytes.len
+	queue.bytes.len += WIRE_HEAD + size
+	queue.bytes[at] = kind
+	queue.bytes[at + 4] = u32(size)
+	return at + WIRE_HEAD
+}
+
+// The next message on a queue, taken off it; false when there's none (or
+// what's there isn't a whole message: then it's all let go). Once all
+// are taken the queue is empty again.
+wire_take :: fun(queue: ^Wire_Queue) -> Wire_Message, bool {
+	none := Wire_Message{kind = 0, body = queue.bytes[0:0]}
+	if queue.read_at + WIRE_HEAD > queue.bytes.len {
+		wire_start(queue)
+		return none, false
+	}
+	kind : u32 = queue.bytes[queue.read_at]
+	size : u32 = queue.bytes[queue.read_at + 4]
+	body_at := queue.read_at + WIRE_HEAD
+	if body_at + i64(size) > queue.bytes.len {
+		wire_start(queue)
+		return none, false
+	}
+	queue.read_at = body_at + i64(size)
+	return Wire_Message{kind = kind, body = queue.bytes[body_at : body_at + i64(size)]}, true
+}
+
+// A message's body as a value of a type; false when it's too short to be one.
+wire_value :: fun(message: Wire_Message, otherwise: $T) -> T, bool {
+	if message.body.len < size_of(T) do return otherwise, false
+	value : T = message.body[0]
+	return value, true
+}
+
+// A list message's count of items of a type, if its body holds them all
+// (and at most most of them); else 0 and false.
+wire_count :: fun(message: Wire_Message, item_size: i64, most: i64) -> i64, bool {
+	if message.body.len < 8 do return 0, false
+	count : i64 = message.body[0]
+	if count < 0 or count > most or 8 + count * item_size > message.body.len do return 0, false
+	return count, true
+}
