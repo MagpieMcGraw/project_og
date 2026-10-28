@@ -14,15 +14,16 @@ use world
 use sky
 use world_state
 use wire
-use net
+use mara.os
 use logging
 
 // A client of the server, in a slot by its player's (the world's players):
-// whether one's here; its connection (NO_SOCKET: the host's own); what it's
-// said, and what it's to be told; whether its place's people are to be told.
+// whether one's here; its connection (its id NO_SOCKET: the host's own);
+// what it's said, and what it's to be told; whether its place's people are
+// to be told.
 Server_Client :: struct {
 	here: bool
-	connection: u64
+	connection: Tcp_Connection
 	from_client: Wire_Queue
 	to_client: Wire_Queue
 	people_due: bool
@@ -31,7 +32,7 @@ Server_Client :: struct {
 World_Server :: struct {
 	state: World_State
 	clients: [MAX_PLAYERS!]Server_Client
-	listener: u64         // where others connect (NO_SOCKET: none: only the host plays)
+	listener: Tcp_Listener   // where others connect (its id NO_SOCKET: none: only the host plays)
 	next_id: i64          // the next player's number
 	ticked_at: u64        // when its last tick was due
 	// What every client's to be told: the clock (after ticks, or a place
@@ -45,21 +46,22 @@ server_start :: fun(server: ^World_Server) {
 	world_start(&server.state)
 	for &client in server.clients {
 		client.here = false
-		client.connection = NO_SOCKET
+		client.connection = no_connection()
 		wire_start(&client.from_client)
 		wire_start(&client.to_client)
 		client.people_due = false
 	}
-	server.listener = NO_SOCKET
+	server.listener = Tcp_Listener{id = NO_SOCKET, v4 = false, port = 0}
 	server.next_id = 1
 	server.ticked_at = time_now()
 	server.clock_due = true
 	server.doors_due = false
 }
 
-// A client joining, on a connection (NO_SOCKET: the host's own): its slot,
-// -1 when they're all taken. Its player's nowhere till it says (its place).
-server_join :: fun(server: ^World_Server, connection: u64) -> i64 {
+// A client joining, on a connection (no_connection: the host's own): its
+// slot, -1 when they're all taken. Its player's nowhere till it says (its
+// place).
+server_join :: fun(server: ^World_Server, connection: Tcp_Connection) -> i64 {
 	for &client, k in server.clients {
 		if client.here do continue
 		client.here = true
@@ -81,9 +83,8 @@ server_leave :: fun(server: ^World_Server, slot: i64, reason: err) {
 	client := &server.clients[slot]
 	print("player % left: %", server.state.players[slot].id, reason)
 	server_tell_about(server, slot, " left")
-	net_close(client.connection)
+	tcp_close(&client.connection)
 	client.here = false
-	client.connection = NO_SOCKET
 	player_clear(&server.state.players[slot], 0)
 }
 
@@ -93,14 +94,16 @@ server_leave :: fun(server: ^World_Server, slot: i64, reason: err) {
 // client told what's changed — the clock and the sky, its place's people,
 // the doors — and sent what's waiting for it.
 server_run :: fun(server: ^World_Server, plugin: ^Plugin) {
-	if server.listener != NO_SOCKET {
+	if server.listener.id != NO_SOCKET {
 		for true {
-			connection, connected := net_accept(server.listener)
+			connection := no_connection()
+			connected, accept_error := tcp_accept(&server.listener, &connection)
+			if accept_error do print("couldn't take a connection: %", accept_error)
 			if not connected do break
 			slot := server_join(server, connection)
 			if slot < 0 {
 				print("a player couldn't join: the server's full")
-				net_close(connection)
+				tcp_close(&connection)
 				continue
 			}
 			print("player % joined", server.state.players[slot].id)
@@ -109,8 +112,8 @@ server_run :: fun(server: ^World_Server, plugin: ^Plugin) {
 	}
 	for &client, slot in server.clients {
 		if not client.here do continue
-		if client.connection != NO_SOCKET {
-			receive_error := wire_receive(&client.from_client, client.connection)
+		if client.connection.id != NO_SOCKET {
+			receive_error := wire_receive(&client.from_client, &client.connection)
 			if receive_error {
 				server_leave(server, slot, receive_error)
 				continue
@@ -161,8 +164,8 @@ server_run :: fun(server: ^World_Server, plugin: ^Plugin) {
 			}
 			wire_put_list(&client.to_client, MESSAGE_PLAYERS, others)
 		}
-		if client.connection != NO_SOCKET {
-			send_error := wire_send(&client.to_client, client.connection)
+		if client.connection.id != NO_SOCKET {
+			send_error := wire_send(&client.to_client, &client.connection)
 			if send_error do server_leave(server, slot, send_error)
 		}
 	}

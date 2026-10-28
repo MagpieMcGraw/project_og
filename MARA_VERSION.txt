@@ -1,4 +1,4 @@
-Mara 9d90101a (2026-10-28 18:37): A struct holding a list writes into a byte buffer
-commit 9d90101a7d5eb135b8d23cf029d24acd21b7341c
-released 2026-10-28 18:40 by release.sh: Mara.exe built -o:speed from a clean tree
-suite with this Mara.exe and stdlib: pass=391  xfail=283  skip=20  mismatches=0
+Mara c322fb64 (2026-10-28 23:06): mara.os sockets: IPv4 first, and a fuller fallback at net_any
+commit c322fb646e08347c29d78c7da321a5f41b72c7e3
+released 2026-10-28 23:12 by release.sh: Mara.exe built -o:speed from a clean tree
+suite with this Mara.exe and stdlib: pass=393  xfail=283  skip=20  mismatches=0

@@ -1,6 +1,6 @@
 // Messages between a world's server and its clients, as bytes: in a queue
-// in one program for now (Wire_Queue: the host's own player), over the
-// network later. A message is its kind and its body's size (u32 each),
+// in one program (Wire_Queue: the host's own player), or over the network
+// (mara.os's TCP: wire_connect, wire_send, wire_receive). A message is its kind and its body's size (u32 each),
 // then its body: a plain value's bytes, or a list's count (i64) and then
 // its items'.
 //
@@ -15,7 +15,8 @@ use mara.core
 use mara.math
 use mara.memory
 use logging
-use net
+use mara.os
+use mara.string
 
 // A queue's room: what can wait in it at once.
 WIRE_ROOM :: 1 * MB
@@ -180,28 +181,61 @@ wire_compact :: fun(queue: ^Wire_Queue) {
 	queue.read_at = 0
 }
 
-// Takes in what's come over a connection, after what's waiting. Closed when
-// the other side's gone (or what's come can't be messages: Bad_Messages).
-wire_receive :: fun(queue: ^Wire_Queue, connection: u64) -> err {
-	if queue.broken do return Bad_Messages
-	wire_compact(queue)
-	net_receive(connection, &queue.bytes)?
+// The port a server listens on unless told another.
+DEFAULT_PORT :: 27100
+
+// No connection: the host's own player's (its queues passed directly).
+no_connection :: fun() -> Tcp_Connection {
+	return Tcp_Connection{id = NO_SOCKET, v4 = false, peer = net_any(0)}
 }
 
-// Sends what's waiting over a connection, as much as goes now (the rest
-// waits). Closed when the other side's gone.
-wire_send :: fun(queue: ^Wire_Queue, connection: u64) -> err {
-	if queue.read_at == queue.bytes.len do return
-	sent := net_send(connection, queue.bytes[queue.read_at : queue.bytes.len])?
-	queue.read_at += sent
-	if queue.read_at == queue.bytes.len {
-		queue.bytes.len = 0
-		queue.read_at = 0
+// Connects to a server at an address — a name or an IP address's text,
+// then :port, else DEFAULT_PORT — tried for 2 seconds (a server just
+// started may not be listening yet).
+wire_connect :: fun(address_and_port: []utf8) -> Tcp_Connection, err {
+	address := address_and_port
+	port : i64 = DEFAULT_PORT
+	for c, k in address {
+		if c != ':' do continue
+		number, is_number := parse_number(address[k + 1 : address.len])
+		if is_number do port = i64(number)
+		address = address[0:k]
+		break
 	}
+	to := net_lookup(address, u16(port))?
+	connection := no_connection()
+	connect_error : err
+	for try in 0:20 {
+		connection, connect_error = tcp_connect(to)
+		if not connect_error do break
+		sleep_ms(100)
+	}
+	return connection, connect_error
+}
+
+// Takes in what's come over a connection, after what's waiting. Closed when
+// the other side's gone (or what's come can't be messages: Bad_Messages).
+wire_receive :: fun(queue: ^Wire_Queue, connection: ^Tcp_Connection) -> err {
+	if queue.broken do return Bad_Messages
+	wire_compact(queue)
+	room := queue.bytes[queue.bytes.len : queue.bytes.cap]
+	open := tcp_receive(connection, &room)?
+	queue.bytes.len += room.len
+	if not open do return Closed
+}
+
+// Sends what's waiting over a connection, all of it (waiting while the
+// system has no room for more). Send_Failed when the other side's gone.
+wire_send :: fun(queue: ^Wire_Queue, connection: ^Tcp_Connection) -> err {
+	if queue.read_at == queue.bytes.len do return
+	tcp_send(connection, queue.bytes[queue.read_at : queue.bytes.len])?
+	queue.bytes.len = 0
+	queue.read_at = 0
 }
 
 Wire_Error :: error {
 	Bad_Messages    // what's come over a connection can't be messages
+	Closed          // the other side's gone
 }
 
 // A message's body as a value of a type; false when it's too short to be one.

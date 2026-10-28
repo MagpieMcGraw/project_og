@@ -25,7 +25,6 @@ use world_state
 use world_server
 use world_copy
 use wire
-use net
 use land
 use scene
 use sky
@@ -176,7 +175,7 @@ Viewer :: struct {
 	hosting: bool
 	server: World_Server
 	server_address: [64]utf8
-	connection: u64
+	connection: Tcp_Connection
 	to_server: Wire_Queue
 	from_server: Wire_Queue
 	server_lost: bool
@@ -447,8 +446,8 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 }
 
 viewer_close :: fun(viewer: ^Viewer) {
-	net_close(viewer.connection)
-	if viewer.hosting do net_close(viewer.server.listener)
+	tcp_close(&viewer.connection)
+	if viewer.hosting do tcp_listen_stop(&viewer.server.listener)
 	audio_close(&viewer.audio)
 	platform_close(&viewer.platform)
 	note_cache(viewer)
@@ -1257,35 +1256,18 @@ take_place :: fun(viewer: ^Viewer, world_id: u32, cell: u32, x: i64, y: i64, fee
 // started, this player its first client), or connecting to it at the
 // address set (a.b.c.d, or localhost; :port, else DEFAULT_PORT).
 open_link :: fun(viewer: ^Viewer) -> err {
-	viewer.connection = NO_SOCKET
+	viewer.connection = no_connection()
 	viewer.server_lost = false
 	wire_start(&viewer.to_server)
 	wire_start(&viewer.from_server)
 	viewer.hosting = viewer.server_address.len == 0
 	if viewer.hosting {
 		server_start(&viewer.server)
-		_ = server_join(&viewer.server, NO_SOCKET)
+		_ = server_join(&viewer.server, no_connection())
 		if viewer.picture.path.len == 0 do host_listen(viewer)
 		return
 	}
-	address := viewer.server_address[:]
-	port : i64 = DEFAULT_PORT
-	for c, k in address {
-		if c != ':' do continue
-		number, is_number := parse_number(address[k + 1 : address.len])
-		if is_number do port = i64(number)
-		address = address[0:k]
-		break
-	}
-	net_start()?
-	// (A server just started may not be listening yet: tried for 2 seconds.)
-	connect_error : err
-	for try in 0:20 {
-		viewer.connection, connect_error = net_connect(address, port)
-		if not connect_error do break
-		sleep_ms(100)
-	}
-	if connect_error do return connect_error
+	viewer.connection = wire_connect(viewer.server_address)?
 	note(&viewer.journal, "connected to the server at ")
 	note(&viewer.journal, viewer.server_address)
 	note_end(&viewer.journal)
@@ -1295,9 +1277,7 @@ open_link :: fun(viewer: ^Viewer) -> err {
 // this machine only (DEFAULT_PORT). When it can't — another game's hosting
 // there — it plays on alone, and says so.
 host_listen :: fun(viewer: ^Viewer) {
-	listen_error := net_start()
-	listener : u64 = NO_SOCKET
-	if not listen_error do listener, listen_error = net_listen(DEFAULT_PORT, false)
+	listener, listen_error := tcp_listen(net_local(DEFAULT_PORT))
 	if listen_error {
 		note(&viewer.journal, "others can't join this game: ")
 		note_error(&viewer.journal, listen_error)
@@ -1329,8 +1309,8 @@ run_link :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	if viewer.hosting {
 		server_run(&viewer.server, plugin)
 	elif not viewer.server_lost
-		link_error := wire_send(&viewer.to_server, viewer.connection)
-		if not link_error do link_error = wire_receive(&viewer.from_server, viewer.connection)
+		link_error := wire_send(&viewer.to_server, &viewer.connection)
+		if not link_error do link_error = wire_receive(&viewer.from_server, &viewer.connection)
 		if link_error {
 			note(&viewer.journal, "lost the server: ")
 			note_error(&viewer.journal, link_error)

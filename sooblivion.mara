@@ -25,7 +25,7 @@ use model
 use world
 use world_state
 use world_server
-use net
+use wire
 use bot_player
 use pathing
 use scene
@@ -1929,20 +1929,15 @@ command_serve :: fun(port: i64, seconds: f64, open: bool) {
 		print("couldn't load the plugin: %", load_error)
 		return
 	}
-	start_error := net_start()
-	if start_error {
-		print("couldn't start the network: %", start_error)
-		return
-	}
-	listener, listen_error := net_listen(port, open)
+	server : World_Server
+	server_start(&server)
+	listener, listen_error := tcp_listen(if open do net_any(u16(port)) else net_local(u16(port)))
 	if listen_error {
 		print("couldn't listen on port %: %", port, listen_error)
 		return
 	}
-	defer net_close(listener)
-	server : World_Server
-	server_start(&server)
 	server.listener = listener
+	defer tcp_listen_stop(&server.listener)
 	print("serving the world on port % (%)", port, if open do "open to others" else "this machine's only")
 	start := time_now()
 	for seconds <= 0 or f64(time_now() - start) / 1000000000 < seconds {
@@ -1994,7 +1989,7 @@ command_bot :: fun(address: []utf8, orders_path: []utf8, status_path: []utf8) {
 		print("bot: couldn't connect to %: %", address, connect_error)
 		return
 	}
-	defer net_close(bot.connection)
+	defer tcp_close(&bot.connection)
 	print("bot: joined the world at %; its orders from %, what it sees to %", address, orders_path, status_path)
 	run_error := bot_run(&bot, &plugin)
 	if run_error do print("bot: lost the server: %", run_error)

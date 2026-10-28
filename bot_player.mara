@@ -25,7 +25,6 @@ use walking
 use world_state
 use world_copy
 use wire
-use net
 use pathing
 use logging
 
@@ -95,7 +94,7 @@ Bot_Order :: struct {
 
 Bot :: struct {
 	// Its link to the server, and the world as the server's told it.
-	connection: u64
+	connection: Tcp_Connection
 	to_server: Wire_Queue
 	from_server: Wire_Queue
 	seen: World_Copy
@@ -149,7 +148,7 @@ Bot :: struct {
 // starts; what it sees goes to status_path. (Its place is cleared by the
 // caller, with the tables' storage: scene_clear.)
 bot_start :: fun(bot: ^Bot, orders_path: []utf8, status_path: []utf8, loader: Loader) {
-	bot.connection = NO_SOCKET
+	bot.connection = no_connection()
 	wire_start(&bot.to_server)
 	wire_start(&bot.from_server)
 	copy_start(&bot.seen)
@@ -197,26 +196,9 @@ bot_start :: fun(bot: ^Bot, orders_path: []utf8, status_path: []utf8, loader: Lo
 	}
 }
 
-// Connects the bot to the server at an address (a.b.c.d, or localhost;
-// :port, else DEFAULT_PORT), tried for 2 seconds.
+// Connects the bot to the server at an address (wire_connect).
 bot_connect :: fun(bot: ^Bot, address_and_port: []utf8) -> err {
-	address := address_and_port
-	port : i64 = DEFAULT_PORT
-	for c, k in address {
-		if c != ':' do continue
-		number, is_number := parse_number(address[k + 1 : address.len])
-		if is_number do port = i64(number)
-		address = address[0:k]
-		break
-	}
-	net_start()?
-	connect_error : err
-	for try in 0:20 {
-		bot.connection, connect_error = net_connect(address, port)
-		if not connect_error do break
-		sleep_ms(100)
-	}
-	return connect_error
+	bot.connection = wire_connect(address_and_port)?
 }
 
 // Runs the bot till it's told to leave, or the server's gone (why given
@@ -227,8 +209,8 @@ bot_connect :: fun(bot: ^Bot, address_and_port: []utf8) -> err {
 bot_run :: fun(bot: ^Bot, plugin: ^Plugin) -> err {
 	stepped_at := time_now()
 	for bot.order.kind != .leave {
-		wire_send(&bot.to_server, bot.connection)?
-		wire_receive(&bot.from_server, bot.connection)?
+		wire_send(&bot.to_server, &bot.connection)?
+		wire_receive(&bot.from_server, &bot.connection)?
 		seen := &bot.seen
 		copy_take(seen, &bot.from_server)
 		for told in seen.notes do bot_hear(bot, told)
@@ -264,7 +246,7 @@ bot_run :: fun(bot: ^Bot, plugin: ^Plugin) -> err {
 	}
 	print("bot: leaving")
 	bot_write_status(bot, plugin)
-	wire_send(&bot.to_server, bot.connection)?
+	wire_send(&bot.to_server, &bot.connection)?
 }
 
 // Something the bot's heard (a note from the server: another player's
