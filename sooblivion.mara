@@ -1406,6 +1406,7 @@ command_anim :: fun(what: []utf8) {
 				at := k * CONTROLLED_BLOCK_SIZE
 				interpolator : i32 = sequence.blocks[at]
 				palette : i32 = sequence.blocks[at + 9]
+				priority : u8 = sequence.blocks[at + 8]
 				node_at : u32 = sequence.blocks[at + 13]
 				property_at : u32 = sequence.blocks[at + 17]
 				controller_at : u32 = sequence.blocks[at + 21]
@@ -1418,7 +1419,7 @@ command_anim :: fun(what: []utf8) {
 					palette_name(&mesh, i64(palette), i64(controller_at), &controller)
 				}
 				if interpolator >= 0 and i64(interpolator) < mesh.blocks.len {
-					print("  % % % (%)", node, controller, property, mesh.header.type_names[i64(mesh.header.block_types[i64(interpolator)])])
+					print("  % % % (%), priority %", node, controller, property, mesh.header.type_names[i64(mesh.header.block_types[i64(interpolator)])], priority)
 				else
 					print("  % % % (no interpolator)", node, controller, property)
 				}

@@ -57,12 +57,11 @@ MESH_INDEX_ROOM :: 33554432
 // What's held in view is drawn between these (draw_frame's held).
 HELD_NEAR :: 1
 HELD_FAR :: 1000
-// How what's held is framed: as Oblivion.ini's fDefaultFOV, 75 degrees
-// across, shows it on the 4:3 screen its animations were made for. As
-// high as that whatever the screen's shape; a wider one shows more at the
-// sides.
+// How wide across what's held is drawn (degrees), whatever the screen's
+// shape: Oblivion.ini's fDefaultFOV, which the game keeps across (a wider
+// screen sees less up and down). Wider, the left hand comes into view at
+// the end of the swing from the left (onehandattackleft.kf, 0.46 s).
 HELD_FIELD_ACROSS :: 75
-HELD_FIELD_ASPECT :: 4.0 / 3.0
 // Room for rigged parts' vertices' bones and weights (16 bytes each), and
 // for the matrices they're posed with each frame (the palette).
 INFLUENCE_ROOM :: 2097152
@@ -3417,7 +3416,7 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 		// world's view is: its height's angle, 2 atan(tan(across / 2) /
 		// aspect), the atan as an acos.
 		aspect := f32(width) / f32(height)
-		slope := tan(to_radians(HELD_FIELD_ACROSS) / 2) / HELD_FIELD_ASPECT
+		slope := tan(to_radians(HELD_FIELD_ACROSS) / 2) / aspect
 		held_field := 2 * acos(1 / sqrt_f32(1 + slope * slope))
 		held_projection := mat4_perspective(held_field, aspect, HELD_NEAR, HELD_FAR)
 		held_view_projection := mat4_mul(held_projection, view_matrix(camera))

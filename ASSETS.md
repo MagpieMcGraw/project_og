@@ -58,7 +58,7 @@ Oblivion.esm and the base game's archives; sizes are as stored.
   (or what they wear there) on `_1stperson\skeleton.nif`, its eyes
   (`Camera01`, as the animation moves them) on the camera's, drawn in a
   depth of its own and framed as the game frames it (75 degrees across a
-  4:3 screen); an iron longsword in the `Weapon` bone (its scabbard,
+  screen of any shape, as the game keeps it); an iron longsword in the `Weapon` bone (its scabbard,
   `Scb`, left out), playing `onehandidle.kf`, and on a left click
   `onehandattackright.kf`. A click during a swing queues the other
   (`onehandattackleft.kf`, then back), which cuts in at the swing's
