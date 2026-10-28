@@ -26,6 +26,7 @@ WIRE_HEAD :: 8
 MESSAGE_PLAYER :: 1       // where the player is now (Player_Message)
 MESSAGE_PLACE :: 2        // the place the player's come into (Place_Message)
 MESSAGE_USE_DOOR :: 3     // a door that opens in place, opened or shut (its reference, u32)
+MESSAGE_SAY :: 4          // something the player says to the others (Note_Message)
 // From a server to its clients.
 MESSAGE_CLOCK :: 10       // the clock and the sky (Clock_Message)
 MESSAGE_PEOPLE :: 11      // the people in the player's place (a list of References)

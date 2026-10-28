@@ -140,6 +140,13 @@ send_place :: fun(queue: ^Wire_Queue, world_id: u32, cell: u32, x: i64, y: i64, 
 	wire_put(queue, MESSAGE_PLACE, Place_Message{world_id = world_id, cell = cell, x = x, y = y, feet = feet})
 }
 
+// Says something to the other players (what fits of it).
+send_say :: fun(queue: ^Wire_Queue, text: []utf8) {
+	said := Note_Message{text = []}
+	add_what_fits(&said.text, text)
+	wire_put(queue, MESSAGE_SAY, said)
+}
+
 // Asks the server to open a shut door that opens in place, or shut an open one.
 send_use_door :: fun(queue: ^Wire_Queue, reference: u32) {
 	wire_put(queue, MESSAGE_USE_DOOR, reference)

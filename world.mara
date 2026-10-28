@@ -9,6 +9,7 @@ module world
 use mara.core
 use mara.math
 use mara.string
+use mara.memory
 use esm
 use logging
 
@@ -329,6 +330,27 @@ editor_id :: fun(data: []byte) -> []utf8 {
 	field, found := find_field(data, "EDID")
 	if not found do return field_text(data[0:0])
 	return field_text(field)
+}
+
+// A record's name for people (FULL), else its editor id.
+record_name :: fun(plugin: ^Plugin, form_id: u32) -> str256 {
+	scratch : [1 * MB]byte
+	name : str256
+	record, record_error := find_record(plugin, form_id, &scratch)
+	if record_error do return name
+	full_name, has_name := find_field(record.data, "FULL")
+	if has_name do &name + field_text(full_name)
+	else do &name + editor_id(record.data)
+	return name
+}
+
+// A record's editor id, as text kept by value.
+editor_id_of :: fun(plugin: ^Plugin, form_id: u32) -> str256 {
+	scratch : [1 * MB]byte
+	name : str256
+	record, record_error := find_record(plugin, form_id, &scratch)
+	if not record_error do &name + editor_id(record.data)
+	return name
 }
 
 // ---- cells and what's in them ------------------------------------------------

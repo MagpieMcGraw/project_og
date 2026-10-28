@@ -26,6 +26,7 @@ use world
 use world_state
 use world_server
 use net
+use bot_player
 use scene
 use land
 use sky
@@ -1838,6 +1839,54 @@ command_serve :: fun(port: i64, seconds: f64, open: bool) {
 	print("served % ticks", server.state.ticks)
 }
 
+// `sooblivion bot <address[:port]> [orders file] [status file]`: a bot
+// joins the world served there (a game hosted on this machine, or `serve`)
+// as a player, with no window (bot_player.mara): beside the first other
+// player, following them, till the orders file says otherwise. What it
+// sees is written to the status file every second.
+command_bot :: fun(address: []utf8, orders_path: []utf8, status_path: []utf8) {
+	index_storage : [96 * MB]byte = void
+	index_storage.len = 0
+	plugin, load_error := load_oblivion(&index_storage)
+	if load_error {
+		print("couldn't load the plugin: %", load_error)
+		return
+	}
+	order : Load_Order
+	order_error := read_load_order(&order)
+	directory_storage : [64 * MB]byte = void
+	directory_storage.len = 0
+	archives : Archives
+	archives_error := if order_error do order_error else open_game_archives(&order, &archives, &directory_storage)
+	if archives_error {
+		print("couldn't open the archives: %", archives_error)
+		return
+	}
+	defer close_archives(&archives)
+	table_storage : [16 * MB]byte = void
+	table_storage.len = 0
+	// (Never touched: loading doesn't draw.)
+	renderer : render.Renderer = void
+	file_room : [64 * MB]byte = void
+	block_room : [16 * MB]byte = void
+	model_room : [64 * MB]byte = void
+	texture_room : [64 * MB]byte = void
+	room := load_room(&file_room, &block_room, &model_room, &texture_room)
+	loader := Loader{renderer = &renderer, archives = &archives, room = &room, drawing = false}
+	bot : Bot = void
+	scene_clear(&bot.place, &table_storage)
+	bot_start(&bot, orders_path, status_path, loader)
+	connect_error := bot_connect(&bot, address)
+	if connect_error {
+		print("bot: couldn't connect to %: %", address, connect_error)
+		return
+	}
+	defer net_close(bot.connection)
+	print("bot: joined the world at %; its orders from %, what it sees to %", address, orders_path, status_path)
+	run_error := bot_run(&bot, &plugin)
+	if run_error do print("bot: lost the server: %", run_error)
+}
+
 // `sooblivion world-run <world> <hours>`: the world's state run as a server
 // would run it, with no window: its clock and its skies, a player standing
 // in each of a few of the world's cells (under their regions' skies, or the
@@ -2738,6 +2787,8 @@ usage :: fun() {
 	print("                                   the world run as a server, no window; open: to other machines")
 	print("sooblivion connect <address[:port]> [view-cell <id> | view-world <world> <x> <y>]")
 	print("                                   play in a world served elsewhere")
+	print("sooblivion bot <address[:port]> [orders file] [status file]")
+	print("                                   a bot player, no window: follows you, takes orders from the file")
 	print("sooblivion walk-check <world | cell> <x> <y> <z> <yaw> <seconds>")
 	print("                                   a walker walked forward in a place loaded without drawing")
 	print("sooblivion world-run <world> <hours>")
@@ -3555,6 +3606,8 @@ main :: (args: [][]utf8) {
 			else do seconds = number
 		}
 		command_serve(port, seconds, open)
+	elif command == "bot" and args.len > 2
+		command_bot(args[2], if args.len > 3 do args[3] else "cache/bot_orders.txt", if args.len > 4 do args[4] else "cache/bot_status.txt")
 	elif command == "connect" and args.len > 2
 		// Playing in a world served elsewhere: from a place as the view
 		// commands start, the Inn of Ill Omen without one.

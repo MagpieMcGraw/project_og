@@ -448,6 +448,7 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 
 viewer_close :: fun(viewer: ^Viewer) {
 	net_close(viewer.connection)
+	if viewer.hosting do net_close(viewer.server.listener)
 	audio_close(&viewer.audio)
 	platform_close(&viewer.platform)
 	note_cache(viewer)
@@ -1279,6 +1280,7 @@ open_link :: fun(viewer: ^Viewer) -> err {
 	if viewer.hosting {
 		server_start(&viewer.server)
 		_ = server_join(&viewer.server, NO_SOCKET)
+		if viewer.picture.path.len == 0 do host_listen(viewer)
 		return
 	}
 	address := viewer.server_address[:]
@@ -1301,6 +1303,25 @@ open_link :: fun(viewer: ^Viewer) -> err {
 	if connect_error do return connect_error
 	note(&viewer.journal, "connected to the server at ")
 	note(&viewer.journal, viewer.server_address)
+	note_end(&viewer.journal)
+}
+
+// Has the world hosted take others joining (a bot, another window), on
+// this machine only (DEFAULT_PORT). When it can't — another game's hosting
+// there — it plays on alone, and says so.
+host_listen :: fun(viewer: ^Viewer) {
+	listen_error := net_start()
+	listener : u64 = NO_SOCKET
+	if not listen_error do listener, listen_error = net_listen(DEFAULT_PORT, false)
+	if listen_error {
+		note(&viewer.journal, "others can't join this game: ")
+		note_error(&viewer.journal, listen_error)
+		note_end(&viewer.journal)
+		return
+	}
+	viewer.server.listener = listener
+	note(&viewer.journal, "others on this machine can join: port ")
+	note(&viewer.journal, DEFAULT_PORT)
 	note_end(&viewer.journal)
 }
 
@@ -1855,15 +1876,6 @@ note_failures :: fun(viewer: ^Viewer) {
 	}
 }
 
-// A record's editor id, as text kept by value.
-editor_id_of :: fun(plugin: ^Plugin, form_id: u32) -> str256 {
-	scratch : [1 * MB]byte
-	name : str256
-	record, record_error := find_record(plugin, form_id, &scratch)
-	if not record_error do &name + editor_id(record.data)
-	return name
-}
-
 // Counts a frame drawn; each second, the count goes in the title.
 count_frame :: fun(viewer: ^Viewer) {
 	viewer.frames_counted += 1
@@ -2395,18 +2407,6 @@ choose_music :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32, world_id: u32) 
 		kind = MUSIC_EXPLORE
 	}
 	want_music(&viewer.audio, kind)
-}
-
-// A record's name for people (FULL), else its editor id.
-record_name :: fun(plugin: ^Plugin, form_id: u32) -> str256 {
-	scratch : [1 * MB]byte
-	name : str256
-	record, record_error := find_record(plugin, form_id, &scratch)
-	if record_error do return name
-	full_name, has_name := find_field(record.data, "FULL")
-	if has_name do &name + field_text(full_name)
-	else do &name + editor_id(record.data)
-	return name
 }
 
 // Puts the camera where one arrives in the scene's cell through a door;

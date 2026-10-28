@@ -80,6 +80,7 @@ server_join :: fun(server: ^World_Server, connection: u64) -> i64 {
 server_leave :: fun(server: ^World_Server, slot: i64, reason: err) {
 	client := &server.clients[slot]
 	print("player % left: %", server.state.players[slot].id, reason)
+	server_tell_about(server, slot, " left")
 	net_close(client.connection)
 	client.here = false
 	client.connection = NO_SOCKET
@@ -103,6 +104,7 @@ server_run :: fun(server: ^World_Server, plugin: ^Plugin) {
 				continue
 			}
 			print("player % joined", server.state.players[slot].id)
+			server_tell_about(server, slot, " joined")
 		}
 	}
 	for &client, slot in server.clients {
@@ -204,6 +206,9 @@ server_take :: fun(server: ^World_Server, plugin: ^Plugin, slot: i64, message: W
 		if not whole do return
 		_ = world_use_door(state, reference)
 		server.doors_due = true
+	elif message.kind == MESSAGE_SAY
+		said, whole := wire_value(message, Note_Message{text = []})
+		if whole do server_tell_about(server, slot, ": ", said.text)
 	}
 }
 
@@ -254,6 +259,19 @@ server_take_place :: fun(server: ^World_Server, plugin: ^Plugin, slot: i64, plac
 // Tells a client's journal of a failure: what, and why.
 server_note :: fun(server: ^World_Server, slot: i64, what: []utf8, reason: err) {
 	wire_put(&server.clients[slot].to_client, MESSAGE_NOTE, note_message(what, reason))
+}
+
+// Tells every other client's journal something about a client's player:
+// "player 2" and the rest (what fits).
+server_tell_about :: fun(server: ^World_Server, slot: i64, text: []utf8, more: []utf8 = "") {
+	told := Note_Message{text = []}
+	add_what_fits(&told.text, "player ")
+	add_what_fits(&told.text, int_text(server.state.players[slot].id))
+	add_what_fits(&told.text, text)
+	add_what_fits(&told.text, more)
+	for &client, other_slot in server.clients {
+		if client.here and other_slot != slot do wire_put(&client.to_client, MESSAGE_NOTE, told)
+	}
 }
 
 // Tells every client's journal of a failure.
