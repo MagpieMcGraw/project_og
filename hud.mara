@@ -1,0 +1,288 @@
+// The HUD: the player's health, magicka and fatigue ribbons, the weapon
+// and spell they have ready, the compass, the reticle, and the name of
+// what it's on. Laid out as the game's menus\main\hud_main_menu.xml,
+// hud_reticle.xml and hud_info_menu.xml lay it out (their sums worked out
+// here, not read from them), in its menus' units: the screen MENU_HEIGHT
+// high and as wide as its shape makes it, pictures drawn pixel for pixel
+// in those units (cropped to their width and height), text in the game's
+// fonts (Data\Fonts in the Misc archive: a .fnt of glyphs, a .tex picture).
+module sooblivion
+
+use mara.core
+use mara.math
+use mara.memory
+use mara.os
+use bsa
+use logging
+render :: use render
+
+// How high the screen is in the menus' units, and the margin the menus
+// keep inside it (Oblivion.ini's iSafeZoneXWide and iSafeZoneYWide).
+MENU_HEIGHT :: 960
+SAFE_X :: 20
+SAFE_Y :: 20
+// The HUD's text color: parchment (hud_info_menu's 254, 244, 183).
+HUD_TEXT :: [4!]f32{0.996, 0.957, 0.718, 1}
+// The activate icons (all_small_activate_icons.dds, each 30 across): the
+// hand that takes, the face that talks, the door.
+ICON_TAKE :: 1
+ICON_TALK :: 8
+ICON_DOOR :: 9
+// The game's fonts (Oblivion.ini's SFontFile_1 to _5): the files' names
+// in the Misc archive's fonts folder, without .fnt.
+FONT_FILES :: 5
+
+// A glyph of a font: where in its picture (the corners' u and v), how big
+// (in the font's pixels: the menus' units), the room before and after it,
+// and how far its top is above the line's baseline.
+Glyph :: struct {
+	u0: f32
+	v0: f32
+	u1: f32
+	v1: f32
+	width: f32
+	height: f32
+	before: f32
+	after: f32
+	above: f32
+}
+
+// A font: its picture (a texture slot), a line's height, its glyphs by
+// byte, and how far above the baseline its tallest reaches.
+Font :: struct {
+	texture: i64
+	line_height: f32
+	ascent: f32
+	glyphs: [256!]Glyph
+}
+
+// The HUD's pictures (texture slots), its fonts, and what it shows: the
+// player's health, magicka and fatigue (shares, 0 to 1), the name of what
+// the reticle is on (empty for nothing; named: whose) and what using it
+// would do (ICON_*; 0 for nothing usable).
+Hud :: struct {
+	ready: bool
+	frame: i64
+	health_empty: i64
+	health_full: i64
+	magic_empty: i64
+	magic_full: i64
+	fatigue_empty: i64
+	fatigue_full: i64
+	ribbon_edge: i64
+	weapon_icon: i64
+	magic_icon: i64
+	compass_back: i64
+	compass_face: i64
+	reticle: i64
+	activate_icons: i64
+	fonts: [FONT_FILES!]Font
+	health: f32
+	magicka: f32
+	fatigue: f32
+	name: str256
+	named: u32
+	activate: i64
+}
+
+// A font's file's name (1 to 5, as the menus number them).
+font_file :: fun(number: i64) -> str64 {
+	if number == 2 do return "kingthings_shadowed"
+	if number == 3 do return "tahoma_bold_small"
+	if number == 4 do return "daedric_font"
+	if number == 5 do return "handwritten"
+	return "kingthings_regular"
+}
+
+// Loads the HUD's pictures and fonts onto the card; the weapon's icon is
+// weapon_icon (an ICON field's path, under textures\menus\icons\; empty:
+// the HUD's own). Full ribbons, nothing aimed at.
+load_hud :: fun(hud: ^Hud, renderer: ^render.Renderer, archives: ^Archives, weapon_icon: []utf8, scratch: ^[]byte) -> err {
+	hud.ready = false
+	hud.frame = menu_texture(renderer, archives, "hud\\hud_frame.dds", scratch)
+	hud.health_empty = menu_texture(renderer, archives, "hud\\hud_ribbon_health_empty.dds", scratch)
+	hud.health_full = menu_texture(renderer, archives, "hud\\hud_ribbon_health_full.dds", scratch)
+	hud.magic_empty = menu_texture(renderer, archives, "hud\\hud_ribbon_magic_empty.dds", scratch)
+	hud.magic_full = menu_texture(renderer, archives, "hud\\hud_ribbon_magic_full.dds", scratch)
+	hud.fatigue_empty = menu_texture(renderer, archives, "hud\\hud_ribbon_fatigue_empty.dds", scratch)
+	hud.fatigue_full = menu_texture(renderer, archives, "hud\\hud_ribbon_fatigue_full.dds", scratch)
+	hud.ribbon_edge = menu_texture(renderer, archives, "shared\\ribbon_slider.dds", scratch)
+	hud.magic_icon = menu_texture(renderer, archives, "icons\\icon_hud_default_magic.dds", scratch)
+	hud.weapon_icon = menu_texture(renderer, archives, "icons\\icon_hud_default_weapon.dds", scratch)
+	if weapon_icon.len > 0 {
+		path : [160]utf8
+		&path + "icons\\"
+		add_what_fits(&path, weapon_icon)
+		own := menu_texture(renderer, archives, path, scratch)
+		if own != 0 do hud.weapon_icon = own
+	}
+	hud.compass_back = menu_texture(renderer, archives, "hud\\hud_back.dds", scratch)
+	hud.compass_face = menu_texture(renderer, archives, "hud\\hud_compass_face.dds", scratch)
+	hud.reticle = menu_texture(renderer, archives, "misc\\hud_reticle.dds", scratch)
+	hud.activate_icons = menu_texture(renderer, archives, "shared\\all_small_activate_icons.dds", scratch)
+	for k in 0:FONT_FILES do load_font(&hud.fonts[k], renderer, archives, font_file(k + 1), scratch)?
+	hud.health = 1
+	hud.magicka = 1
+	hud.fatigue = 1
+	hud.name.len = 0
+	hud.named = 0
+	hud.activate = 0
+	hud.ready = true
+}
+
+// A menu picture (a path under textures\menus\, as the menus name them),
+// on the card: its slot; 0 (the white texture) when it couldn't be read.
+menu_texture :: fun(renderer: ^render.Renderer, archives: ^Archives, path: []utf8, scratch: ^[]byte) -> i64 {
+	full : [160]utf8
+	&full + "textures\\menus\\"
+	add_what_fits(&full, path)
+	scratch.len = 0
+	return render.texture_for(renderer, archives, full, scratch, render.CLAMP_BOTH)
+}
+
+// A font read from the Misc archive's fonts folder (name: its files'
+// name): its glyphs from name.fnt (a header of 296 bytes, its line's
+// height first; then 256 glyphs of 14 numbers: the texture, the four
+// corners' u and v, width, height, the room before and after, how far
+// above the baseline), its picture from name_0_lod_a.tex (its width and
+// height, then red, green, blue and alpha for each pixel), put on the card.
+load_font :: fun(font: ^Font, renderer: ^render.Renderer, archives: ^Archives, name: []utf8, scratch: ^[]byte) -> err {
+	glyphs_path : [96]utf8
+	&glyphs_path + "fonts\\"
+	&glyphs_path + name
+	&glyphs_path + ".fnt"
+	glyphs_file, has_glyphs := find_archived(archives, glyphs_path)
+	if not has_glyphs do return File_Error.Open_Failed
+	scratch.len = 0
+	data := read_archived(archives, glyphs_file, scratch)?
+	if data.len < 296 + 256 * 56 do return File_Error.Read_Failed
+	line_height : f32 = data[0]
+	font.line_height = line_height
+	font.ascent = 0
+	for k in 0:256 {
+		at := 296 + k * 56
+		glyph := &font.glyphs[k]
+		glyph.u0 = data[at + 4]
+		glyph.v0 = data[at + 8]
+		glyph.u1 = data[at + 28]
+		glyph.v1 = data[at + 32]
+		glyph.width = data[at + 36]
+		glyph.height = data[at + 40]
+		glyph.before = data[at + 44]
+		glyph.after = data[at + 48]
+		glyph.above = data[at + 52]
+		font.ascent = max(font.ascent, glyph.above)
+	}
+	picture_path : [96]utf8
+	&picture_path + "fonts\\"
+	&picture_path + name
+	&picture_path + "_0_lod_a.tex"
+	picture_file, has_picture := find_archived(archives, picture_path)
+	if not has_picture do return File_Error.Open_Failed
+	scratch.len = 0
+	picture := read_archived(archives, picture_file, scratch)?
+	if picture.len < 8 do return File_Error.Read_Failed
+	width : u32 = picture[0]
+	height : u32 = picture[4]
+	if picture.len < 8 + i64(width) * i64(height) * 4 do return File_Error.Read_Failed
+	font.texture = render.texture_from_pixels(renderer, picture_path, picture[8 : picture.len], i64(width), i64(height))
+}
+
+// How wide a line of text is in a font (the menus' units).
+text_width :: fun(font: ^Font, text: []utf8) -> f32 {
+	width : f32 = 0
+	for c in text {
+		glyph := &font.glyphs[i64(c)]
+		width += glyph.before + glyph.width + glyph.after
+	}
+	return width
+}
+
+// Puts a line of text on the 2D layer, in a font, its top left at x, y
+// (pixels), its glyphs scale pixels to a unit, tinted color.
+draw_text :: fun(renderer: ^render.Renderer, font: ^Font, text: []utf8, x: f32, y: f32, scale: f32, color: [4!]f32) {
+	pen := x
+	baseline := y + font.ascent * scale
+	for c in text {
+		glyph := &font.glyphs[i64(c)]
+		if glyph.width > 0 and glyph.height > 0 {
+			render.ui_image(renderer, font.texture, pen + glyph.before * scale, baseline - glyph.above * scale,
+				glyph.width * scale, glyph.height * scale, glyph.u0, glyph.v0, glyph.u1, glyph.v1, color)
+		}
+		pen += (glyph.before + glyph.width + glyph.after) * scale
+	}
+}
+
+// Puts a menu picture on the 2D layer as the menus draw it: pixel for
+// pixel (a texel to a unit), cropped to width by height from crop_x
+// across its picture; at x, y in the menus' units, scale pixels to a unit.
+menu_image :: fun(renderer: ^render.Renderer, texture: i64, x: f32, y: f32, width: f32, height: f32, scale: f32,
+	opacity: f32 = 1, crop_x: f32 = 0)
+{
+	cached := &renderer.textures[texture]
+	if cached.width <= 0 or cached.height <= 0 do return
+	texels_x := f32(cached.width)
+	texels_y := f32(cached.height)
+	render.ui_image(renderer, texture, x * scale, y * scale, width * scale, height * scale,
+		crop_x / texels_x, 0, (crop_x + width) / texels_x, height / texels_y, [1, 1, 1, opacity])
+}
+
+// Puts the HUD on the 2D layer for a screen width by height pixels, the
+// camera turned yaw (radians, from north, clockwise).
+draw_hud :: fun(hud: ^Hud, renderer: ^render.Renderer, width: i64, height: i64, yaw: f32) {
+	if not hud.ready do return
+	scale := f32(height) / MENU_HEIGHT
+	screen_width := f32(width) / scale
+	screen_height : f32 = MENU_HEIGHT
+	// The panel in the bottom left (hudmain_background, which isn't drawn
+	// itself while exploring): the frame, the ribbons, the icons, the compass.
+	left := max_f32(2 * SAFE_X - 60, SAFE_X) + 67
+	top := screen_height - 2 * SAFE_Y - 70
+	menu_image(renderer, hud.frame, left - 70, top - 5, 761, 90, scale)
+	ribbons_top := top + 12
+	draw_ribbon(renderer, hud.health_empty, hud.health_full, hud.ribbon_edge, left, ribbons_top, 2, 0, hud.health, scale)
+	draw_ribbon(renderer, hud.magic_empty, hud.magic_full, hud.ribbon_edge, left, ribbons_top + 18, 1, -1, hud.magicka, scale)
+	draw_ribbon(renderer, hud.fatigue_empty, hud.fatigue_full, hud.ribbon_edge, left, ribbons_top + 36, 1, 0, hud.fatigue, scale)
+	weapon_left := left + 189 + 40
+	menu_image(renderer, hud.weapon_icon, weapon_left, top + 5, 63, 63, scale)
+	magic_left := weapon_left + 63 + 32
+	menu_image(renderer, hud.magic_icon, magic_left, top + 5, 63, 63, scale)
+	// The compass: its face's 768 units a turn, north at 768, the heading
+	// in the middle of its 200-wide window.
+	compass_left := magic_left + 63 + 20
+	compass_top := top + 5
+	menu_image(renderer, hud.compass_back, compass_left - 5, compass_top - 2, 200, 68, scale, 70.0 / 255)
+	degrees := yaw * 180 / PI
+	degrees -= floor_f32(degrees / 360) * 360
+	from := degrees * 768 / 360 + 768 - 100
+	menu_image(renderer, hud.compass_face, compass_left, compass_top + 1, 200, 62, scale, 1, from)
+
+	// The reticle in the middle (half seen), or what using what it's on
+	// would do.
+	middle_x := screen_width / 2
+	middle_y := screen_height / 2
+	if hud.activate > 0 {
+		menu_image(renderer, hud.activate_icons, middle_x - 16, middle_y - 16, 30, 32, scale, 128.0 / 255, f32(30 * (hud.activate - 1)))
+	else
+		menu_image(renderer, hud.reticle, middle_x - 18, middle_y - 18, 37, 37, scale, 128.0 / 255)
+	}
+	// What it's on, by name: in the bottom right, its right edge at the
+	// margin, its foot at the screen's (hudinfo_name, no icons under it).
+	if hud.name.len > 0 {
+		font := &hud.fonts[1]
+		name_width := text_width(font, hud.name)
+		name_top := screen_height - font.line_height
+		draw_text(renderer, font, hud.name, (screen_width - 2 * SAFE_X - name_width) * scale, name_top * scale, scale, HUD_TEXT)
+	}
+}
+
+// One of the HUD's ribbons at left, top: empty, then full as far as share
+// of its 163 (inset by 11 across and inset_y down), its edge at the end.
+draw_ribbon :: fun(renderer: ^render.Renderer, empty: i64, full: i64, edge: i64, left: f32, top: f32, inset_y: f32, edge_y: f32,
+	share: f32, scale: f32)
+{
+	menu_image(renderer, empty, left, top, 189, 16, scale)
+	filled := min_f32(max_f32(share, 0), 1) * 163
+	if filled > 0 do menu_image(renderer, full, left + 11, top + inset_y, filled, 11, scale)
+	menu_image(renderer, edge, left + 11 + filled, top + edge_y, 12, 14, scale)
+}

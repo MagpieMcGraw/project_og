@@ -86,6 +86,7 @@ First_Person :: struct {
 	left_at: f32
 	swung: bool
 	struck_reference: u32
+	weapon_icon: [160]utf8   // the weapon's icon (its ICON: under textures\menus\icons\), for the HUD; empty for none
 	instances: [1]render.Instance
 }
 
@@ -118,10 +119,13 @@ make_first_person :: fun(viewer: ^Viewer, plugin: ^Plugin) -> err {
 	look.parts.len = kept
 	look.has_face = false
 	scratch : [256 * KB]byte
+	held.weapon_icon.len = 0
 	weapon_id, has_weapon := find_by_editor_id(plugin, PLAYER_WEAPON, &scratch)
 	if has_weapon {
 		weapon, weapon_error := find_record(plugin, weapon_id, &scratch)
 		if not weapon_error {
+			weapon_icon, has_icon := find_field(weapon.data, "ICON")
+			if has_icon do add_what_fits(&held.weapon_icon, field_text(weapon_icon))
 			weapon_model, has_model := find_field(weapon.data, "MODL")
 			if has_model {
 				add_npc_part(&look, field_text(weapon_model), "", WEAPON_BONE, 0)
@@ -324,12 +328,13 @@ pose_first_person :: fun(viewer: ^Viewer) {
 	&held.instances + instance
 }
 
-// Who a blow from the camera meets within STRIKE_REACH, short of a wall:
-// the nearest person (an NPC, as an upright cylinder PERSON_RADIUS wide and
-// PERSON_HEIGHT tall from where they stand); their reference, 0 for no one.
-strike :: fun(shown: ^Scene, camera: render.Camera) -> u32 {
+// Who a blow from the camera meets within reach (STRIKE_REACH but where
+// said), short of a wall: the nearest person (an NPC, as an upright
+// cylinder PERSON_RADIUS wide and PERSON_HEIGHT tall from where they
+// stand); their reference, 0 for no one.
+strike :: fun(shown: ^Scene, camera: render.Camera, farthest: f32 = STRIKE_REACH) -> u32 {
 	forward, _, _ := render.camera_axes(camera)
-	reach : f32 = STRIKE_REACH
+	reach := farthest
 	_, wall, hit_wall := pick(shown, camera.position, forward, reach)
 	if hit_wall do reach = wall
 	struck : u32 = 0
