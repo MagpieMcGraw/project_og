@@ -30,6 +30,8 @@ use mara.string
 use sdl_platform
 use audio
 use particles
+use mara.os
+use png
 gl :: use mara.open_gl
 render :: use render
 
@@ -65,8 +67,31 @@ LOAD_BUDGET :: 6000000
 SLOW_FRAME :: 25000000
 // How often the journal gets a summary of the frames since the last.
 SUMMARY_EVERY :: 10000000000
-// Where the viewer's journal goes, in the folder it's run from.
+// Where the viewer's journal goes, in the folder it's run from; taking a
+// picture, where it goes instead (the game's log left as it is).
 LOG_PATH :: "sooblivion.log"
+PICTURE_LOG_PATH :: "picture.log"
+
+// A picture taken in place of showing the window (`sooblivion picture`):
+// the window kept hidden, no sound. Once what's waiting has loaded, and
+// PICTURE_SETTLE frames more (textures, weather), the frame drawn is
+// written to path as a PNG and the viewer quits; after
+// PICTURE_MOST_FRAMES, whatever's loaded by then. Placed, the camera
+// starts at position, turned by yaw and pitch (radians).
+Picture :: struct {
+	path: [260]utf8      // empty: no picture, the window shown
+	placed: bool
+	position: Vec3
+	yaw: f32
+	pitch: f32
+}
+PICTURE_SETTLE :: 3
+PICTURE_MOST_FRAMES :: 6000
+
+// No picture: the window shown, as usual.
+no_picture :: fun() -> Picture {
+	return Picture{path = [], placed = false, position = Vec3{0, 0, 0}, yaw = 0, pitch = 0}
+}
 // How much faster than ours the game's day goes (Oblivion's own), and,
 // with T held, how much faster again.
 TIME_SCALE :: 30
@@ -192,6 +217,11 @@ Viewer :: struct {
 	summary_drawing: u64
 	summary_card: u64
 	gl_errors_seen: [16]u32
+	// The picture to take (set before viewer_open), and the frames drawn
+	// toward it: in all, and since loading caught up.
+	picture: Picture
+	picture_frames: i64
+	picture_settled: i64
 }
 
 // What happened in a frame that the command has to answer.
@@ -206,8 +236,9 @@ View_Event :: union {
 // window (with vsync) and the journal, and sets up drawing, into viewer;
 // the scene's tables are carved from table_storage.
 viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^[]byte) -> err {
-	viewer.journal = journal_open(LOG_PATH)
-	full_log_start()   // (lists found full: see logging.mara)
+	taking_picture := viewer.picture.path.len > 0
+	viewer.journal = journal_open(if taking_picture do PICTURE_LOG_PATH else LOG_PATH)
+	if not taking_picture do full_log_start()   // (lists found full: see logging.mara)
 	read_load_order(&viewer.load_order)?
 	open_game_archives(&viewer.load_order, &viewer.archives, directory_storage)?
 	note(&viewer.journal, "plugins (")
@@ -226,18 +257,26 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	note(&viewer.journal, viewer.archives.list.len)
 	note(&viewer.journal, " archives")
 	note_end(&viewer.journal)
-	viewer.platform = platform_open("sooblivion", 1280, 720)?
+	viewer.platform = platform_open("sooblivion", 1280, 720, taking_picture)?
 	audio_init(&viewer.audio, SOUND_ROOM, table_storage)
 	music_folder := data_path("Music")
 	music_open(&viewer.audio, music_folder)
 	viewer.told_tracks = 0
-	audio_error := audio_open(&viewer.audio)
-	if audio_error {
-		note(&viewer.journal, "no sound: ")
-		note_error(&viewer.journal, audio_error)
+	if taking_picture {
+		note(&viewer.journal, "no sound: taking a picture")
 		note_end(&viewer.journal)
+	else
+		audio_error := audio_open(&viewer.audio)
+		if audio_error {
+			note(&viewer.journal, "no sound: ")
+			note_error(&viewer.journal, audio_error)
+			note_end(&viewer.journal)
+		}
 	}
-	set_vsync(&viewer.platform, true)
+	// (A picture's frames are drawn as fast as they can be.)
+	set_vsync(&viewer.platform, not taking_picture)
+	viewer.picture_frames = 0
+	viewer.picture_settled = 0
 	renderer_init(&viewer.renderer, table_storage)?
 	note(&viewer.journal, if viewer.renderer.bindless_available do "the card draws bindless" else "the card can't draw bindless: textures are bound")
 	note(&viewer.journal, "; anisotropy ")
@@ -472,6 +511,14 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		note_end(&viewer.journal)
 		viewer.told_framebuffer = true
 	}
+	if viewer.picture.path.len > 0 {
+		viewer.picture_frames += 1
+		viewer.picture_settled = if anything_waiting(shown) do 0 else viewer.picture_settled + 1
+		if viewer.picture_settled > PICTURE_SETTLE or viewer.picture_frames > PICTURE_MOST_FRAMES {
+			take_picture(viewer)
+			return .quit
+		}
+	}
 	draw_reticle(platform.width, platform.height, usable)
 	heard_at := f64(time_now()) / 1000000000
 	listener := listener_of(camera^)
@@ -508,7 +555,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	viewer.loading_time = 0
 	viewer.crossing_time = 0
 	note_gl_errors(viewer)
-	if not platform.vsync do wait_for_next_frame(viewer)
+	if not platform.vsync and viewer.picture.path.len == 0 do wait_for_next_frame(viewer)
 	count_frame(viewer)
 
 	if shown.world != 0 {
@@ -516,6 +563,62 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		if x != shown.center_x or y != shown.center_y do return .crossed
 	}
 	return .nothing
+}
+
+// Writes the frame just drawn to the picture's path, as a PNG, every
+// pixel opaque; the journal says where it went, or why it couldn't.
+take_picture :: fun(viewer: ^Viewer) {
+	journal := &viewer.journal
+	bound, width, height := bind_frame_for_reading(&viewer.renderer)
+	if not bound {
+		note(journal, "no picture: the frame wasn't drawn into a framebuffer")
+		note_end(journal)
+		return
+	}
+	pixels : [64 * MB]byte
+	read_pixels(width, height, &pixels)
+	if pixels.len == 0 {
+		note(journal, "no picture: no room for its pixels")
+		note_end(journal)
+		return
+	}
+	// The rows from the top down, as a PNG has them.
+	upright : [64 * MB]byte
+	upright.len = pixels.len
+	row := width * 4
+	for y in 0:height {
+		from := (height - 1 - y) * row
+		for k in 0:row do upright[y * row + k] = pixels[from + k]
+		for x in 0:width do upright[y * row + x * 4 + 3] = u8(255)
+	}
+	png_storage : [64 * MB]byte
+	row_storage : [64 * MB]byte
+	encode_png(upright, width, height, &png_storage, &row_storage)
+	write_error := write_entire_file(viewer.picture.path, png_storage)
+	if write_error {
+		note(journal, "couldn't write the picture to ")
+		note(journal, viewer.picture.path)
+		note(journal, ": ")
+		note_error(journal, write_error)
+		note_end(journal)
+		return
+	}
+	note(journal, "picture: ")
+	note(journal, width)
+	note(journal, " by ")
+	note(journal, height)
+	note(journal, ", after ")
+	note(journal, viewer.picture_frames)
+	note(journal, " frames, into ")
+	note(journal, viewer.picture.path)
+	note_end(journal)
+}
+
+// The camera where a picture says it starts.
+place_camera :: fun(viewer: ^Viewer, picture: Picture) {
+	viewer.camera.position = picture.position
+	viewer.camera.yaw = picture.yaw
+	viewer.camera.pitch = picture.pitch
 }
 
 // Without vsync: waits for the next frame's time. Frames are due on a
@@ -1191,10 +1294,11 @@ leading_door :: fun(shown: ^Scene, reference: u32) -> i64 {
 }
 
 // `sooblivion view <mesh>`: shows a mesh in the window.
-command_view :: fun(what: []utf8) {
+command_view :: fun(what: []utf8, picture: Picture) {
 	directory_storage : [64 * MB]byte
 	table_storage : [SOUND_ROOM + 8 * MB]byte
 	viewer : Viewer
+	viewer.picture = picture
 	open_error := viewer_open(&viewer, &directory_storage, &table_storage)
 	if open_error {
 		print("couldn't open the viewer: %", open_error)
@@ -1220,13 +1324,14 @@ command_view :: fun(what: []utf8) {
 	gpu_model := shown.models[model_index]
 	viewer.camera.position = gpu_model.center - Vec3{0, gpu_model.radius * 2, 0}
 	viewer.speed = gpu_model.radius
+	if picture.placed do place_camera(&viewer, picture)
 	for view_frame(&viewer) != .quit {}
 }
 
 // `sooblivion view-cell <editor id>`: shows an interior cell in the
 // window; its doors lead on, inside and out. When it can't, it says why
 // on the console, and gives the reason back.
-command_view_cell :: fun(name: []utf8) -> err {
+command_view_cell :: fun(name: []utf8, picture: Picture) -> err {
 	data_storage : [400 * MB]byte
 	index_storage : [96 * MB]byte
 	plugin, load_error := load_oblivion(&data_storage, &index_storage)
@@ -1243,6 +1348,7 @@ command_view_cell :: fun(name: []utf8) -> err {
 	directory_storage : [64 * MB]byte
 	table_storage : [SOUND_ROOM + 8 * MB]byte
 	viewer : Viewer
+	viewer.picture = picture
 	open_error := viewer_open(&viewer, &directory_storage, &table_storage)
 	if open_error {
 		print("couldn't open the viewer: %", open_error)
@@ -1257,12 +1363,13 @@ command_view_cell :: fun(name: []utf8) -> err {
 
 	go_inside(&viewer, &plugin, cell)
 	start_in_cell(&viewer, &plugin)
+	if picture.placed do place_camera(&viewer, picture)
 	explore(&viewer, &plugin)
 }
 
 // `sooblivion view-world [world] [x y]`: shows a world's land and what's
 // on it around the cell at x, y on its grid.
-command_view_world :: fun(name: []utf8, x: i64, y: i64) {
+command_view_world :: fun(name: []utf8, x: i64, y: i64, picture: Picture) {
 	data_storage : [400 * MB]byte
 	index_storage : [96 * MB]byte
 	plugin, load_error := load_oblivion(&data_storage, &index_storage)
@@ -1279,6 +1386,7 @@ command_view_world :: fun(name: []utf8, x: i64, y: i64) {
 	directory_storage : [64 * MB]byte
 	table_storage : [SOUND_ROOM + 8 * MB]byte
 	viewer : Viewer
+	viewer.picture = picture
 	open_error := viewer_open(&viewer, &directory_storage, &table_storage)
 	if open_error {
 		print("couldn't open the viewer: %", open_error)
@@ -1294,7 +1402,9 @@ command_view_world :: fun(name: []utf8, x: i64, y: i64) {
 	// In the middle of the cell, high enough to be over its land.
 	middle := Vec3{(f32(x) + 0.5) * CELL_SIZE, (f32(y) + 0.5) * CELL_SIZE, 0}
 	middle.z = ground_height(&plugin, world_id, middle, &scratch) + EYE_HEIGHT
+	if picture.placed do middle = picture.position
 	go_outside(&viewer, &plugin, world_id, middle)
+	if picture.placed do place_camera(&viewer, picture)
 	explore(&viewer, &plugin)
 }
 

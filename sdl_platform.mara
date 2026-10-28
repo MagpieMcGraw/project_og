@@ -6,12 +6,17 @@ use mara.core
 use mara.time
 use mara.sdl
 use mara.open_gl
+use logging
 
-// glFinish: waits for the card to draw everything asked of it. (Not in
+// glFinish: waits for the card to draw everything asked of it; and
+// glReadPixels, to read back what was drawn (read_pixels). (Not in
 // mara.open_gl yet.)
 foreign static_lib "opengl32" prefix gl {
 	fun Finish()
+	fun ReadPixels(x: i32, y: i32, width: i32, height: i32, format: u32, kind: u32, pixels: ^byte)
 }
+PIXELS_RGBA :: 0x1908    // GL_RGBA
+PIXELS_BYTES :: 0x1401   // GL_UNSIGNED_BYTE
 
 // What opening the window can fail with.
 Platform_Error :: error {
@@ -45,9 +50,10 @@ Platform :: struct {
 	vsync: bool       // frames wait for the display's refresh
 }
 
-// Opens a window of the size given, with an OpenGL 4.5 core context.
+// Opens a window of the size given, with an OpenGL 4.5 core context;
+// hidden, it's never shown (what's drawn is read back: read_pixels).
 // Failing, the platform given back is all zeros: not to be used.
-platform_open :: fun(title: []utf8, width: i64, height: i64) -> Platform, err {
+platform_open :: fun(title: []utf8, width: i64, height: i64, hidden: bool = false) -> Platform, err {
 	if not sdl.Init(Video) do return Platform{0}, Init_Failed
 	_ = sdl.GL_SetAttribute(ContextProfileMask, i32(GLprofile.Core))
 	_ = sdl.GL_SetAttribute(ContextMajorVersion, 4)
@@ -58,7 +64,9 @@ platform_open :: fun(title: []utf8, width: i64, height: i64) -> Platform, err {
 	// title may be a view with no room past it.
 	title_text : str256
 	&title_text + title
-	window := sdl.CreateWindow(title_text, i32(width), i32(height), OpenGL | Resizable)
+	flags := OpenGL | Resizable
+	if hidden do flags = OpenGL | Hidden
+	window := sdl.CreateWindow(title_text, i32(width), i32(height), flags)
 	if window == void do return Platform{0}, Window_Failed
 	context := sdl.GL_CreateContext(window)
 	if context == void do return Platform{0}, Context_Failed
@@ -71,6 +79,16 @@ platform_open :: fun(title: []utf8, width: i64, height: i64) -> Platform, err {
 	platform := Platform{window = window, context = context, width = width, height = height, mouse_look = false, vsync = false}
 	update_size(&platform)
 	return platform
+}
+
+// The pixels of the framebuffer bound for reading, width by height from
+// its bottom left, into pixels (its len set): red, green, blue and alpha
+// bytes, the rows from the bottom up. None when pixels hasn't the room.
+read_pixels :: fun(width: i64, height: i64, pixels: ^[]byte) {
+	pixels.len = 0
+	if not fits(width * height * 4, pixels.cap) do return
+	pixels.len = width * height * 4
+	ReadPixels(0, 0, i32(width), i32(height), PIXELS_RGBA, PIXELS_BYTES, pixels.ptr)
 }
 
 platform_close :: fun(platform: ^Platform) {

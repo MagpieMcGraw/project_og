@@ -2241,6 +2241,16 @@ size_framebuffers :: fun(renderer: ^Renderer, width: i64, height: i64) -> err {
 	renderer.framebuffer_height = height
 }
 
+// Binds the frame drawn last (the scene framebuffer's color) for reading
+// (read_pixels), as wide and high as it was drawn; false when there's no
+// framebuffer (the frame went into the window).
+bind_frame_for_reading :: fun(renderer: ^Renderer) -> bool, i64, i64 {
+	if renderer.scene_framebuffer == 0 or renderer.framebuffer_width == 0 do return false, 0, 0
+	BindFramebuffer(READ_FRAMEBUFFER, renderer.scene_framebuffer)
+	ReadBuffer(COLOR_ATTACHMENT0)
+	return true, renderer.framebuffer_width, renderer.framebuffer_height
+}
+
 // A texture to draw into: one level, read pixel for pixel.
 framebuffer_texture :: fun(format: u32, width: i64, height: i64) -> u32 {
 	id : u32 = 0
