@@ -345,21 +345,8 @@ next_word :: fun(text: []utf8, at: ^i64) -> []utf8 {
 
 // The next word of text as a number (1.5, -6.24607e-008).
 next_number :: fun(text: []utf8, at: ^i64) -> f32, err {
-	word := next_word(text, at)
-	// (parse_number reads no exponent: MARA_ISSUES.md. It's read here.)
-	mark := word.len
-	for c, k in word {
-		if c == 'e' or c == 'E' do mark = k
-	}
-	number, is_number := parse_number(word[0 : mark])
+	number, is_number := parse_number(next_word(text, at))
 	if not is_number do return 0, Bad_Curve
-	if mark < word.len {
-		exponent_text := word[mark + 1 : word.len]
-		if exponent_text.len > 0 and exponent_text[0] == '+' do exponent_text = exponent_text[1 : exponent_text.len]
-		exponent, is_exponent := parse_number(exponent_text)
-		if not is_exponent do return 0, Bad_Curve
-		number *= pow(10.0, exponent)
-	}
 	return f32(number)
 }
 
@@ -423,11 +410,10 @@ roll :: fun(dice: ^u64) -> f32 {
 
 // ---- growing ----------------------------------------------------------------------
 
-// A tree being grown: the dice, how big a share of its size is, and its
-// bark's and leaves' vertices and indexes so far. (What it's grown after,
-// the Speed_Tree, is passed beside it: kept in here, the checker takes it
-// for stored in the storage the lists are carved from. MARA_ISSUES.md.)
+// A tree being grown: what it's grown after, the dice, how big a share of
+// its size is, and its bark's and leaves' vertices and indexes so far.
 Growth :: struct {
+	tree: ^Speed_Tree
 	dice: u64
 	leaf_dice: u64            // the leaves' own: they're thinned without the branches changing
 	units: f32                // the tree's size, scaled: what lengths are shares of
@@ -457,6 +443,7 @@ grow_tree :: fun(tree: ^Speed_Tree, seed: i64, leaf_texture: []utf8, fit: Tree_F
 	report := Growth_Report{branches = 0, leaves = 0, left_out = 0}
 	if tree.levels.len == 0 do return Model{0}, report, Not_A_Speed_Tree
 	growth := Growth{
+		tree = tree,
 		dice = 0, leaf_dice = 0,
 		units = tree.size * tree.scale / 100,
 		trunk_way = Vec3{0, 0, 1},
@@ -472,7 +459,7 @@ grow_tree :: fun(tree: ^Speed_Tree, seed: i64, leaf_texture: []utf8, fit: Tree_F
 	// Grown twice: first to count the places for leaves and see the crown,
 	// then again (the same, the dice started again) with as many leaves as
 	// cover it (LEAF_COVERAGE).
-	grow_from_seed(&growth, tree, seed)
+	grow_from_seed(&growth, seed)
 	// Its size as grown: the crown its leaves' places make (as far round
 	// as the average leaf reaches), the top of that or of its trunk.
 	upward : f32 = 1
@@ -495,7 +482,7 @@ grow_tree :: fun(tree: ^Speed_Tree, seed: i64, leaf_texture: []utf8, fit: Tree_F
 	growth.bark_indices.len = 0
 	growth.branches = 0
 	growth.left_out = 0
-	grow_from_seed(&growth, tree, seed)
+	grow_from_seed(&growth, seed)
 	shade_leaves(&growth)
 	fit_growth(&growth, upward, sideways)
 
@@ -515,7 +502,8 @@ grow_tree :: fun(tree: ^Speed_Tree, seed: i64, leaf_texture: []utf8, fit: Tree_F
 }
 
 // Grows the tree from its trunk, the dice started from the seed.
-grow_from_seed :: fun(growth: ^Growth, tree: ^Speed_Tree, seed: i64) {
+grow_from_seed :: fun(growth: ^Growth, seed: i64) {
+	tree := growth.tree
 	growth.dice = u64(seed) *% 0x2545F4914F6CDD1D +% 1
 	growth.leaf_dice = growth.dice ~ 0x5DEECE66D
 	// The trunk: up, leaning a little (its start angle's variance) to a
@@ -528,7 +516,7 @@ grow_from_seed :: fun(growth: ^Growth, tree: ^Speed_Tree, seed: i64) {
 	growth.trunk_way = trunk_way
 	trunk_length := curve_value(&trunk.length, 0, &growth.dice) * growth.units
 	trunk_radius := curve_value(&trunk.radius, 0, &growth.dice) * trunk_length
-	grow_branch(growth, tree, 0, Vec3{0, 0, 0}, trunk_way, trunk_length, trunk_radius, 0)
+	grow_branch(growth, 0, Vec3{0, 0, 0}, trunk_way, trunk_length, trunk_radius, 0)
 }
 
 // What growing a tree made: how many branches (the trunk one) and leaves,
@@ -542,9 +530,8 @@ Growth_Report :: struct {
 // Grows a branch of a level from start, its way, length and radius, bent
 // down by gravity as it goes; then the next level's branches on it, or
 // where it's the level before the last, its leaves.
-grow_branch :: fun(growth: ^Growth, tree: ^Speed_Tree, level_index: i64, start: Vec3, way: Vec3, branch_length: f32, radius: f32,
-	gravity: f32)
-{
+grow_branch :: fun(growth: ^Growth, level_index: i64, start: Vec3, way: Vec3, branch_length: f32, radius: f32, gravity: f32) {
+	tree := growth.tree
 	level := &tree.levels[level_index]
 	along := max(level.along, 1)
 	around := max(level.around, 3)
@@ -601,15 +588,15 @@ grow_branch :: fun(growth: ^Growth, tree: ^Speed_Tree, level_index: i64, start: 
 			stem := curve_value(&child_level.length, span, &growth.leaf_dice) * growth.units
 			place := at + child_way * stem
 			if growth.counting {
-				count_leaf(growth, tree, place)
+				count_leaf(growth, place)
 			elif roll(&growth.leaf_dice) <= growth.leaf_share
-				add_leaf(growth, tree, place)
+				add_leaf(growth, place)
 				// More round it, where the places are too few: up to half a
 				// leaf away.
 				for extra in 1:growth.leaf_cards {
 					reach := sqrt_f32(growth.leaf_area / f32(growth.leaf_places)) * 0.5
 					away := Vec3{2 * roll(&growth.leaf_dice) - 1, 2 * roll(&growth.leaf_dice) - 1, 2 * roll(&growth.leaf_dice) - 1}
-					add_leaf(growth, tree, place + away * reach)
+					add_leaf(growth, place + away * reach)
 				}
 			}
 			continue
@@ -622,7 +609,7 @@ grow_branch :: fun(growth: ^Growth, tree: ^Speed_Tree, level_index: i64, start: 
 		child_radius = min(max(child_radius, BRANCH_LEAST_RADIUS * child_length), BRANCH_MOST_RADIUS * child_length)
 		child_radius = min(child_radius, 0.85 * radius * curve_height(&level.taper, t))
 		bend := curve_value(&child_level.gravity, span, &growth.dice)
-		grow_branch(growth, tree, level_index + 1, at, child_way, child_length, child_radius, bend)
+		grow_branch(growth, level_index + 1, at, child_way, child_length, child_radius, bend)
 	}
 }
 
@@ -682,7 +669,8 @@ add_tube :: fun(growth: ^Growth, level: ^Branch_Level, spine: []Vec3, radius: f3
 
 // A place for a leaf counted: the crown widened to take it in, and the
 // average leaf picture's area added.
-count_leaf :: fun(growth: ^Growth, tree: ^Speed_Tree, place: Vec3) {
+count_leaf :: fun(growth: ^Growth, place: Vec3) {
+	tree := growth.tree
 	if tree.leaves.len == 0 do return
 	area : f32 = 0
 	for &picture in tree.leaves do area += picture.size[0] * picture.size[1]
@@ -695,7 +683,8 @@ count_leaf :: fun(growth: ^Growth, tree: ^Speed_Tree, place: Vec3) {
 // size and its corners. A card's corners all sit at its place; each keeps
 // how far it's set off across and up from there (its tangent's first two),
 // which the renderer turns to face the camera.
-add_leaf :: fun(growth: ^Growth, tree: ^Speed_Tree, place: Vec3) {
+add_leaf :: fun(growth: ^Growth, place: Vec3) {
+	tree := growth.tree
 	if tree.leaves.len == 0 do return
 	if growth.leaf_vertices.len + 4 > growth.leaf_vertices.cap {
 		growth.left_out += 1

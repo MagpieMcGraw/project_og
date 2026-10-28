@@ -7,120 +7,7 @@ against Mara at the time written. When one is fixed, move it to Fixed
 
 ## Open
 
-- An immutable slice param stored into a struct field makes that field
-  read-only everywhere in the program, not just in the values made from
-  the param. Checked against 3a5d0f3:
-
-  ```
-  Holder :: struct {
-  	numbers: []i64
-  }
-  hold :: fun(numbers: []i64) -> Holder {
-  	return Holder{numbers = numbers}
-  }
-  fill :: fun(storage: ^[]byte) -> i64 {
-  	holder := Holder{numbers = slice([:4]i64, storage)}
-  	&holder.numbers + 1
-  	return holder.numbers.len
-  }
-  ```
-
-  says, at the append in fill, "`holder.numbers` is a copy of the
-  immutable param `numbers` (in hold)". In sooblivion a tree's part made
-  from a slice param turned every `part.vertices` write (model.mara,
-  npc.mara) into an error. Expected: fill's holder, carved from mutable
-  storage, can be appended to; or, if a field is meant to take one
-  mutability for the whole program, an error at hold saying so. sooblivion
-  passes the growing tree itself (speedtree.mara, tree_part), so the
-  slices come from its mutable lists.
-
-- A struct made from a pointer to a local struct counts as holding every
-  pointer that local holds, though it takes only some of its fields; so a
-  pointer param kept in a local beside lists carved from storage is "stored
-  into" the storage. Checked against 3a5d0f3:
-
-  ```
-  Work :: struct {
-  	settings: ^Settings
-  	numbers: []i64
-  }
-  Summary :: struct {
-  	numbers: []i64
-  }
-  summary_of :: fun(work: ^Work) -> Summary {
-  	return Summary{numbers = work.numbers}
-  }
-  fill :: fun(settings: ^Settings, storage: ^[]byte) -> i64 {
-  	work := Work{settings = settings, numbers = slice([:16]i64, storage)}
-  	for k in 0:work.settings.count do &work.numbers + k
-  	summaries := slice([:2]Summary, storage)
-  	&summaries + summary_of(&work)
-  	return summaries[0].numbers.len
-  }
-  run :: fun(storage: ^[]byte) -> i64 {
-  	settings := Settings{count = 4}
-  	return fill(&settings, storage)
-  }
-  ```
-
-  says, at `fill(&settings, storage)`, "`fill(...)` stores its `settings`
-  argument into its `storage` argument: reference to local `settings`
-  would escape". Without the summary it builds. Expected: no error, as a
-  Summary has no place for settings. sooblivion passes the Speed_Tree
-  beside its Growth instead of keeping it in there (speedtree.mara).
-
-- mara.string's `parse_number` reads no exponent: `parse_number("-6.24607e-008")`
-  is false. SpeedTree's curves are written so (`%g`). Expected: exponents
-  read, as Mara's own float literals now are (8a8319d). sooblivion reads
-  the exponent itself (speedtree.mara, next_number).
-
-- `return []` in a fun that gives back a slice is refused: the `[]` is
-  typed as an empty array, `[0!]utf8`, which (rightly) doesn't turn into a
-  slice when given back. Checked against 3a5d0f3:
-
-  ```
-  none :: fun() -> []utf8 {
-  	return []
-  }
-  ```
-
-  says "can't return [0!]utf8 as a []utf8: an array doesn't turn into a
-  view when it's given back", and the same with `-> []utf8, err`.
-  Expected: `[]` is the zero of its place, and the place here is the
-  result, a slice: an empty slice. sooblivion gives back an empty view of
-  the storage it was handed (`storage[0:0]`, game_files.mara,
-  read_player_plugins).
-
-- An if-expression choosing between a text literal and a list (not a
-  slice of it) passes the checker, then the program isn't made. Checked
-  against 3a5d0f3:
-
-  ```
-  line : str1024
-  &line + "one two three"
-  print("%", if line.len == 0 do "none" else line)
-  ```
-
-  says "Codegen error: can't lower 'main' from the program graph: its
-  write '' (the value's type)". With `line[:]` it works (29e2911).
-  Expected: the list's slice, as for a slice; or a checker error saying
-  to write `line[:]`. sooblivion writes `line[:]` (command_sky).
-
-- An array literal appended to a slice of arrays taken from storage isn't
-  lowered. Checked against 3a5d0f3:
-
-  ```
-  fill :: fun(count: i64, storage: ^[]byte) -> i64 {
-  	rows := slice([:count][8!]f32, storage)
-  	for k in 0:count do &rows + [-1, -1, -1, -1, 0, 0, 0, 0]
-  	return rows.len
-  }
-  ```
-
-  says "Graph error: lower: an array literal as an operand". Appended to
-  a list (`rows : [4][8!]f32`) it works. Release 61bf180 compiles it and
-  gives 4, so it's fixed there; sooblivion, still on 3a5d0f3, appends a
-  typed local holding the literal (model.mara, rig_skin) till it updates.
+None now.
 
 ## Answered (not issues)
 
@@ -131,8 +18,30 @@ against Mara at the time written. When one is fixed, move it to Fixed
 
 ## Fixed
 
-sooblivion builds with Mara's release, 3a5d0f3 (MARA_VERSION.txt;
+sooblivion builds with Mara's release, 61bf180 (MARA_VERSION.txt;
 update_compiler.bat pulls the next), so all of these are in its copy.
+
+- An immutable slice param stored into a struct field (`hold(numbers)`
+  giving back `Holder{numbers = numbers}`) made that field read-only in
+  every Holder of the program — 61bf180: the copy rule follows values.
+  sooblivion's tree_part still takes the growing tree (it reads as well).
+- A struct made from a pointer to a local struct counted as holding every
+  pointer the local held, so a pointer param kept in a local beside lists
+  carved from storage was "stored into" the storage — 936e8ec: a struct's
+  fields are kept apart. A tree's Growth holds its Speed_Tree again
+  (speedtree.mara).
+- mara.string's `parse_number` read no exponent (`-6.24607e-008`, as
+  SpeedTree's curves have them) — 21d9d29. speedtree.mara's next_number
+  reads its own no more.
+- `return []` in a fun giving back a slice was refused (the `[]` typed an
+  empty array) — 41194dd: `[]` where a slice goes is the empty slice.
+  read_player_plugins (game_files.mara) gives back `[]`.
+- An if-expression choosing between a text literal and a list passed the
+  checker, then the program wasn't made — 9f29045. command_sky prints
+  `line`, not `line[:]`.
+- An array literal appended to a slice of arrays taken from storage
+  (`&rows + [-1, -1, -1, -1, 0, 0, 0, 0]`) wasn't lowered — 161b24f.
+  rig_skin (model.mara) appends the literal.
 
 - There was no way to read an environment variable on Windows — 2f840bc
   (`env(name) -> Path, err`; Not_Set since 3a5d0f3). sooblivion reads the

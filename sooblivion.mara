@@ -1726,7 +1726,7 @@ command_sky :: fun(name: []utf8) {
 			&line + "  "
 		}
 		if region_error do print("  at %: couldn't read its regions: %", place, region_error)
-		else do print("  at %: %", place, if chances.len == 0 do "the climate's" else line[:])
+		else do print("  at %: %", place, if chances.len == 0 do "the climate's" else line)
 		sounds : [32]Region_Sound
 		sounds_error := cell_region_sounds(&plugin, world_id, place[0], place[1], &sounds, &scratch)
 		if sounds_error do print("    couldn't read its sounds: %", sounds_error)

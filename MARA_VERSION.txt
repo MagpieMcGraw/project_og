@@ -1,4 +1,4 @@
-Mara 3a5d0f3f (2026-10-27 14:10): mara.os: env's unset variable is Not_Set, not Not_Found
-commit 3a5d0f3f0cc1d4506564388954042eb21cf1879d
-released 2026-10-27 14:11 by release.sh: Mara.exe built -o:speed from a clean tree
-suite with this Mara.exe and stdlib: pass=375  xfail=274  skip=20  mismatches=0
+Mara 61bf1804 (2026-10-27 20:51): The copy rule follows values, in the escape analysis
+commit 61bf1804983014e1b70347dedc1a4d34391b5ac7
+released 2026-10-27 21:18 by release.sh: Mara.exe built -o:speed from a clean tree
+suite with this Mara.exe and stdlib: pass=383  xfail=280  skip=20  mismatches=0

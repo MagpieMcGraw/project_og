@@ -32,12 +32,13 @@ spelling every list-to-slice place out.
 
 - `npc.mara:345` and `:353`: `return kept.bones[:]` from a fun giving back
   `[]Pose_Bone`. Returns don't decay, by the rule chosen on 2026-10-17.
+  (Gone since ec2ebb5: npc_skeleton gives back the skeleton's index.)
 - `bsa.mara:110`: `header_view := header_bytes[:]`, a fixed array
   (`[36!]byte`), so that `&header_view` can be the `^[]byte` that
   read_exactly moves the length of.
 - `sooblivion.mara:1729`: `if chances.len == 0 do "the climate's" else
-  line[:]`. Without `[:]` it fails in codegen, not in the checker. It's
-  in MARA_ISSUES.md's Open list.
+  line[:]`. Without `[:]` it fails in codegen, not in the checker.
+  (Fixed in Mara 9f29045, release 61bf180: it's `line` since.)
 
 ## Declarations: building isn't the same as meaning the same
 

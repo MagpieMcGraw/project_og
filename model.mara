@@ -649,9 +649,7 @@ rig_skin :: fun(mesh: ^Nif, skin: i64, how: ^Build_Options, vertices: []Vertex, 
 	count := vertices.len
 	// Each vertex's heaviest four so far: entries, then weights.
 	heaviest := slice([:count][8!]f32, storage)
-	// (Through a local: an array literal appended doesn't lower, MARA_ISSUES.md.)
-	none_yet : [8!]f32 = [-1, -1, -1, -1, 0, 0, 0, 0]
-	for k in 0:count do &heaviest + none_yet
+	for k in 0:count do &heaviest + [-1, -1, -1, -1, 0, 0, 0, 0]
 	data_index : i64 = -1
 	bones := Refs{count = 0, data = []}
 	match mesh.blocks[skin] {

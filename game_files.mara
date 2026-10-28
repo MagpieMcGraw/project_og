@@ -66,16 +66,15 @@ read_load_order :: fun(order: ^Load_Order) -> err {
 // The player's chosen plugins, %LOCALAPPDATA%\Oblivion\Plugins.txt, read
 // into storage; empty when there's no such file.
 read_player_plugins :: fun(storage: ^[]byte) -> []utf8, err {
-	none_read : []utf8 = storage[0:0]   // (`return []` gives back an array: MARA_ISSUES.md)
 	local, env_error := env("LOCALAPPDATA")
-	if env_error == Env_Error.Not_Set do return none_read
-	if env_error do return none_read, env_error
+	if env_error == Env_Error.Not_Set do return []
+	if env_error do return [], env_error
 	ending := "/Oblivion/Plugins.txt"
-	if local.len + ending.len >= local.cap do return none_read
+	if local.len + ending.len >= local.cap do return []
 	path := local + ending
 	data, read_error := read_entire_file(path, storage)
-	if read_error == File_Error.Open_Failed do return none_read
-	if read_error do return none_read, read_error
+	if read_error == File_Error.Open_Failed do return []
+	if read_error do return [], read_error
 	return data
 }
 
