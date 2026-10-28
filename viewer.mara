@@ -2108,6 +2108,8 @@ command_view_cell :: fun(name: []utf8, picture: Picture, server_address: []utf8 
 	go_inside(&viewer, &plugin, cell)
 	start_in_cell(&viewer, &plugin)
 	if picture.placed do place_camera(&viewer, picture)
+	place_walker(&viewer)
+	take_place(&viewer, 0, cell, 0, 0, player_feet(&viewer))
 	take_first_person(&viewer, &plugin)
 	explore(&viewer, &plugin)
 }
@@ -2231,6 +2233,7 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 			viewer.camera.yaw = there.rotation.z
 			viewer.camera.pitch = 0
 			place_walker(viewer)
+			if world_id == 0 do take_place(viewer, 0, target, 0, 0, player_feet(viewer))
 		}
 		// The map of the world shown, read when it changes.
 		if viewer.shown.world != 0 and viewer.shown.world != viewer.map_world {
@@ -2311,7 +2314,8 @@ ready_exit :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 
 // Shows an interior cell, its name in the window's title: what it holds
 // loaded from then on, a little each frame (load_some), then the outside
-// a door leads to readied.
+// a door leads to readied. (The caller tells the server of the place once
+// the player's in it, where they arrive: take_place.)
 go_inside :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
 	shown := &viewer.shown
 	start := time_now()
@@ -2319,7 +2323,6 @@ go_inside :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
 	viewer.exit_readied = false
 	viewer.exit_door = -1
 	show_error := show_interior(shown, plugin, cell, viewer_loader(viewer))
-	take_place(viewer, 0, cell, 0, 0, player_feet(viewer))
 	take_cell_sky(viewer, plugin, cell)
 	choose_music(viewer, plugin, cell, 0)
 	viewer.speed = 400

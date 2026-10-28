@@ -43,10 +43,24 @@ ARRIVED :: 64
 FOLLOW_NEAR :: 160
 FOLLOW_RUN :: 600
 FOLLOW_JUMP :: 4096
+// Following, it goes the way the player went: by points of it TRAIL_STEP
+// apart (TRAIL_POINTS at most: further behind than that, it goes to them
+// at once), each passed once it's within TRAIL_NEAR across of it and
+// TRAIL_RISE up or down.
+TRAIL_STEP :: 64
+TRAIL_POINTS :: 128
+TRAIL_NEAR :: 48
+TRAIL_RISE :: 96
+// Going to a player, it stands this far behind them (where there's floor
+// and nothing between; else where they stand).
+JOIN_BEHIND :: 100
 // Going somewhere, it's stuck when it's gone less than STUCK_LEAST across
 // in STUCK_SECONDS. Stuck following, it goes to the one it follows at once.
 STUCK_SECONDS :: 2
 STUCK_LEAST :: 40
+// Fallen this far below where it last stood (out through a gap in the
+// place's collision), it's put back there.
+FALL_MOST :: 2048
 // How near a door it can use it; how far it tells of people and doors,
 // and how many people at most; how long it loads a step (nanoseconds).
 DOOR_REACH :: 300
@@ -93,10 +107,15 @@ Bot :: struct {
 	placed: bool
 	waiting_told: bool
 	// Its body: its feet, the way it faces, how fast it went across in its
-	// last step (units a second).
+	// last step (units a second), where it last stood on something.
 	walker: Walker
 	yaw: f32
 	speed: f32
+	stood_at: Vec3
+	// The way the player it follows has gone since it was last beside them:
+	// points of it, the next to go to first; where the last was marked.
+	trail: [TRAIL_POINTS]Vec3
+	trail_end: Vec3
 	// What it's doing; the seconds it's run; where it was when it last
 	// looked whether it's stuck, and when; whether it is.
 	order: Bot_Order
@@ -135,6 +154,9 @@ bot_start :: fun(bot: ^Bot, orders_path: []utf8, status_path: []utf8, loader: Lo
 	bot.walker = Walker{position = Vec3{0, 0, 0}, rising = 0, on_ground = false}
 	bot.yaw = 0
 	bot.speed = 0
+	bot.stood_at = Vec3{0, 0, 0}
+	bot.trail.len = 0
+	bot.trail_end = Vec3{0, 0, 0}
 	bot.order = Bot_Order{kind = .follow, target = Vec3{0, 0, 0}, player = 0, yaw = 0, until = 0, running = false}
 	bot.seconds = 0
 	bot.checked_at = Vec3{0, 0, 0}
@@ -244,14 +266,21 @@ bot_hear :: fun(bot: ^Bot, told: Note_Message) {
 	&bot.heard + told
 }
 
-// Steps the bot (seconds of real time): walked the way its order has it,
-// into other cells as it crosses them (the server told), what's left of
-// its place loaded a little, and the server told where it is.
+// Steps the bot (seconds of real time): walked the way its order has it
+// (fallen out of the place, put back where it last stood), into other
+// cells as it crosses them (the server told), what's left of its place
+// loaded a little, and the server told where it is.
 bot_step :: fun(bot: ^Bot, plugin: ^Plugin, seconds: f32) {
 	going := bot_going(bot, plugin, seconds)
 	place := &bot.place
 	before := bot.walker.position
 	walk(&bot.walker, place, going, false, seconds)
+	if bot.walker.on_ground {
+		bot.stood_at = bot.walker.position
+	elif bot.walker.position.z < bot.stood_at.z - FALL_MOST
+		print("bot: fell out of the place at % %: put back where it last stood", bot.walker.position.x, bot.walker.position.y)
+		bot.walker = Walker{position = bot.stood_at, rising = 0, on_ground = false}
+	}
 	feet := bot.walker.position
 	across := Vec3{feet.x - before.x, feet.y - before.y, 0}
 	bot.speed = vec3_length(across) / seconds
@@ -284,9 +313,10 @@ bot_step :: fun(bot: ^Bot, plugin: ^Plugin, seconds: f32) {
 
 // The way the bot goes this step by its order (across the ground, units a
 // second; none to stand), turned toward it. Going somewhere, it stands once
-// it's there; heading, once its time's up. Following, it stands near the
-// one it follows (facing them), runs when far behind, and goes to them at
-// once when they're in another place, far off, or it's stuck.
+// it's there; heading, once its time's up. Following, it goes the way the
+// one it follows went (up the stairs they took, round the corners they
+// turned), stands near them (facing them), runs when far behind, and goes
+// to them at once when they're in another place, far off, or it's stuck.
 bot_going :: fun(bot: ^Bot, plugin: ^Plugin, seconds: f32) -> Vec3 {
 	order := &bot.order
 	feet := bot.walker.position
@@ -303,16 +333,33 @@ bot_going :: fun(bot: ^Bot, plugin: ^Plugin, seconds: f32) -> Vec3 {
 		if not found do return Vec3{0, 0, 0}
 		away := Vec3{other.feet.x - feet.x, other.feet.y - feet.y, 0}
 		distance := vec3_length(away)
-		if not bot_here(bot, other) or distance > FOLLOW_JUMP or bot.stuck and distance > FOLLOW_NEAR * 2 {
+		far_behind := distance > FOLLOW_JUMP or bot.trail.len == bot.trail.cap
+		if not bot_here(bot, other) or far_behind or bot.stuck and distance > FOLLOW_NEAR * 2 {
 			_, join_error := bot_join(bot, plugin, other.id)
 			if join_error do print("bot: couldn't load all of the place: %", join_error)
 			return Vec3{0, 0, 0}
 		}
+		bot_mark_trail(bot, other.feet)
 		if distance < FOLLOW_NEAR {
+			// Beside them: the way they came is behind it.
+			bot.trail.len = 0
+			bot.trail_end = other.feet
 			bot_turn_to(bot, heading_of(away), seconds)
 			return Vec3{0, 0, 0}
 		}
-		return bot_toward(bot, away, order.running or distance > FOLLOW_RUN, seconds)
+		// Along the way they went, from the furthest point of it come to.
+		passed : i64 = 0
+		for point, k in bot.trail {
+			if trail_reached(point, feet) do passed = k + 1
+		}
+		if passed > 0 {
+			for k in passed:bot.trail.len do bot.trail[k - passed] = bot.trail[k]
+			bot.trail.len -= passed
+		}
+		toward := away
+		if bot.trail.len > 0 do toward = Vec3{bot.trail[0].x - feet.x, bot.trail[0].y - feet.y, 0}
+		behind_by := f32(bot.trail.len) * TRAIL_STEP
+		return bot_toward(bot, toward, order.running or distance > FOLLOW_RUN or behind_by > FOLLOW_RUN, seconds)
 	elif order.kind == .head
 		if bot.seconds >= order.until {
 			order.kind = .stay
@@ -324,11 +371,27 @@ bot_going :: fun(bot: ^Bot, plugin: ^Plugin, seconds: f32) -> Vec3 {
 }
 
 // Turns the bot toward away (across the ground), and the way it goes there
-// this step: walking or running.
+// this step: walking or running (none, when away's straight up or down).
 bot_toward :: fun(bot: ^Bot, away: Vec3, running: bool, seconds: f32) -> Vec3 {
+	if vec3_length(away) < 1 do return Vec3{0, 0, 0}
 	bot_turn_to(bot, heading_of(away), seconds)
 	speed : f32 = if running do BOT_RUN else BOT_WALK
 	return vec3_normalize(away) * speed
+}
+
+// Marks the way the player it follows has gone: where their feet are, once
+// they're TRAIL_STEP from the last mark.
+bot_mark_trail :: fun(bot: ^Bot, their_feet: Vec3) {
+	if vec3_length(their_feet - bot.trail_end) < TRAIL_STEP do return
+	if fits(bot.trail.len + 1, bot.trail.cap) do &bot.trail + their_feet
+	bot.trail_end = their_feet
+}
+
+// Whether feet have come to a point of a trail: within TRAIL_NEAR of it
+// across, TRAIL_RISE up or down.
+trail_reached :: fun(point: Vec3, feet: Vec3) -> bool {
+	across := vec3_length(Vec3{point.x - feet.x, point.y - feet.y, 0})
+	return across < TRAIL_NEAR and abs_f32(point.z - feet.z) < TRAIL_RISE
 }
 
 // Turns the bot toward a heading (radians from north toward east), as far
@@ -374,16 +437,43 @@ bot_here :: fun(bot: ^Bot, other: Other_Player) -> bool {
 	return other.world == 0 and other.cell == bot.cell
 }
 
-// Puts the bot beside a player (their number; 0: the first other), a
-// little behind them, in the place they're in. False when the server
-// hasn't told of them (yet).
+// Puts the bot beside a player (their number; 0: the first other), in the
+// place they're in: JOIN_BEHIND from them, the first way round them —
+// behind, then a little to the side, the side, ahead last — with floor
+// there and nothing between (open_way), else where they stand. False when the server
+// hasn't told of them (yet). Put there however far placing gets (why it
+// stopped given back).
 bot_join :: fun(bot: ^Bot, plugin: ^Plugin, id: i64) -> bool, err {
 	other, found := bot_other(bot, id)
 	if not found do return false
-	behind := Vec3{-sin_f32(other.yaw), -cos_f32(other.yaw), 0} * 100
 	print("bot: to player %", other.id)
-	bot_take_place(bot, plugin, other.world, other.cell, other.feet + behind + Vec3{0, 0, 20}, other.yaw)?
-	return true
+	place_error := bot_take_place(bot, plugin, other.world, other.cell, other.feet + Vec3{0, 0, 20}, other.yaw)
+	for turn in [180, 135, -135, 90, -90, 45, -45, 0] {
+		way_yaw := other.yaw + f32(turn) * PI / 180
+		way := Vec3{sin_f32(way_yaw), cos_f32(way_yaw), 0}
+		if not open_way(&bot.place, other.feet, way, JOIN_BEHIND) do continue
+		bot.walker.position = other.feet + way * JOIN_BEHIND + Vec3{0, 0, 20}
+		bot.stood_at = bot.walker.position
+		bot.checked_at = bot.walker.position
+		break
+	}
+	bot.trail.len = 0
+	bot.trail_end = other.feet
+	return true, place_error
+}
+
+// Whether a body could stand a distance along a way (across the ground)
+// from feet: nothing in between at its waist, and floor under it — the
+// land, or something's top — no more than a few steps down.
+open_way :: fun(place: ^Scene, feet: Vec3, way: Vec3, distance: f32) -> bool {
+	waist := feet + Vec3{0, 0, WALKER_HEIGHT / 2}
+	_, _, blocked := pick(place, waist, way, distance + WALKER_RADIUS)
+	if blocked do return false
+	spot := waist + way * distance
+	_, _, floored := pick(place, spot, Vec3{0, 0, -1}, WALKER_HEIGHT / 2 + STEP_HEIGHT * 3)
+	if floored do return true
+	height, has_land := land_height(place, spot)
+	return has_land and height > feet.z - STEP_HEIGHT * 3 and height < waist.z
 }
 
 // Takes a place for the bot: a world's cells round its feet (world_id), or
@@ -401,6 +491,7 @@ bot_take_place :: fun(bot: ^Bot, plugin: ^Plugin, world_id: u32, cell: u32, feet
 	bot.cell = if world_id != 0 do 0 else cell
 	bot.placed = true
 	bot.walker = Walker{position = feet, rising = 0, on_ground = false}
+	bot.stood_at = feet
 	bot.yaw = yaw
 	bot.stuck = false
 	bot.checked_at = feet
@@ -623,6 +714,11 @@ bot_write_status :: fun(bot: ^Bot, plugin: ^Plugin) {
 			add_what_fits(&text, int_text(order.player))
 		}
 		if order.running do add_what_fits(&text, ", running")
+		if bot.trail.len > 0 {
+			add_what_fits(&text, ", the way they went (")
+			add_what_fits(&text, int_text(bot.trail.len))
+			add_what_fits(&text, " points of it to go)")
+		}
 		_, found := bot_other(bot, order.player)
 		if not found do add_what_fits(&text, " (no such player now)")
 	elif order.kind == .head

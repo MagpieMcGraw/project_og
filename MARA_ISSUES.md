@@ -7,7 +7,21 @@ against Mara at the time written. When one is fixed, move it to Fixed
 
 ## Open
 
-None.
+- A module's constant array of numbers can't be looped over or indexed:
+  lowering fails (checked against Mara c322fb6, 2026-10-29):
+
+      module const_loop
+      use mara.core
+      TURNS :: [180, 135, -135]
+      main :: fun() {
+          for turn in TURNS do print("%", turn)
+      }
+
+  `Codegen error: can't lower 'main' from the program graph: its index ''`.
+  `TURNS[1]` and `TURNS[k]` fail the same way. A constant array of text
+  works (`WORDS :: ["a", "b"]`, `WORDS[k]`: viewer.mara's MOON_PHASES),
+  and so does the literal written in the loop. sooblivion's bot_join
+  loops over the literal (bot_player.mara).
 
 ## Answered (not issues)
 
