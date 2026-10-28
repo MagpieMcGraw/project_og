@@ -2561,6 +2561,15 @@ command_picture :: fun(args: [][]utf8) {
 	picture := no_picture()
 	&picture.path + args[0]
 	view := args[1 : args.len]
+	if view.len >= 3 and view[view.len - 2] == "frames" {
+		count, is_count := parse_number(view[view.len - 1])
+		if not is_count {
+			usage()
+			return
+		}
+		picture.timed_frames = i64(count)
+		view = view[0 : view.len - 2]
+	}
 	if view.len >= 3 and view[view.len - 2] == "menu" {
 		// A menu, and maybe its page: stats, stats2, map4...
 		which := view[view.len - 1]

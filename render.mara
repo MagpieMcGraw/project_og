@@ -2901,8 +2901,7 @@ setup_land_buffers :: fun(renderer: ^Renderer) {
 // two is loaded twice, as a texture's handle keeps its edges for good.
 texture_for :: fun(renderer: ^Renderer, archives: ^Archives, path: []utf8, scratch: ^[]byte, clamp_mode: u32 = REPEAT_BOTH) -> i64 {
 	if path.len == 0 do return 0
-	key := text_hash(path)
-	if clamp_mode != REPEAT_BOTH do key = (key ~ (u64(clamp_mode + 1) *% 0x9E3779B97F4A7C15)) | 1
+	key := texture_key(path, clamp_mode)
 	known, found := index_get(&renderer.texture_index, key)
 	if found do return known
 	if not fits(renderer.textures.len + 1, renderer.textures.cap) do return 0
@@ -2928,6 +2927,21 @@ texture_for :: fun(renderer: ^Renderer, archives: ^Archives, path: []utf8, scrat
 	}
 	_ = index_put(&renderer.texture_index, key, slot)
 	return slot
+}
+
+// A texture's key in the renderer's index: its path's hash, and how its
+// edges go.
+texture_key :: fun(path: []utf8, clamp_mode: u32) -> u64 {
+	key := text_hash(path)
+	if clamp_mode != REPEAT_BOTH do key = (key ~ (u64(clamp_mode + 1) *% 0x9E3779B97F4A7C15)) | 1
+	return key
+}
+
+// The slot of a texture loaded before (as texture_for loads it), and
+// false when it hasn't been: a look that needs no room to read one into.
+known_texture :: fun(renderer: ^Renderer, path: []utf8, clamp_mode: u32 = REPEAT_BOTH) -> i64, bool {
+	if path.len == 0 do return 0, true
+	return index_get(&renderer.texture_index, texture_key(path, clamp_mode))
 }
 
 // Puts a texture made of pixels (red, green, blue, alpha, rows from the

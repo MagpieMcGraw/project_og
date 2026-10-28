@@ -938,6 +938,15 @@ tile_texture :: fun(book: ^Menu_Book, tile: i64, renderer: ^render.Renderer, arc
 	path : [256]utf8
 	&path + "textures\\"
 	add_what_fits(&path, file)
+	known, found := render.known_texture(renderer, path, render.CLAMP_BOTH)
+	if found do return known
+	return load_menu_texture(renderer, archives, path)
+}
+
+// A menu's picture (a path in the archives) loaded onto the card: its
+// slot. (Its room to be read into is laid down only here: the picture
+// is loaded once, then known_texture finds it.)
+load_menu_texture :: fun(renderer: ^render.Renderer, archives: ^Archives, path: []utf8) -> i64 {
 	scratch : [16 * MB]byte
 	return render.texture_for(renderer, archives, path, &scratch, render.CLAMP_BOTH)
 }

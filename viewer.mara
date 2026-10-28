@@ -90,13 +90,14 @@ Picture :: struct {
 	held_at: f32
 	menu: i64            // a menu open in it (MENU_*); 0 for none
 	menu_page: i64       // the menu's page (1 to 5); 0 for its first
+	timed_frames: i64    // frames drawn and timed once it's settled, before it's taken; 0 for none
 }
 PICTURE_SETTLE :: 3
 PICTURE_MOST_FRAMES :: 6000
 
 // No picture: the window shown, as usual.
 no_picture :: fun() -> Picture {
-	return Picture{path = [], placed = false, position = Vec3{0, 0, 0}, yaw = 0, pitch = 0, held = -1, held_at = 0, menu = 0, menu_page = 0}
+	return Picture{path = [], placed = false, position = Vec3{0, 0, 0}, yaw = 0, pitch = 0, held = -1, held_at = 0, menu = 0, menu_page = 0, timed_frames = 0}
 }
 // How much faster than ours the game's day goes (Oblivion's own), and,
 // with T held, how much faster again.
@@ -228,6 +229,12 @@ Viewer :: struct {
 	picture: Picture
 	picture_frames: i64
 	picture_settled: i64
+	// A picture's timed frames: since when, the processor's drawing and the
+	// HUD's (and the open menu's) share of it, added up.
+	timing_since: u64
+	timed_drawing: u64
+	timed_hud: u64
+	hud_time: u64        // this frame's HUD and menu, put on the 2D layer
 	// The player's arms and what they hold, drawn with the camera.
 	held: First_Person
 	// The HUD, and what it names: the reference the reticle is on (0 for none).
@@ -570,10 +577,12 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		set_scene_lights(&viewer.renderer, &shown.lights)
 		shown.lights_changed = false
 	}
+	hud_start := time_now()
 	ui_begin(&viewer.renderer)
 	draw_hud(&viewer.hud, &viewer.book, &viewer.renderer, &viewer.archives, platform.width, platform.height, camera.yaw,
 		viewer.menu_open == 0)
 	draw_open_menu(viewer, platform.width, platform.height)
+	viewer.hud_time = time_now() - hud_start
 	drawn, framebuffer_error := draw_frame(&viewer.renderer, &shown.models, &shown.instances, &shown.distant_instances, &shown.grounds,
 		&shown.waters, &shown.tree_cells, &shown.grass_cells, &viewer.held.instances, &viewer.look, shown.lighting, camera^,
 		platform.width, platform.height)
@@ -589,7 +598,18 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	if viewer.picture.path.len > 0 {
 		viewer.picture_frames += 1
 		viewer.picture_settled = if anything_waiting(shown) do 0 else viewer.picture_settled + 1
-		if viewer.picture_settled > PICTURE_SETTLE or viewer.picture_frames > PICTURE_MOST_FRAMES {
+		// Timed frames: from the one after it settles (the drawing added up is
+		// the frame before's, measured after this point).
+		if viewer.picture_settled == PICTURE_SETTLE + 1 {
+			viewer.timing_since = time_now()
+			viewer.timed_drawing = 0
+			viewer.timed_hud = 0
+		elif viewer.picture_settled > PICTURE_SETTLE + 1
+			viewer.timed_drawing += viewer.drawing_time
+			viewer.timed_hud += viewer.hud_time
+		}
+		if viewer.picture_settled > PICTURE_SETTLE + viewer.picture.timed_frames or viewer.picture_frames > PICTURE_MOST_FRAMES {
+			if viewer.picture.timed_frames > 0 do note_timing(viewer)
 			take_picture(viewer)
 			return .quit
 		}
@@ -754,6 +774,23 @@ note_blow :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	name := reference_name(plugin, struck)
 	note(journal, "struck ")
 	note(journal, if name.len > 0 do name[:] else "someone")
+	note_end(journal)
+}
+
+// Tells the journal how long a picture's timed frames took: each, and of
+// that the processor's drawing and the HUD's.
+note_timing :: fun(viewer: ^Viewer) {
+	journal := &viewer.journal
+	frames := max(viewer.picture.timed_frames, 1)
+	note(journal, "timed ")
+	note(journal, frames)
+	note(journal, " frames: ")
+	note_milliseconds(journal, (time_now() - viewer.timing_since) / u64(frames))
+	note(journal, " ms each; drawing ")
+	note_milliseconds(journal, viewer.timed_drawing / u64(frames))
+	note(journal, " ms, of it the HUD ")
+	note_milliseconds(journal, viewer.timed_hud / u64(frames))
+	note(journal, " ms")
 	note_end(journal)
 }
 

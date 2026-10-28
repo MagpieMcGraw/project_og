@@ -352,8 +352,8 @@ fill_map_menu :: fun(viewer: ^Viewer) {
 	if map.picture.len == 0 do return
 	picture := map.picture[9 : map.picture.len]   // (the filename trait is under textures\)
 	_ = book_set_text(book, "map_world_map", "filename", picture)
-	scratch : [16 * MB]byte
-	texture := render.texture_for(&viewer.renderer, &viewer.archives, map.picture, &scratch, render.CLAMP_BOTH)
+	texture, known := render.known_texture(&viewer.renderer, map.picture, render.CLAMP_BOTH)
+	if not known do texture = load_menu_texture(&viewer.renderer, &viewer.archives, map.picture)
 	if texture <= 0 do return
 	cached := &viewer.renderer.textures[texture]
 	_ = book_set(book, "map_world_map", "width", f32(cached.width * MAP_ZOOM))

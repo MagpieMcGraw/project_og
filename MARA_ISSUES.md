@@ -7,6 +7,25 @@ against Mara at the time written. When one is fixed, move it to Fixed
 
 ## Open
 
+- A local list costs its whole room each time its fun is called, however
+  little of it is used. Checked against 61bf180 (-release):
+
+  ```
+  touch :: fun(n: i64) -> i64 {
+  	room : [16 * MB]byte
+  	&room + u8(n)
+  	return room.len
+  }
+  ```
+
+  called 100 times takes 70 ms: 0.7 ms a call for one byte used. In
+  sooblivion a menu's picture looked up its texture with a 16 MB room to
+  read one into (needed only the first time): the HUD took 11.7 ms a frame,
+  0.04 ms with the room laid down only when a picture is loaded
+  (menus.mara, load_menu_texture). Expected: a list's room left as it is
+  (only its len set), as `bare x : T` doesn't construct; or, if it's
+  cleared on purpose, a way to say not to.
+
 - A generic fun's param can't have a default, so a generic can't take
   `#caller_span` or `#caller_name`. Checked against 61bf180:
 
