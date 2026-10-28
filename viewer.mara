@@ -712,16 +712,29 @@ take_picture :: fun(viewer: ^Viewer) {
 // Makes the player's first-person model (make_first_person); the journal
 // says why, when it can't be.
 take_first_person :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	journal := &viewer.journal
+	started := time_now()
 	held_error := make_first_person(viewer, plugin)
 	if held_error {
-		note(&viewer.journal, "no first-person arms: ")
-		note_error(&viewer.journal, held_error)
-		note_end(&viewer.journal)
+		note(journal, "no first-person arms: ")
+		note_error(journal, held_error)
+		note_end(journal)
 	}
+	held_at := time_now()
 	// The HUD too, with the weapon's icon.
 	scratch : [32 * MB]byte
 	hud_error := book_open(&viewer.book, &viewer.renderer, &viewer.archives, &scratch)
+	book_at := time_now()
 	if not hud_error do hud_error = load_hud(&viewer.hud, &viewer.book, &viewer.archives, viewer.held.weapon_icon, &scratch)
+	hud_at := time_now()
+	note(journal, "first-person arms made in ")
+	note_milliseconds(journal, held_at - started)
+	note(journal, " ms; the menus' fonts and strings read in ")
+	note_milliseconds(journal, book_at - held_at)
+	note(journal, " ms; the HUD's menus in ")
+	note_milliseconds(journal, hud_at - book_at)
+	note(journal, " ms")
+	note_end(journal)
 	viewer.start_date = read_start_date(plugin)
 	stats_error := read_player_stats(plugin, &viewer.player_stats)
 	if stats_error {

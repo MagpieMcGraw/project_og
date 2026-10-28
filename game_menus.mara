@@ -107,22 +107,26 @@ Game_Date :: struct {
 	year: i64
 }
 
-// The day the game starts on: its globals GameDay, GameMonth, GameYear
-// (27 Last Seed 433 in Oblivion.esm).
+// The globals the game's date starts from (Oblivion.esm's GameDay,
+// GameMonth, GameYear: by form id, as finding a record by editor id reads
+// them all).
+GLOBAL_GAME_DAY :: 0x00000037
+GLOBAL_GAME_MONTH :: 0x00000036
+GLOBAL_GAME_YEAR :: 0x00000035
+
+// The day the game starts on (27 Last Seed 433 in Oblivion.esm).
 read_start_date :: fun(plugin: ^Plugin) -> Game_Date {
 	date := Game_Date{day = 27, month = 7, year = 433}
-	date.day = i64(global_value(plugin, "GameDay", f32(date.day)))
-	date.month = i64(global_value(plugin, "GameMonth", f32(date.month)))
-	date.year = i64(global_value(plugin, "GameYear", f32(date.year)))
+	date.day = i64(global_value(plugin, GLOBAL_GAME_DAY, f32(date.day)))
+	date.month = i64(global_value(plugin, GLOBAL_GAME_MONTH, f32(date.month)))
+	date.year = i64(global_value(plugin, GLOBAL_GAME_YEAR, f32(date.year)))
 	return date
 }
 
 // A global's value (its FLTV), or otherwise when there's none.
-global_value :: fun(plugin: ^Plugin, name: []utf8, otherwise: f32) -> f32 {
+global_value :: fun(plugin: ^Plugin, form_id: u32, otherwise: f32) -> f32 {
 	scratch : [64 * KB]byte
-	id, found := find_by_editor_id(plugin, name, &scratch)
-	if not found do return otherwise
-	record, record_error := find_record(plugin, id, &scratch)
+	record, record_error := find_record(plugin, form_id, &scratch)
 	if record_error do return otherwise
 	value_field, has_value := find_field(record.data, "FLTV")
 	if not has_value or value_field.len < 4 do return otherwise

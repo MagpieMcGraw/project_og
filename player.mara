@@ -21,9 +21,11 @@ use logging
 render :: use render
 
 FIRST_PERSON_SKELETON :: "meshes\\characters\\_1stperson\\skeleton.nif"
-// The player's record (their race: its body), and what they hold for now.
+// The player's record (their race: its body), and what they hold for now
+// (WeapIronLongsword; by form id: finding a record by editor id reads them
+// all).
 PLAYER_NPC :: 0x00000007
-PLAYER_WEAPON :: "WeapIronLongsword"
+PLAYER_WEAPON :: 0x00000C0C
 // The first-person skeleton's bones a weapon hangs from, and its eyes.
 WEAPON_BONE :: "Weapon"
 // A weapon's scabbard, in its mesh: shown only while it's sheathed.
@@ -120,18 +122,15 @@ make_first_person :: fun(viewer: ^Viewer, plugin: ^Plugin) -> err {
 	look.has_face = false
 	scratch : [256 * KB]byte
 	held.weapon_icon.len = 0
-	weapon_id, has_weapon := find_by_editor_id(plugin, PLAYER_WEAPON, &scratch)
-	if has_weapon {
-		weapon, weapon_error := find_record(plugin, weapon_id, &scratch)
-		if not weapon_error {
-			weapon_icon, has_icon := find_field(weapon.data, "ICON")
-			if has_icon do add_what_fits(&held.weapon_icon, field_text(weapon_icon))
-			weapon_model, has_model := find_field(weapon.data, "MODL")
-			if has_model {
-				add_npc_part(&look, field_text(weapon_model), "", WEAPON_BONE, 0)
-				// Drawn: its scabbard left in the sheath.
-				&look.parts[look.parts.len - 1].without + SCABBARD_NODE
-			}
+	weapon, weapon_error := find_record(plugin, u32(PLAYER_WEAPON), &scratch)
+	if not weapon_error {
+		weapon_icon, has_icon := find_field(weapon.data, "ICON")
+		if has_icon do add_what_fits(&held.weapon_icon, field_text(weapon_icon))
+		weapon_model, has_model := find_field(weapon.data, "MODL")
+		if has_model {
+			add_npc_part(&look, field_text(weapon_model), "", WEAPON_BONE, 0)
+			// Drawn: its scabbard left in the sheath.
+			&look.parts[look.parts.len - 1].without + SCABBARD_NODE
 		}
 	}
 
