@@ -1,0 +1,13 @@
+2026-10-26 16:47:53
+runtime error: cstring() at C:\Code\Mara\code\SDL\sdl.mara:1303:80: no terminating 0 in the slice (checked [len] since len < cap, or [cap-1] for a full slice) — append into headroom or zero-pad the buffer
+
+2026-10-27 08:59:36
+Assert failed at C:\Code\Mara\code\core.mara:29:2
+Expected dst.len + src.len <= dst.cap, but dst.len + src.len was 1039 and dst.cap was 1024
+
+2026-10-27 09:27:38
+sooblivion.mara:1702:37 runtime error: 67 items into a list with room for 64
+
+2026-10-27 20:12:20
+tree_picture.mara:98:2 runtime error: slice len 2097152 not in [0, 0] (cap) for 'slice'
+
