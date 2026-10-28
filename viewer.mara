@@ -17,6 +17,7 @@ use mara.memory
 use mara.sdl
 use mara.time
 use bsa
+use file_cache
 use nif
 use model
 use world
@@ -302,6 +303,21 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	note(&viewer.journal, viewer.archives.list.len)
 	note(&viewer.journal, " archives")
 	note_end(&viewer.journal)
+	// The cache of their files unpacked (the files unpacked before, read
+	// again without unpacking).
+	cache := &viewer.archives.cache
+	cache_open(cache, directory_storage)
+	if cache.usable {
+		note(&viewer.journal, "the cache: ")
+		note(&viewer.journal, cache.places.len)
+		note(&viewer.journal, " files unpacked before, ")
+		note(&viewer.journal, cache.data_size / MB)
+		note(&viewer.journal, " MB")
+	else
+		note(&viewer.journal, "no cache (another run may have it): ")
+		note_error(&viewer.journal, cache.failure)
+	}
+	note_end(&viewer.journal)
 	viewer.platform = platform_open("sooblivion", 1280, 720, taking_picture)?
 	audio_init(&viewer.audio, SOUND_ROOM, table_storage)
 	music_folder := data_path("Music")
@@ -398,8 +414,30 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 viewer_close :: fun(viewer: ^Viewer) {
 	audio_close(&viewer.audio)
 	platform_close(&viewer.platform)
+	note_cache(viewer)
 	close_archives(&viewer.archives)
 	journal_close(&viewer.journal)
+}
+
+// Notes what the cache did this run: files read from it and added to it,
+// and why it stopped being added to, or read, if it did.
+note_cache :: fun(viewer: ^Viewer) {
+	cache := &viewer.archives.cache
+	journal := &viewer.journal
+	note(journal, "the cache: ")
+	note(journal, cache.read_count)
+	note(journal, " files read from it (")
+	note(journal, cache.read_bytes / MB)
+	note(journal, " MB), ")
+	note(journal, cache.added_count)
+	note(journal, " added (")
+	note(journal, cache.added_bytes / MB)
+	note(journal, " MB)")
+	if cache.failure {
+		note(journal, "; it failed: ")
+		note_error(journal, cache.failure)
+	}
+	note_end(journal)
 }
 
 // The rooms loading uses, as views of storages the caller keeps: each up

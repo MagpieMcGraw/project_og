@@ -142,12 +142,20 @@ world_climate :: fun(plugin: ^Plugin, world_id: u32, scratch: ^[]byte) -> Climat
 	return read_climate(plugin, climate_id, scratch)
 }
 
+// The climates for where none is named, in Oblivion.esm: TamrielClimate,
+// and DefaultClimate (by form id: finding a record by editor id reads
+// them all).
+CLIMATE_TAMRIEL :: 0x000688E2
+CLIMATE_DEFAULT :: 0x0000015F
+
 // The climate for where none is named: TamrielClimate, or DefaultClimate;
 // 0 when there's neither.
 fallback_climate :: fun(plugin: ^Plugin, scratch: ^[]byte) -> u32 {
-	climate_id := find_by_editor_id(plugin, "CLMT", "TamrielClimate", scratch)
-	if climate_id == 0 do climate_id = find_by_editor_id(plugin, "CLMT", "DefaultClimate", scratch)
-	return climate_id
+	for climate_id in [CLIMATE_TAMRIEL, CLIMATE_DEFAULT] {
+		_, found := index_get(&plugin.records, u64(climate_id))
+		if found do return u32(climate_id)
+	}
+	return 0
 }
 
 // Whether an interior cell behaves like an exterior (its DATA's flag 0x80:

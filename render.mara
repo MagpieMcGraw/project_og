@@ -1791,6 +1791,9 @@ Renderer :: struct {
 	// The textures whose bindless handles are still to be made (their
 	// slots): made all at once (make_waiting_handles).
 	handles_waiting: [MAX_TEXTURES]i64
+	// Names for textures, made a batch at a time (new_texture_name).
+	texture_names: [TEXTURE_NAME_BATCH!]u32
+	texture_names_left: i64
 	texture_index: Key_Index
 	// The textures that couldn't be loaded since the journal last told of
 	// them: how many, and the first's path and why. (Each is drawn white.)
@@ -1884,6 +1887,7 @@ renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
 	}
 	renderer.textures.len = 0
 	renderer.handles_waiting.len = 0
+	renderer.texture_names_left = 0
 	renderer.texture_index = key_index(1 << 14, storage)
 
 	// The white texture: slot 0, for parts with none. Then a flat normal
@@ -1898,11 +1902,25 @@ renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
 	}
 }
 
+// How many texture names are made at once: making one waits for the
+// driver to catch up with all that's been asked of it (0.9 ms, with the
+// textures before it on their way to the card).
+TEXTURE_NAME_BATCH :: 256
+
+// A name for a new texture, from the batch made last.
+new_texture_name :: fun(renderer: ^Renderer) -> u32 {
+	if renderer.texture_names_left == 0 {
+		GenTextures(i32(TEXTURE_NAME_BATCH), &renderer.texture_names[0])
+		renderer.texture_names_left = TEXTURE_NAME_BATCH
+	}
+	renderer.texture_names_left -= 1
+	return renderer.texture_names[renderer.texture_names_left]
+}
+
 // A texture of one pixel, in the next slot: that slot.
 one_pixel_texture :: fun(renderer: ^Renderer, pixel: [4!]u8) -> i64 {
 	color := pixel
-	id : u32 = 0
-	GenTextures(1, &id)
+	id := new_texture_name(renderer)
 	BindTexture(TEXTURE_2D, id)
 	TexImage2D(TEXTURE_2D, 0, i32(RGBA8), 1, 1, 0, RGBA, UNSIGNED_BYTE, color)
 	TexParameteri(TEXTURE_2D, TEXTURE_MAX_LEVEL, 0)
@@ -2985,8 +3003,7 @@ texture_from_pixels :: fun(renderer: ^Renderer, path: []utf8, pixels: []byte, wi
 	known, found := index_get(&renderer.texture_index, key)
 	if found do return known
 	if not fits(renderer.textures.len + 1, renderer.textures.cap) or pixels.len < width * height * 4 do return 0
-	id : u32 = 0
-	GenTextures(1, &id)
+	id := new_texture_name(renderer)
 	BindTexture(TEXTURE_2D, id)
 	TexImage2D(TEXTURE_2D, 0, i32(RGBA8), i32(width), i32(height), 0, RGBA, UNSIGNED_BYTE, pixels)
 	GenerateMipmap(TEXTURE_2D)
@@ -3026,8 +3043,7 @@ load_texture :: fun(renderer: ^Renderer, archives: ^Archives, path: []utf8, scra
 	texture := read_archive_texture(archives, path, scratch)?
 	has_alpha := texture.format == .dxt3 or texture.format == .dxt5 or texture.format == .bgra8 or texture.format == .bgra4
 
-	id : u32 = 0
-	GenTextures(1, &id)
+	id := new_texture_name(renderer)
 	BindTexture(TEXTURE_2D, id)
 	levels : i64 = 0
 	for mip, level in texture.mips {

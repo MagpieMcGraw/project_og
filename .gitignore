@@ -10,3 +10,4 @@ memory.txt
 *.png
 *.log
 compiler/
+cache/

@@ -1,0 +1,65 @@
+// Files on disk opened and read the ways mara.os doesn't: for adding to
+// the end, and for reading and writing both (the cache's), by CreateFileW
+// (mara.os binds CreateFileA itself: MARA_ISSUES.md); folders made; a view
+// filled whole.
+module disk
+
+use mara.core
+use mara.os
+
+foreign static_lib "kernel32" {
+	fun CreateFileW(name: ^u16, access: u32, share: u32, security: ^byte, disposition: u32, flags: u32, template: File_Id) -> File_Id
+	fun CreateDirectoryW(name: ^u16, security: ^byte) -> i32
+}
+FILE_APPEND_DATA :: 0x0004
+
+// A path as Windows' wide text, a 0 after it: its letters taken one to a
+// UTF-16 unit (ASCII paths only). False when it's too long.
+wide_path :: fun(path: []utf8) -> [261]u16, bool {
+	wide : [261]u16
+	for c in path {
+		if wide.len == wide.cap - 1 do return wide, false
+		&wide + u16(c)
+	}
+	&wide + u16(0)
+	return wide, true
+}
+
+// Opens the file at path for adding to its end, made if it isn't there.
+file_open_append :: fun(path: []utf8) -> File_Id, err {
+	wide, fits_path := wide_path(path)
+	if not fits_path do return NO_FILE, File_Error.Open_Failed
+	id := CreateFileW(wide.ptr, FILE_APPEND_DATA, FILE_SHARE_READ, void, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NO_FILE)
+	if id == INVALID_HANDLE_VALUE do return NO_FILE, File_Error.Open_Failed
+	return id
+}
+
+// Opens the file at path to read and to write, made if it isn't there —
+// emptied, if afresh. Others may read it meanwhile but not write it: a
+// second program opening it so fails.
+file_open_own :: fun(path: []utf8, afresh: bool) -> File_Id, err {
+	wide, fits_path := wide_path(path)
+	if not fits_path do return NO_FILE, File_Error.Open_Failed
+	disposition : u32 = if afresh do CREATE_ALWAYS else OPEN_ALWAYS
+	id := CreateFileW(wide.ptr, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, void, disposition, FILE_ATTRIBUTE_NORMAL, NO_FILE)
+	if id == INVALID_HANDLE_VALUE do return NO_FILE, File_Error.Open_Failed
+	return id
+}
+
+// Makes a folder at path, unless there's one.
+make_folder :: fun(path: []utf8) {
+	wide, fits_path := wide_path(path)
+	if fits_path do _ = CreateDirectoryW(wide.ptr, void)
+}
+
+// Fills view (all its len) from the file's current place, in as many reads
+// as that takes. Read_Failed when the file ends first.
+read_exactly :: fun(file: File_Id, view: ^[]byte) -> err {
+	got : i64 = 0
+	for got < view.len {
+		rest := view[got : view.len]
+		file_read(file, &rest)?
+		if rest.len == 0 do return File_Error.Read_Failed
+		got += rest.len
+	}
+}

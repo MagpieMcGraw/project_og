@@ -14,6 +14,8 @@ use mara.core
 use mara.os
 use mara.string
 use inflate
+use disk
+use file_cache
 
 // What reading an archive can fail with, beyond what reading files can.
 Archive_Error :: error {
@@ -75,6 +77,7 @@ Archive :: struct {
 	directory: []byte          // the archive from its start up to the files' data
 	folders: []Folder
 	files: []Archive_File
+	stamp: u64                 // its name, size and directory mixed: another archive's, or this one changed, differs
 }
 
 // A name of a folder or file in an archive, as text.
@@ -86,18 +89,6 @@ folder_name :: fun(archive: ^Archive, folder: Folder) -> []utf8 {
 file_name :: fun(archive: ^Archive, file: Archive_File) -> []utf8 {
 	names : []utf8 = archive.directory
 	return names[file.name_at : file.name_at + file.name_len]
-}
-
-// Fills view (all its len) from the file's current place, in as many reads
-// as that takes. Read_Failed when the file ends first.
-read_exactly :: fun(file: File_Id, view: ^[]byte) -> err {
-	got : i64 = 0
-	for got < view.len {
-		rest := view[got : view.len]
-		file_read(file, &rest)?
-		if rest.len == 0 do return Read_Failed
-		got += rest.len
-	}
 }
 
 // Opens an archive and reads its directory into storage (its len moved
@@ -178,7 +169,14 @@ open_archive :: fun(path: []utf8, storage: ^[]byte) -> Archive, err {
 	}
 	if at != directory_size - i64(header.file_names_size) do return Archive{0}, Bad_Directory
 
-	return Archive{file = file, header = header, directory = directory, folders = folders, files = files}
+	// Its stamp: the cache's files of it are those with it in their keys.
+	stamp : u64 = u64(file_size(file)?)
+	for c in get_file(path) do stamp = mix_key(stamp, u64(c | 0x20))
+	for k in 0:directory_size / 8 {
+		piece : u64 = directory[k * 8]
+		stamp = mix_key(stamp, piece)
+	}
+	return Archive{file = file, header = header, directory = directory, folders = folders, files = files, stamp = stamp}
 }
 
 close_archive :: fun(archive: ^Archive) {
@@ -332,9 +330,11 @@ read_file :: fun(archive: ^Archive, index: i64, storage: ^[]byte, checked := fal
 MAX_ARCHIVES :: 32
 
 // Several archives searched as one, in their order: the game's meshes,
-// textures and sounds with the plugins' own (see open_game_archives).
+// textures and sounds with the plugins' own (see open_game_archives); and
+// the cache of their files unpacked, if it's opened (cache_open).
 Archives :: struct {
 	list: [MAX_ARCHIVES]Archive
+	cache: File_Cache
 }
 
 // A file found in archives: which archive (its index in the list), and
@@ -363,9 +363,19 @@ find_archived_folder :: fun(archives: ^Archives, path: []utf8) -> i64, i64, bool
 	return -1, -1, false
 }
 
-// Reads a file found in archives into storage, as read_file does.
+// Reads a file found in archives into storage, as read_file does: from the
+// cache, if it's packed and the cache has it, else unpacked and added to
+// the cache.
 read_archived :: fun(archives: ^Archives, file: Archived_File, storage: ^[]byte) -> []byte, err {
-	return read_file(&archives.list[file.archive], file.index, storage)
+	archive := &archives.list[file.archive]
+	entry := archive.files[file.index]
+	if not entry.packed or not archives.cache.usable do return read_file(archive, file.index, storage)
+	key := mix_key(archive.stamp, mix_key(entry.hash, u64(entry.offset) << 32 | u64(entry.size)))
+	cached, found := cache_read(&archives.cache, key, storage)
+	if found do return cached
+	data := read_file(archive, file.index, storage)?
+	cache_add(&archives.cache, key, data)
+	return data
 }
 
 // A file's size in its archive (packed, if it's packed).
@@ -376,4 +386,5 @@ archived_size :: fun(archives: ^Archives, file: Archived_File) -> i64 {
 close_archives :: fun(archives: ^Archives) {
 	for &archive in archives.list do close_archive(archive)
 	archives.list.len = 0
+	cache_close(&archives.cache)
 }

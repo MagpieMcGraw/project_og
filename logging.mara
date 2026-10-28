@@ -13,6 +13,7 @@ use mara.core
 use mara.os
 use mara.string
 use mara.time
+use disk
 
 Journal :: struct {
 	file: File_Id      // NO_FILE when the log couldn't be made: the console only
@@ -144,25 +145,10 @@ full_log_start :: fun() {
 	if not open_error do file_close(file)
 }
 
-// CreateFileW, to open a file for adding to its end: mara.os opens files
-// to read or to write over, and binds CreateFileA itself (MARA_ISSUES.md).
-foreign static_lib "kernel32" {
-	fun CreateFileW(name: ^u16, access: u32, share: u32, security: ^byte, disposition: u32, flags: u32, template: File_Id) -> File_Id
-}
-FILE_APPEND_DATA :: 0x0004
-
 // Adds text to the end of the file at path (made if it isn't there), unless
-// that would make it longer than most bytes. (The path's letters are taken
-// one to a UTF-16 unit: ASCII paths only.)
+// that would make it longer than most bytes. (ASCII paths only: wide_path.)
 add_to_file :: fun(path: []utf8, text: []utf8, most: i64) -> err {
-	wide : [261]u16
-	for c in path {
-		if wide.len == wide.cap - 1 do return File_Error.Open_Failed
-		&wide + u16(c)
-	}
-	&wide + u16(0)
-	id := CreateFileW(wide.ptr, FILE_APPEND_DATA, FILE_SHARE_READ, void, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NO_FILE)
-	if id == INVALID_HANDLE_VALUE do return File_Error.Open_Failed
+	id := file_open_append(path)?
 	defer file_close(id)
 	size := file_size(id)?
 	if size + text.len > most do return

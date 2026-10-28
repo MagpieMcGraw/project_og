@@ -15,6 +15,7 @@ use mara.memory
 use mara.time
 use esm
 use bsa
+use disk
 use inflate
 use nif
 use dds
