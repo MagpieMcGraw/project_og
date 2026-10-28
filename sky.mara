@@ -264,6 +264,10 @@ Region_Sound :: struct {
 	chance: f32
 }
 
+// Room for a cell's region sounds: Oblivion.esm's cells have up to 106
+// (seven regions; a region up to 32).
+REGION_SOUNDS :: 256
+
 // The sounds an exterior cell's regions make now and then (their RDSD
 // lists: each a sound, its weathers, its chance in ten-millionths of a
 // try), into sounds.
@@ -282,8 +286,9 @@ cell_region_sounds :: fun(plugin: ^Plugin, world_id: u32, x: i64, y: i64, sounds
 		fields := Fields{data = record.data, at = 0, broken = false}
 		for field in next_field(&fields) {
 			if field.kind != "RDSD" do continue
-			for e in 0:field.data.len / 12 {
-				if not fits(sounds.len + 1, sounds.cap) do return
+			count := field.data.len / 12
+			if not fits(sounds.len + count, sounds.cap) do count = sounds.cap - sounds.len
+			for e in 0:count {
 				sound : u32 = field.data[e * 12]
 				weathers : u32 = field.data[e * 12 + 4]
 				chance : u32 = field.data[e * 12 + 8]

@@ -249,6 +249,10 @@ command_nifs :: fun(name: []utf8) {
 	part_total : i64 = 0
 	triangle_total : i64 = 0
 	untextured : i64 = 0
+	motion_total : i64 = 0
+	most_motions : i64 = 0
+	flip_total : i64 = 0
+	flip_frame_total : i64 = 0
 	// The Havok blocks: how many of each type, in how many files.
 	havok_types : [64]Type_Count
 	// Specular properties on and off; the materials' glossiness.
@@ -319,6 +323,10 @@ command_nifs :: fun(name: []utf8) {
 				triangle_total += part.indices.len / 3
 				if part.texture.len == 0 do untextured += 1
 			}
+			motion_total += built.motions.len
+			most_motions = max(most_motions, built.motions.len)
+			flip_total += built.flips.len
+			for &flip in built.flips do flip_frame_total += flip.frames.len
 			continue
 		}
 		failed += 1
@@ -334,6 +342,7 @@ command_nifs :: fun(name: []utf8) {
 		nif_count, block_total, failed, with_trailing, elapsed_ms(start))
 	print("models: % parts, % triangles, % parts without a texture, % failed",
 		part_total, triangle_total, untextured, model_failures)
+	print("  % motions (the most in one model %), % flipbooks of % frames", motion_total, most_motions, flip_total, flip_frame_total)
 	print("a vertex is % bytes, an instance drawn % (the mesh program reads 64 and 176)", size_of(Vertex), size_of(Drawn_Instance))
 	line : str1024
 	for &entry in sequence_names {
@@ -1420,7 +1429,7 @@ command_anim :: fun(what: []utf8) {
 	idle := find_sequence(&mesh, "Idle")
 	if idle < 0 do idle = find_sequence(&mesh, "SpecialIdle")
 	if idle < 0 do return
-	tracks : [8]Track
+	tracks : [256]Track
 	track_room : [4 * MB]byte
 	read_tracks(&mesh, idle, &tracks, &track_room, false)
 	start, stop := sequence_span(&mesh, idle)
@@ -1728,7 +1737,7 @@ command_sky :: fun(name: []utf8) {
 		}
 		if region_error do print("  at %: couldn't read its regions: %", place, region_error)
 		else do print("  at %: %", place, if chances.len == 0 do "the climate's" else line)
-		sounds : [32]Region_Sound
+		sounds : [REGION_SOUNDS]Region_Sound
 		sounds_error := cell_region_sounds(&plugin, world_id, place[0], place[1], &sounds, &scratch)
 		if sounds_error do print("    couldn't read its sounds: %", sounds_error)
 		sound_line : str1024
@@ -1850,7 +1859,7 @@ command_door :: fun(what: []utf8) {
 			continue
 		}
 		start, stop := sequence_span(&mesh, sequence)
-		tracks : [8]Track
+		tracks : [256]Track
 		track_room : [4 * MB]byte
 		read_tracks(&mesh, sequence, &tracks, &track_room, false)
 		print("%: from % to % s, % tracks", name, start, stop, tracks.len)

@@ -144,7 +144,7 @@ Viewer :: struct {
 	// and a lightning flash's brightness now, fading.
 	weather_sounds: [8]Placed_Sound
 	last_weather_sounds: [8]Placed_Sound
-	region_sounds: [32]Region_Sound
+	region_sounds: [REGION_SOUNDS]Region_Sound
 	region_sounds_tried: f64
 	thunder_tried: f64
 	lightning: f32

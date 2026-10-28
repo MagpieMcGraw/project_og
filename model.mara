@@ -155,14 +155,16 @@ Model_Particles :: struct {
 }
 
 // The frames a flipbook holds, and the keys saying which shows when, at most.
-FLIP_FRAMES :: 48
+FLIP_FRAMES :: 128   // (the longest in the game's meshes has 81)
 FLIP_KEYS :: 32
 
 // A part's texture flipped through frames (a flame's, say): the frames'
 // archive paths; its span of time, played at a frequency from a phase;
 // and its keys — at each time, which frame (as a number) — or, with none,
-// the frames in turn across the span.
+// the frames in turn across the span. Made from one flip controller (a
+// block of the NIF): the parts it flips share it.
 Model_Flip :: struct {
+	controller: i64
 	frames: [FLIP_FRAMES][160]utf8
 	start_time: f32
 	stop_time: f32
@@ -314,21 +316,27 @@ build_model_with :: fun(mesh: ^Nif, node: i64, left_out: []i64, how: Build_Optio
 		}
 	}
 	// And a flipbook for each flip controller at most, a particle system
-	// for each one.
+	// for each one. Each part's motions are its texturing's and its
+	// material's (add_motions): as many as the most any texturing and any
+	// material has, for each part, at most.
 	flip_count : i64 = 0
 	system_count : i64 = 0
-	motion_count : i64 = 0
+	most_texturing_values : i64 = 0
+	most_material_values : i64 = 0
 	for block in mesh.blocks {
 		match block {
 		Flip_Controller
 			flip_count += 1
 		Particle_System
 			system_count += 1
-		Value_Controller
-			motion_count += 1
+		Texturing texturing
+			most_texturing_values = max(most_texturing_values, value_controllers(mesh, texturing.controller))
+		Material material
+			most_material_values = max(most_material_values, value_controllers(mesh, material.controller))
 		else
 		}
 	}
+	motion_count := shape_count * (most_texturing_values + most_material_values)
 	model := Model{
 		parts = slice([:shape_count]Model_Part, storage),
 		flips = slice([:flip_count]Model_Flip, storage),
@@ -830,6 +838,25 @@ add_motions :: fun(mesh: ^Nif, properties: Inherited, model: ^Model, part: i64) 
 		else
 		}
 	}
+}
+
+// How many value controllers a chain of controllers (from the first) has,
+// as add_controller_motions goes down it.
+value_controllers :: fun(mesh: ^Nif, first: i64) -> i64 {
+	count : i64 = 0
+	at := first
+	for at >= 0 and at < mesh.blocks.len {
+		match mesh.blocks[at] {
+		Value_Controller value
+			count += 1
+			at = value.controller.next
+		Flip_Controller flip
+			at = flip.next
+		else
+			return count
+		}
+	}
+	return count
 }
 
 // The motions of a chain of controllers (from the first): each value
@@ -1383,7 +1410,8 @@ add_active_keys :: fun(mesh: ^Nif, interpolator: i64, entry: ^Model_Particles) {
 // The flipbook of a texturing's base texture, if its controllers flip it
 // (through one frame at least): its index in the model's flips; -1 for
 // none. (Followed down the chain of flip controllers only: the first on a
-// texturing, in Oblivion's meshes.)
+// texturing, in Oblivion's meshes.) Made once for each controller: another
+// part with the same one gets the same flipbook.
 add_flip :: fun(mesh: ^Nif, controller: i64, model: ^Model) -> i64 {
 	at := controller
 	for at >= 0 and at < mesh.blocks.len {
@@ -1393,11 +1421,17 @@ add_flip :: fun(mesh: ^Nif, controller: i64, model: ^Model) -> i64 {
 				at = flip.next
 				continue
 			}
-			if not fits(model.flips.len + 1, model.flips.cap) or flip.sources.count == 0 do return -1
+			if flip.sources.count == 0 do return -1
+			for &made, made_index in model.flips {
+				if made.controller == at do return made_index
+			}
+			if not fits(model.flips.len + 1, model.flips.cap) do return -1
 			entry := next(&model.flips)
+			entry.controller = at
 			entry.frames.len = 0
-			for k in 0:flip.sources.count {
-				if not fits(entry.frames.len + 1, entry.frames.cap) do break
+			frame_count := flip.sources.count
+			if not fits(frame_count, entry.frames.cap) do frame_count = entry.frames.cap
+			for k in 0:frame_count {
 				frame := next(&entry.frames)
 				texture_path(mesh, Texture_Slot{used = true, source = flip.sources.at(k), clamp_mode = 0, filter_mode = 0, uv_set = 0}, frame)
 			}
