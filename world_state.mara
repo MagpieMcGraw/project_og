@@ -4,7 +4,9 @@
 //
 // For now: its clock; its sky's climate and weather (by form id: what a
 // weather looks and sounds like is the viewer's to read), rolled from the
-// world's own seed; and where the player is, as their client reports it.
+// world's own seed; where the player is, as their client reports it; the
+// people in the place they're in, as they stand; the doors that open in
+// place, open or shut.
 module world_state
 
 use mara.core
@@ -12,8 +14,10 @@ use mara.math
 use mara.time
 use mara.memory
 use mara.string
+use esm
 use world
 use sky
+use logging
 
 // The world steps this often (seconds of real time), and at most this
 // many times to catch up after a long frame (more are let go).
@@ -28,6 +32,17 @@ WEATHER_LEAST_HOURS :: 4
 WEATHER_MOST_HOURS :: 8
 // The hour the world starts at.
 START_HOUR :: 10
+// The people and the doors the world keeps, at most.
+WORLD_ACTORS :: 512
+WORLD_DOORS :: 1024
+
+// A door that opens in place, as the world has it: open or shut, and when
+// it last changed (the world's seconds). One the world hasn't is shut.
+Door_State :: struct {
+	reference: u32
+	open: bool
+	since: f64
+}
 
 World_State :: struct {
 	// The clock: the game's hour (0 to 24) and its days gone; how long the
@@ -60,6 +75,16 @@ World_State :: struct {
 	player_world: u32
 	player_feet: Vec3
 	player_yaw: f32
+	// The place the player's in: an interior (place_cell), or a world's
+	// cells round place_x, place_y (place_world); the people in it (NPCs
+	// placed, ACHR), as they stand now: where, turned how, how big.
+	place_world: u32
+	place_cell: u32
+	place_x: i64
+	place_y: i64
+	actors: [WORLD_ACTORS]Reference
+	// The doors that open in place that have been opened (or shut again).
+	doors: [WORLD_DOORS]Door_State
 }
 
 // A world starting: its clock at START_HOUR of its first day, no sky yet,
@@ -82,6 +107,12 @@ world_start :: fun(state: ^World_State) {
 	state.player_world = 0
 	state.player_feet = Vec3{0, 0, 0}
 	state.player_yaw = 0
+	state.place_world = 0
+	state.place_cell = 0
+	state.place_x = 0
+	state.place_y = 0
+	state.actors.len = 0
+	state.doors.len = 0
 }
 
 // Steps the world a tick (WORLD_TICK of real time): the clock on (faster
@@ -172,6 +203,104 @@ world_change_weather :: fun(state: ^World_State, plugin: ^Plugin, at_once: bool)
 	state.weather_transition = weather.transition
 	state.weather_share = if at_once do 1 else 0
 	return weather_error
+}
+
+// ---- the people, the doors -------------------------------------------------------
+
+// Takes an interior as the place the player's in: the people in it.
+world_take_interior :: fun(state: ^World_State, plugin: ^Plugin, cell: u32) -> err {
+	state.place_world = 0
+	state.place_cell = cell
+	state.actors.len = 0
+	add_actors(state, plugin, cell, EVERYWHERE, NOWHERE)?
+}
+
+// Takes a world's cells round the one at x, y as the place the player's
+// in: the people in them and in the world's persistent cell there. Moving
+// within the world, those still in it stay as they are, those out of it
+// go, and only the cells come into it are read. All its cells are read
+// whatever fails (the first failure given back).
+world_take_area :: fun(state: ^World_State, plugin: ^Plugin, world_id: u32, x: i64, y: i64) -> err {
+	area := area_around(x, y)
+	kept := NOWHERE
+	if state.place_world == world_id and state.place_cell == 0 {
+		kept = area_around(state.place_x, state.place_y)
+		staying : i64 = 0
+		for k in 0:state.actors.len {
+			if not area_holds(area, state.actors[k].position) do continue
+			state.actors[staying] = state.actors[k]
+			staying += 1
+		}
+		state.actors.len = staying
+	else
+		state.actors.len = 0
+	}
+	state.place_world = world_id
+	state.place_cell = 0
+	state.place_x = x
+	state.place_y = y
+	first_error : err
+	for cell_y in area.low_y..area.high_y {
+		for cell_x in area.low_x..area.high_x {
+			if cell_x >= kept.low_x and cell_x <= kept.high_x and cell_y >= kept.low_y and cell_y <= kept.high_y do continue
+			cell := exterior_cell(plugin, world_id, cell_x, cell_y)
+			if cell == 0 do continue
+			cell_error := add_actors(state, plugin, cell, EVERYWHERE, NOWHERE)
+			if cell_error and not first_error do first_error = cell_error
+		}
+	}
+	persistent := persistent_cell(plugin, world_id)
+	if persistent != 0 {
+		persistent_error := add_actors(state, plugin, persistent, area, kept)
+		if persistent_error and not first_error do first_error = persistent_error
+	}
+	return first_error
+}
+
+// Adds a cell's people (those not disabled) in an area and not in kept.
+add_actors :: fun(state: ^World_State, plugin: ^Plugin, cell: u32, area: Grid_Area, kept: Grid_Area) -> err {
+	references : [16384]Reference = void
+	references.len = 0
+	cell_references(plugin, cell, &references)?
+	for reference in references {
+		if reference.flags & RECORD_DISABLED != 0 do continue
+		if not area_holds(area, reference.position) or area_holds(kept, reference.position) do continue
+		base_at, found := index_get(&plugin.records, u64(reference.base))
+		if not found or record_header_at(plugin, base_at).kind != "NPC_" do continue
+		if not fits(state.actors.len + 1, state.actors.cap) do break
+		&state.actors + reference
+	}
+}
+
+// One of the people in the place the player's in, by their reference; false
+// when they aren't.
+world_actor :: fun(state: ^World_State, reference: u32) -> Reference, bool {
+	for actor in state.actors {
+		if actor.form_id == reference do return actor, true
+	}
+	return Reference{0}, false
+}
+
+// Opens a shut door that opens in place, or shuts an open one, now (the
+// world's seconds): whether it's open after.
+world_use_door :: fun(state: ^World_State, reference: u32) -> bool {
+	for &door in state.doors {
+		if door.reference != reference do continue
+		door.open = not door.open
+		door.since = state.seconds
+		return door.open
+	}
+	if not fits(state.doors.len + 1, state.doors.cap) do return false
+	&state.doors + Door_State{reference = reference, open = true, since = state.seconds}
+	return true
+}
+
+// Whether a door that opens in place is open (one the world hasn't is shut).
+world_door_open :: fun(state: ^World_State, reference: u32) -> bool {
+	for door in state.doors {
+		if door.reference == reference do return door.open
+	}
+	return false
 }
 
 // The player moved into other cells: the weathers that may come there,

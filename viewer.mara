@@ -540,7 +540,8 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 			viewer.chosen_door = leading
 			return .door
 		}
-		_ = use_door(shown, targeted)
+		// (Asked of the world: the door swings when it says, follow_doors.)
+		_ = world_use_door(&viewer.world, targeted)
 	}
 	if input.pressed[E] and not usable {
 		viewer.missed = true
@@ -597,11 +598,13 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	report_player(viewer, input.held[T])
 	show_time(viewer, f32(seconds))
 	noises : [16]Door_Noise
+	follow_doors(viewer)
 	swing_doors(shown, f32(seconds), &noises)
 	move_pieces(shown, viewer.look.time)
 	// The people posed, the player's arms too: a left click swings.
 	step_first_person(viewer, input.mouse_pressed[1])
 	viewer.renderer.palette.len = 0
+	follow_actors(viewer)
 	pose_npcs(shown, &viewer.renderer, viewer.look.time)
 	pose_first_person(viewer)
 	upload_palette(&viewer.renderer)
@@ -1059,6 +1062,53 @@ report_player :: fun(viewer: ^Viewer, hurried: bool) {
 	state.player_feet = if viewer.walking do viewer.walker.position else viewer.camera.position - Vec3{0, 0, EYE_HEIGHT}
 	state.player_yaw = viewer.camera.yaw
 	state.hurried = hurried
+}
+
+// Swings the doors that open in place to the world's say: one that isn't
+// at rest as the world has it starts swinging; one just placed is put so
+// at once.
+follow_doors :: fun(viewer: ^Viewer) {
+	shown := &viewer.shown
+	for &swinging in shown.swinging {
+		wanted := world_door_open(&viewer.world, swinging.reference)
+		if swinging.fresh {
+			swinging.fresh = false
+			if wanted != swinging.open do rest_door(shown, swinging, wanted)
+			continue
+		}
+		if not swinging.moving and wanted != swinging.open do _ = use_door(shown, swinging.reference)
+	}
+}
+
+// Keeps the people shown where the world has them, as they stand. (They
+// stand still, for now: this is what moves them when they walk.)
+follow_actors :: fun(viewer: ^Viewer) {
+	shown := &viewer.shown
+	for &instance in shown.instances {
+		if instance.reference == 0 do continue
+		_, is_person := index_get(&shown.model_rigs, u64(instance.model + 1))
+		if not is_person do continue
+		actor, found := world_actor(&viewer.world, instance.reference)
+		if not found do continue
+		moved := place_instance(shown.models[instance.model], instance.model, reference_transform(actor), instance.reference)
+		instance.world = moved.world
+		instance.center = moved.center
+		instance.radius = moved.radius
+	}
+}
+
+// Takes the place the player's in as the world's (its people) and has the
+// people not shown yet wait to be: an interior (cell), or a world's cells
+// round x, y.
+take_place :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32, cell: u32, x: i64, y: i64) {
+	state := &viewer.world
+	place_error := if world_id == 0 do world_take_interior(state, plugin, cell) else world_take_area(state, plugin, world_id, x, y)
+	if place_error {
+		note(&viewer.journal, "couldn't read all of the place's people: ")
+		note_error(&viewer.journal, place_error)
+		note_end(&viewer.journal)
+	}
+	queue_actors(&viewer.shown, state.actors)
 }
 
 // Steps the world on its ticks due by now (WORLD_TICK each; after a long
@@ -1816,6 +1866,7 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 			x, y := grid_of(viewer.camera.position)
 			start := time_now()
 			show_error := show_exterior(&viewer.shown, plugin, viewer.shown.world, x, y)
+			take_place(viewer, plugin, viewer.shown.world, 0, x, y)
 			choose_music(viewer, plugin, exterior_cell(plugin, viewer.shown.world, x, y), viewer.shown.world)
 			// Into other cells: their weathers (if they're others', the next
 			// soon), and their regions' sounds.
@@ -1958,6 +2009,7 @@ go_inside :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
 	viewer.exit_readied = false
 	viewer.exit_door = -1
 	show_error := show_interior(shown, plugin, cell, viewer_loader(viewer))
+	take_place(viewer, plugin, 0, cell, 0, 0)
 	take_cell_sky(viewer, plugin, cell)
 	choose_music(viewer, plugin, cell, 0)
 	viewer.speed = 400
@@ -2002,6 +2054,7 @@ go_outside :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32, place: Vec3) 
 	if viewer.shown.distant_world != world_id do begin_distant_objects(&viewer.shown, world_id)
 	x, y := grid_of(place)
 	show_error := show_exterior(shown, plugin, world_id, x, y)
+	take_place(viewer, plugin, world_id, 0, x, y)
 	choose_music(viewer, plugin, exterior_cell(plugin, world_id, x, y), world_id)
 	viewer.loading_since = start
 	viewer.loading_frames = 0

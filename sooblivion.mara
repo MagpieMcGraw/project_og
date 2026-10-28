@@ -1112,12 +1112,18 @@ command_walk :: fun(name: []utf8, x: i64, y: i64, steps: i64) {
 	block_room : [16 * MB]byte
 	model_room : [64 * MB]byte
 	texture_room : [64 * MB]byte
+	state : World_State
+	world_start(&state)
 
 	for step in 0..steps {
 		cell_x := x + step
 		place_start := time_now()
 		show_error := show_exterior(&walked, &plugin, world_id, cell_x, y)
 		if show_error do print("  placing the cells around % % stopped early: %", cell_x, y, show_error)
+		// The world's people there, waiting with the rest.
+		people_error := world_take_area(&state, &plugin, world_id, cell_x, y)
+		if people_error do print("  couldn't read all of the people around % %: %", cell_x, y, people_error)
+		queue_actors(&walked, state.actors)
 		place_ms := elapsed_ms(place_start)
 
 		// What's waiting, read as loading would: the meshes and their
@@ -1128,7 +1134,7 @@ command_walk :: fun(name: []utf8, x: i64, y: i64, steps: i64) {
 		texture_ns : u64 = 0
 		for &item in walked.waiting {
 			// Placed as loading would place it (as model 0: there's no card here).
-			add_instance(&walked, 0, item.world)
+			add_instance(&walked, 0, item.world, item.reference)
 			_, known := known_model(&walked, item.path)
 			if known do continue
 			_ = index_put(&walked.paths, text_hash(item.path), 1)
@@ -1757,22 +1763,30 @@ command_walk_check :: fun(name: []utf8, start: Vec3, yaw_degrees: f32, seconds: 
 	loader := Loader{renderer = &renderer, archives = &archives, room = &room, drawing = false}
 
 	load_start := time_now()
+	// The place, and the world's people in it.
+	state : World_State
+	world_start(&state)
+	x, y := grid_of(start)
 	show_error : err
+	take_error : err
 	if world_id != 0 {
-		x, y := grid_of(start)
 		show_error = show_exterior(&place, &plugin, world_id, x, y)
+		take_error = world_take_area(&state, &plugin, world_id, x, y)
 	else
 		show_error = show_interior(&place, &plugin, cell, loader)
+		take_error = world_take_interior(&state, &plugin, cell)
 	}
 	if show_error do print("placing the place stopped early: %", show_error)
+	if take_error do print("couldn't read all of the place's people: %", take_error)
+	queue_actors(&place, state.actors)
 	for not load_waiting(&place, &plugin, loader, 0xFFFFFFFFFFFFFFFF, start) {}
 	solid : i64 = 0
 	for &instance in place.instances {
 		range := place.model_collision[instance.model]
 		if range.count > 0 or range.upright > 0 do solid += 1
 	}
-	print("loaded without drawing in % ms: % things placed, % walked into (% triangles), % land cells",
-		elapsed_ms(load_start), place.instances.len, solid, place.collision_points.len / 3, place.grounds.len)
+	print("loaded without drawing in % ms: % things placed, % walked into (% triangles), % land cells, % people",
+		elapsed_ms(load_start), place.instances.len, solid, place.collision_points.len / 3, place.grounds.len, state.actors.len)
 
 	feet := start - Vec3{0, 0, EYE_HEIGHT}
 	walker := Walker{position = feet, rising = 0, on_ground = false}

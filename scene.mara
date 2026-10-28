@@ -37,30 +37,9 @@ use logging
 // thousand.)
 COLLISION_POINTS :: 3145728
 
-// How many cells around the camera's are loaded outside: 2 is 5 by 5.
-EXTERIOR_RADIUS :: 2
 // How many cells around the camera's have their trees drawn: as far as
 // the game drew them (uGridDistantTreeRange).
 TREE_RADIUS :: 15
-
-// A part of the world the grid's cells x and y go from low to high in.
-Grid_Area :: struct {
-	everywhere: bool   // no limit: an interior cell's
-	low_x: i64
-	low_y: i64
-	high_x: i64
-	high_y: i64
-}
-
-EVERYWHERE :: Grid_Area{everywhere = true, low_x = 0, low_y = 0, high_x = 0, high_y = 0}
-NOWHERE :: Grid_Area{everywhere = false, low_x = 1, low_y = 1, high_x = 0, high_y = 0}
-
-// Whether a place is in an area.
-area_holds :: fun(area: Grid_Area, position: Vec3) -> bool {
-	if area.everywhere do return true
-	x, y := grid_of(position)
-	return x >= area.low_x and x <= area.high_x and y >= area.low_y and y <= area.high_y
-}
 
 // A door in the scene that leads somewhere.
 Scene_Door :: struct {
@@ -175,6 +154,7 @@ Swinging_Door :: struct {
 	moving: bool
 	opening: bool
 	time: f32
+	fresh: bool      // just placed: put open or shut as the world has it, not swung there
 }
 
 // What loading a model can fail with, beyond reading its file.
@@ -709,19 +689,8 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, plac
 			}
 			continue
 		}
-		// An NPC: put together when it's loaded.
-		if base.header.kind == "NPC_" {
-			if fits(scene.waiting.len + 1, scene.waiting.cap) {
-				waiting := next(&scene.waiting)
-				waiting.reference = reference.form_id
-				waiting.door = false
-				waiting.npc = reference.base
-				waiting.tree = 0
-				waiting.path.len = 0
-				waiting.world = reference_transform(reference)
-			}
-			continue
-		}
+		// An NPC: the world's, shown where it has them (queue_actors).
+		if base.header.kind == "NPC_" do continue
 		path := model_path(base)
 		if path.len == 0 or is_marker(path) do continue
 		// A door that opens in place, of a kind loaded: its pieces.
@@ -756,6 +725,31 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, plac
 			&waiting.path + path
 			waiting.world = reference_transform(reference)
 		}
+	}
+}
+
+// Has the people of the world's place (as they stand now) that aren't here
+// yet, nor waiting, wait to be put together and placed: outside, those in
+// the area shown.
+queue_actors :: fun(scene: ^Scene, actors: []Reference) {
+	area := if scene.world != 0 do shown_area(scene) else EVERYWHERE
+	for actor in actors {
+		if not area_holds(area, actor.position) do continue
+		here := false
+		for &instance in scene.instances {
+			if instance.reference == actor.form_id do here = true
+		}
+		for k in scene.waiting_next:scene.waiting.len {
+			if scene.waiting[k].reference == actor.form_id do here = true
+		}
+		if here or not fits(scene.waiting.len + 1, scene.waiting.cap) do continue
+		waiting := next(&scene.waiting)
+		waiting.reference = actor.form_id
+		waiting.door = false
+		waiting.npc = actor.base
+		waiting.tree = 0
+		waiting.path.len = 0
+		waiting.world = reference_transform(actor)
 	}
 }
 
@@ -1145,18 +1139,6 @@ widen_box :: fun(low: ^Vec3, high: ^Vec3, place: Vec3) {
 }
 
 // ---- outside ------------------------------------------------------------------------
-
-// The cells within radius of the one at x, y.
-area_around_by :: fun(x: i64, y: i64, radius: i64) -> Grid_Area {
-	return Grid_Area{everywhere = false, low_x = x - radius, low_y = y - radius, high_x = x + radius, high_y = y + radius}
-}
-
-// The area of cells loaded around a cell.
-area_around :: fun(x: i64, y: i64) -> Grid_Area {
-	return Grid_Area{everywhere = false,
-		low_x = x - EXTERIOR_RADIUS, low_y = y - EXTERIOR_RADIUS,
-		high_x = x + EXTERIOR_RADIUS, high_y = y + EXTERIOR_RADIUS}
-}
 
 // Lets go of the land outside an area (all of it, when everything): its
 // slots free for other land.
@@ -1567,7 +1549,8 @@ place_door :: fun(scene: ^Scene, kind_index: i64, placement: Mat4, reference: u3
 	kind := &scene.door_kinds[kind_index]
 	if kind.frame >= 0 do add_instance(scene, kind.frame, placement, reference)
 	for &piece in kind.pieces do add_instance(scene, piece.model, piece_world(placement, piece, &piece.closing, kind.close_stop), reference)
-	door := Swinging_Door{reference = reference, kind = kind_index, placement = placement, open = false, moving = false, opening = false, time = 0}
+	door := Swinging_Door{reference = reference, kind = kind_index, placement = placement, open = false, moving = false, opening = false,
+		time = 0, fresh = true}
 	for &placed in scene.swinging {
 		if placed.reference == reference {
 			placed^ = door
@@ -1590,6 +1573,28 @@ use_door :: fun(scene: ^Scene, reference: u32) -> bool {
 		return true
 	}
 	return false
+}
+
+// Puts a door that opens in place at rest, open or shut: its pieces posed
+// so, no sound made.
+rest_door :: fun(scene: ^Scene, door: ^Swinging_Door, open: bool) {
+	kind := &scene.door_kinds[door.kind]
+	door.open = open
+	door.opening = open
+	door.moving = false
+	door.time = 0
+	at := if open do kind.open_stop else kind.close_stop
+	for &piece in kind.pieces {
+		track := if open do &piece.opening else &piece.closing
+		posed := piece_world(door.placement, piece, track, at)
+		for &instance in scene.instances {
+			if instance.reference != door.reference or instance.model != piece.model do continue
+			moved := place_instance(scene.models[instance.model], instance.model, posed, instance.reference)
+			instance.world = moved.world
+			instance.center = moved.center
+			instance.radius = moved.radius
+		}
+	}
 }
 
 // Whether a reference is a door that opens in place.

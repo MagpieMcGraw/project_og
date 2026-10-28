@@ -774,6 +774,42 @@ cell_of_reference :: fun(plugin: ^Plugin, reference: u32) -> u32 {
 	return 0
 }
 
+// ---- areas of the grid --------------------------------------------------------
+
+// How many cells around the player's are loaded outside: 2 is 5 by 5.
+EXTERIOR_RADIUS :: 2
+
+// A part of the world the grid's cells x and y go from low to high in.
+Grid_Area :: struct {
+	everywhere: bool   // no limit: an interior cell's
+	low_x: i64
+	low_y: i64
+	high_x: i64
+	high_y: i64
+}
+
+EVERYWHERE :: Grid_Area{everywhere = true, low_x = 0, low_y = 0, high_x = 0, high_y = 0}
+NOWHERE :: Grid_Area{everywhere = false, low_x = 1, low_y = 1, high_x = 0, high_y = 0}
+
+// Whether a place is in an area.
+area_holds :: fun(area: Grid_Area, position: Vec3) -> bool {
+	if area.everywhere do return true
+	x, y := grid_of(position)
+	return x >= area.low_x and x <= area.high_x and y >= area.low_y and y <= area.high_y
+}
+
+// The cells within radius of the one at x, y.
+area_around_by :: fun(x: i64, y: i64, radius: i64) -> Grid_Area {
+	return Grid_Area{everywhere = false, low_x = x - radius, low_y = y - radius, high_x = x + radius, high_y = y + radius}
+}
+
+// The area of cells loaded around a cell.
+area_around :: fun(x: i64, y: i64) -> Grid_Area {
+	return Grid_Area{everywhere = false,
+		low_x = x - EXTERIOR_RADIUS, low_y = y - EXTERIOR_RADIUS,
+		high_x = x + EXTERIOR_RADIUS, high_y = y + EXTERIOR_RADIUS}
+}
+
 // ---- chance ---------------------------------------------------------------------
 
 // The next number of a seed's run (xorshift), the seed moved on.
