@@ -2568,17 +2568,27 @@ usage :: fun() {
 
 // `sooblivion picture <out.png> <view | view-cell | view-world> … [at x y
 // z yaw pitch] [held <idle | right | left> <seconds>] [menu <stats |
-// map>[page]] [frames n] [out]`: what the view
+// map>[page]] [frames n] [out] [walk seconds]`: what the view
 // command shows, drawn by the game's renderer in a window kept hidden,
 // without sound, once it's loaded; written to out.png. `at` places the
 // camera: where, and turned (degrees: yaw from north toward east, pitch
 // up). `held` holds the first-person arms in an animation (the idle, the
 // attack from the right or from the left) at a time in it. `out` goes
 // through the nearest door once it's loaded, the picture of the other side.
+// `walk` goes on foot, forward for that many seconds, before it's taken.
 command_picture :: fun(args: [][]utf8) {
 	picture := no_picture()
 	&picture.path + args[0]
 	view := args[1 : args.len]
+	if view.len >= 3 and view[view.len - 2] == "walk" {
+		seconds, is_number := parse_number(view[view.len - 1])
+		if not is_number {
+			usage()
+			return
+		}
+		picture.walk_for = f32(seconds)
+		view = view[0 : view.len - 2]
+	}
 	if view.len >= 2 and view[view.len - 1] == "out" {
 		picture.out = true
 		view = view[0 : view.len - 1]
@@ -2993,8 +3003,8 @@ command_tree :: fun(name: []utf8, seed_text: []utf8) {
 		print("couldn't grow it: %", grow_error)
 		return
 	}
-	print("grown with seed %: % branches, % leaves (% left out); % parts, from % to %", seed, report.branches,
-		report.leaves, report.left_out, grown.parts.len, grown.bounds_min, grown.bounds_max)
+	print("grown with seed %: % branches, % leaves (% left out); % parts, from % to %; its trunk % across at its foot", seed,
+		report.branches, report.leaves, report.left_out, grown.parts.len, grown.bounds_min, grown.bounds_max, report.trunk_radius * 2)
 	for &part in grown.parts do print("  % vertices, % triangles, %", part.vertices.len, part.indices.len / 3, part.texture)
 }
 

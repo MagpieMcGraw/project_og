@@ -189,7 +189,14 @@ Load_Error :: error {
 Collision_Range :: struct {
 	first: i64
 	count: i64
+	// An upright cylinder from the model's middle, walked round (a person,
+	// a tree's trunk): its radius and height; 0 for none.
+	upright: f32
+	upright_height: f32
 }
+
+// The thinnest trunk walked round: thinner, a shrub's, walked through.
+TREE_TRUNK_LEAST :: 4
 
 // A cell waiting for its land to be put on the card.
 Waiting_Land :: struct {
@@ -589,7 +596,8 @@ load_model :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64, err {
 	// What it collides as (from its blocks, still in their room).
 	collision_start := scene.collision_points.len
 	add_collision(&mesh, &scene.collision_points)
-	&scene.model_collision + Collision_Range{first = collision_start, count = scene.collision_points.len - collision_start}
+	&scene.model_collision + Collision_Range{first = collision_start, count = scene.collision_points.len - collision_start,
+		upright = 0, upright_height = 0}
 	&scene.models + gpu
 	return scene.models.len - 1
 }
@@ -958,10 +966,12 @@ grow_tree_model :: fun(scene: ^Scene, loader: Loader, kind: ^Tree_Kind, seed_ind
 	read_speed_tree(data, &tree)?
 	seed := if look.seeds.len > 0 do look.seeds[seed_index] else tree.seed
 	loader.room.model.len = 0
-	grown, _ := grow_tree(&tree, seed, look.leaves, kind.fit, &loader.room.model)?
+	grown, report := grow_tree(&tree, seed, look.leaves, kind.fit, &loader.room.model)?
 	gpu := upload_model(loader.renderer, &grown, loader.archives, &loader.room.texture)?
-	// (No collision yet: walking goes through trees.)
-	&scene.model_collision + Collision_Range{first = scene.collision_points.len, count = 0}
+	// Its trunk walked round (a shrub's walked through).
+	trunk := if report.trunk_radius >= TREE_TRUNK_LEAST do report.trunk_radius else 0
+	&scene.model_collision + Collision_Range{first = scene.collision_points.len, count = 0, upright = trunk,
+		upright_height = grown.bounds_max.z}
 	&scene.models + gpu
 	return scene.models.len - 1
 }
@@ -1485,7 +1495,8 @@ add_part_model :: fun(scene: ^Scene, loader: Loader, mesh: ^Nif, node: i64, left
 	gpu := upload_model(loader.renderer, &built, loader.archives, &room.texture)?
 	collision_start := scene.collision_points.len
 	add_collision_part(mesh, node, left_out, &scene.collision_points)
-	&scene.model_collision + Collision_Range{first = collision_start, count = scene.collision_points.len - collision_start}
+	&scene.model_collision + Collision_Range{first = collision_start, count = scene.collision_points.len - collision_start,
+		upright = 0, upright_height = 0}
 	&scene.models + gpu
 	return scene.models.len - 1
 }

@@ -31,7 +31,8 @@ Oblivion.esm and the base game's archives; sizes are as stored.
   Open/Close sequences and their sound keys.
 - **Land normal maps:** each layer's `_n`, blended as its colors are.
 - **Sound:** WAV files, SOUN records, placed sounds, light and activator
-  sounds, door sounds.
+  sounds, door sounds, the player's weapon swishes and blows
+  (WPNSwish*, WPNHit*: on flesh, or on anything else).
 - **NPCs, standing:** the people placed (ACHR), each put together from
   their race's body (its textures on the shared meshes) and head parts,
   their eyes and hair (tinted by their hair color), a tail for the beast
@@ -81,7 +82,7 @@ Oblivion.esm and the base game's archives; sizes are as stored.
 | NPCs moving about | IDLE 650 (the idles their conditions pick), AI packages, the walking and turning `.kf` | they stand where they're placed, breathing (`idle.kf`) |
 | Faces' age and expressions | the age maps (`headhuman{m,f}{10..60}.dds` and their normal maps: the skin shader's FaceGenMap1, times 4), which `facegen\si.ctl`'s age control picks; `.tri` 85 (expressions, the mouth for speech); the bodies' `.egt` | shapes and skins are used (see above); the skin is as if of no age |
 | Weapons and shields worn | WEAP, their models on the back or side (a mesh's `Prn` names the bone: SideWeapon, BackWeapon) | the player holds one in first person |
-| Combat | WEAP damage and reach, health, NPC reactions (stagger, recoil `.kf`), blocking, power attacks, the player's gear and inventory | a blow finds whom it meets; nothing comes of it yet |
+| Combat | WEAP damage and reach, health, NPC reactions (stagger, recoil `.kf`), blocking, power attacks, the player's gear and inventory | a blow finds whom or what it meets, and sounds; nothing comes of it yet |
 | Creatures | ACRE 1,473 placed; CREA 914; 34 creature folders | none drawn |
 | Animations | `.kf` 1,843 (creatures 1,068, characters 775); IDLE 650 | read (B-splines too, and text keys); NPCs play idle.kf; the player's first-person idle and two attacks |
 | Voices | Voices1/2 BSAs: 38,898 `.mp3` + `.lip`, 1.7 GB; DIAL 3,817, INFO 19,278 | mp3.mara decodes them (checked against ffmpeg); `.lip` drives FaceGen mouth morphs |
@@ -96,7 +97,7 @@ lightning) and the regions' sounds (birds, insects, wind).
 
 | What | Data | Notes |
 |---|---|---|
-| Trees' wind, fronds, collision | `.spt` flexibility curves (6002, 6003), wind (9000s, 16000s), fronds (13000s, 14002), collision (5000s); TREE CNAM leaf angles, dimming, rock and rustle speeds | trees stand still and can be walked through |
+| Trees' wind, fronds, collision | `.spt` flexibility curves (6002, 6003), wind (9000s, 16000s), fronds (13000s, 14002), collision (5000s); TREE CNAM leaf angles, dimming, rock and rustle speeds | trees stand still; their trunks are walked round as cylinders (not the files' collision shapes) |
 | Sunbeams | `sunbeam01–03.nif` | |
 | HDR (eye adapting, bloom) | WTHR HNAM | |
 | Water reflections | — | framebuffers are in now; left for later earlier |
@@ -198,6 +199,15 @@ guesses for now.
 - The weather through a gate: it goes on into a world of the same
   climate here (a city has its parent Tamriel's); another climate's
   world (an Oblivion realm) starts its own at once.
+- Walking into trees and people: a tree's trunk is an upright cylinder
+  as thick as its grown trunk's foot here (or its ring above, the
+  thinner), shrubs (thinner than 8 across) walked through; a person a
+  cylinder 56 across and 128 tall. The game has the trees' `.spt`
+  collision shapes and the actors' own.
+- A swing's swish by the weapon's kind and weight (two-handed: large; a
+  one-handed blade under 6: small; else medium), played as the swing
+  starts; a blow's sound as it lands, by edge (blunt or blade), on flesh
+  or on anything else.
 - What E aims at: the collision here, a door counting up to 48 units
   behind a wall's collision (the castles' tower walls close their
   collision over their load doors' doorways). The game may aim at what's

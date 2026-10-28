@@ -441,7 +441,7 @@ Growth :: struct {
 // its leaves, cards that face the camera (leaf_texture), made in storage.
 // Fitted to its billboard's size (Tree_Fit), where that's given.
 grow_tree :: fun(tree: ^Speed_Tree, seed: i64, leaf_texture: []utf8, fit: Tree_Fit, storage: ^[]byte) -> Model, Growth_Report, err {
-	report := Growth_Report{branches = 0, leaves = 0, left_out = 0}
+	report := Growth_Report{branches = 0, leaves = 0, left_out = 0, trunk_radius = 0}
 	if tree.levels.len == 0 do return Model{0}, report, Not_A_Speed_Tree
 	growth := Growth{
 		tree = tree,
@@ -498,7 +498,8 @@ grow_tree :: fun(tree: ^Speed_Tree, seed: i64, leaf_texture: []utf8, fit: Tree_F
 	&bark_texture + ".dds"
 	if growth.bark_indices.len > 0 do &parts + tree_part(&growth, false, bark_texture)
 	if growth.leaf_indices.len > 0 do &parts + tree_part(&growth, true, leaf_texture)
-	report = Growth_Report{branches = growth.branches, leaves = growth.leaves, left_out = growth.left_out}
+	report = Growth_Report{branches = growth.branches, leaves = growth.leaves, left_out = growth.left_out,
+		trunk_radius = trunk_foot_radius(&growth)}
 	return Model{parts = parts, flips = [], particles = [], motions = [], bounds_min = low, bounds_max = high, palette = []}, report
 }
 
@@ -521,11 +522,36 @@ grow_from_seed :: fun(growth: ^Growth, seed: i64) {
 }
 
 // What growing a tree made: how many branches (the trunk one) and leaves,
-// and how many were left out for want of room.
+// and how many were left out for want of room; how thick its trunk is at
+// its foot (its radius, from the tree's middle).
 Growth_Report :: struct {
 	branches: i64
 	leaves: i64
 	left_out: i64
+	trunk_radius: f32
+}
+
+// The trunk's radius at its foot, as grown and fitted: its first ring's
+// or its second's, the thinner (a flared foot is let in), each across (x
+// and y) from its middle on average. (The trunk is the first tube grown,
+// its rings the first of its vertices: around + 1 to a ring.)
+trunk_foot_radius :: fun(growth: ^Growth) -> f32 {
+	around := max(growth.tree.levels[0].around, 3)
+	if growth.bark_vertices.len < (around + 1) * 2 do return 0
+	thinnest : f32 = 1000000
+	for ring in 0:2 {
+		first := ring * (around + 1)
+		middle := Vec3{0, 0, 0}
+		for k in first:first + around do middle = middle + growth.bark_vertices[k].position
+		middle = middle * (1 / f32(around))
+		total : f32 = 0
+		for k in first:first + around {
+			at := growth.bark_vertices[k].position - middle
+			total += sqrt_f32(at.x * at.x + at.y * at.y)
+		}
+		thinnest = min(thinnest, total / f32(around))
+	}
+	return thinnest
 }
 
 // Grows a branch of a level from start, its way, length and radius, bent

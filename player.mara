@@ -31,14 +31,32 @@ WEAPON_BONE :: "Weapon"
 // A weapon's scabbard, in its mesh: shown only while it's sheathed.
 SCABBARD_NODE :: "Scb"
 EYE_BONE :: "Camera01"
-// How far a blow reaches (units), and how a person is met by it: an
-// upright cylinder from where they stand, as wide and tall as one.
+// How far a blow reaches (units). A person's met by it as the walker
+// meets them: an upright cylinder (PERSON_RADIUS, PERSON_HEIGHT).
 STRIKE_REACH :: 160
 // How long one animation takes to give way to the next (seconds): their
 // poses mixed, the new one's share growing.
 HELD_BLEND :: 0.12
-PERSON_RADIUS :: 28
-PERSON_HEIGHT :: 128
+
+// The sounds of swings and blows: Oblivion.esm's SOUN records (by form
+// id), each a folder of sounds one's picked from. A swish as a swing
+// starts, by the weapon's size; a blow's, by its edge, on flesh or on
+// anything else.
+SOUND_SWISH_SMALL :: 0x000872C2         // WPNSwishSmall
+SOUND_SWISH_MEDIUM :: 0x000887F7        // WPNSwishMedium
+SOUND_SWISH_LARGE :: 0x0008976F         // WPNSwishLarge
+SOUND_HIT_BLADE_FLESH :: 0x0018B9F1     // WPNHitBladeFlesh
+SOUND_HIT_BLUNT_FLESH :: 0x0018B9F2     // WPNHitBluntFlesh
+SOUND_HIT_BLADE :: 0x00025415           // WPNHitBlade
+SOUND_HIT_BLUNT :: 0x00025414           // WPNHitBlunt
+// A weapon's kind (its DATA's first field), and the weight a one-handed
+// blade swishes small under (a dagger's).
+WEAPON_BLADE_ONE_HAND :: 0
+WEAPON_BLADE_TWO_HAND :: 1
+WEAPON_BLUNT_ONE_HAND :: 2
+WEAPON_BLUNT_TWO_HAND :: 3
+WEAPON_STAFF :: 4
+SMALL_BLADE_WEIGHT :: 6
 
 // The first-person animations (held_animation_path).
 HELD_IDLE :: 0
@@ -68,8 +86,10 @@ Held_Animation :: struct {
 // whether its blow is struck yet; the one it took over from (-1 for none),
 // held where it was then, mixed out over HELD_BLEND from the start. A
 // blow struck since the viewer last told of it: swung, and whom it met (a
-// reference; 0 for no one). What's drawn with the camera: instances (none
-// till it's made: ready).
+// reference; 0 for no one) or whether it met something else. A swing begun
+// since the viewer last told of it. The weapon's sounds (SOUN form ids):
+// its swish, its blows on flesh and on things. What's drawn with the
+// camera: instances (none till it's made: ready).
 First_Person :: struct {
 	ready: bool
 	model: i64
@@ -88,8 +108,32 @@ First_Person :: struct {
 	left_at: f32
 	swung: bool
 	struck_reference: u32
+	struck_thing: bool
+	swinging: bool
+	swish_sound: u32
+	flesh_sound: u32
+	thing_sound: u32
 	weapon_icon: [160]utf8   // the weapon's icon (its ICON: under textures\menus\icons\), for the HUD; empty for none
 	instances: [1]render.Instance
+}
+
+// The sounds a weapon makes (its record): a two-handed one's swish large,
+// a light blade's small, others' medium; a blunt one's (a staff's too)
+// blows blunt, others' a blade's.
+take_weapon_sounds :: fun(held: ^First_Person, weapon: Record) {
+	data, has_data := find_field(weapon.data, "DATA")
+	if not has_data or data.len < 28 do return
+	kind : u32 = data[0]
+	weight : f32 = data[24]
+	if kind == WEAPON_BLADE_TWO_HAND or kind == WEAPON_BLUNT_TWO_HAND or kind == WEAPON_STAFF {
+		held.swish_sound = SOUND_SWISH_LARGE
+	elif kind == WEAPON_BLADE_ONE_HAND and weight < SMALL_BLADE_WEIGHT
+		held.swish_sound = SOUND_SWISH_SMALL
+	}
+	if kind == WEAPON_BLUNT_ONE_HAND or kind == WEAPON_BLUNT_TWO_HAND or kind == WEAPON_STAFF {
+		held.flesh_sound = SOUND_HIT_BLUNT_FLESH
+		held.thing_sound = SOUND_HIT_BLUNT
+	}
 }
 
 // An animation's file (HELD_*).
@@ -122,8 +166,12 @@ make_first_person :: fun(viewer: ^Viewer, plugin: ^Plugin) -> err {
 	look.has_face = false
 	scratch : [256 * KB]byte
 	held.weapon_icon.len = 0
+	held.swish_sound = SOUND_SWISH_MEDIUM
+	held.flesh_sound = SOUND_HIT_BLADE_FLESH
+	held.thing_sound = SOUND_HIT_BLADE
 	weapon, weapon_error := find_record(plugin, u32(PLAYER_WEAPON), &scratch)
 	if not weapon_error {
+		take_weapon_sounds(held, weapon)
 		weapon_icon, has_icon := find_field(weapon.data, "ICON")
 		if has_icon do add_what_fits(&held.weapon_icon, field_text(weapon_icon))
 		weapon_model, has_model := find_field(weapon.data, "MODL")
@@ -153,7 +201,7 @@ make_first_person :: fun(viewer: ^Viewer, plugin: ^Plugin) -> err {
 	}
 	held.model = shown.models.len
 	&shown.models + held.gpu
-	&shown.model_collision + Collision_Range{first = shown.collision_points.len, count = 0}
+	&shown.model_collision + Collision_Range{first = shown.collision_points.len, count = 0, upright = 0, upright_height = 0}
 	held.eye_bone = pose_index(held.bones, EYE_BONE)
 	held.eye_turn = mat4_identity()
 	if held.eye_bone >= 0 {
@@ -164,6 +212,8 @@ make_first_person :: fun(viewer: ^Viewer, plugin: ^Plugin) -> err {
 	start_held(held, HELD_IDLE, viewer.look.time)
 	held.swung = false
 	held.struck_reference = 0
+	held.struck_thing = false
+	held.swinging = false
 	held.ready = true
 }
 
@@ -219,8 +269,10 @@ read_held_keys :: fun(kf: ^Nif, text_keys: i64, held_animation: ^Held_Animation)
 }
 
 // Starts an animation (HELD_*) at a time: nothing to follow it, its blow
-// not struck; the one playing (if any) mixed out, from where it is.
+// not struck; the one playing (if any) mixed out, from where it is. An
+// attack's a swing begun (swinging).
 start_held :: fun(held: ^First_Person, which: i64, now: f32) {
+	if which != HELD_IDLE do held.swinging = true
 	held.left = held.playing
 	held.left_at = held.at
 	held.playing = which
@@ -239,16 +291,18 @@ step_first_person :: fun(viewer: ^Viewer, clicked: bool) {
 	held := &viewer.held
 	if not held.ready do return
 	now := viewer.look.time
-	// A picture's: one animation held at a time, its blow struck once past its hit.
+	// A picture's: one animation held at a time, its blow struck once past
+	// its hit (once what's there is loaded: picture_settled).
 	if viewer.picture.held >= 0 {
 		which := viewer.picture.held
 		if held.playing != which do start_held(held, which, now)
 		held.left = -1
 		held.at = min_f32(held.animations[which].start + viewer.picture.held_at, held.animations[which].stop)
-		if not held.struck and held.animations[which].hit >= 0 and held.at >= held.animations[which].hit {
+		past_hit := held.animations[which].hit >= 0 and held.at >= held.animations[which].hit
+		if not held.struck and past_hit and viewer.picture_settled > 0 {
 			held.struck = true
 			held.swung = true
-			held.struck_reference = strike(&viewer.shown, viewer.camera)
+			held.struck_reference, held.struck_thing = strike(&viewer.shown, viewer.camera)
 		}
 		return
 	}
@@ -267,7 +321,7 @@ step_first_person :: fun(viewer: ^Viewer, clicked: bool) {
 		if not held.struck and held_animation.hit >= 0 and at >= held_animation.hit {
 			held.struck = true
 			held.swung = true
-			held.struck_reference = strike(&viewer.shown, viewer.camera)
+			held.struck_reference, held.struck_thing = strike(&viewer.shown, viewer.camera)
 		}
 		cut_short := held.following >= 0 and held_animation.follow >= 0 and at >= held_animation.follow
 		if cut_short or at >= held_animation.stop {
@@ -328,39 +382,51 @@ pose_first_person :: fun(viewer: ^Viewer) {
 }
 
 // Who a blow from the camera meets within reach (STRIKE_REACH but where
-// said), short of a wall: the nearest person (an NPC, as an upright
-// cylinder PERSON_RADIUS wide and PERSON_HEIGHT tall from where they
-// stand); their reference, 0 for no one.
-strike :: fun(shown: ^Scene, camera: render.Camera, farthest: f32 = STRIKE_REACH) -> u32 {
+// said), short of a wall: the nearest person (an NPC, as the upright
+// cylinder walked round: PERSON_RADIUS wide and PERSON_HEIGHT tall from
+// where they stand); their reference, 0 for no one. And, meeting no one
+// first, whether it meets something else: a wall, a thing, a tree's trunk.
+strike :: fun(shown: ^Scene, camera: render.Camera, farthest: f32 = STRIKE_REACH) -> u32, bool {
 	forward, _, _ := render.camera_axes(camera)
 	reach := farthest
 	_, wall, hit_wall := pick(shown, camera.position, forward, reach)
 	if hit_wall do reach = wall
 	struck : u32 = 0
+	thing := hit_wall
 	for &instance in shown.instances {
-		_, is_person := index_get(&shown.model_rigs, u64(instance.model + 1))
-		if not is_person do continue
-		feet := Vec3{instance.placement[3][0], instance.placement[3][1], instance.placement[3][2]}
-		// Where the line enters the cylinder, across (x and y): the nearer
-		// root of |from + t way| = radius; 0 from inside it.
-		from_x := camera.position.x - feet.x
-		from_y := camera.position.y - feet.y
-		a := forward.x * forward.x + forward.y * forward.y
-		b := 2 * (from_x * forward.x + from_y * forward.y)
-		c := from_x * from_x + from_y * from_y - PERSON_RADIUS * PERSON_RADIUS
-		t : f32 = 0
-		if c > 0 {
-			if a < 0.000001 do continue
-			room := b * b - 4 * a * c
-			if room < 0 do continue
-			t = (0 - b - sqrt_f32(room)) / (2 * a)
-			if t < 0 do continue
-		}
-		if t > reach do continue
-		height := camera.position.z + forward.z * t - feet.z
-		if height < 0 or height > PERSON_HEIGHT do continue
+		range := shown.model_collision[instance.model]
+		if range.upright == 0 do continue
+		scale := vec3_length(Vec3{instance.world[0][0], instance.world[0][1], instance.world[0][2]})
+		feet := Vec3{instance.world[3][0], instance.world[3][1], instance.world[3][2]}
+		t, met := upright_met(camera.position, forward, feet, range.upright * scale, range.upright_height * scale)
+		if not met or t > reach do continue
 		reach = t
-		struck = instance.reference
+		_, is_person := index_get(&shown.model_rigs, u64(instance.model + 1))
+		struck = if is_person do instance.reference else 0
+		thing = not is_person
 	}
-	return struck
+	return struck, struck == 0 and thing
+}
+
+// Where a line from a place (by way, its length 1) meets an upright
+// cylinder from feet, radius wide and height tall, if it does: how far
+// along (0 from inside it).
+upright_met :: fun(from: Vec3, way: Vec3, feet: Vec3, radius: f32, height: f32) -> f32, bool {
+	// Where the line enters the cylinder, across (x and y): the nearer
+	// root of |from + t way| = radius.
+	from_x := from.x - feet.x
+	from_y := from.y - feet.y
+	a := way.x * way.x + way.y * way.y
+	b := 2 * (from_x * way.x + from_y * way.y)
+	c := from_x * from_x + from_y * from_y - radius * radius
+	t : f32 = 0
+	if c > 0 {
+		if a < 0.000001 do return 0, false
+		room := b * b - 4 * a * c
+		if room < 0 do return 0, false
+		t = (0 - b - sqrt_f32(room)) / (2 * a)
+		if t < 0 do return 0, false
+	}
+	up := from.z + way.z * t - feet.z
+	return t, up >= 0 and up <= height
 }

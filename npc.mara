@@ -62,6 +62,11 @@ HEAD_BONE :: "Bip01 Head"
 // a bit no text's hash sets.
 NPC_MODEL_KEY :: 0x8000000000000000
 
+// A person as the walker and blows meet them: an upright cylinder from
+// where they stand, as wide and tall as one.
+PERSON_RADIUS :: 28
+PERSON_HEIGHT :: 128
+
 // Parts an NPC is made of, at most; shapes its model has, at most.
 NPC_PARTS :: 32
 NPC_MODEL_PARTS :: 128
@@ -547,8 +552,9 @@ build_npc_model :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, npc_id: u
 		first_entry = scene.rig_entries.len, entry_count = whole.palette.len}
 	for entry in whole.palette do &scene.rig_entries + entry
 	_ = index_put(&scene.model_rigs, u64(scene.models.len + 1), scene.npc_rigs.len)
-	// (No collision: walking goes through people for now.)
-	&scene.model_collision + Collision_Range{first = scene.collision_points.len, count = 0}
+	// Walked round, as an upright cylinder.
+	&scene.model_collision + Collision_Range{first = scene.collision_points.len, count = 0, upright = PERSON_RADIUS,
+		upright_height = PERSON_HEIGHT}
 	&scene.models + gpu
 	return scene.models.len - 1
 }

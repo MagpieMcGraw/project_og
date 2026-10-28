@@ -86,6 +86,8 @@ PICTURE_LOG_PATH :: "picture.log"
 // in it (seconds), past its hit striking once. Out, once it's settled it
 // goes through the door out (the one whose outside was readied, else the
 // nearest), and the picture's of the other side, once that's settled.
+// Walking (walk_for), it's on foot, going forward that many seconds first
+// (else it flies, where it's put).
 Picture :: struct {
 	path: [260]utf8      // empty: no picture, the window shown
 	placed: bool
@@ -98,6 +100,7 @@ Picture :: struct {
 	menu_page: i64       // the menu's page (1 to 5); 0 for its first
 	timed_frames: i64    // frames drawn and timed once it's settled, before it's taken; 0 for none
 	out: bool            // through the door out once it's settled, the picture taken there
+	walk_for: f32        // seconds walked forward first, on foot; 0: flying
 }
 PICTURE_SETTLE :: 3
 PICTURE_MOST_FRAMES :: 6000
@@ -105,7 +108,7 @@ PICTURE_MOST_FRAMES :: 6000
 // No picture: the window shown, as usual.
 no_picture :: fun() -> Picture {
 	return Picture{path = [], placed = false, position = Vec3{0, 0, 0}, yaw = 0, pitch = 0, held = -1, held_at = 0, menu = 0, menu_page = 0,
-		timed_frames = 0, out = false}
+		timed_frames = 0, out = false, walk_for = 0}
 }
 // How much faster than ours the game's day goes (Oblivion's own), and,
 // with T held, how much faster again.
@@ -242,6 +245,7 @@ Viewer :: struct {
 	picture: Picture
 	picture_frames: i64
 	picture_settled: i64
+	picture_walked: f32   // seconds a picture's walk has gone (Picture.walk_for)
 	// A picture's timed frames: since when, the processor's drawing and the
 	// HUD's (and the open menu's) share of it, added up.
 	timing_since: u64
@@ -338,6 +342,7 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	set_vsync(&viewer.platform, not taking_picture)
 	viewer.picture_frames = 0
 	viewer.picture_settled = 0
+	viewer.picture_walked = 0
 	viewer.held.ready = false
 	viewer.held.instances.len = 0
 	viewer.hud.ready = false
@@ -363,7 +368,8 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.exit_door = -1
 	viewer.missed = false
 	viewer.missed_target = 0
-	viewer.walking = false
+	// On foot (taking a picture, only if it walks).
+	viewer.walking = if taking_picture do viewer.picture.walk_for > 0 else true
 	viewer.walker = Walker{position = Vec3{0, 0, 0}, rising = 0, on_ground = false}
 	viewer.eyes = 0
 	viewer.sky_world = 0
@@ -545,7 +551,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	// What the HUD names: a person the reticle's on within reach (they've no
 	// collision for targeted_reference to meet), else what it is on; and
 	// what using it would do.
-	person := strike(shown, camera^, DOOR_REACH)
+	person, _ := strike(shown, camera^, DOOR_REACH)
 	viewer.targeted = if person != 0 do person else targeted
 	viewer.hud.activate = 0
 	if usable do viewer.hud.activate = ICON_DOOR
@@ -567,6 +573,11 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	}
 
 	seconds, now := time_since(viewer.frame_start)
+	// A picture's walk: forward till its seconds have gone.
+	if viewer.picture_walked < viewer.picture.walk_for {
+		input.held[W] = true
+		viewer.picture_walked += f32(seconds)
+	}
 	viewer.frame_start = now
 
 	if platform.mouse_look {
@@ -659,7 +670,8 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	}
 	if viewer.picture.path.len > 0 {
 		viewer.picture_frames += 1
-		viewer.picture_settled = if still_loading(viewer) do 0 else viewer.picture_settled + 1
+		walked := viewer.picture_walked >= viewer.picture.walk_for
+		viewer.picture_settled = if still_loading(viewer) or not walked do 0 else viewer.picture_settled + 1
 		// Out: through the door out, once (it's settled again there).
 		if viewer.picture.out and viewer.picture_settled > PICTURE_SETTLE and shown.doors.len > 0 {
 			viewer.picture.out = false
@@ -786,6 +798,15 @@ take_picture :: fun(viewer: ^Viewer) {
 	note(journal, viewer.picture_frames)
 	note(journal, " frames, into ")
 	note(journal, viewer.picture.path)
+	note(journal, "; the camera at ")
+	note(journal, i64(viewer.camera.position.x))
+	note(journal, " ")
+	note(journal, i64(viewer.camera.position.y))
+	note(journal, " ")
+	note(journal, i64(viewer.camera.position.z))
+	note(journal, ", turned ")
+	note(journal, i64(viewer.camera.yaw * 180 / PI))
+	note(journal, " degrees")
 	note_end(journal)
 }
 
@@ -856,12 +877,21 @@ reference_name :: fun(plugin: ^Plugin, reference_id: u32) -> str256 {
 	return name
 }
 
-// Tells the journal what a blow met: whom (their name), or no one.
+// Plays a sound of the player's (a SOUN record's form id) where they are.
+play_player_sound :: fun(viewer: ^Viewer, plugin: ^Plugin, sound: u32) {
+	shown := &viewer.shown
+	kind := scene_sound_kind(shown, plugin, sound)
+	if kind < 0 do return
+	play_once(&viewer.audio, &viewer.archives, &shown.sound_kinds[kind], viewer.camera.position, listener_of(viewer.camera))
+}
+
+// Tells the journal what a blow met: whom (their name), something else, or
+// nothing.
 note_blow :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	journal := &viewer.journal
 	struck := viewer.held.struck_reference
 	if struck == 0 {
-		note(journal, "swung at no one")
+		note(journal, if viewer.held.struck_thing do "struck something" else "swung at no one")
 		note_end(journal)
 		return
 	}
@@ -1776,10 +1806,12 @@ command_view_world :: fun(name: []utf8, x: i64, y: i64, picture: Picture) {
 	explore(&viewer, &plugin)
 }
 
-// Flies around until the viewer quits: through doors when E is pressed at
-// one, and outside, into the cells around the camera as it moves — what
-// they need loaded a little each frame.
+// Flies or walks around until the viewer quits (on foot from where the
+// camera starts): through doors when E is pressed at one, and outside,
+// into the cells around the camera as it moves — what they need loaded a
+// little each frame.
 explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	place_walker(viewer)
 	scratch : [16 * MB]byte = void
 	scratch.len = 0
 	journal := &viewer.journal
@@ -1852,8 +1884,16 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 			viewer.hud.named = viewer.targeted
 			viewer.hud.name = reference_name(plugin, viewer.targeted)
 		}
+		// A swing's swish as it starts; its blow's sound as it lands, on
+		// someone or something.
+		if viewer.held.swinging {
+			play_player_sound(viewer, plugin, viewer.held.swish_sound)
+			viewer.held.swinging = false
+		}
 		if viewer.held.swung {
 			note_blow(viewer, plugin)
+			if viewer.held.struck_reference != 0 do play_player_sound(viewer, plugin, viewer.held.flesh_sound)
+			elif viewer.held.struck_thing do play_player_sound(viewer, plugin, viewer.held.thing_sound)
 			viewer.held.swung = false
 		}
 		if viewer.missed {

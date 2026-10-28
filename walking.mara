@@ -49,6 +49,8 @@ Nearby :: struct {
 	world: Mat4            // the model's space to the world
 	to_model: Mat4         // and back
 	scale: f32             // how much bigger the instance is than its model
+	upright: f32           // its model's upright cylinder (Collision_Range): radius and height; 0 for none
+	upright_height: f32
 }
 
 // Moves a walker a frame through the scene: going across the ground (units
@@ -104,18 +106,38 @@ find_nearby :: fun(walker: ^Walker, shown: ^Scene, reach: f32, nearby: ^[]Nearby
 	middle := walker.position + Vec3{0, 0, WALKER_HEIGHT * 0.5}
 	for &instance in shown.instances {
 		range := shown.model_collision[instance.model]
-		if range.count == 0 do continue
+		if range.count == 0 and range.upright == 0 do continue
 		if vec3_length(instance.center - middle) > instance.radius + reach do continue
 		if not fits(nearby.len + 1, nearby.cap) do return
 		nearby + Nearby{first = range.first, count = range.count, world = instance.world,
 			to_model = mat4_inverse(instance.world),
-			scale = vec3_length(Vec3{instance.world[0][0], instance.world[0][1], instance.world[0][2]})}
+			scale = vec3_length(Vec3{instance.world[0][0], instance.world[0][1], instance.world[0][2]}),
+			upright = range.upright, upright_height = range.upright_height}
 	}
 }
 
 // Pushes the walker's spheres out of the triangles they're in, one
-// triangle at a time.
+// triangle at a time; and the walker out of the upright cylinders it's in,
+// across.
 push_out :: fun(walker: ^Walker, shown: ^Scene, nearby: ^[]Nearby) {
+	for &near in nearby {
+		if near.upright == 0 do continue
+		foot := Vec3{near.world[3][0], near.world[3][1], near.world[3][2]}
+		if walker.position.z + WALKER_HEIGHT < foot.z or walker.position.z + STEP_HEIGHT > foot.z + near.upright_height * near.scale do continue
+		reach := near.upright * near.scale + WALKER_RADIUS
+		away_x := walker.position.x - foot.x
+		away_y := walker.position.y - foot.y
+		distance := sqrt_f32(away_x * away_x + away_y * away_y)
+		if distance >= reach do continue
+		// (Right on its middle: out any way.)
+		if distance < 0.001 {
+			away_x = 1
+			away_y = 0
+			distance = 1
+		}
+		walker.position.x = foot.x + away_x / distance * reach
+		walker.position.y = foot.y + away_y / distance * reach
+	}
 	heights : [3!]f32 = [STEP_HEIGHT + WALKER_RADIUS, WALKER_HEIGHT * 0.5 + STEP_HEIGHT * 0.5, WALKER_HEIGHT - WALKER_RADIUS]
 	for height in heights {
 		for &near in nearby {
