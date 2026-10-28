@@ -32,6 +32,9 @@ EYE_BONE :: "Camera01"
 // How far a blow reaches (units), and how a person is met by it: an
 // upright cylinder from where they stand, as wide and tall as one.
 STRIKE_REACH :: 160
+// How long one animation takes to give way to the next (seconds): their
+// poses mixed, the new one's share growing.
+HELD_BLEND :: 0.12
 PERSON_RADIUS :: 28
 PERSON_HEIGHT :: 128
 
@@ -57,25 +60,30 @@ Held_Animation :: struct {
 }
 
 // The player's first-person model and how it's posed now: the scene's
-// model and its palette's entries; where its eyes are (as the idle
-// starts, in its own space); the animation playing, since when (the
+// model and its palette's entries; its eyes' bone (Camera01; -1 when it
+// hasn't one: then EYE_HEIGHT up) and their turn; the animation playing, since when (the
 // look's time), where in it now, the attack to follow it (-1 for none),
-// whether its blow is struck yet. A blow struck since the viewer last told
-// of it: swung, and whom it met (a reference; 0 for no one). What's drawn
-// with the camera: instances (none till it's made: ready).
+// whether its blow is struck yet; the one it took over from (-1 for none),
+// held where it was then, mixed out over HELD_BLEND from the start. A
+// blow struck since the viewer last told of it: swung, and whom it met (a
+// reference; 0 for no one). What's drawn with the camera: instances (none
+// till it's made: ready).
 First_Person :: struct {
 	ready: bool
 	model: i64
 	gpu: render.Gpu_Model
 	bones: [MAX_POSE_BONES]Pose_Bone
 	entries: [NPC_PALETTE]Palette_Entry
-	eye: Vec3
+	eye_bone: i64
+	eye_turn: Mat4      // how its eyes are turned as the idle starts (a camera's axes: looking down -z, y up)
 	animations: [HELD_ANIMATIONS!]Held_Animation
 	playing: i64
 	started: f32
 	at: f32
 	following: i64
 	struck: bool
+	left: i64
+	left_at: f32
 	swung: bool
 	struck_reference: u32
 	instances: [1]render.Instance
@@ -143,12 +151,13 @@ make_first_person :: fun(viewer: ^Viewer, plugin: ^Plugin) -> err {
 	held.model = shown.models.len
 	&shown.models + held.gpu
 	&shown.model_collision + Collision_Range{first = shown.collision_points.len, count = 0}
-	held.eye = Vec3{0, 0, EYE_HEIGHT}
-	eye := pose_index(held.bones, EYE_BONE)
-	if eye >= 0 {
-		place := held.bones[eye].place
-		held.eye = Vec3{place[3][0], place[3][1], place[3][2]}
+	held.eye_bone = pose_index(held.bones, EYE_BONE)
+	held.eye_turn = mat4_identity()
+	if held.eye_bone >= 0 {
+		held.eye_turn = held.bones[held.eye_bone].place
+		held.eye_turn[3] = [0, 0, 0, 1]
 	}
+	held.playing = -1
 	start_held(held, HELD_IDLE, viewer.look.time)
 	held.swung = false
 	held.struck_reference = 0
@@ -207,8 +216,10 @@ read_held_keys :: fun(kf: ^Nif, text_keys: i64, held_animation: ^Held_Animation)
 }
 
 // Starts an animation (HELD_*) at a time: nothing to follow it, its blow
-// not struck.
+// not struck; the one playing (if any) mixed out, from where it is.
 start_held :: fun(held: ^First_Person, which: i64, now: f32) {
+	held.left = held.playing
+	held.left_at = held.at
 	held.playing = which
 	held.started = now
 	held.at = held.animations[which].start
@@ -217,9 +228,10 @@ start_held :: fun(held: ^First_Person, which: i64, now: f32) {
 }
 
 // Moves the first-person animations on to the look's time: a click starts
-// an attack from the idle, or has the other follow the one playing (from
-// its follow key on); an attack strikes at its Hit key and at its end
-// gives way to the one following, or the idle; the idle loops.
+// an attack from the idle, or, during one, has the other follow it. An
+// attack strikes at its Hit key; one following cuts in at its follow key
+// (a:L, a:R), the swing cut short there, as the game does; else at its end
+// the idle comes back. The idle loops.
 step_first_person :: fun(viewer: ^Viewer, clicked: bool) {
 	held := &viewer.held
 	if not held.ready do return
@@ -228,6 +240,7 @@ step_first_person :: fun(viewer: ^Viewer, clicked: bool) {
 	if viewer.picture.held >= 0 {
 		which := viewer.picture.held
 		if held.playing != which do start_held(held, which, now)
+		held.left = -1
 		held.at = min_f32(held.animations[which].start + viewer.picture.held_at, held.animations[which].stop)
 		if not held.struck and held.animations[which].hit >= 0 and held.at >= held.animations[which].hit {
 			held.struck = true
@@ -241,7 +254,7 @@ step_first_person :: fun(viewer: ^Viewer, clicked: bool) {
 		at := held_animation.start + (now - held.started)
 		if held.playing == HELD_IDLE {
 			start_held(held, HELD_ATTACK_RIGHT, now)
-		elif held.following < 0 and held_animation.follow >= 0 and at >= held_animation.follow
+		elif held.following < 0
 			held.following = if held.playing == HELD_ATTACK_RIGHT do HELD_ATTACK_LEFT else HELD_ATTACK_RIGHT
 		}
 	}
@@ -253,7 +266,9 @@ step_first_person :: fun(viewer: ^Viewer, clicked: bool) {
 			held.swung = true
 			held.struck_reference = strike(&viewer.shown, viewer.camera)
 		}
-		if at >= held_animation.stop {
+		cut_short := held.following >= 0 and held_animation.follow >= 0 and at >= held_animation.follow
+		if cut_short or at >= held_animation.stop {
+			held.at = min_f32(at, held_animation.stop)   // (where it's mixed out from)
 			start_held(held, if held.following >= 0 do held.following else HELD_IDLE, now)
 			held_animation = &held.animations[held.playing]
 			at = held_animation.start
@@ -264,9 +279,11 @@ step_first_person :: fun(viewer: ^Viewer, clicked: bool) {
 	held.at = min_f32(at, held_animation.stop)
 }
 
-// Poses the first-person model as its animation has it now: its palette
-// added to the renderer's; placed with its eyes on the camera's, looking
-// its way; lit by the scene's lights near it. Drawn from held.instances.
+// Poses the first-person model as its animation has it now (mixed with
+// the one it took over from, at first): its palette added to the
+// renderer's; placed with its eyes, as the animation moves them, on the
+// camera, looking its way; lit by the scene's lights near it. Drawn from
+// held.instances.
 pose_first_person :: fun(viewer: ^Viewer) {
 	held := &viewer.held
 	held.instances.len = 0
@@ -275,7 +292,13 @@ pose_first_person :: fun(viewer: ^Viewer) {
 	if not fits(palette.len + held.entries.len, palette.cap) do return
 	held_animation := &held.animations[held.playing]
 	places : [MAX_POSE_BONES]Mat4
-	pose_rig(held_animation.rig, &held_animation.tracks, held.at, &places)
+	share := if held.left >= 0 do (viewer.look.time - held.started) / HELD_BLEND else 1
+	if share < 1 {
+		left := &held.animations[held.left]
+		blend_rigs(left.rig, &left.tracks, held.left_at, held_animation.rig, &held_animation.tracks, held.at, share, &places)
+	else
+		pose_rig(held_animation.rig, &held_animation.tracks, held.at, &places)
+	}
 	palette_base := palette.len
 	for entry in held.entries {
 		moving := entry.offset
@@ -290,7 +313,11 @@ pose_first_person :: fun(viewer: ^Viewer) {
 		turn[1][axis] = forward[axis]
 		turn[2][axis] = up[axis]
 	}
-	placement := mat4_mul(mat4_translate(viewer.camera.position), mat4_mul(turn, mat4_translate(Vec3{0, 0, 0} - held.eye)))
+	eye := mat4_translate(Vec3{0, 0, EYE_HEIGHT})
+	if held.eye_bone >= 0 and held.eye_bone < places.len do eye = places[held.eye_bone]
+	// (Its eyes as the animation moves them go where the camera is, turned
+	// as they are when the idle starts, which looks ahead.)
+	placement := mat4_mul(mat4_translate(viewer.camera.position), mat4_mul(turn, mat4_mul(held.eye_turn, mat4_inverse(eye))))
 	instance := render.place_instance(held.gpu, held.model, placement)
 	instance.palette_base = palette_base
 	render.choose_lights(&instance, &viewer.shown.lights)

@@ -635,6 +635,51 @@ pose_rig :: fun(rig: []Rig_Bone, tracks: ^[]Track, time: f32, places: ^[]Mat4) {
 	}
 }
 
+// Two rigs of one skeleton (bone for bone, as rig_nodes makes them) posed
+// at their times, each bone's place in its parent mixed: the second's by
+// share (0 to 1), the first's by the rest. Into places.
+blend_rigs :: fun(first: []Rig_Bone, first_tracks: ^[]Track, first_time: f32, second: []Rig_Bone, second_tracks: ^[]Track,
+	second_time: f32, share: f32, places: ^[]Mat4)
+{
+	places.len = 0
+	for k in 0:min(first.len, second.len) {
+		from := first[k].local
+		if first[k].track >= 0 do from = track_pose(&first_tracks[first[k].track], first_time)
+		to := second[k].local
+		if second[k].track >= 0 do to = track_pose(&second_tracks[second[k].track], second_time)
+		local := mix_transforms(from, to, share)
+		parent := second[k].parent
+		place := if parent >= 0 do mat4_mul(places[parent], local) else local
+		places + place
+	}
+}
+
+// A share of the way from one transform to another: where each is, and
+// their axes, mixed; the axes made square again (x first, y square to it,
+// z from the two) and as long as their mixed scale.
+mix_transforms :: fun(from: Mat4, to: Mat4, share: f32) -> Mat4 {
+	mixed := mat4_identity()
+	axes : [3!]Vec3
+	for column in 0:3 {
+		a := Vec3{from[column][0], from[column][1], from[column][2]}
+		b := Vec3{to[column][0], to[column][1], to[column][2]}
+		axes[column] = a + (b - a) * share
+	}
+	from_scale := vec3_length(Vec3{from[0][0], from[0][1], from[0][2]})
+	to_scale := vec3_length(Vec3{to[0][0], to[0][1], to[0][2]})
+	scale := from_scale + (to_scale - from_scale) * share
+	x := vec3_normalize(axes[0])
+	y := vec3_normalize(axes[1] - x * dot(x, axes[1]))
+	z := cross(x, y)
+	for axis in 0:3 {
+		mixed[0][axis] = x[axis] * scale
+		mixed[1][axis] = y[axis] * scale
+		mixed[2][axis] = z[axis] * scale
+		mixed[3][axis] = from[3][axis] + (to[3][axis] - from[3][axis]) * share
+	}
+	return mixed
+}
+
 // A node's name; empty for a block that isn't a node.
 node_name :: fun(mesh: ^Nif, index: i64) -> []utf8 {
 	match mesh.blocks[index] {
