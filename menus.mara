@@ -1,0 +1,1086 @@
+// The game's menus, read from their XML (menus\ in the Misc archive) and
+// drawn as it lays them out. A menu is a tree of tiles (menu, rect, image,
+// text, nif, template), each with traits (x, y, width, alpha, filename,
+// string, user0…). A trait is worked out by its operations in turn on a
+// working value: a constant, `<copy src="parent()" trait="width"/>`, then
+// `<add> 5 </add>`… An operation's argument is a constant, another tile's
+// trait (src a selector — me(), parent(), sibling(name), child(name),
+// screen(), strings() — or a tile's name), or operations of its own.
+// Booleans are &true; (2) and &false; (1): any other number is false. The
+// game sets traits too (book_set): what the player has, what's aimed at.
+//
+// Its units: a screen MENU_HEIGHT high and as wide as its shape makes it;
+// pictures drawn texel for texel (zoom 100) and cropped to their size.
+module sooblivion
+
+use mara.core
+use mara.math
+use mara.memory
+use mara.os
+use mara.string
+use bsa
+use logging
+render :: use render
+
+// Room for all the menus read: their tiles, traits and operations, and
+// the text their constants are written in.
+MENU_TILES :: 8192
+MENU_TRAITS :: 32768
+MENU_OPERATIONS :: 65536
+MENU_TEXT :: 1 * MB
+MENUS :: 64
+
+// What a tile is.
+TILE_MENU :: 1
+TILE_RECT :: 2
+TILE_IMAGE :: 3
+TILE_TEXT :: 4
+TILE_NIF :: 5
+TILE_TEMPLATE :: 6
+
+// What an operation does to the working value (see the top).
+OP_COPY :: 1
+OP_ADD :: 2
+OP_SUB :: 3
+OP_MUL :: 4
+OP_DIV :: 5
+OP_MOD :: 6
+OP_MIN :: 7
+OP_MAX :: 8
+OP_ABS :: 9
+OP_CEIL :: 10
+OP_FLOOR :: 11
+OP_GT :: 12
+OP_GTE :: 13
+OP_LT :: 14
+OP_LTE :: 15
+OP_EQ :: 16
+OP_NEQ :: 17
+OP_AND :: 18
+OP_OR :: 19
+OP_NOT :: 20
+OP_ONLY_IF :: 21
+OP_ONLY_IF_NOT :: 22
+OP_RAND :: 23
+OP_IGNORED :: 24   // ref: keyboard navigation's, not the layout's
+
+// The menus' booleans.
+MENU_TRUE :: 2
+MENU_FALSE :: 1
+// Justified (a text's justify): its x the left edge, the middle, the right edge.
+JUSTIFY_LEFT :: 1
+JUSTIFY_CENTER :: 2
+JUSTIFY_RIGHT :: 4
+// A zoom that stretches the whole picture to the tile's size (&scale;).
+ZOOM_SCALE :: -1
+
+// A trait's value: a number, or text.
+Menu_Value :: struct {
+	number: f32
+	text: [256]utf8
+	is_text: bool
+}
+
+// A tile: what it is, its name, where it is in its menu's tree (-1 for
+// none), its first trait (the rest linked from it), whether it's inside a
+// template (not drawn: the game makes copies of templates).
+Menu_Tile :: struct {
+	kind: i64
+	name: [64]utf8
+	parent: i64
+	first_child: i64
+	last_child: i64
+	next_sibling: i64
+	previous_sibling: i64
+	first_trait: i64
+	in_template: bool
+}
+
+// A trait of a tile: its name, the tile's next trait (-1 after the last),
+// its first operation (-1 for none; the rest linked from it). Its value:
+// set by the game (then its operations are passed over), or worked out in
+// a frame (stamp); working while it's being worked out (a loop: its last
+// value stands).
+Menu_Trait :: struct {
+	name: [32]utf8
+	next: i64
+	first_operation: i64
+	set: bool
+	value: Menu_Value
+	stamp: i64
+	working: bool
+}
+
+// An operation: what it does, the next in its list (-1 after the last),
+// its argument: a constant (a number, or text in the book's text), a
+// trait (src and trait), or operations (their first; -1 for none).
+Menu_Operation :: struct {
+	kind: i64
+	next: i64
+	has_constant: bool
+	number: f32
+	text_at: i64
+	text_length: i64
+	source: [64]utf8
+	trait: [32]utf8
+	first_argument: i64
+}
+
+// The menus read: their tiles, traits, operations and constants' text;
+// each menu's root tile; the strings (strings.xml's tile); the frame the
+// values are worked out for; the screen's size in the menus' units; the
+// game's fonts (by the menus' numbers, 1 to 5, less one).
+Menu_Book :: struct {
+	tiles: [MENU_TILES]Menu_Tile
+	traits: [MENU_TRAITS]Menu_Trait
+	operations: [MENU_OPERATIONS]Menu_Operation
+	text: [MENU_TEXT]utf8
+	menus: [MENUS]i64
+	strings: i64
+	frame: i64
+	screen_width: f32
+	screen_height: f32
+	fonts: [FONT_FILES!]Font
+	dice: u64
+}
+
+// Opens the book: nothing read but the game's fonts and strings.xml.
+book_open :: fun(book: ^Menu_Book, renderer: ^render.Renderer, archives: ^Archives, scratch: ^[]byte) -> err {
+	book.tiles.len = 0
+	book.traits.len = 0
+	book.operations.len = 0
+	book.text.len = 0
+	book.menus.len = 0
+	book.strings = -1
+	book.frame = 0
+	book.screen_width = MENU_HEIGHT
+	book.screen_height = MENU_HEIGHT
+	book.dice = 0x2545F4914F6CDD1D
+	for k in 0:FONT_FILES do load_font(&book.fonts[k], renderer, archives, font_file(k + 1), scratch)?
+	strings := book_read(book, archives, "menus\\strings.xml", scratch)?
+	book.strings = strings
+}
+
+// Reads a menu's XML (a path in the archives) into the book: its root
+// tile, by index.
+book_read :: fun(book: ^Menu_Book, archives: ^Archives, path: []utf8, scratch: ^[]byte) -> i64, err {
+	file, found := find_archived(archives, path)
+	if not found do return -1, File_Error.Open_Failed
+	scratch.len = 0
+	data := read_archived(archives, file, scratch)?
+	text : []utf8 = data
+	// A holder for what's at the file's top (the menu, and what it includes).
+	holder := new_tile(book, TILE_RECT, "", -1, false)
+	if holder < 0 do return -1, Too_Many_Tiles
+	at : i64 = 0
+	parse_children(book, archives, text, &at, holder, false)
+	root := book.tiles[holder].first_child
+	if root < 0 do return -1, Not_A_Menu
+	book.tiles[root].parent = -1
+	if fits(book.menus.len + 1, book.menus.cap) do &book.menus + root
+	return root
+}
+
+// What reading a menu can fail with.
+Menu_Error :: error {
+	Too_Many_Tiles   // the book's room for tiles is taken
+	Not_A_Menu       // its file has no tile
+}
+
+// ---- reading the XML ---------------------------------------------------------------
+
+// A new tile under parent (-1 for none), last of its children: its index;
+// -1 when the book has no room for it.
+new_tile :: fun(book: ^Menu_Book, kind: i64, name: []utf8, parent: i64, in_template: bool) -> i64 {
+	if not fits(book.tiles.len + 1, book.tiles.cap) do return -1
+	index := book.tiles.len
+	tile := next(&book.tiles)
+	tile.kind = kind
+	tile.name.len = 0
+	add_what_fits(&tile.name, name)
+	tile.parent = parent
+	tile.first_child = -1
+	tile.last_child = -1
+	tile.next_sibling = -1
+	tile.previous_sibling = -1
+	tile.first_trait = -1
+	tile.in_template = in_template
+	if parent >= 0 {
+		above := &book.tiles[parent]
+		tile.previous_sibling = above.last_child
+		if above.last_child >= 0 do book.tiles[above.last_child].next_sibling = index
+		else do above.first_child = index
+		above.last_child = index
+	}
+	return index
+}
+
+// A tile kind by its element's name; 0 for an element that's a trait.
+tile_kind :: fun(name: []utf8) -> i64 {
+	if name == "menu" do return TILE_MENU
+	if name == "rect" do return TILE_RECT
+	if name == "image" do return TILE_IMAGE
+	if name == "text" do return TILE_TEXT
+	if name == "nif" do return TILE_NIF
+	if name == "template" do return TILE_TEMPLATE
+	return 0
+}
+
+// An operation kind by its element's name; 0 for an element that isn't one.
+operation_kind :: fun(name: []utf8) -> i64 {
+	if name == "copy" do return OP_COPY
+	if name == "add" do return OP_ADD
+	if name == "sub" do return OP_SUB
+	if name == "mul" or name == "mult" do return OP_MUL
+	if name == "div" do return OP_DIV
+	if name == "mod" do return OP_MOD
+	if name == "min" do return OP_MIN
+	if name == "max" do return OP_MAX
+	if name == "abs" do return OP_ABS
+	if name == "ceil" do return OP_CEIL
+	if name == "floor" or name == "trunc" do return OP_FLOOR
+	if name == "gt" do return OP_GT
+	if name == "gte" do return OP_GTE
+	if name == "lt" do return OP_LT
+	if name == "lte" do return OP_LTE
+	if name == "eq" do return OP_EQ
+	if name == "neq" do return OP_NEQ
+	if name == "and" do return OP_AND
+	if name == "or" do return OP_OR
+	if name == "not" do return OP_NOT
+	if name == "onlyif" do return OP_ONLY_IF
+	if name == "onlyifnot" or name == "onlynotif" do return OP_ONLY_IF_NOT
+	if name == "rand" do return OP_RAND
+	if name == "ref" do return OP_IGNORED
+	return 0
+}
+
+// An element's tag, read from just past its '<': its name, its src, name
+// and trait attributes, whether it closes (</…>) and whether it closes
+// itself (…/>). at is left past its '>'.
+Menu_Tag :: struct {
+	name: [64]utf8
+	source: [128]utf8
+	tile_name: [64]utf8
+	trait: [32]utf8
+	closing: bool
+	self_closing: bool
+}
+
+// What comes next in the XML from at: a tag (true, read into tag), or
+// text up to the next '<' (false, its view in text_found). Comments are
+// passed over. At the end: false and no text.
+next_piece :: fun(text: []utf8, at: ^i64, tag: ^Menu_Tag) -> bool, []utf8 {
+	for at^ < text.len {
+		if text[at^] != '<' {
+			start := at^
+			for at^ < text.len and text[at^] != '<' do at^ += 1
+			return false, text[start : at^]
+		}
+		// A comment: past its end.
+		if at^ + 3 < text.len and text[at^ + 1] == '!' and text[at^ + 2] == '-' and text[at^ + 3] == '-' {
+			at^ += 4
+			for at^ + 2 < text.len and not (text[at^] == '-' and text[at^ + 1] == '-' and text[at^ + 2] == '>') do at^ += 1
+			at^ = min(at^ + 3, text.len)
+			continue
+		}
+		read_tag(text, at, tag)
+		return true, text[0:0]
+	}
+	return false, text[0:0]
+}
+
+// A tag from at (on its '<'), into tag; at past its '>'.
+read_tag :: fun(text: []utf8, at: ^i64, tag: ^Menu_Tag) {
+	tag.name.len = 0
+	tag.source.len = 0
+	tag.tile_name.len = 0
+	tag.trait.len = 0
+	tag.closing = false
+	tag.self_closing = false
+	at^ += 1
+	if at^ < text.len and text[at^] == '/' {
+		tag.closing = true
+		at^ += 1
+	}
+	for at^ < text.len and not is_tag_space(text[at^]) and text[at^] != '>' and text[at^] != '/' {
+		if fits(tag.name.len + 1, tag.name.cap) do &tag.name + lower(text[at^])
+		at^ += 1
+	}
+	// Its attributes: name="value".
+	for at^ < text.len and text[at^] != '>' {
+		if text[at^] == '/' {
+			tag.self_closing = true
+			at^ += 1
+			continue
+		}
+		if is_tag_space(text[at^]) {
+			at^ += 1
+			continue
+		}
+		attribute : [32]utf8
+		for at^ < text.len and text[at^] != '=' and text[at^] != '>' and not is_tag_space(text[at^]) {
+			if fits(attribute.len + 1, attribute.cap) do &attribute + lower(text[at^])
+			at^ += 1
+		}
+		for at^ < text.len and text[at^] != '"' and text[at^] != '>' do at^ += 1
+		if at^ >= text.len or text[at^] != '"' do continue
+		at^ += 1
+		start := at^
+		for at^ < text.len and text[at^] != '"' do at^ += 1
+		value := text[start : at^]
+		if at^ < text.len do at^ += 1
+		if attribute == "src" {
+			add_what_fits(&tag.source, value)
+		elif attribute == "name"
+			add_what_fits(&tag.tile_name, value)
+		elif attribute == "trait"
+			add_what_fits(&tag.trait, value)
+		}
+	}
+	if at^ < text.len do at^ += 1
+}
+
+is_tag_space :: fun(c: utf8) -> bool {
+	return c == ' ' or c == '\t' or c == '\n' or c == '\r'
+}
+
+// A tile's children from at, till its closing tag: tiles, includes (a
+// prefab from menus\prefabs\, its tiles and traits as the tile's own) and
+// traits.
+parse_children :: fun(book: ^Menu_Book, archives: ^Archives, text: []utf8, at: ^i64, tile: i64, in_template: bool) {
+	tag : Menu_Tag
+	for at^ < text.len {
+		is_tag, _ := next_piece(text, at, &tag)
+		if not is_tag do continue
+		if tag.closing do return
+		kind := tile_kind(tag.name)
+		if kind != 0 {
+			child := new_tile(book, kind, tag.tile_name, tile, in_template or kind == TILE_TEMPLATE)
+			if child < 0 do return
+			if not tag.self_closing do parse_children(book, archives, text, at, child, in_template or kind == TILE_TEMPLATE)
+		elif tag.name == "include"
+			include_prefab(book, archives, tag.source, tile, in_template)
+		else
+			trait := new_trait(book, tile, tag.name)
+			if trait >= 0 and not tag.self_closing do parse_operations(book, text, at, &book.traits[trait].first_operation, tag.name)
+		}
+	}
+}
+
+// A prefab (menus\prefabs\name) read into a tile: its tiles and traits.
+include_prefab :: fun(book: ^Menu_Book, archives: ^Archives, name: []utf8, tile: i64, in_template: bool) {
+	path : [160]utf8
+	&path + "menus\\prefabs\\"
+	add_what_fits(&path, name)
+	file, found := find_archived(archives, path)
+	if not found do return
+	storage : [256 * KB]byte
+	data, read_error := read_archived(archives, file, &storage)
+	if read_error do return
+	text : []utf8 = data
+	at : i64 = 0
+	parse_children(book, archives, text, &at, tile, in_template)
+}
+
+// A new trait of a tile, first of its traits (a later one of the same
+// name is found first, so it wins): its index; -1 for no room.
+new_trait :: fun(book: ^Menu_Book, tile: i64, name: []utf8) -> i64 {
+	if not fits(book.traits.len + 1, book.traits.cap) do return -1
+	index := book.traits.len
+	trait := next(&book.traits)
+	trait.name.len = 0
+	add_what_fits(&trait.name, name)
+	trait.next = book.tiles[tile].first_trait
+	trait.first_operation = -1
+	trait.set = false
+	trait.value.number = 0
+	trait.value.text.len = 0
+	trait.value.is_text = false
+	trait.stamp = -1
+	trait.working = false
+	book.tiles[tile].first_trait = index
+	return index
+}
+
+// A list of operations from at, till the closing tag of what holds them:
+// text an implicit copy of its constant; an element that's no operation
+// closes them too (the game's files have a `<_handonly>` closed by
+// another). Linked from first.
+parse_operations :: fun(book: ^Menu_Book, text: []utf8, at: ^i64, first: ^i64, holder: []utf8) {
+	tag : Menu_Tag
+	last : i64 = -1
+	for at^ < text.len {
+		is_tag, piece := next_piece(text, at, &tag)
+		operation : i64 = -1
+		if not is_tag {
+			constant := trim_menu_text(piece)
+			if constant.len == 0 do continue
+			operation = new_operation(book, OP_COPY)
+			if operation >= 0 do set_constant(book, operation, constant)
+		else
+			if tag.closing do return
+			kind := operation_kind(tag.name)
+			if kind == 0 do return
+			operation = new_operation(book, kind)
+			if operation >= 0 {
+				made := &book.operations[operation]
+				add_what_fits(&made.source, tag.source)
+				add_what_fits(&made.trait, tag.trait)
+				if not tag.self_closing do parse_argument(book, text, at, operation)
+			}
+		}
+		if operation < 0 do return
+		if last >= 0 do book.operations[last].next = operation
+		else do first^ = operation
+		last = operation
+	}
+}
+
+// An operation's content from at, till its closing tag: a constant, or
+// operations (its argument worked out from them).
+parse_argument :: fun(book: ^Menu_Book, text: []utf8, at: ^i64, operation: i64) {
+	tag : Menu_Tag
+	last : i64 = -1
+	for at^ < text.len {
+		is_tag, piece := next_piece(text, at, &tag)
+		if not is_tag {
+			constant := trim_menu_text(piece)
+			if constant.len > 0 do set_constant(book, operation, constant)
+			continue
+		}
+		if tag.closing do return
+		kind := operation_kind(tag.name)
+		if kind == 0 do continue
+		inner := new_operation(book, kind)
+		if inner < 0 do return
+		made := &book.operations[inner]
+		add_what_fits(&made.source, tag.source)
+		add_what_fits(&made.trait, tag.trait)
+		if not tag.self_closing do parse_argument(book, text, at, inner)
+		if last >= 0 do book.operations[last].next = inner
+		else do book.operations[operation].first_argument = inner
+		last = inner
+	}
+}
+
+new_operation :: fun(book: ^Menu_Book, kind: i64) -> i64 {
+	if not fits(book.operations.len + 1, book.operations.cap) do return -1
+	index := book.operations.len
+	made := next(&book.operations)
+	made.kind = kind
+	made.next = -1
+	made.has_constant = false
+	made.number = 0
+	made.text_at = -1
+	made.text_length = 0
+	made.source.len = 0
+	made.trait.len = 0
+	made.first_argument = -1
+	return index
+}
+
+// An operation's constant from its text: an entity's number (&true;…), a
+// number, or the text (kept in the book's).
+set_constant :: fun(book: ^Menu_Book, operation: i64, text: []utf8) {
+	made := &book.operations[operation]
+	made.has_constant = true
+	if text.len > 2 and text[0] == '&' and text[text.len - 1] == ';' {
+		made.number = entity_value(text[1 : text.len - 1])
+		return
+	}
+	number, is_number := parse_number(text)
+	if is_number {
+		made.number = f32(number)
+		return
+	}
+	if not fits(book.text.len + text.len, book.text.cap) do return
+	made.text_at = book.text.len
+	made.text_length = text.len
+	&book.text + text
+}
+
+// An entity's number (as the game defines them; 0 for one it doesn't).
+entity_value :: fun(name: []utf8) -> f32 {
+	if name == "true" do return MENU_TRUE
+	if name == "false" or name == "xbox" or name == "xenon" do return MENU_FALSE
+	if name == "left" do return JUSTIFY_LEFT
+	if name == "center" do return JUSTIFY_CENTER
+	if name == "right" do return JUSTIFY_RIGHT
+	if name == "scale" or name == "generic" do return -1
+	if name == "click_past" do return 101
+	if name == "no_click_past" do return 102
+	if name == "mixed_menu" do return 103
+	if name == "does_not_stack" do return 6008
+	if name == "prev" do return 104
+	if name == "next" do return 105
+	if name == "first" do return 106
+	if name == "last" do return 107
+	if name == "xlist" do return 108
+	if name == "xitem" do return 109
+	if compare_folded(name[0 : min(name.len, 7)], "xbutton") == 0 or name == "xboxhint" do return MENU_FALSE
+	return 0
+}
+
+// Text from the XML without the spaces round it.
+trim_menu_text :: fun(text: []utf8) -> []utf8 {
+	start : i64 = 0
+	stop := text.len
+	for start < stop and is_tag_space(text[start]) do start += 1
+	for stop > start and is_tag_space(text[stop - 1]) do stop -= 1
+	return text[start : stop]
+}
+
+// ---- working out traits --------------------------------------------------------------
+
+// The screen: a tile outside the menus (its traits width, height, cropx,
+// cropy), as selectors name it.
+SCREEN_TILE :: -2
+
+// A tile's trait by name: its index; -1 when it hasn't it.
+find_trait :: fun(book: ^Menu_Book, tile: i64, name: []utf8) -> i64 {
+	if tile < 0 do return -1
+	trait := book.tiles[tile].first_trait
+	for trait >= 0 {
+		if book.traits[trait].name == name do return trait
+		trait = book.traits[trait].next
+	}
+	return -1
+}
+
+// A trait's value now (see the top); a tile without it: 0, but for what
+// the game works out itself (a text's width and height, a picture's
+// width and height its file's).
+trait_value :: fun(book: ^Menu_Book, tile: i64, name: []utf8, renderer: ^render.Renderer, archives: ^Archives) -> Menu_Value {
+	value := Menu_Value{0}
+	if tile == SCREEN_TILE {
+		if name == "width" {
+			value.number = book.screen_width
+		elif name == "height"
+			value.number = book.screen_height
+		elif name == "cropx"
+			value.number = SAFE_X
+		elif name == "cropy"
+			value.number = SAFE_Y
+		}
+		return value
+	}
+	if tile < 0 do return value
+	trait := find_trait(book, tile, name)
+	if trait < 0 {
+		kind := book.tiles[tile].kind
+		if kind == TILE_TEXT and (name == "width" or name == "height") {
+			width, height := text_size(book, tile, renderer, archives)
+			value.number = if name == "width" do width else height
+		elif kind == TILE_IMAGE and (name == "width" or name == "height" or name == "filewidth" or name == "fileheight")
+			texture := tile_texture(book, tile, renderer, archives)
+			if texture > 0 {
+				cached := &renderer.textures[texture]
+				value.number = f32(if name == "width" or name == "filewidth" do cached.width else cached.height)
+			}
+		elif name == "visible" or name == "red" or name == "green" or name == "blue" or name == "alpha"
+			value.number = if name == "visible" do MENU_TRUE else 255
+		elif name == "zoom"
+			value.number = 100
+		}
+		return value
+	}
+	held := &book.traits[trait]
+	if held.set or held.stamp == book.frame or held.working do return held.value
+	held.working = true
+	start := Menu_Value{0}
+	worked := run_operations(book, tile, held.first_operation, start, renderer, archives)
+	held = &book.traits[trait]
+	held.value = worked
+	held.stamp = book.frame
+	held.working = false
+	return worked
+}
+
+// A trait's number (text that reads as a number, as that).
+trait_number :: fun(book: ^Menu_Book, tile: i64, name: []utf8, renderer: ^render.Renderer, archives: ^Archives) -> f32 {
+	value := trait_value(book, tile, name, renderer, archives)
+	if not value.is_text do return value.number
+	number, is_number := parse_number(trim_menu_text(value.text))
+	return if is_number do f32(number) else 0
+}
+
+// Operations in turn on a working value (from start).
+run_operations :: fun(book: ^Menu_Book, tile: i64, first: i64, start: Menu_Value, renderer: ^render.Renderer, archives: ^Archives)
+	-> Menu_Value
+{
+	working := start
+	operation := first
+	for operation >= 0 {
+		kind := book.operations[operation].kind
+		if kind != OP_IGNORED {
+			argument, has_argument := operation_argument(book, tile, operation, working, renderer, archives)
+			working = apply_operation(book, kind, working, argument, has_argument)
+		}
+		operation = book.operations[operation].next
+	}
+	return working
+}
+
+// An operation's argument: its constant, the trait it names (a copy of
+// a trait ending in _ takes the one numbered by the working value: a
+// switch), or what its own operations work out from 0. False when it has
+// none.
+operation_argument :: fun(book: ^Menu_Book, tile: i64, operation: i64, working: Menu_Value, renderer: ^render.Renderer,
+	archives: ^Archives) -> Menu_Value, bool
+{
+	made := &book.operations[operation]
+	value := Menu_Value{0}
+	if made.trait.len > 0 {
+		source := if made.source.len > 0 do select_tile(book, tile, made.source) else tile
+		name : [48]utf8
+		add_what_fits(&name, made.trait)
+		if made.kind == OP_COPY and made.trait[made.trait.len - 1] == '_' do add_what_fits(&name, int_text(i64(working.number)))
+		return trait_value(book, source, name, renderer, archives), true
+	}
+	if made.has_constant {
+		if made.text_at >= 0 {
+			value.is_text = true
+			add_what_fits(&value.text, book.text[made.text_at : made.text_at + made.text_length])
+		else
+			value.number = made.number
+		}
+		return value, true
+	}
+	if made.first_argument >= 0 do return run_operations(book, tile, made.first_argument, value, renderer, archives), true
+	return value, false
+}
+
+// The tile a selector or name picks, seen from a tile: -1 for none.
+select_tile :: fun(book: ^Menu_Book, tile: i64, source: []utf8) -> i64 {
+	if source == "me()" do return tile
+	if source == "parent()" do return if book.tiles[tile].parent >= 0 do book.tiles[tile].parent else SCREEN_TILE
+	if source == "screen()" do return SCREEN_TILE
+	if source == "strings()" do return book.strings
+	open := 0
+	for c, k in source {
+		if c == '(' {
+			open = k
+			break
+		}
+	}
+	if open > 0 and source[source.len - 1] == ')' {
+		selector := source[0 : open]
+		argument := source[open + 1 : source.len - 1]
+		if selector == "sibling" {
+			if argument.len == 0 do return book.tiles[tile].previous_sibling
+			above := book.tiles[tile].parent
+			if above < 0 do return -1
+			return named_child(book, above, argument, false)
+		}
+		if selector == "child" {
+			if argument.len == 0 do return book.tiles[tile].last_child
+			return named_child(book, tile, argument, true)
+		}
+		if selector == "grandparent" {
+			above := book.tiles[tile].parent
+			return if above >= 0 do book.tiles[above].parent else -1
+		}
+		return -1
+	}
+	// A tile by name: in the tile's own menu first, then in any.
+	root := tile
+	for book.tiles[root].parent >= 0 do root = book.tiles[root].parent
+	if book.tiles[root].name == source do return root
+	found := named_child(book, root, source, true)
+	if found >= 0 do return found
+	for menu in book.menus {
+		if book.tiles[menu].name == source do return menu
+	}
+	for menu in book.menus {
+		if menu == root do continue
+		found = named_child(book, menu, source, true)
+		if found >= 0 do return found
+	}
+	return -1
+}
+
+// A tile's child by name (with deep, any descendant), the last first; -1
+// for none.
+named_child :: fun(book: ^Menu_Book, tile: i64, name: []utf8, deep: bool) -> i64 {
+	child := book.tiles[tile].last_child
+	for child >= 0 {
+		if book.tiles[child].name == name do return child
+		if deep {
+			found := named_child(book, child, name, true)
+			if found >= 0 do return found
+		}
+		child = book.tiles[child].previous_sibling
+	}
+	return -1
+}
+
+// An operation on the working value with its argument (see the top).
+apply_operation :: fun(book: ^Menu_Book, kind: i64, working: Menu_Value, argument: Menu_Value, has_argument: bool) -> Menu_Value {
+	if kind == OP_COPY do return argument
+	result := Menu_Value{0}
+	a := working.number
+	b := argument.number
+	if kind == OP_ADD and (working.is_text or argument.is_text) {
+		// Text joined (a number written as it reads).
+		result.is_text = true
+		add_value_text(&result.text, working)
+		add_value_text(&result.text, argument)
+		return result
+	}
+	if kind == OP_EQ and (working.is_text or argument.is_text) {
+		result.number = MENU_FALSE
+		return result
+	}
+	if kind == OP_ADD {
+		result.number = a + b
+	elif kind == OP_SUB
+		result.number = a - b
+	elif kind == OP_MUL
+		result.number = a * b
+	elif kind == OP_DIV
+		result.number = if b != 0 do a / b else 0
+	elif kind == OP_MOD
+		result.number = if b != 0 do a - floor_f32(a / b) * b else 0
+	elif kind == OP_MIN
+		result.number = min_f32(a, b)
+	elif kind == OP_MAX
+		result.number = max_f32(a, b)
+	elif kind == OP_ABS
+		result.number = if a < 0 do abs_f32(a + b) else a
+	elif kind == OP_CEIL
+		result.number = ceil_f32(a + b)
+	elif kind == OP_FLOOR
+		result.number = floor_f32(a + b)
+	elif kind == OP_GT
+		result.number = truth(a > b)
+	elif kind == OP_GTE
+		result.number = truth(a >= b)
+	elif kind == OP_LT
+		result.number = truth(a < b)
+	elif kind == OP_LTE
+		result.number = truth(a <= b)
+	elif kind == OP_EQ
+		result.number = truth(a == b)
+	elif kind == OP_NEQ
+		result.number = truth(a != b)
+	elif kind == OP_AND
+		result.number = truth(a == MENU_TRUE and b == MENU_TRUE)
+	elif kind == OP_OR
+		result.number = truth(a == MENU_TRUE or b == MENU_TRUE)
+	elif kind == OP_NOT
+		result.number = truth((if has_argument do b else a) != MENU_TRUE)
+	elif kind == OP_ONLY_IF
+		if b == MENU_TRUE do result = working
+	elif kind == OP_ONLY_IF_NOT
+		if b != MENU_TRUE do result = working
+	elif kind == OP_RAND
+		book.dice = book.dice *% 6364136223846793005 +% 1442695040888963407
+		result.number = f32(1 + i64((book.dice >> 33) % u64(max(i64(b), 1))))
+	}
+	return result
+}
+
+// A comparison's answer, as the menus have booleans.
+truth :: fun(yes: bool) -> f32 {
+	return if yes do MENU_TRUE else MENU_FALSE
+}
+
+// A value's text, added to text: its own, or its number (whole when it's
+// whole).
+add_value_text :: fun(text: ^[256]utf8, value: Menu_Value) {
+	if value.is_text {
+		add_what_fits(text, value.text)
+		return
+	}
+	if value.number == floor_f32(value.number) {
+		add_what_fits(text, int_text(i64(value.number)))
+		return
+	}
+	add_what_fits(text, int_text(i64(value.number)))
+	add_what_fits(text, ".")
+	fraction := i64(abs_f32(value.number - f32(i64(value.number))) * 100 + 0.5)
+	if fraction < 10 do add_what_fits(text, "0")
+	add_what_fits(text, int_text(fraction))
+}
+
+// Sets a trait of the tile of a name (in any menu read) as the game does:
+// its operations passed over from then on. False when there's no such
+// tile.
+book_set :: fun(book: ^Menu_Book, tile_name: []utf8, trait_name: []utf8, number: f32) -> bool {
+	trait := settable_trait(book, tile_name, trait_name)
+	if trait < 0 do return false
+	held := &book.traits[trait]
+	held.set = true
+	held.value.number = number
+	held.value.is_text = false
+	held.value.text.len = 0
+	return true
+}
+
+// Sets a trait to text, as book_set does a number.
+book_set_text :: fun(book: ^Menu_Book, tile_name: []utf8, trait_name: []utf8, text: []utf8) -> bool {
+	trait := settable_trait(book, tile_name, trait_name)
+	if trait < 0 do return false
+	held := &book.traits[trait]
+	held.set = true
+	held.value.number = 0
+	held.value.is_text = true
+	held.value.text.len = 0
+	add_what_fits(&held.value.text, text)
+	return true
+}
+
+// The trait of a tile by name, made when it hasn't one; -1 for no tile.
+settable_trait :: fun(book: ^Menu_Book, tile_name: []utf8, trait_name: []utf8) -> i64 {
+	tile : i64 = -1
+	for menu in book.menus {
+		if book.tiles[menu].name == tile_name {
+			tile = menu
+			break
+		}
+		found := named_child(book, menu, tile_name, true)
+		if found >= 0 and not book.tiles[found].in_template {
+			tile = found
+			break
+		}
+	}
+	if tile < 0 do return -1
+	trait := find_trait(book, tile, trait_name)
+	if trait < 0 do trait = new_trait(book, tile, trait_name)
+	return trait
+}
+
+// ---- drawing ---------------------------------------------------------------------------
+
+// A picture or text to draw, where (the menus' units, its tile's place
+// on the screen), how deep (the higher, the later: on top), clipped to a
+// window (clip_right less than clip_left for none).
+Menu_Drawn :: struct {
+	tile: i64
+	x: f32
+	y: f32
+	depth: f32
+	clip_left: f32
+	clip_top: f32
+	clip_right: f32
+	clip_bottom: f32
+}
+
+// Draws a menu (its root tile) onto the renderer's 2D layer for a screen
+// width by height pixels: its visible pictures and text, the deepest last.
+draw_menu :: fun(book: ^Menu_Book, menu: i64, renderer: ^render.Renderer, archives: ^Archives, width: i64, height: i64) {
+	scale := f32(height) / MENU_HEIGHT
+	book.screen_height = MENU_HEIGHT
+	book.screen_width = f32(width) / scale
+	drawn : [2048]Menu_Drawn
+	gather_drawn(book, menu, 0, 0, 0, Menu_Drawn{tile = -1, x = 0, y = 0, depth = 0, clip_left = 0, clip_top = 0, clip_right = -1, clip_bottom = -1},
+		renderer, archives, &drawn)
+	// By depth, the shallow first (an insertion sort: few, mostly in order).
+	for k in 1:drawn.len {
+		moving := drawn[k]
+		j := k
+		for j > 0 and drawn[j - 1].depth > moving.depth {
+			drawn[j] = drawn[j - 1]
+			j -= 1
+		}
+		drawn[j] = moving
+	}
+	for item in drawn {
+		if book.tiles[item.tile].kind == TILE_IMAGE do draw_menu_image(book, item, renderer, archives, scale)
+		else do draw_menu_text(book, item, renderer, archives, scale)
+	}
+}
+
+// A tile and what's under it, where they are (its parent at x, y, depth),
+// into drawn: the visible pictures and text, not a template's.
+gather_drawn :: fun(book: ^Menu_Book, tile: i64, parent_x: f32, parent_y: f32, parent_depth: f32, window: Menu_Drawn,
+	renderer: ^render.Renderer, archives: ^Archives, drawn: ^[]Menu_Drawn)
+{
+	if book.tiles[tile].in_template do return
+	if trait_number(book, tile, "visible", renderer, archives) != MENU_TRUE do return
+	x := parent_x + trait_number(book, tile, "x", renderer, archives)
+	y := parent_y + trait_number(book, tile, "y", renderer, archives)
+	depth := parent_depth + trait_number(book, tile, "depth", renderer, archives)
+	clipping := window
+	if trait_number(book, tile, "clipwindow", renderer, archives) == MENU_TRUE {
+		clipping.clip_left = x
+		clipping.clip_top = y
+		clipping.clip_right = x + trait_number(book, tile, "width", renderer, archives)
+		clipping.clip_bottom = y + trait_number(book, tile, "height", renderer, archives)
+	}
+	kind := book.tiles[tile].kind
+	if (kind == TILE_IMAGE or kind == TILE_TEXT) and fits(drawn.len + 1, drawn.cap) {
+		item := clipping
+		item.tile = tile
+		item.x = x
+		item.y = y
+		item.depth = depth
+		if trait_number(book, tile, "clips", renderer, archives) != MENU_TRUE {
+			item.clip_right = -1
+			item.clip_bottom = -1
+		}
+		drawn + item
+	}
+	child := book.tiles[tile].first_child
+	for child >= 0 {
+		gather_drawn(book, child, x, y, depth, clipping, renderer, archives, drawn)
+		child = book.tiles[child].next_sibling
+	}
+}
+
+// A picture tile's texture (its filename under textures\); 0 for none.
+tile_texture :: fun(book: ^Menu_Book, tile: i64, renderer: ^render.Renderer, archives: ^Archives) -> i64 {
+	name := trait_value(book, tile, "filename", renderer, archives)
+	if not name.is_text do return 0
+	file := trim_menu_text(name.text)
+	if file.len == 0 do return 0
+	path : [256]utf8
+	&path + "textures\\"
+	add_what_fits(&path, file)
+	scratch : [16 * MB]byte
+	return render.texture_for(renderer, archives, path, &scratch, render.CLAMP_BOTH)
+}
+
+// A tile's tint: red, green, blue, opacity (0 to 1).
+tile_color :: fun(book: ^Menu_Book, tile: i64, renderer: ^render.Renderer, archives: ^Archives) -> [4!]f32 {
+	return [trait_number(book, tile, "red", renderer, archives) / 255, trait_number(book, tile, "green", renderer, archives) / 255,
+		trait_number(book, tile, "blue", renderer, archives) / 255, min_f32(max_f32(trait_number(book, tile, "alpha", renderer, archives) / 255, 0), 1)]
+}
+
+// A picture tile drawn: its texture from cropx, cropy, a texel to a unit
+// at zoom 100 (zoom &scale;: the whole picture stretched), cropped to its
+// width and height, clipped to its window.
+draw_menu_image :: fun(book: ^Menu_Book, item: Menu_Drawn, renderer: ^render.Renderer, archives: ^Archives, scale: f32) {
+	tile := item.tile
+	texture := tile_texture(book, tile, renderer, archives)
+	if texture <= 0 do return
+	cached := &renderer.textures[texture]
+	if cached.width <= 0 or cached.height <= 0 do return
+	color := tile_color(book, tile, renderer, archives)
+	if color[3] <= 0 do return
+	width := trait_number(book, tile, "width", renderer, archives)
+	height := trait_number(book, tile, "height", renderer, archives)
+	if width <= 0 or height <= 0 do return
+	zoom := trait_number(book, tile, "zoom", renderer, archives)
+	texels_x := f32(cached.width)
+	texels_y := f32(cached.height)
+	crop_x := trait_number(book, tile, "cropx", renderer, archives)
+	crop_y := trait_number(book, tile, "cropy", renderer, archives)
+	u0 := crop_x / texels_x
+	v0 := crop_y / texels_y
+	u1 := (crop_x + width * 100 / max_f32(zoom, 1)) / texels_x
+	v1 := (crop_y + height * 100 / max_f32(zoom, 1)) / texels_y
+	if zoom == ZOOM_SCALE {
+		u0 = 0
+		v0 = 0
+		u1 = 1
+		v1 = 1
+	}
+	x := item.x
+	y := item.y
+	// Clipped to its window: the texture cut as the rectangle is.
+	if item.clip_right >= item.clip_left {
+		left := max_f32(x, item.clip_left)
+		top := max_f32(y, item.clip_top)
+		right := min_f32(x + width, item.clip_right)
+		bottom := min_f32(y + height, item.clip_bottom)
+		if right <= left or bottom <= top do return
+		across := (u1 - u0) / width
+		down := (v1 - v0) / height
+		u0 += (left - x) * across
+		v0 += (top - y) * down
+		u1 -= (x + width - right) * across
+		v1 -= (y + height - bottom) * down
+		x = left
+		y = top
+		width = right - left
+		height = bottom - top
+	}
+	render.ui_image(renderer, texture, x * scale, y * scale, width * scale, height * scale, u0, v0, u1, v1, color)
+}
+
+// A text tile's size: as wide as its longest line, as high as its lines
+// (wrapped to its wrapwidth, at most wraplines of them).
+text_size :: fun(book: ^Menu_Book, tile: i64, renderer: ^render.Renderer, archives: ^Archives) -> f32, f32 {
+	font := tile_font(book, tile, renderer, archives)
+	value := trait_value(book, tile, "string", renderer, archives)
+	text : [256]utf8
+	add_value_text(&text, value)
+	lines : [16]Text_Line
+	wrap_text(font, text, trait_number(book, tile, "wrapwidth", renderer, archives), &lines)
+	most_lines := trait_number(book, tile, "wraplines", renderer, archives)
+	if most_lines > 0 and f32(lines.len) > most_lines do lines.len = i64(most_lines)
+	widest : f32 = 0
+	for line in lines do widest = max_f32(widest, line.width)
+	return widest, f32(lines.len) * font.line_height
+}
+
+// A line of wrapped text: where in the text, how wide.
+Text_Line :: struct {
+	start: i64
+	stop: i64
+	width: f32
+}
+
+// Text cut into lines no wider than wrap (0: one line), at spaces.
+wrap_text :: fun(font: ^Font, text: []utf8, wrap: f32, lines: ^[]Text_Line) {
+	lines.len = 0
+	if text.len == 0 do return
+	start : i64 = 0
+	for start < text.len and fits(lines.len + 1, lines.cap) {
+		stop := start
+		last_space : i64 = -1
+		width : f32 = 0
+		for stop < text.len {
+			glyph := &font.glyphs[i64(text[stop])]
+			advance := glyph.before + glyph.width + glyph.after
+			if wrap > 0 and width + advance > wrap and stop > start {
+				if last_space > start do stop = last_space
+				break
+			}
+			if text[stop] == ' ' do last_space = stop
+			width += advance
+			stop += 1
+		}
+		lines + Text_Line{start = start, stop = stop, width = text_width(font, text[start : stop])}
+		start = stop
+		for start < text.len and text[start] == ' ' do start += 1
+	}
+}
+
+// A text tile's font (its font trait, 1 to 5).
+tile_font :: fun(book: ^Menu_Book, tile: i64, renderer: ^render.Renderer, archives: ^Archives) -> ^Font {
+	number := i64(trait_number(book, tile, "font", renderer, archives))
+	if number < 1 or number > FONT_FILES do number = 1
+	return &book.fonts[number - 1]
+}
+
+// A text tile drawn: its lines justified about its x (left, middle, right).
+draw_menu_text :: fun(book: ^Menu_Book, item: Menu_Drawn, renderer: ^render.Renderer, archives: ^Archives, scale: f32) {
+	tile := item.tile
+	color := tile_color(book, tile, renderer, archives)
+	if color[3] <= 0 do return
+	font := tile_font(book, tile, renderer, archives)
+	value := trait_value(book, tile, "string", renderer, archives)
+	text : [256]utf8
+	add_value_text(&text, value)
+	lines : [16]Text_Line
+	wrap_text(font, text, trait_number(book, tile, "wrapwidth", renderer, archives), &lines)
+	most_lines := trait_number(book, tile, "wraplines", renderer, archives)
+	if most_lines > 0 and f32(lines.len) > most_lines do lines.len = i64(most_lines)
+	justify := i64(trait_number(book, tile, "justify", renderer, archives))
+	top := item.y
+	for line in lines {
+		left := item.x
+		if justify == JUSTIFY_CENTER do left -= line.width / 2
+		if justify == JUSTIFY_RIGHT do left -= line.width
+		draw_text(renderer, font, text[line.start : line.stop], left * scale, top * scale, scale, color)
+		top += font.line_height
+	}
+}
+
+// Starts a frame of the book's menus: their values worked out afresh.
+book_frame :: fun(book: ^Menu_Book) {
+	book.frame += 1
+}

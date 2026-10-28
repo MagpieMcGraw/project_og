@@ -230,6 +230,8 @@ Viewer :: struct {
 	held: First_Person
 	// The HUD, and what it names: the reference the reticle is on (0 for none).
 	hud: Hud
+	// The game's menus read (the HUD's among them).
+	book: Menu_Book
 	targeted: u32
 }
 
@@ -527,7 +529,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		shown.lights_changed = false
 	}
 	ui_begin(&viewer.renderer)
-	draw_hud(&viewer.hud, &viewer.renderer, platform.width, platform.height, camera.yaw)
+	draw_hud(&viewer.hud, &viewer.book, &viewer.renderer, &viewer.archives, platform.width, platform.height, camera.yaw)
 	drawn, framebuffer_error := draw_frame(&viewer.renderer, &shown.models, &shown.instances, &shown.distant_instances, &shown.grounds,
 		&shown.waters, &shown.tree_cells, &shown.grass_cells, &viewer.held.instances, &viewer.look, shown.lighting, camera^,
 		platform.width, platform.height)
@@ -654,7 +656,8 @@ take_first_person :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	}
 	// The HUD too, with the weapon's icon.
 	scratch : [32 * MB]byte
-	hud_error := load_hud(&viewer.hud, &viewer.renderer, &viewer.archives, viewer.held.weapon_icon, &scratch)
+	hud_error := book_open(&viewer.book, &viewer.renderer, &viewer.archives, &scratch)
+	if not hud_error do hud_error = load_hud(&viewer.hud, &viewer.book, &viewer.archives, viewer.held.weapon_icon, &scratch)
 	if hud_error {
 		note(&viewer.journal, "no HUD: ")
 		note_error(&viewer.journal, hud_error)

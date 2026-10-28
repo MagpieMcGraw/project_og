@@ -1,11 +1,9 @@
-// The HUD: the player's health, magicka and fatigue ribbons, the weapon
-// and spell they have ready, the compass, the reticle, and the name of
-// what it's on. Laid out as the game's menus\main\hud_main_menu.xml,
-// hud_reticle.xml and hud_info_menu.xml lay it out (their sums worked out
-// here, not read from them), in its menus' units: the screen MENU_HEIGHT
-// high and as wide as its shape makes it, pictures drawn pixel for pixel
-// in those units (cropped to their width and height), text in the game's
-// fonts (Data\Fonts in the Misc archive: a .fnt of glyphs, a .tex picture).
+// The HUD: the game's menus\main\hud_main_menu.xml, hud_reticle.xml and
+// hud_info_menu.xml read into the menu book (menus.mara) and drawn as they
+// lay it out, with what the game would set in them: the player's health,
+// magicka and fatigue, their weapon's icon, the camera's heading, what the
+// reticle is on and what using it would do. And the game's fonts (Data\Fonts
+// in the Misc archive: a .fnt of glyphs, a .tex picture) the menus write in.
 module sooblivion
 
 use mara.core
@@ -21,13 +19,12 @@ render :: use render
 MENU_HEIGHT :: 960
 SAFE_X :: 20
 SAFE_Y :: 20
-// The HUD's text color: parchment (hud_info_menu's 254, 244, 183).
-HUD_TEXT :: [4!]f32{0.996, 0.957, 0.718, 1}
-// The activate icons (all_small_activate_icons.dds, each 30 across): the
-// hand that takes, the face that talks, the door.
+// The activate icons (all_small_activate_icons.dds, 34 apart on PC, as
+// hudreticle_reticle's user5 numbers them): the hand that takes, the face
+// that talks, the door.
 ICON_TAKE :: 1
-ICON_TALK :: 8
-ICON_DOOR :: 9
+ICON_TALK :: 7
+ICON_DOOR :: 8
 // The game's fonts (Oblivion.ini's SFontFile_1 to _5): the files' names
 // in the Misc archive's fonts folder, without .fnt.
 FONT_FILES :: 5
@@ -56,30 +53,21 @@ Font :: struct {
 	glyphs: [256!]Glyph
 }
 
-// The HUD's pictures (texture slots), its fonts, and what it shows: the
-// player's health, magicka and fatigue (shares, 0 to 1), the name of what
-// the reticle is on (empty for nothing; named: whose) and what using it
-// would do (ICON_*; 0 for nothing usable).
+// The HUD: its menus in the book (their roots: the main one, the info
+// one, the reticle; ready once read) and what it shows: the player's
+// health, magicka and fatigue (shares, 0 to 1), their weapon's icon (its
+// ICON, under textures\menus\icons\; empty: the HUD's own), the name of
+// what the reticle is on (empty for nothing; named: whose) and what using
+// it would do (ICON_*; 0 for nothing usable).
 Hud :: struct {
 	ready: bool
-	frame: i64
-	health_empty: i64
-	health_full: i64
-	magic_empty: i64
-	magic_full: i64
-	fatigue_empty: i64
-	fatigue_full: i64
-	ribbon_edge: i64
-	weapon_icon: i64
-	magic_icon: i64
-	compass_back: i64
-	compass_face: i64
-	reticle: i64
-	activate_icons: i64
-	fonts: [FONT_FILES!]Font
+	main_menu: i64
+	info_menu: i64
+	reticle_menu: i64
 	health: f32
 	magicka: f32
 	fatigue: f32
+	weapon_icon: [160]utf8
 	name: str256
 	named: u32
 	activate: i64
@@ -94,50 +82,51 @@ font_file :: fun(number: i64) -> str64 {
 	return "kingthings_regular"
 }
 
-// Loads the HUD's pictures and fonts onto the card; the weapon's icon is
-// weapon_icon (an ICON field's path, under textures\menus\icons\; empty:
-// the HUD's own). Full ribbons, nothing aimed at.
-load_hud :: fun(hud: ^Hud, renderer: ^render.Renderer, archives: ^Archives, weapon_icon: []utf8, scratch: ^[]byte) -> err {
+// Reads the HUD's menus into the book (opened). Full ribbons, nothing
+// aimed at.
+load_hud :: fun(hud: ^Hud, book: ^Menu_Book, archives: ^Archives, weapon_icon: []utf8, scratch: ^[]byte) -> err {
 	hud.ready = false
-	hud.frame = menu_texture(renderer, archives, "hud\\hud_frame.dds", scratch)
-	hud.health_empty = menu_texture(renderer, archives, "hud\\hud_ribbon_health_empty.dds", scratch)
-	hud.health_full = menu_texture(renderer, archives, "hud\\hud_ribbon_health_full.dds", scratch)
-	hud.magic_empty = menu_texture(renderer, archives, "hud\\hud_ribbon_magic_empty.dds", scratch)
-	hud.magic_full = menu_texture(renderer, archives, "hud\\hud_ribbon_magic_full.dds", scratch)
-	hud.fatigue_empty = menu_texture(renderer, archives, "hud\\hud_ribbon_fatigue_empty.dds", scratch)
-	hud.fatigue_full = menu_texture(renderer, archives, "hud\\hud_ribbon_fatigue_full.dds", scratch)
-	hud.ribbon_edge = menu_texture(renderer, archives, "shared\\ribbon_slider.dds", scratch)
-	hud.magic_icon = menu_texture(renderer, archives, "icons\\icon_hud_default_magic.dds", scratch)
-	hud.weapon_icon = menu_texture(renderer, archives, "icons\\icon_hud_default_weapon.dds", scratch)
-	if weapon_icon.len > 0 {
-		path : [160]utf8
-		&path + "icons\\"
-		add_what_fits(&path, weapon_icon)
-		own := menu_texture(renderer, archives, path, scratch)
-		if own != 0 do hud.weapon_icon = own
-	}
-	hud.compass_back = menu_texture(renderer, archives, "hud\\hud_back.dds", scratch)
-	hud.compass_face = menu_texture(renderer, archives, "hud\\hud_compass_face.dds", scratch)
-	hud.reticle = menu_texture(renderer, archives, "misc\\hud_reticle.dds", scratch)
-	hud.activate_icons = menu_texture(renderer, archives, "shared\\all_small_activate_icons.dds", scratch)
-	for k in 0:FONT_FILES do load_font(&hud.fonts[k], renderer, archives, font_file(k + 1), scratch)?
+	hud.main_menu = book_read(book, archives, "menus\\main\\hud_main_menu.xml", scratch)?
+	hud.info_menu = book_read(book, archives, "menus\\main\\hud_info_menu.xml", scratch)?
+	hud.reticle_menu = book_read(book, archives, "menus\\main\\hud_reticle.xml", scratch)?
 	hud.health = 1
 	hud.magicka = 1
 	hud.fatigue = 1
+	hud.weapon_icon.len = 0
+	add_what_fits(&hud.weapon_icon, weapon_icon)
 	hud.name.len = 0
 	hud.named = 0
 	hud.activate = 0
 	hud.ready = true
 }
 
-// A menu picture (a path under textures\menus\, as the menus name them),
-// on the card: its slot; 0 (the white texture) when it couldn't be read.
-menu_texture :: fun(renderer: ^render.Renderer, archives: ^Archives, path: []utf8, scratch: ^[]byte) -> i64 {
-	full : [160]utf8
-	&full + "textures\\menus\\"
-	add_what_fits(&full, path)
-	scratch.len = 0
-	return render.texture_for(renderer, archives, full, scratch, render.CLAMP_BOTH)
+// Puts the HUD on the 2D layer for a screen width by height pixels, the
+// camera turned yaw (radians, from north, clockwise): what the game sets
+// in its menus set, then the menus drawn.
+draw_hud :: fun(hud: ^Hud, book: ^Menu_Book, renderer: ^render.Renderer, archives: ^Archives, width: i64, height: i64, yaw: f32) {
+	if not hud.ready do return
+	book_frame(book)
+	_ = book_set(book, "HUDMainMenu", "user3", 1)   // exploring (0: in a menu)
+	_ = book_set(book, "hudmain_health_full", "user0", hud.health)
+	_ = book_set(book, "hudmain_magic_full", "user0", hud.magicka)
+	_ = book_set(book, "hudmain_fatigue_full", "user0", hud.fatigue)
+	if hud.weapon_icon.len > 0 {
+		icon : [192]utf8
+		&icon + "Menus\\Icons\\"
+		add_what_fits(&icon, hud.weapon_icon)
+		_ = book_set_text(book, "hudmain_Weapon_Icon", "filename", icon)
+	}
+	_ = book_set(book, "hudmain_Weapon_Icon", "user2", 100)   // its condition: whole
+	degrees := yaw * 180 / PI
+	degrees -= floor_f32(degrees / 360) * 360
+	_ = book_set(book, "hudmain_compass_window", "user0", degrees)
+	_ = book_set(book, "HUDReticle", "visible", MENU_TRUE)
+	_ = book_set(book, "hudreticle_reticle", "user5", f32(hud.activate))
+	_ = book_set(book, "HUDInfoMenu", "visible", if hud.name.len > 0 do MENU_TRUE else MENU_FALSE)
+	_ = book_set_text(book, "hudinfo_name", "string", hud.name)
+	draw_menu(book, hud.main_menu, renderer, archives, width, height)
+	draw_menu(book, hud.info_menu, renderer, archives, width, height)
+	draw_menu(book, hud.reticle_menu, renderer, archives, width, height)
 }
 
 // A font read from the Misc archive's fonts folder (name: its files'
@@ -211,78 +200,4 @@ draw_text :: fun(renderer: ^render.Renderer, font: ^Font, text: []utf8, x: f32, 
 		}
 		pen += (glyph.before + glyph.width + glyph.after) * scale
 	}
-}
-
-// Puts a menu picture on the 2D layer as the menus draw it: pixel for
-// pixel (a texel to a unit), cropped to width by height from crop_x
-// across its picture; at x, y in the menus' units, scale pixels to a unit.
-menu_image :: fun(renderer: ^render.Renderer, texture: i64, x: f32, y: f32, width: f32, height: f32, scale: f32,
-	opacity: f32 = 1, crop_x: f32 = 0)
-{
-	cached := &renderer.textures[texture]
-	if cached.width <= 0 or cached.height <= 0 do return
-	texels_x := f32(cached.width)
-	texels_y := f32(cached.height)
-	render.ui_image(renderer, texture, x * scale, y * scale, width * scale, height * scale,
-		crop_x / texels_x, 0, (crop_x + width) / texels_x, height / texels_y, [1, 1, 1, opacity])
-}
-
-// Puts the HUD on the 2D layer for a screen width by height pixels, the
-// camera turned yaw (radians, from north, clockwise).
-draw_hud :: fun(hud: ^Hud, renderer: ^render.Renderer, width: i64, height: i64, yaw: f32) {
-	if not hud.ready do return
-	scale := f32(height) / MENU_HEIGHT
-	screen_width := f32(width) / scale
-	screen_height : f32 = MENU_HEIGHT
-	// The panel in the bottom left (hudmain_background, which isn't drawn
-	// itself while exploring): the frame, the ribbons, the icons, the compass.
-	left := max_f32(2 * SAFE_X - 60, SAFE_X) + 67
-	top := screen_height - 2 * SAFE_Y - 70
-	menu_image(renderer, hud.frame, left - 70, top - 5, 761, 90, scale)
-	ribbons_top := top + 12
-	draw_ribbon(renderer, hud.health_empty, hud.health_full, hud.ribbon_edge, left, ribbons_top, 2, 0, hud.health, scale)
-	draw_ribbon(renderer, hud.magic_empty, hud.magic_full, hud.ribbon_edge, left, ribbons_top + 18, 1, -1, hud.magicka, scale)
-	draw_ribbon(renderer, hud.fatigue_empty, hud.fatigue_full, hud.ribbon_edge, left, ribbons_top + 36, 1, 0, hud.fatigue, scale)
-	weapon_left := left + 189 + 40
-	menu_image(renderer, hud.weapon_icon, weapon_left, top + 5, 63, 63, scale)
-	magic_left := weapon_left + 63 + 32
-	menu_image(renderer, hud.magic_icon, magic_left, top + 5, 63, 63, scale)
-	// The compass: its face's 768 units a turn, north at 768, the heading
-	// in the middle of its 200-wide window.
-	compass_left := magic_left + 63 + 20
-	compass_top := top + 5
-	menu_image(renderer, hud.compass_back, compass_left - 5, compass_top - 2, 200, 68, scale, 70.0 / 255)
-	degrees := yaw * 180 / PI
-	degrees -= floor_f32(degrees / 360) * 360
-	from := degrees * 768 / 360 + 768 - 100
-	menu_image(renderer, hud.compass_face, compass_left, compass_top + 1, 200, 62, scale, 1, from)
-
-	// The reticle in the middle (half seen), or what using what it's on
-	// would do.
-	middle_x := screen_width / 2
-	middle_y := screen_height / 2
-	if hud.activate > 0 {
-		menu_image(renderer, hud.activate_icons, middle_x - 16, middle_y - 16, 30, 32, scale, 128.0 / 255, f32(30 * (hud.activate - 1)))
-	else
-		menu_image(renderer, hud.reticle, middle_x - 18, middle_y - 18, 37, 37, scale, 128.0 / 255)
-	}
-	// What it's on, by name: in the bottom right, its right edge at the
-	// margin, its foot at the screen's (hudinfo_name, no icons under it).
-	if hud.name.len > 0 {
-		font := &hud.fonts[1]
-		name_width := text_width(font, hud.name)
-		name_top := screen_height - font.line_height
-		draw_text(renderer, font, hud.name, (screen_width - 2 * SAFE_X - name_width) * scale, name_top * scale, scale, HUD_TEXT)
-	}
-}
-
-// One of the HUD's ribbons at left, top: empty, then full as far as share
-// of its 163 (inset by 11 across and inset_y down), its edge at the end.
-draw_ribbon :: fun(renderer: ^render.Renderer, empty: i64, full: i64, edge: i64, left: f32, top: f32, inset_y: f32, edge_y: f32,
-	share: f32, scale: f32)
-{
-	menu_image(renderer, empty, left, top, 189, 16, scale)
-	filled := min_f32(max_f32(share, 0), 1) * 163
-	if filled > 0 do menu_image(renderer, full, left + 11, top + inset_y, filled, 11, scale)
-	menu_image(renderer, edge, left + 11 + filled, top + edge_y, 12, 14, scale)
 }

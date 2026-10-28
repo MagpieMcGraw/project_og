@@ -148,7 +148,7 @@ glow or opacity — their own, or an Idle's.
 
 | What | Data | Notes |
 |---|---|---|
-| Menus, HUD | Misc BSA: 89 menu `.xml`; `textures\menus` 1,999 (+ 80% and 50% copies, 3,545) | the HUD is drawn: its frame, ribbons (full for now: no stats yet), the weapon's icon, the compass, the reticle (the talk and door icons on people and doors), the name of what it's on; laid out by hand from `hud_main_menu.xml`, `hud_reticle.xml` and `hud_info_menu.xml` (a screen 960 high, pictures pixel for pixel, Oblivion.ini's safe zone 20). The menus' XML (traits worked out by `<copy>`, `<add>`… from other elements') isn't read yet: menus need it |
+| Menus, HUD | Misc BSA: 89 menu `.xml`; `textures\menus` 1,999 (+ 80% and 50% copies, 3,545) | menus.mara reads the menus' XML (tiles, traits worked out by their operations, `<include>`d prefabs, &true; 2 and &false; 1) and draws it; the HUD is drawn from `hud_main_menu.xml`, `hud_reticle.xml` and `hud_info_menu.xml` with what the game sets in them (the ribbons full: no stats yet). Templates (lists), NIF tiles and input aren't done; no other menu is open yet |
 | Fonts | 5 `.fnt` + `.tex` | read: a 296-byte header (the line's height first), 256 glyphs of 14 numbers (the texture, its corners' u and v, width, height, room before and after, height above the baseline); the `.tex` its width, height and RGBA |
 | Loading screens | LSCR 337 | a texture and a line of text each |
 | Books | BOOK 887 | HTML-ish text |
