@@ -1585,7 +1585,7 @@ Cached_Texture :: struct {
 	id: u32
 	width: i64             // its largest mipmap's size in pixels (menus draw pictures pixel for pixel)
 	height: i64
-	handle: u64            // its bindless handle, resident; 0 without bindless
+	handle: u64            // its bindless handle, resident; 0 without bindless, or till it's made (make_waiting_handles)
 	has_alpha: bool        // its file keeps an alpha channel (DXT3, DXT5, 32-bit): a normal map's gloss
 }
 
@@ -1788,6 +1788,9 @@ Renderer :: struct {
 
 	// Textures, found by their paths' hashes.
 	textures: [MAX_TEXTURES]Cached_Texture
+	// The textures whose bindless handles are still to be made (their
+	// slots): made all at once (make_waiting_handles).
+	handles_waiting: [MAX_TEXTURES]i64
 	texture_index: Key_Index
 	// The textures that couldn't be loaded since the journal last told of
 	// them: how many, and the first's path and why. (Each is drawn white.)
@@ -1880,6 +1883,7 @@ renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
 		renderer.part_starts[p] = 0
 	}
 	renderer.textures.len = 0
+	renderer.handles_waiting.len = 0
 	renderer.texture_index = key_index(1 << 14, storage)
 
 	// The white texture: slot 0, for parts with none. Then a flat normal
@@ -1909,18 +1913,32 @@ one_pixel_texture :: fun(renderer: ^Renderer, pixel: [4!]u8) -> i64 {
 	entry.id = id
 	entry.width = 1
 	entry.height = 1
-	entry.handle = resident_handle(renderer, id)
+	entry.handle = 0
 	entry.has_alpha = true
+	wait_for_handle(renderer, renderer.textures.len - 1)
 	return renderer.textures.len - 1
 }
 
-// A texture's bindless handle, made resident; 0 without bindless. Its
-// parameters are set for good after this.
-resident_handle :: fun(renderer: ^Renderer, id: u32) -> u64 {
-	if not renderer.bindless_available do return 0
-	handle := GetTextureHandleARB(id)
-	MakeTextureHandleResidentARB(handle)
-	return handle
+// Puts a texture (its slot) among those whose bindless handles are to be
+// made (make_waiting_handles); without bindless, there are none to make.
+// Its parameters are set for good once that's done.
+wait_for_handle :: fun(renderer: ^Renderer, slot: i64) {
+	if not renderer.bindless_available do return
+	if not fits(renderer.handles_waiting.len + 1, renderer.handles_waiting.cap) do make_waiting_handles(renderer)
+	&renderer.handles_waiting + slot
+}
+
+// Makes the bindless handles of the textures waiting for them, resident,
+// before anything reads them: all at once, as one made straight after its
+// texture is put on the card waits for the card (0.7 ms each; 35 us in a
+// frame's batch, 4 us a frame on).
+make_waiting_handles :: fun(renderer: ^Renderer) {
+	for slot in renderer.handles_waiting {
+		entry := &renderer.textures[slot]
+		entry.handle = GetTextureHandleARB(entry.id)
+		MakeTextureHandleResidentARB(entry.handle)
+	}
+	renderer.handles_waiting.len = 0
 }
 
 // The program a frame's drawing uses: [1], bindless, when it's in use.
@@ -2446,6 +2464,7 @@ upload_distant_piece :: fun(renderer: ^Renderer, part: ^Model_Part, color_textur
 
 	piece_number := renderer.distant_pieces.len
 	if renderer.bindless_available {
+		make_waiting_handles(renderer)
 		handles : [2!]u64 = [renderer.textures[color_texture].handle, renderer.textures[normal_texture].handle]
 		BindBuffer(SHADER_STORAGE_BUFFER, renderer.distant_texture_buffer)
 		BufferSubData(SHADER_STORAGE_BUFFER, isize(piece_number * 16), handles)
@@ -2497,6 +2516,7 @@ setup_tree_buffers :: fun(renderer: ^Renderer) {
 upload_trees :: fun(renderer: ^Renderer, trees: ^[]Placed_Tree, x: i64, y: i64, slot: i64) -> Gpu_Trees {
 	placed := Gpu_Trees{x = x, y = y, slot = slot, center = Vec3{0, 0, 0}, radius = 0, runs = []}
 	if trees.len == 0 do return placed
+	make_waiting_handles(renderer)
 	instances : [TREES_PER_CELL]Tree_Instance
 	low := trees[0].position
 	high := low
@@ -2629,6 +2649,7 @@ setup_grass_buffers :: fun(renderer: ^Renderer) {
 upload_grass :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, blades: ^[]Placed_Grass, x: i64, y: i64, slot: i64) -> Gpu_Grass {
 	placed := Gpu_Grass{x = x, y = y, slot = slot, center = Vec3{0, 0, 0}, radius = 0, runs = []}
 	if blades.len == 0 do return placed
+	make_waiting_handles(renderer)
 	instances : [GRASS_PER_CELL]Grass_Instance
 	low := blades[0].position
 	high := low
@@ -2932,8 +2953,9 @@ texture_for :: fun(renderer: ^Renderer, archives: ^Archives, path: []utf8, scrat
 		entry.id = id
 		entry.width = width
 		entry.height = height
-		entry.handle = resident_handle(renderer, id)
+		entry.handle = 0
 		entry.has_alpha = has_alpha
+		wait_for_handle(renderer, slot)
 	}
 	_ = index_put(&renderer.texture_index, key, slot)
 	return slot
@@ -2980,8 +3002,9 @@ texture_from_pixels :: fun(renderer: ^Renderer, path: []utf8, pixels: []byte, wi
 	entry.id = id
 	entry.width = width
 	entry.height = height
-	entry.handle = resident_handle(renderer, id)
+	entry.handle = 0
 	entry.has_alpha = false
+	wait_for_handle(renderer, slot)
 	_ = index_put(&renderer.texture_index, key, slot)
 	return slot
 }
@@ -3320,8 +3343,11 @@ upload_land :: fun(renderer: ^Renderer, mesh: ^Land_Mesh, x: i64, y: i64, slot: 
 			}
 			quadrant.textures[k] = texture_slot
 			quadrant.normal_maps[k] = normal_slot
-			handles[k] = renderer.textures[texture_slot].handle
-			handles[QUADRANT_TEXTURES + k] = renderer.textures[normal_slot].handle
+		}
+		make_waiting_handles(renderer)
+		for k in 0:QUADRANT_TEXTURES {
+			handles[k] = renderer.textures[quadrant.textures[k]].handle
+			handles[QUADRANT_TEXTURES + k] = renderer.textures[quadrant.normal_maps[k]].handle
 		}
 		if renderer.bindless_available {
 			BindBuffer(SHADER_STORAGE_BUFFER, renderer.land_texture_buffer)
@@ -3513,6 +3539,7 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 	camera: Camera, width: i64, height: i64) -> Frame_Stats, err
 {
 	stats := Frame_Stats{instances = 0, visible = 0, drawn_parts = 0, draw_calls = 0, land_cells = 0}
+	make_waiting_handles(renderer)
 	framebuffer_error := size_framebuffers(renderer, width, height)
 	soft := not framebuffer_error
 	if soft do BindFramebuffer(FRAMEBUFFER, renderer.scene_framebuffer)
