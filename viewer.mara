@@ -1710,11 +1710,9 @@ command_view :: fun(what: []utf8, picture: Picture) {
 // window; its doors lead on, inside and out. When it can't, it says why
 // on the console, and gives the reason back.
 command_view_cell :: fun(name: []utf8, picture: Picture) -> err {
-	data_storage : [400 * MB]byte = void
-	data_storage.len = 0
 	index_storage : [96 * MB]byte = void
 	index_storage.len = 0
-	plugin, load_error := load_oblivion(&data_storage, &index_storage)
+	plugin, load_error := load_oblivion(&index_storage)
 	if load_error {
 		print("couldn't load the plugin: %", load_error)
 		return load_error
@@ -1758,11 +1756,9 @@ command_view_cell :: fun(name: []utf8, picture: Picture) -> err {
 // `sooblivion view-world [world] [x y]`: shows a world's land and what's
 // on it around the cell at x, y on its grid.
 command_view_world :: fun(name: []utf8, x: i64, y: i64, picture: Picture) {
-	data_storage : [400 * MB]byte = void
-	data_storage.len = 0
 	index_storage : [96 * MB]byte = void
 	index_storage.len = 0
-	plugin, load_error := load_oblivion(&data_storage, &index_storage)
+	plugin, load_error := load_oblivion(&index_storage)
 	if load_error {
 		print("couldn't load the plugin: %", load_error)
 		return

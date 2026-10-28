@@ -40,9 +40,8 @@ Painted_Texture :: struct {
 command_tree_picture :: fun(name: []utf8, out_path: []utf8, seed_or_bare: []utf8) {
 	bare := seed_or_bare == "bare"
 	seed_text := if bare do out_path[0:0] else seed_or_bare
-	data_storage : [400 * MB]byte
 	index_storage : [96 * MB]byte
-	plugin, load_error := load_oblivion(&data_storage, &index_storage)
+	plugin, load_error := load_oblivion(&index_storage)
 	if load_error {
 		print("couldn't load the plugins: %", load_error)
 		return

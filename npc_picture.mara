@@ -21,9 +21,8 @@ use facegen
 HEAD_PICTURE_SPAN :: 30
 
 command_npc_picture :: fun(name: []utf8, out_path: []utf8) {
-	data_storage : [400 * MB]byte
 	index_storage : [96 * MB]byte
-	plugin, load_error := load_oblivion(&data_storage, &index_storage)
+	plugin, load_error := load_oblivion(&index_storage)
 	if load_error {
 		print("couldn't load the plugins: %", load_error)
 		return

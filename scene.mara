@@ -525,7 +525,7 @@ named_sound_kind :: fun(scene: ^Scene, plugin: ^Plugin, name: []utf8) -> i64 {
 		for &span in plugin.files {
 			at := span.sounds_at
 			for at < span.sounds_end {
-				header : Record_Header = plugin.data[at]
+				header := record_header_at(plugin, at)
 				if header.kind != "SOUN" {
 					at += HEADER_SIZE
 					continue
@@ -841,7 +841,7 @@ note_load_time :: fun(scene: ^Scene, what: []utf8, start: u64) {
 tree_kind :: fun(scene: ^Scene, plugin: ^Plugin, base: u32, loader: Loader) -> i64 {
 	header_at, found := index_get(&plugin.records, u64(base))
 	if not found do return -1
-	header : Record_Header = plugin.data[header_at]
+	header := record_header_at(plugin, header_at)
 	if header.kind != "TREE" do return -1
 	known, seen := index_get(&scene.tree_kinds, u64(base))
 	if seen do return known - 1

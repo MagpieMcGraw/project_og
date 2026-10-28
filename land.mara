@@ -148,11 +148,11 @@ find_land :: fun(plugin: ^Plugin, cell: u32) -> i64, bool {
 		file := plugin.files.len - back
 		group_at, found := index_get(&plugin.cell_children, cell_group_key(file, cell))
 		if not found do continue
-		group_header : Group_Header = plugin.data[group_at]
+		group_header := group_header_at(plugin, group_at)
 		end := group_at + i64(group_header.size)
 		at := group_at + HEADER_SIZE
 		for at < end {
-			header : Record_Header = plugin.data[at]
+			header := record_header_at(plugin, at)
 			if header.kind == "GRUP" {
 				at += HEADER_SIZE
 				continue

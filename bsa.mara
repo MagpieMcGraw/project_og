@@ -69,10 +69,11 @@ Archive_File :: struct {
 	packed: bool
 }
 
-// An open archive with its directory read. The file stays open, for
-// reading files from it with read_file.
+// An open archive: the whole of it mapped (file_map: read as its pages are
+// touched), its files read from there with read_file; its directory's
+// tables.
 Archive :: struct {
-	file: File_Id
+	bytes: []byte
 	header: Archive_Header
 	directory: []byte          // the archive from its start up to the files' data
 	folders: []Folder
@@ -94,13 +95,11 @@ file_name :: fun(archive: ^Archive, file: Archive_File) -> []utf8 {
 // Opens an archive and reads its directory into storage (its len moved
 // past it), with the tables of its folders and files.
 open_archive :: fun(path: []utf8, storage: ^[]byte) -> Archive, err {
-	file := file_open_read(path)?
-	defer? file_close(file)
+	bytes := file_map(path)?
+	defer? file_unmap(bytes)
 
-	header_bytes : [36!]byte
-	header_view := header_bytes[:]
-	read_exactly(file, &header_view)?
-	header : Archive_Header = header_bytes[0]
+	if bytes.len < 36 do return Archive{0}, Not_An_Archive
+	header : Archive_Header = bytes[0]
 	if header.magic[0:3] != "BSA" do return Archive{0}, Not_An_Archive
 	if header.version != OBLIVION_VERSION do return Archive{0}, Wrong_Version
 	if header.flags & ARCHIVE_FOLDER_NAMES == 0 or header.flags & ARCHIVE_FILE_NAMES == 0 do return Archive{0}, Bad_Directory
@@ -108,13 +107,8 @@ open_archive :: fun(path: []utf8, storage: ^[]byte) -> Archive, err {
 	folder_count := i64(header.folder_count)
 	file_count := i64(header.file_count)
 	directory_size := 36 + folder_count * 16 + folder_count + i64(header.folder_names_size) + file_count * 16 + i64(header.file_names_size)
-	if storage.len + directory_size > storage.cap do return Archive{0}, No_Room
-
-	start := storage.len
-	directory := storage[start : start + directory_size]
-	_ = file_seek(file, 0, SEEK_SET)?
-	read_exactly(file, &directory)?
-	storage.len = start + directory_size
+	if directory_size > bytes.len do return Archive{0}, Bad_Directory
+	directory := bytes[0 : directory_size]
 
 	folders := slice([:folder_count]Folder, storage)
 	files := slice([:file_count]Archive_File, storage)
@@ -170,17 +164,18 @@ open_archive :: fun(path: []utf8, storage: ^[]byte) -> Archive, err {
 	if at != directory_size - i64(header.file_names_size) do return Archive{0}, Bad_Directory
 
 	// Its stamp: the cache's files of it are those with it in their keys.
-	stamp : u64 = u64(file_size(file)?)
+	stamp : u64 = u64(bytes.len)
 	for c in get_file(path) do stamp = mix_key(stamp, u64(c | 0x20))
 	for k in 0:directory_size / 8 {
 		piece : u64 = directory[k * 8]
 		stamp = mix_key(stamp, piece)
 	}
-	return Archive{file = file, header = header, directory = directory, folders = folders, files = files, stamp = stamp}
+	return Archive{bytes = bytes, header = header, directory = directory, folders = folders, files = files, stamp = stamp}
 }
 
 close_archive :: fun(archive: ^Archive) {
-	file_close(archive.file)
+	file_unmap(archive.bytes)
+	archive.bytes = []
 }
 
 // The hash an archive sorts a name by: a folder's whole name, or a file's
@@ -301,25 +296,24 @@ read_file :: fun(archive: ^Archive, index: i64, storage: ^[]byte, checked := fal
 	entry := archive.files[index]
 	start := storage.len
 	none := storage[start : start]
-	if start + entry.size > storage.cap do return none, No_Room
-	_ = file_seek(archive.file, entry.offset, SEEK_SET)?
+	if entry.offset + entry.size > archive.bytes.len do return none, Bad_Directory
+	stored := archive.bytes[entry.offset : entry.offset + entry.size]
 
 	if not entry.packed {
-		data := storage[start : start + entry.size]
-		read_exactly(archive.file, &data)?
+		if start + entry.size > storage.cap do return none, No_Room
+		storage[start : start + entry.size] = stored
 		storage.len = start + entry.size
-		return data
+		return storage[start : start + entry.size]
 	}
 
-	// Packed: read into the end of storage's room, unpacked in front of it.
-	packed := storage[storage.cap - entry.size : storage.cap]
-	read_exactly(archive.file, &packed)?
-	unpacked_size : u32 = packed[0]
+	// Packed: its unpacked size, then the stream, unpacked into storage.
+	if stored.len < 4 do return none, Bad_Directory
+	unpacked_size : u32 = stored[0]
 	if unpacked_size == 0 do return none   // an empty file: its size and nothing more
-	if start + i64(unpacked_size) > storage.cap - entry.size do return none, No_Room
+	if start + i64(unpacked_size) > storage.cap do return none, No_Room
 	output := storage[start : start + i64(unpacked_size)]
 	output.len = 0
-	unzip(packed[4 : packed.len], &output, checked)?
+	unzip(stored[4 : stored.len], &output, checked)?
 	storage.len = start + output.len
 	return storage[start : start + output.len]
 }

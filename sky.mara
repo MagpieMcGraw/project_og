@@ -355,7 +355,7 @@ default_weather :: fun() -> Weather {
 find_by_editor_id :: fun(plugin: ^Plugin, kind: []utf8, name: []utf8, scratch: ^[]byte) -> u32 {
 	for key, slot in plugin.records.keys {
 		if key == 0 do continue
-		header : Record_Header = plugin.data[i64(plugin.records.values[slot])]
+		header := record_header_at(plugin, i64(plugin.records.values[slot]))
 		if header.kind != kind do continue
 		scratch.len = 0
 		record, record_error := record_at(plugin, i64(plugin.records.values[slot]), scratch)

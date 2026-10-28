@@ -107,7 +107,7 @@ Plugin_Span :: struct {
 // record a later file has too (an override) is found as that file has it;
 // form ids are the game's, their top bytes places in the load order.
 Plugin :: struct {
-	data: []byte
+	file_bytes: [MAX_PLUGIN_FILES][]byte   // each file's bytes (mapped: file_map), as files has them
 	files: [MAX_PLUGIN_FILES]Plugin_Span
 	records: Key_Index           // each record's place, by its form id
 	cell_children: Key_Index     // each file's group of a cell's references, by cell_group_key
@@ -127,7 +127,7 @@ RECORD_SLOTS :: 1 << 22
 CELL_SLOTS :: 1 << 17
 WORLD_SLOTS :: 1 << 10
 
-// Indexes the plugins' data (plugin.data and each file's name, span and
+// Indexes the plugins' data (plugin.file_bytes and each file's name, span and
 // place in the load order set): each file's masters read from its TES4
 // record, then one walk over each file. The indexes are carved from storage.
 index_plugin :: fun(plugin: ^Plugin, storage: ^[]byte) -> err {
@@ -151,9 +151,11 @@ read_masters :: fun(plugin: ^Plugin, file: i64) -> err {
 	span.interior_cells_end = 0
 	span.sounds_at = 0
 	span.sounds_end = 0
-	header : Record_Header = plugin.data[span.start]
-	if header.kind != "TES4" do return Not_A_Plugin
-	body := plugin.data[span.start + HEADER_SIZE : span.start + HEADER_SIZE + i64(header.size)]
+	data := plugin.file_bytes[file]
+	if data.len < HEADER_SIZE do return Not_A_Plugin
+	header : Record_Header = data[0]
+	if header.kind != "TES4" or HEADER_SIZE + i64(header.size) > data.len do return Not_A_Plugin
+	body := data[HEADER_SIZE : HEADER_SIZE + i64(header.size)]
 	fields := Fields{data = body, at = 0, broken = false}
 	for field in next_field(&fields) {
 		if field.kind != "MAST" do continue
@@ -174,7 +176,9 @@ read_masters :: fun(plugin: ^Plugin, file: i64) -> err {
 // One walk over a plugin file's groups and records, into the indexes.
 index_file :: fun(plugin: ^Plugin, file: i64) -> err {
 	span := &plugin.files[file]
-	data := plugin.data
+	// (Its own bytes, from its start: a place in them is at - base.)
+	data := plugin.file_bytes[file]
+	base := span.start
 	// The world whose group the walk is in, where that group ends, and
 	// whether its blocks of cells have begun: the cell before them is the
 	// world's persistent one.
@@ -185,9 +189,9 @@ index_file :: fun(plugin: ^Plugin, file: i64) -> err {
 	for at < span.end {
 		if at + HEADER_SIZE > span.end do return Truncated
 		if world != 0 and at >= world_end do world = 0
-		header : Record_Header = data[at]
+		header : Record_Header = data[at - base]
 		if header.kind == "GRUP" {
-			group_header : Group_Header = data[at]
+			group_header : Group_Header = data[at - base]
 			if group_header.group_type == GROUP_CELL_CHILDREN {
 				index_put(&plugin.cell_children, cell_group_key(file, global_form(plugin, file, group_header.label)), at)?
 			}
@@ -198,7 +202,7 @@ index_file :: fun(plugin: ^Plugin, file: i64) -> err {
 			}
 			if group_header.group_type == GROUP_EXTERIOR_BLOCK do in_blocks = true
 			if group_header.group_type == GROUP_TOP {
-				label : [4!]utf8 = data[at + 8]
+				label : [4!]utf8 = data[at - base + 8]
 				if label == "CELL" {
 					span.interior_cells_at = at + HEADER_SIZE
 					span.interior_cells_end = at + i64(group_header.size)
@@ -216,7 +220,7 @@ index_file :: fun(plugin: ^Plugin, file: i64) -> err {
 		if form_id != 0 do index_put(&plugin.records, u64(form_id), at)?
 		if world != 0 and header.kind == "CELL" {
 			index_put(&plugin.cell_worlds, u64(form_id), i64(world))?
-			body := data[at + HEADER_SIZE : next_at]
+			body := data[at - base + HEADER_SIZE : next_at - base]
 			grid, has_grid := find_field(body, "XCLC")
 			if not in_blocks {
 				index_put(&plugin.persistent_cells, u64(world), i64(form_id))?
@@ -263,12 +267,34 @@ record_form :: fun(plugin: ^Plugin, record: Record, raw: u32) -> u32 {
 	return global_form(plugin, record.file, raw)
 }
 
-// The record at a place in the plugins' data.
-record_at :: fun(plugin: ^Plugin, at: i64, scratch: ^[]byte) -> Record, err {
-	header : Record_Header = plugin.data[at]
-	body := plugin.data[at + HEADER_SIZE : at + HEADER_SIZE + i64(header.size)]
-	data := record_data(header, body, scratch)?
+// The plugins' bytes at a place (the files' spans laid end to end), size
+// of them: a view of the file they're in.
+plugin_bytes :: fun(plugin: ^Plugin, at: i64, size: i64) -> []byte {
 	file := file_at(plugin, at)
+	from := at - plugin.files[file].start
+	return plugin.file_bytes[file][from : from + size]
+}
+
+// The header of the record at a place in the plugins.
+record_header_at :: fun(plugin: ^Plugin, at: i64) -> Record_Header {
+	header : Record_Header = plugin_bytes(plugin, at, HEADER_SIZE)[0]
+	return header
+}
+
+// The header of the group at a place in the plugins.
+group_header_at :: fun(plugin: ^Plugin, at: i64) -> Group_Header {
+	header : Group_Header = plugin_bytes(plugin, at, HEADER_SIZE)[0]
+	return header
+}
+
+// The record at a place in the plugins.
+record_at :: fun(plugin: ^Plugin, at: i64, scratch: ^[]byte) -> Record, err {
+	file := file_at(plugin, at)
+	bytes := plugin.file_bytes[file]
+	from := at - plugin.files[file].start
+	header : Record_Header = bytes[from]
+	body := bytes[from + HEADER_SIZE : from + HEADER_SIZE + i64(header.size)]
+	data := record_data(header, body, scratch)?
 	header.form_id = global_form(plugin, file, header.form_id)
 	return Record{header = header, data = data, file = file}
 }
@@ -276,7 +302,7 @@ record_at :: fun(plugin: ^Plugin, at: i64, scratch: ^[]byte) -> Record, err {
 // The record with a form id, as the last plugin to have it has it.
 find_record :: fun(plugin: ^Plugin, form_id: u32, scratch: ^[]byte) -> Record, err {
 	at, found := index_get(&plugin.records, u64(form_id))
-	if not found do return Record{header = Record_Header{0}, data = plugin.data[0:0], file = 0}, No_Such_Record
+	if not found do return Record{header = Record_Header{0}, data = [], file = 0}, No_Such_Record
 	return record_at(plugin, at, scratch)
 }
 
@@ -312,7 +338,7 @@ find_interior_cell :: fun(plugin: ^Plugin, name: []utf8, scratch: ^[]byte) -> u3
 	for &span in plugin.files {
 		at := span.interior_cells_at
 		for at < span.interior_cells_end {
-			header : Record_Header = plugin.data[at]
+			header := record_header_at(plugin, at)
 			if header.kind == "GRUP" {
 				at += HEADER_SIZE
 				continue
@@ -345,11 +371,11 @@ cell_references :: fun(plugin: ^Plugin, cell: u32, references: ^[]Reference) -> 
 	for file in 0:plugin.files.len {
 		group_at, found := index_get(&plugin.cell_children, cell_group_key(file, cell))
 		if not found do continue
-		group_header : Group_Header = plugin.data[group_at]
+		group_header := group_header_at(plugin, group_at)
 		end := group_at + i64(group_header.size)
 		at := group_at + HEADER_SIZE
 		for at < end {
-			header : Record_Header = plugin.data[at]
+			header := record_header_at(plugin, at)
 			if header.kind == "GRUP" {
 				at += HEADER_SIZE   // the persistent, temporary and distant groups: into them
 				continue
@@ -358,7 +384,7 @@ cell_references :: fun(plugin: ^Plugin, cell: u32, references: ^[]Reference) -> 
 			if next_at > end do return Broken_Group
 			placed := header.kind == "REFR" or header.kind == "ACHR"
 			if placed and fits(references.len + 1, references.cap) and winning_copy(plugin, file, header, at) {
-				body := plugin.data[at + HEADER_SIZE : next_at]
+				body := plugin_bytes(plugin, at + HEADER_SIZE, i64(header.size))
 				references + read_reference(plugin, file, header, body)
 			}
 			at = next_at
@@ -380,21 +406,21 @@ cell_distant_references :: fun(plugin: ^Plugin, cell: u32, references: ^[]Refere
 	for file in 0:plugin.files.len {
 		group_at, found := index_get(&plugin.cell_children, cell_group_key(file, cell))
 		if not found do continue
-		group_header : Group_Header = plugin.data[group_at]
+		group_header := group_header_at(plugin, group_at)
 		end := group_at + i64(group_header.size)
 		at := group_at + HEADER_SIZE
 		for at < end {
 			// The cell's groups: only the visible-distant one is read.
-			inner : Group_Header = plugin.data[at]
+			inner := group_header_at(plugin, at)
 			if inner.kind != "GRUP" do break
 			inner_end := at + i64(inner.size)
 			if inner.group_type == GROUP_CELL_VISIBLE_DISTANT {
 				place := at + HEADER_SIZE
 				for place < inner_end {
-					header : Record_Header = plugin.data[place]
+					header := record_header_at(plugin, place)
 					next_place := place + HEADER_SIZE + i64(header.size)
 					if header.kind == "REFR" and fits(references.len + 1, references.cap) and winning_copy(plugin, file, header, place) {
-						references + read_reference(plugin, file, header, plugin.data[place + HEADER_SIZE : next_place])
+						references + read_reference(plugin, file, header, plugin_bytes(plugin, place + HEADER_SIZE, i64(header.size)))
 					}
 					place = next_place
 				}
@@ -742,7 +768,7 @@ cell_of_reference :: fun(plugin: ^Plugin, reference: u32) -> u32 {
 	for key, slot in cells.keys {
 		if key == 0 do continue
 		group_at := i64(cells.values[slot])
-		group_header : Group_Header = plugin.data[group_at]
+		group_header := group_header_at(plugin, group_at)
 		if at > group_at and at < group_at + i64(group_header.size) do return u32(key & 0xFFFFFFFF)
 	}
 	return 0
