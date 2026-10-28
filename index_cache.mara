@@ -1,7 +1,7 @@
 // The plugins' index kept in the cache folder (INDEX_CACHE_PATH), so a
-// start reads it instead of walking every record: what indexing finds of
-// each file (Kept_Span), then the tables as they are in memory, each its
-// count, keys and values. Its
+// start reads it instead of walking every record: each file's span (what
+// indexing found of it with the rest), then the tables as they are in
+// memory, each its count, keys and values. Its
 // stamp says what it was made from: the plugin files (their names, sizes
 // and times written) and the program (a build may index otherwise). When
 // the stamp differs, or the file isn't whole, the plugins are indexed
@@ -30,17 +30,6 @@ Index_Header :: struct {
 	stamp: u64
 	file_count: i64
 	size: i64        // the whole file's, in bytes
-}
-
-// What indexing finds of a plugin file (its span's other fields are the
-// load order's: the same, as the stamp is).
-Kept_Span :: struct {
-	masters: [16!]u32
-	master_count: i64
-	interior_cells_at: i64
-	interior_cells_end: i64
-	sounds_at: i64
-	sounds_end: i64
 }
 
 // A stamp of the plugin files in the load order (names, sizes, times
@@ -79,20 +68,15 @@ read_index_file :: fun(file: File_Id, plugin: ^Plugin, stamp: u64, storage: ^[]b
 	if header.magic != INDEX_MAGIC or header.stamp != stamp or header.file_count != plugin.files.len do return Stale_Index
 	if file_size(file)? != header.size do return Stale_Index
 
-	// What indexing found of each file, read into the room past what
-	// storage holds (used again after).
-	kept_size := size_of(Kept_Span)
-	if storage.len + header.file_count * kept_size > storage.cap do return Stale_Index
-	kept_bytes := storage[storage.len : storage.len + header.file_count * kept_size]
-	read_exactly(file, &kept_bytes)?
-	for &span, k in plugin.files {
-		kept : Kept_Span = kept_bytes[k * kept_size]
-		span.masters = kept.masters
-		span.master_count = kept.master_count
-		span.interior_cells_at = kept.interior_cells_at
-		span.interior_cells_end = kept.interior_cells_end
-		span.sounds_at = kept.sounds_at
-		span.sounds_end = kept.sounds_end
+	// Each file's span, read into the room past what storage holds (used
+	// again after).
+	span_size := size_of(Plugin_Span)
+	if storage.len + header.file_count * span_size > storage.cap do return Stale_Index
+	spans := storage[storage.len : storage.len + header.file_count * span_size]
+	read_exactly(file, &spans)?
+	for k in 0:header.file_count {
+		span : Plugin_Span = spans[k * span_size]
+		plugin.files[k] = span
 	}
 
 	read_table(file, &plugin.records, RECORD_SLOTS, storage)?
@@ -130,13 +114,10 @@ write_plugin_index :: fun(plugin: ^Plugin, stamp: u64) -> err {
 	chunk : [1 * MB]byte
 	chunk.len = 32
 	chunk[0] = header
-	for &span in plugin.files {
-		kept := Kept_Span{masters = span.masters, master_count = span.master_count,
-			interior_cells_at = span.interior_cells_at, interior_cells_end = span.interior_cells_end,
-			sounds_at = span.sounds_at, sounds_end = span.sounds_end}
+	for span in plugin.files {
 		at := chunk.len
-		chunk.len += size_of(Kept_Span)
-		chunk[at] = kept
+		chunk.len += size_of(Plugin_Span)
+		chunk[at] = span
 	}
 	written := chunk.len
 	_ = file_write(file, chunk)?

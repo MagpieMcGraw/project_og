@@ -146,7 +146,7 @@ full_log_start :: fun() {
 }
 
 // Adds text to the end of the file at path (made if it isn't there), unless
-// that would make it longer than most bytes. (ASCII paths only: wide_path.)
+// that would make it longer than most bytes.
 add_to_file :: fun(path: []utf8, text: []utf8, most: i64) -> err {
 	id := file_open_append(path)?
 	defer file_close(id)

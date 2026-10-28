@@ -1,4 +1,4 @@
-Mara 61bf1804 (2026-10-27 20:51): The copy rule follows values, in the escape analysis
-commit 61bf1804983014e1b70347dedc1a4d34391b5ac7
-released 2026-10-27 21:18 by release.sh: Mara.exe built -o:speed from a clean tree
-suite with this Mara.exe and stdlib: pass=383  xfail=280  skip=20  mismatches=0
+Mara 9d90101a (2026-10-28 18:37): A struct holding a list writes into a byte buffer
+commit 9d90101a7d5eb135b8d23cf029d24acd21b7341c
+released 2026-10-28 18:40 by release.sh: Mara.exe built -o:speed from a clean tree
+suite with this Mara.exe and stdlib: pass=391  xfail=283  skip=20  mismatches=0

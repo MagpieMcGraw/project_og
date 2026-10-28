@@ -7,114 +7,7 @@ against Mara at the time written. When one is fixed, move it to Fixed
 
 ## Open
 
-- A generic fun's param can't have a default, so a generic can't take
-  `#caller_span` or `#caller_name`. Checked against 61bf180:
-
-  ```
-  room_for :: fun(list: ^[]$T, site: atom = #caller_span) -> bool {
-  	if list.len < list.cap do return true
-  	print("full at %", site)
-  	return false
-  }
-  ```
-
-  says "a generic's param with a default is not supported yet". Expected:
-  defaults as on any fun. sooblivion's check takes the numbers instead,
-  `fits(list.len + 1, list.cap)` (logging.mara), where it would take the
-  list (`room_for(&list)`).
-
-- mara.os can't add to the end of a file: file_open_write writes over
-  it, and nothing opens one for appending. A program can't bind
-  CreateFileA itself either, as mara.os binds it (privately). Checked
-  against 61bf180:
-
-  ```
-  foreign static_lib "kernel32" {
-  	fun CreateFileA(name: cstring, access: u32, share: u32, security: ^byte, disposition: u32, flags: u32, template: File_Id) -> File_Id
-  }
-  ```
-
-  says "foreign symbol 'CreateFileA' is already declared in library
-  'kernel32' (first declaration at os.mara:995); each external symbol
-  may be bound by at most one foreign block". Expected: an append open in
-  mara.os (`file_open_append`); and a private binding not keeping others
-  from binding the same symbol. sooblivion binds CreateFileW for its full
-  log (logging.mara, add_to_file).
-
-- `-profile memory` gives an arena's peak as a number like an address.
-  Checked against 61bf180 with Mara's own doc/memory_profiling.mara: its
-  memory.txt ends
-
-  ```
-        size B       peak B   peak %  arena
-       1048576 140702278017248 13418414880.49  Arena_Basic
-  ```
-
-  Expected: the most bytes in use at once, at most the size. sooblivion's
-  runs give 140703099914000 for its 2 GB arena.
-
-- `-profile memory` doesn't watch a list in an item made with `next()`
-  from a carved slice, and that list's len writes are put down to a list
-  watched before at the same address. Checked against 61bf180:
-
-  ```
-  Part :: struct {
-  	texture: [160]utf8
-  	count: i64
-  }
-  Bytes :: struct {
-  	data: [100000]u8
-  }
-  make_parts :: fun(storage: ^[]byte) -> i64 {
-  	parts := slice([:4]Part, storage)
-  	for k in 0:4 {
-  		&parts + Part{texture = [], count = k}
-  		&parts[k].texture + "textures/a.dds"
-  	}
-  	return parts.len
-  }
-  make_bytes :: fun(storage: ^[]byte) -> i64 {
-  	holders := slice([:1]Bytes, storage)
-  	holder := next(&holders)
-  	holder.data.len = 0
-  	for k in 0:50000 do &holder.data + u8(k)
-  	return holder.data.len
-  }
-  ```
-
-  with `make_parts(&storage)`, `storage.len = 0`, `make_bytes(&storage)`
-  in main, memory.txt has `Part.texture` at a peak of 50000 of its 160,
-  and no `Bytes.data`. Expected: `Bytes.data` at 50000 of 100000, and
-  `Part.texture` at 14. In sooblivion's profiles `Model_Part.texture`
-  reaches 69243 of 160 (nifs: the model room is emptied for each mesh)
-  and `read_npc_look.eyes_texture` 28856 of 128 (npc). Slices carved from
-  storage (`slice([:n]T, storage)`) aren't in the report either; the
-  doc says partial arrays only, but they're where most of sooblivion's
-  room is (a model's parts, motions, flipbooks).
-
-- A struct holding a list can't be written into a byte buffer: the
-  program isn't made. Checked against 61bf180 and main Mara (Mara.exe):
-
-  ```
-  Span :: struct {
-  	name: [8]utf8
-  	start: i64
-  }
-  main :: () {
-  	chunk : [256]byte
-  	chunk.len = 64
-  	span := Span{name = [], start = 3}
-  	&span.name + "abc"
-  	chunk[16] = span
-  	print("span written: %", chunk.len)
-  }
-  ```
-
-  says "Codegen error: can't lower 'main' from the program graph: its
-  view ''" at `chunk[16] = span` (a struct of plain fields writes fine).
-  Expected: its bytes written, the list's len and room with them, as a
-  list's are on its own. sooblivion's plugin index (index_cache.mara)
-  writes a Kept_Span of the fields it needs instead of the Plugin_Span.
+None.
 
 ## Answered (not issues)
 
@@ -130,8 +23,30 @@ against Mara at the time written. When one is fixed, move it to Fixed
 
 ## Fixed
 
-sooblivion builds with Mara's release, 61bf180 (MARA_VERSION.txt;
+sooblivion builds with Mara's release, 9d90101a (MARA_VERSION.txt;
 update_compiler.bat pulls the next), so all of these are in its copy.
+
+- A struct holding a list couldn't be written into a byte buffer (the
+  program wasn't made: "can't lower ... its view ''") — 9d90101a. The
+  plugins' index (index_cache.mara) writes each Plugin_Span whole again,
+  not a Kept_Span of some of its fields.
+- mara.os couldn't add to the end of a file, and a program couldn't bind
+  CreateFileA as mara.os did — 72fa281: file_open_append, and a foreign
+  symbol may be bound again with the same C signature. logging.mara's
+  full log appends with mara.os's; disk.mara still opens the cache's
+  files for reading and writing both (CreateFileW), which mara.os
+  doesn't.
+- A generic fun's param couldn't have a default, so a generic couldn't
+  take `#caller_span` or `#caller_name` — 2943553. sooblivion's check
+  still takes the numbers, `fits(list.len + 1, list.cap)` (183 calls);
+  it could take the list now (`room_for(&list)`).
+- `-profile memory` gave an arena's peak as a number like an address —
+  bdba31d: the most bytes in use at once.
+- `-profile memory` didn't watch a list in an item made with `next()`
+  from a carved slice, and put its len writes down to a list watched
+  before at the same address — 5a34835; slices taken from storage are
+  in the report too (105c8a4). The repro gives `Bytes.data` at 50000 of
+  100000, `Part.texture` at 14.
 
 - An immutable slice param stored into a struct field (`hold(numbers)`
   giving back `Holder{numbers = numbers}`) made that field read-only in

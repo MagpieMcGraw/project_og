@@ -1,7 +1,6 @@
-// Files on disk opened and read the ways mara.os doesn't: for adding to
-// the end, and for reading and writing both (the cache's), by CreateFileW
-// (mara.os binds CreateFileA itself: MARA_ISSUES.md); folders made; a view
-// filled whole.
+// Files on disk opened and read the ways mara.os doesn't: for reading and
+// writing both (the cache's), by CreateFileW; folders made; a file's
+// stamp; a view filled whole.
 module disk
 
 use mara.core
@@ -12,7 +11,6 @@ foreign static_lib "kernel32" {
 	fun CreateDirectoryW(name: ^u16, security: ^byte) -> i32
 	fun GetFileAttributesExW(name: ^u16, level: i32, info: ^byte) -> i32
 }
-FILE_APPEND_DATA :: 0x0004
 
 // A path as Windows' wide text, a 0 after it: its letters taken one to a
 // UTF-16 unit (ASCII paths only). False when it's too long.
@@ -24,15 +22,6 @@ wide_path :: fun(path: []utf8) -> [261]u16, bool {
 	}
 	&wide + u16(0)
 	return wide, true
-}
-
-// Opens the file at path for adding to its end, made if it isn't there.
-file_open_append :: fun(path: []utf8) -> File_Id, err {
-	wide, fits_path := wide_path(path)
-	if not fits_path do return NO_FILE, File_Error.Open_Failed
-	id := CreateFileW(wide.ptr, FILE_APPEND_DATA, FILE_SHARE_READ, void, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NO_FILE)
-	if id == INVALID_HANDLE_VALUE do return NO_FILE, File_Error.Open_Failed
-	return id
 }
 
 // Opens the file at path to read and to write, made if it isn't there —
