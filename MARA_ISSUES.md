@@ -41,6 +41,57 @@ against Mara at the time written. When one is fixed, move it to Fixed
   from binding the same symbol. sooblivion binds CreateFileW for its full
   log (logging.mara, add_to_file).
 
+- `-profile memory` gives an arena's peak as a number like an address.
+  Checked against 61bf180 with Mara's own doc/memory_profiling.mara: its
+  memory.txt ends
+
+  ```
+        size B       peak B   peak %  arena
+       1048576 140702278017248 13418414880.49  Arena_Basic
+  ```
+
+  Expected: the most bytes in use at once, at most the size. sooblivion's
+  runs give 140703099914000 for its 2 GB arena.
+
+- `-profile memory` doesn't watch a list in an item made with `next()`
+  from a carved slice, and that list's len writes are put down to a list
+  watched before at the same address. Checked against 61bf180:
+
+  ```
+  Part :: struct {
+  	texture: [160]utf8
+  	count: i64
+  }
+  Bytes :: struct {
+  	data: [100000]u8
+  }
+  make_parts :: fun(storage: ^[]byte) -> i64 {
+  	parts := slice([:4]Part, storage)
+  	for k in 0:4 {
+  		&parts + Part{texture = [], count = k}
+  		&parts[k].texture + "textures/a.dds"
+  	}
+  	return parts.len
+  }
+  make_bytes :: fun(storage: ^[]byte) -> i64 {
+  	holders := slice([:1]Bytes, storage)
+  	holder := next(&holders)
+  	holder.data.len = 0
+  	for k in 0:50000 do &holder.data + u8(k)
+  	return holder.data.len
+  }
+  ```
+
+  with `make_parts(&storage)`, `storage.len = 0`, `make_bytes(&storage)`
+  in main, memory.txt has `Part.texture` at a peak of 50000 of its 160,
+  and no `Bytes.data`. Expected: `Bytes.data` at 50000 of 100000, and
+  `Part.texture` at 14. In sooblivion's profiles `Model_Part.texture`
+  reaches 69243 of 160 (nifs: the model room is emptied for each mesh)
+  and `read_npc_look.eyes_texture` 28856 of 128 (npc). Slices carved from
+  storage (`slice([:n]T, storage)`) aren't in the report either; the
+  doc says partial arrays only, but they're where most of sooblivion's
+  room is (a model's parts, motions, flipbooks).
+
 ## Answered (not issues)
 
 - Struct values can't be compared (`part.diffuse != Vec3{1, 1, 1}`): not
