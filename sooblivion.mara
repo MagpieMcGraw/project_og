@@ -16,6 +16,7 @@ use mara.time
 use esm
 use bsa
 use disk
+use index_cache
 use inflate
 use nif
 use dds
@@ -659,6 +660,7 @@ load_oblivion :: fun(data_storage: ^[]byte, index_storage: ^[]byte) -> Plugin, e
 	read_load_order(&order)?
 	plugin := Plugin{0}
 	first := data_storage.len
+	paths : [MAX_PLUGIN_FILES]Path
 	for &file, k in order.plugins {
 		at := data_storage.len - first
 		path := data_path(file.name)
@@ -669,11 +671,25 @@ load_oblivion :: fun(data_storage: ^[]byte, index_storage: ^[]byte) -> Plugin, e
 		span.end = at + data.len
 		span.own_index = u32(k)
 		&plugin.files + span
+		&paths + path
 	}
 	plugin.data = data_storage[first : data_storage.len]
-	index_plugin(&plugin, index_storage)?
-	print("indexed % records of % plugins in % ms: % cells' groups, % exterior cells, % worlds with persistent cells",
-		plugin.records.count, plugin.files.len, elapsed_ms(start), plugin.cell_children.count, plugin.exterior_cells.count, plugin.persistent_cells.count)
+	read_at := time_now()
+
+	// The index kept in the cache, if it was made from these files by this
+	// build; else they're indexed, and it's kept for next time.
+	stamp, stamp_error := plugins_stamp(paths)
+	kept := not stamp_error and read_plugin_index(&plugin, stamp, index_storage)
+	if not kept {
+		index_plugin(&plugin, index_storage)?
+		if not stamp_error {
+			write_error := write_plugin_index(&plugin, stamp)
+			if write_error do print("couldn't keep the plugins' index in the cache: %", write_error)
+		}
+	}
+	print("% % records of % plugins in % ms (read in %): % cells' groups, % exterior cells, % worlds with persistent cells",
+		if kept do "the cache's index of" else "indexed", plugin.records.count, plugin.files.len, elapsed_ms(start),
+		i64((read_at - start) / 1000000), plugin.cell_children.count, plugin.exterior_cells.count, plugin.persistent_cells.count)
 	return plugin
 }
 

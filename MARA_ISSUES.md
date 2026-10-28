@@ -111,6 +111,30 @@ against Mara at the time written. When one is fixed, move it to Fixed
   doc says partial arrays only, but they're where most of sooblivion's
   room is (a model's parts, motions, flipbooks).
 
+- A struct holding a list can't be written into a byte buffer: the
+  program isn't made. Checked against 61bf180 and main Mara (Mara.exe):
+
+  ```
+  Span :: struct {
+  	name: [8]utf8
+  	start: i64
+  }
+  main :: () {
+  	chunk : [256]byte
+  	chunk.len = 64
+  	span := Span{name = [], start = 3}
+  	&span.name + "abc"
+  	chunk[16] = span
+  	print("span written: %", chunk.len)
+  }
+  ```
+
+  says "Codegen error: can't lower 'main' from the program graph: its
+  view ''" at `chunk[16] = span` (a struct of plain fields writes fine).
+  Expected: its bytes written, the list's len and room with them, as a
+  list's are on its own. sooblivion's plugin index (index_cache.mara)
+  writes a Kept_Span of the fields it needs instead of the Plugin_Span.
+
 ## Answered (not issues)
 
 - Struct values can't be compared (`part.diffuse != Vec3{1, 1, 1}`): not

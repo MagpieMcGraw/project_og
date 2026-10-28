@@ -120,15 +120,20 @@ cell_group_key :: fun(file: i64, cell: u32) -> u64 {
 	return (u64(file) << 32) | u64(cell)
 }
 
+// The plugins' indexes' rooms: for every record, for cells, for worlds.
+RECORD_SLOTS :: 1 << 22
+CELL_SLOTS :: 1 << 17
+WORLD_SLOTS :: 1 << 10
+
 // Indexes the plugins' data (plugin.data and each file's name, span and
 // place in the load order set): each file's masters read from its TES4
 // record, then one walk over each file. The indexes are carved from storage.
 index_plugin :: fun(plugin: ^Plugin, storage: ^[]byte) -> err {
-	plugin.records = key_index(1 << 22, storage)
-	plugin.cell_children = key_index(1 << 17, storage)
-	plugin.exterior_cells = key_index(1 << 17, storage)
-	plugin.cell_worlds = key_index(1 << 17, storage)
-	plugin.persistent_cells = key_index(1 << 10, storage)
+	plugin.records = key_index(RECORD_SLOTS, storage)
+	plugin.cell_children = key_index(CELL_SLOTS, storage)
+	plugin.exterior_cells = key_index(CELL_SLOTS, storage)
+	plugin.cell_worlds = key_index(CELL_SLOTS, storage)
+	plugin.persistent_cells = key_index(WORLD_SLOTS, storage)
 	for file in 0:plugin.files.len {
 		read_masters(plugin, file)?
 		index_file(plugin, file)?
