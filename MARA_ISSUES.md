@@ -118,10 +118,9 @@ against Mara at the time written. When one is fixed, move it to Fixed
   ```
 
   says "Graph error: lower: an array literal as an operand". Appended to
-  a list (`rows : [4][8!]f32`) it works. Main Mara's Mara.exe (61bf180
-  checked out, 2026-10-28) compiles it and gives 4: fixed there, not in a
-  release yet. sooblivion appends a typed local holding the literal
-  (model.mara, rig_skin) till the release has it.
+  a list (`rows : [4][8!]f32`) it works. Release 61bf180 compiles it and
+  gives 4, so it's fixed there; sooblivion, still on 3a5d0f3, appends a
+  typed local holding the literal (model.mara, rig_skin) till it updates.
 
 ## Answered (not issues)
 
