@@ -23,6 +23,7 @@ use dds
 use png
 use model
 use world
+use world_state
 use scene
 use land
 use sky
@@ -1705,6 +1706,52 @@ command_record :: fun(name: []utf8) {
 	}
 }
 
+// `sooblivion world-run <world> <hours>`: the world's state run as a server
+// would run it, with no window: its clock and its sky's weather, the player
+// standing in the world's cell 0 0, stepped on its ticks (hurried) for that
+// many of the game's hours. Each weather that comes in is told of.
+command_world_run :: fun(name: []utf8, hours: f32) {
+	index_storage : [96 * MB]byte = void
+	index_storage.len = 0
+	plugin, load_error := load_oblivion(&index_storage)
+	if load_error {
+		print("couldn't load the plugin: %", load_error)
+		return
+	}
+	scratch : [16 * MB]byte = void
+	scratch.len = 0
+	world_id := find_world(&plugin, name, &scratch)
+	if world_id == 0 {
+		print("no world %", name)
+		return
+	}
+	climate, climate_error := world_climate(&plugin, world_id, &scratch)
+	if climate_error do print("couldn't read the climate (the default instead): %", climate_error)
+	if climate_error do climate = default_climate()
+	state : World_State
+	world_start(&state)
+	state.player_world = world_id
+	state.hurried = true
+	start := time_now()
+	take_error := world_take_climate(&state, &plugin, &climate)
+	if take_error do print("couldn't read the regions or a weather: %", take_error)
+	print("climate %, % of day %: % comes in at once", editor_id_of(&plugin, climate.form_id), clock_text(state.hour), state.day,
+		editor_id_of(&plugin, state.weather))
+	steps := i64(hours / world_tick_hours(&state))
+	changes : i64 = 0
+	for _ in 0:steps {
+		was := state.weather
+		step_error := world_step(&state, &plugin)
+		if step_error do print("couldn't read a weather: %", step_error)
+		if state.weather != was {
+			changes += 1
+			print("  % of day %: % coming in over % hours, staying % more", clock_text(state.hour), state.day,
+				editor_id_of(&plugin, state.weather), state.weather_transition, state.weather_hours_left)
+		}
+	}
+	print("% ticks (% of the game's hours) in % ms: % weathers came in", steps, hours, elapsed_ms(start), changes)
+}
+
 // `sooblivion sky [world]`: the sky outside at hours through a day — its
 // colors, the sun, the light and fog — as the viewer would draw it.
 command_sky :: fun(name: []utf8) {
@@ -2535,6 +2582,8 @@ usage :: fun() {
 	print("sooblivion bsa <archive>           an archive's folders and files")
 	print("sooblivion bsa <archive> <file>    one file from an archive, unpacked")
 	print("sooblivion plugins                 the plugins loaded, in order, and the archives")
+	print("sooblivion world-run <world> <hours>")
+	print("                                   the world's clock and weather run headless, as a server would")
 	print("sooblivion tree <name.spt | -all> [seed]")
 	print("                                   a SpeedTree file read and grown (every one: -all)")
 	print("sooblivion tree-picture <TREE editor id> <out.png> [seed | bare]")
@@ -3317,6 +3366,10 @@ main :: (args: [][]utf8) {
 		command_map(if args.len > 2 do args[2] else "Tamriel")
 	elif command == "sky"
 		command_sky(if args.len > 2 do args[2] else "Tamriel")
+	elif command == "world-run" and args.len > 3
+		hours, is_number := parse_number(args[3])
+		if is_number do command_world_run(args[2], f32(hours))
+		else do usage()
 	elif command == "doors"
 		command_doors()
 	elif command == "find" and args.len > 2

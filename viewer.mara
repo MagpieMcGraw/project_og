@@ -21,6 +21,7 @@ use file_cache
 use nif
 use model
 use world
+use world_state
 use land
 use scene
 use sky
@@ -110,10 +111,6 @@ no_picture :: fun() -> Picture {
 	return Picture{path = [], placed = false, position = Vec3{0, 0, 0}, yaw = 0, pitch = 0, held = -1, held_at = 0, menu = 0, menu_page = 0,
 		timed_frames = 0, out = false, walk_for = 0}
 }
-// How much faster than ours the game's day goes (Oblivion's own), and,
-// with T held, how much faster again.
-TIME_SCALE :: 30
-HURRIED_TIME_SCALE :: 2000
 // The room the sounds' clips are loaded into.
 SOUND_ROOM :: 64 * MB
 
@@ -133,13 +130,6 @@ LAST_WEATHER_BIT :: 0x0100000000000000
 MASSER_SIZE :: 0.3
 SECUNDA_SIZE :: 0.12
 STARS_TURN_DAYS :: 2
-
-// How long a weather stays before the next is chosen, in the game's hours.
-WEATHER_LEAST_HOURS :: 4
-WEATHER_MOST_HOURS :: 8
-
-// The hour the viewer starts at.
-START_HOUR :: 10
 
 // What the viewer commands share: the game's plugins in their order and its
 // archives, the window, drawing, what's drawn, the keyboard and mouse, and
@@ -165,21 +155,19 @@ Viewer :: struct {
 	walker: Walker
 	eyes: f32           // how high the walker's eyes are: smoothed over steps
 
-	// The sky outside: the world's climate; its weather — the one coming in,
-	// the last one going out, how far it has come in (0 to 1), the game's
-	// hours left before the next, the weathers that may come where the
-	// camera is, and whether it's time to choose the next (explore does);
-	// the hour of the game's day, and what the sky and water look like now.
-	climate: Climate
+	// The world as it is — its clock, its sky's climate and weather, where
+	// the player is: stepped on its ticks (run_world) and shown here; when
+	// its last tick was due.
+	world: World_State
+	world_ticked_at: u64
+	// The sky as shown: the records of the world's weathers (the one coming
+	// in, the last one going out: show_weather reads them), what's seen and
+	// heard by chance rolled from the viewer's own seed (the regions'
+	// sounds, thunder), the moons' phase on the card (-1: none yet).
 	weather: Weather
 	last_weather: Weather
-	weather_share: f32
-	weather_hours_left: f32
-	weathers_here: [16]Weather_Chance
-	weather_due: bool
-	weather_seed: u64
-	day: i64            // the game's days gone, for the moons' phases
-	moon_phase: i64     // the phase whose pictures are on the card (-1: none yet)
+	chance_seed: u64
+	moon_phase: i64
 	// The weather's sounds: its rain's and wind's loops (heard everywhere,
 	// as loud as the weather has come in), and the last weather's, going;
 	// the sounds the regions here make now and then (birds, insects), and
@@ -192,9 +180,7 @@ Viewer :: struct {
 	thunder_tried: f64
 	lightning: f32
 	sky_world: u32      // the world they're of, 0 for none yet (or an interior's own)
-	sky_taken: bool     // a sky has been taken: there's a weather to go on with
 	sky_inside: bool    // in an interior that behaves like an exterior: lit by the sky
-	hour: f32
 	look: Sky_Look
 	water: Water_Type   // the world's water, as its WATR has it
 
@@ -373,17 +359,12 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.walker = Walker{position = Vec3{0, 0, 0}, rising = 0, on_ground = false}
 	viewer.eyes = 0
 	viewer.sky_world = 0
-	viewer.sky_taken = false
 	viewer.sky_inside = false
-	viewer.hour = START_HOUR
+	world_start(&viewer.world)
+	viewer.world_ticked_at = time_now()
 	viewer.weather = default_weather()
 	viewer.last_weather = default_weather()
-	viewer.weather_share = 1
-	viewer.weather_hours_left = 0
-	viewer.weathers_here.len = 0
-	viewer.weather_due = false
-	viewer.weather_seed = time_now() | 1
-	viewer.day = 0
+	viewer.chance_seed = time_now() | 1
 	viewer.moon_phase = -1
 	viewer.weather_sounds.len = 0
 	viewer.last_weather_sounds.len = 0
@@ -474,13 +455,7 @@ update_title :: fun(viewer: ^Viewer) {
 	&title + (if viewer.renderer.use_bindless do ", bindless" else ", bound textures")
 	&title + (if viewer.walking do ", walking" else ", flying")
 	&title + " — "
-	whole_hours := i64(viewer.hour)
-	minutes := i64((viewer.hour - f32(whole_hours)) * 60)
-	if whole_hours < 10 do &title + "0"
-	&title + int_text(whole_hours)
-	&title + ":"
-	if minutes < 10 do &title + "0"
-	&title + int_text(minutes)
+	&title + clock_text(viewer.world.hour)
 	&title + " — "
 	&title + int_text(viewer.drawn.visible)
 	&title + " of "
@@ -619,7 +594,8 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		if input.held[A] do camera.position = camera.position - right * step
 	}
 
-	pass_time(viewer, f32(seconds), input.held[T])
+	report_player(viewer, input.held[T])
+	show_time(viewer, f32(seconds))
 	noises : [16]Door_Noise
 	swing_doors(shown, f32(seconds), &noises)
 	move_pieces(shown, viewer.look.time)
@@ -710,12 +686,13 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	heard_at := f64(time_now()) / 1000000000
 	listener := listener_of(camera^)
 	hear_start(&viewer.audio)
-	hear_sounds(&viewer.audio, &viewer.archives, &shown.sounds, listener, viewer.hour, heard_at)
+	hour := viewer.world.hour
+	hear_sounds(&viewer.audio, &viewer.archives, &shown.sounds, listener, hour, heard_at)
 	if viewer.look.outside {
-		for &sound in viewer.weather_sounds do sound.volume = viewer.weather_share
-		for &sound in viewer.last_weather_sounds do sound.volume = 1 - viewer.weather_share
-		hear_sounds(&viewer.audio, &viewer.archives, &viewer.weather_sounds, listener, viewer.hour, heard_at)
-		hear_sounds(&viewer.audio, &viewer.archives, &viewer.last_weather_sounds, listener, viewer.hour, heard_at)
+		for &sound in viewer.weather_sounds do sound.volume = viewer.world.weather_share
+		for &sound in viewer.last_weather_sounds do sound.volume = 1 - viewer.world.weather_share
+		hear_sounds(&viewer.audio, &viewer.archives, &viewer.weather_sounds, listener, hour, heard_at)
+		hear_sounds(&viewer.audio, &viewer.archives, &viewer.last_weather_sounds, listener, hour, heard_at)
 		outdoor_sounds(viewer, listener, heard_at)
 	}
 	hear_finish(&viewer.audio)
@@ -1073,17 +1050,47 @@ place_walker :: fun(viewer: ^Viewer) {
 	viewer.eyes = viewer.camera.position.z
 }
 
-// Moves the game's day on by a frame's seconds (much faster when hurried),
-// and outside, the sky with it: its colors, the clouds' drift, the light
-// everything's drawn with.
-pass_time :: fun(viewer: ^Viewer, seconds: f32, hurried: bool) {
-	scale : f32 = if hurried do HURRIED_TIME_SCALE else TIME_SCALE
-	hours := seconds * scale / 3600
-	viewer.hour += hours
-	if viewer.hour >= 24 {
-		viewer.hour -= 24
-		viewer.day += 1
+// Tells the world where the player is, as their client would: their place
+// and feet (the camera's, flying), which way they face; and whether they
+// hurry time (T held).
+report_player :: fun(viewer: ^Viewer, hurried: bool) {
+	state := &viewer.world
+	state.player_world = viewer.shown.world
+	state.player_feet = if viewer.walking do viewer.walker.position else viewer.camera.position - Vec3{0, 0, EYE_HEIGHT}
+	state.player_yaw = viewer.camera.yaw
+	state.hurried = hurried
+}
+
+// Steps the world on its ticks due by now (WORLD_TICK each; after a long
+// frame MOST_TICKS_AT_ONCE at most, the rest let go), then shows its
+// weather if it's changed.
+run_world :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	tick := u64(WORLD_TICK * 1000000000)
+	now := time_now()
+	ticks : i64 = 0
+	for now - viewer.world_ticked_at >= tick {
+		if ticks == MOST_TICKS_AT_ONCE {
+			viewer.world_ticked_at = now
+			break
+		}
+		step_error := world_step(&viewer.world, plugin)
+		if step_error {
+			note(&viewer.journal, "couldn't read the next weather: the default's coming in; ")
+			note_error(&viewer.journal, step_error)
+			note_end(&viewer.journal)
+		}
+		viewer.world_ticked_at += tick
+		ticks += 1
 	}
+	show_weather(viewer, plugin)
+}
+
+// Shows the world's time by a frame's seconds: outside, the sky at its
+// hour — its colors, the clouds' drift (faster hurried), the light
+// everything's drawn with — as its weather has come in.
+show_time :: fun(viewer: ^Viewer, seconds: f32) {
+	state := &viewer.world
+	scale : f32 = if state.hurried do HURRIED_TIME_SCALE else TIME_SCALE
 	look := &viewer.look
 	look.time += seconds
 	shown := &viewer.shown
@@ -1101,13 +1108,9 @@ pass_time :: fun(viewer: ^Viewer, seconds: f32, hurried: bool) {
 	// Without distant land, the fog ends where the loaded cells do.
 	most_fog : f32 = CELL_SIZE * (EXTERIOR_RADIUS + 0.5)
 	if has_distant_land(viewer) do most_fog = 1000000
-	// The weather coming in, and the next one's time.
-	viewer.weather_share = min(1, viewer.weather_share + hours / max(viewer.weather.transition, 0.01))
-	viewer.weather_hours_left -= hours
-	if viewer.weather_hours_left <= 0 do viewer.weather_due = true
-	look.weather_share = viewer.weather_share
-	look.state = changing_sky_at(&viewer.climate, &viewer.last_weather, &viewer.weather, viewer.weather_share, viewer.hour, most_fog)
-	look.wind = mix_number(viewer.last_weather.wind_speed, viewer.weather.wind_speed, viewer.weather_share)
+	look.weather_share = state.weather_share
+	look.state = changing_sky_at(&state.climate, &viewer.last_weather, &viewer.weather, state.weather_share, state.hour, most_fog)
+	look.wind = mix_number(viewer.last_weather.wind_speed, viewer.weather.wind_speed, state.weather_share)
 	look.cloud_lower_offset += seconds * scale / TIME_SCALE * viewer.weather.cloud_speed_lower
 	look.cloud_upper_offset += seconds * scale / TIME_SCALE * viewer.weather.cloud_speed_upper
 	// A lightning flash, in its color, fading.
@@ -1136,21 +1139,21 @@ outdoor_sounds :: fun(viewer: ^Viewer, listener: Listener, now: f64) {
 		viewer.region_sounds_tried = now
 		for &region_sound in viewer.region_sounds {
 			if viewer.weather.classification & region_sound.weathers == 0 do continue
-			if random_share(&viewer.weather_seed) >= region_sound.chance do continue
+			if random_share(&viewer.chance_seed) >= region_sound.chance do continue
 			// (Its kind was read when the regions were: in the scene's kinds.)
 			kind_index := scene_sound_kind_known(shown, region_sound.sound)
 			if kind_index < 0 do continue
 			kind := &shown.sound_kinds[kind_index]
-			if not plays_at_hour(kind, viewer.hour) do continue
-			turn := random_share(&viewer.weather_seed) * 6.2831853
-			away := 300 + random_share(&viewer.weather_seed) * 1200
-			place := listener.position + Vec3{cos_f32(turn) * away, sin_f32(turn) * away, random_share(&viewer.weather_seed) * 400}
+			if not plays_at_hour(kind, viewer.world.hour) do continue
+			turn := random_share(&viewer.chance_seed) * 6.2831853
+			away := 300 + random_share(&viewer.chance_seed) * 1200
+			place := listener.position + Vec3{cos_f32(turn) * away, sin_f32(turn) * away, random_share(&viewer.chance_seed) * 400}
 			play_once(&viewer.audio, &viewer.archives, kind, place, listener)
 		}
 	}
-	if viewer.weather.thunder > 0 and viewer.weather_share > 0.5 and now >= viewer.thunder_tried + 1 {
+	if viewer.weather.thunder > 0 and viewer.world.weather_share > 0.5 and now >= viewer.thunder_tried + 1 {
 		viewer.thunder_tried = now
-		if random_share(&viewer.weather_seed) < viewer.weather.thunder * THUNDER_CHANCE {
+		if random_share(&viewer.chance_seed) < viewer.weather.thunder * THUNDER_CHANCE {
 			viewer.lightning = 1
 			for sound in viewer.weather.sounds {
 				if sound.role != WEATHER_SOUND_THUNDER do continue
@@ -1195,11 +1198,11 @@ MOON_PHASES :: ["full", "three_wan", "half_wan", "one_wan", "new", "one_wax", "h
 // the sun's glare, as much as the weather and the sun's height have it.
 move_night_sky :: fun(viewer: ^Viewer) {
 	look := &viewer.look
-	climate := &viewer.climate
-	days := f32(viewer.day) + viewer.hour / 24
+	climate := &viewer.world.climate
+	days := f32(viewer.world.day) + viewer.world.hour / 24
 	look.stars_turn = days * 6.2831853 / STARS_TURN_DAYS
 	dusk := climate.sunset_begin
-	since_dusk := viewer.hour - dusk
+	since_dusk := viewer.world.hour - dusk
 	if since_dusk < 0 do since_dusk += 24
 	night_hours := climate.sunrise_end + 24 - dusk
 	along := since_dusk / night_hours * 3.14159265
@@ -1224,7 +1227,7 @@ move_night_sky :: fun(viewer: ^Viewer) {
 			else do look.secunda = slot
 		}
 	}
-	glare := mix_number(viewer.last_weather.sun_glare, viewer.weather.sun_glare, viewer.weather_share)
+	glare := mix_number(viewer.last_weather.sun_glare, viewer.weather.sun_glare, viewer.world.weather_share)
 	look.sun_glare_strength = glare * look.state.daylight * min(1, max(0, look.state.sun_direction.z * 4))
 }
 
@@ -1233,12 +1236,13 @@ move_night_sky :: fun(viewer: ^Viewer) {
 night_sky_textures :: fun(viewer: ^Viewer) -> err {
 	look := &viewer.look
 	room := &viewer.room
-	look.sun_glare = texture_for(&viewer.renderer, &viewer.archives, viewer.climate.sun_glare_texture, &room.texture, CLAMP_BOTH)
+	climate := &viewer.world.climate
+	look.sun_glare = texture_for(&viewer.renderer, &viewer.archives, climate.sun_glare_texture, &room.texture, CLAMP_BOTH)
 	look.stars = 0
 	look.nebula = 0
 	viewer.moon_phase = -1
-	if viewer.climate.stars.len == 0 do return
-	stars_file, found := find_archived(&viewer.archives, viewer.climate.stars)
+	if climate.stars.len == 0 do return
+	stars_file, found := find_archived(&viewer.archives, climate.stars)
 	if not found do return Not_In_Archive
 	room.file.len = 0
 	data := read_archived(&viewer.archives, stars_file, &room.file)?
@@ -1303,7 +1307,7 @@ take_cell_sky :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
 	viewer.sky_inside = behaves
 	if not behaves do return
 	if climate_id == 0 {
-		if viewer.sky_taken do return   // (the sky outside goes on)
+		if viewer.world.sky_taken do return   // (the sky outside goes on)
 		climate_id = fallback_climate(plugin, &scratch)
 	}
 	climate, climate_error := read_climate(plugin, climate_id, &scratch)
@@ -1318,16 +1322,19 @@ take_cell_sky :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
 	use_climate(viewer, plugin, &climate)
 }
 
-// Takes a climate: its sun and night sky on the card, the weathers that may
-// come where the camera is. The weather is the sky's, not the world's: it
-// goes on under the same climate (from Tamriel into a city, and back); a
-// first sky, or another climate's, starts one of its own at once.
+// Takes a climate: the world's sky's (world_take_climate: its weather goes
+// on under the same climate, a first or another starts its own), its sun
+// and night sky on the card, the sounds of the regions where the player is,
+// the weather shown.
 use_climate :: fun(viewer: ^Viewer, plugin: ^Plugin, climate: ^Climate) {
-	same := viewer.sky_taken and climate.form_id == viewer.climate.form_id
-	viewer.climate = climate^
-	viewer.sky_taken = true
+	climate_error := world_take_climate(&viewer.world, plugin, climate)
+	if climate_error {
+		note(&viewer.journal, "couldn't read the regions here or a weather: the climate's or the default instead; ")
+		note_error(&viewer.journal, climate_error)
+		note_end(&viewer.journal)
+	}
 	look := &viewer.look
-	look.sun = texture_for(&viewer.renderer, &viewer.archives, viewer.climate.sun_texture, &viewer.room.texture)
+	look.sun = texture_for(&viewer.renderer, &viewer.archives, viewer.world.climate.sun_texture, &viewer.room.texture)
 	night_error := night_sky_textures(viewer)
 	if night_error {
 		note(&viewer.journal, "couldn't read the night sky: ")
@@ -1335,35 +1342,26 @@ use_climate :: fun(viewer: ^Viewer, plugin: ^Plugin, climate: ^Climate) {
 		note_end(&viewer.journal)
 	}
 	journal := &viewer.journal
+	climate_shown := &viewer.world.climate
 	note(journal, "the sky: sunrise ")
-	note(journal, i64(viewer.climate.sunrise_begin))
+	note(journal, i64(climate_shown.sunrise_begin))
 	note(journal, " to ")
-	note(journal, i64(viewer.climate.sunrise_end))
+	note(journal, i64(climate_shown.sunrise_end))
 	note(journal, ", sunset ")
-	note(journal, i64(viewer.climate.sunset_begin))
+	note(journal, i64(climate_shown.sunset_begin))
 	note(journal, " to ")
-	note(journal, i64(viewer.climate.sunset_end))
+	note(journal, i64(climate_shown.sunset_end))
 	note_end(journal)
-	_ = weathers_at_camera(viewer, plugin)
-	if not same do change_weather(viewer, plugin, true)
+	take_region_sounds(viewer, plugin)
+	show_weather(viewer, plugin)
 }
 
-// The weathers that may come where the camera is: its cell's regions', or
-// the climate's. True when they're not the ones that could before.
-weathers_at_camera :: fun(viewer: ^Viewer, plugin: ^Plugin) -> bool {
+// The sounds the regions where the player is make now and then (birds,
+// insects), their kinds read.
+take_region_sounds :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	scratch : [256 * KB]byte
-	x, y := grid_of(viewer.camera.position)
-	found : [16]Weather_Chance
-	region_error := cell_weathers(plugin, viewer.shown.world, x, y, &found, &scratch)
-	if region_error {
-		note(&viewer.journal, "couldn't read the regions here: the climate's weathers instead; ")
-		note_error(&viewer.journal, region_error)
-		note_end(&viewer.journal)
-		found.len = 0
-	}
-	if found.len == 0 do found = viewer.climate.weathers
-	// The regions' sounds here, their kinds read.
-	sounds_error := cell_region_sounds(plugin, viewer.shown.world, x, y, &viewer.region_sounds, &scratch)
+	x, y := grid_of(viewer.world.player_feet)
+	sounds_error := cell_region_sounds(plugin, viewer.world.player_world, x, y, &viewer.region_sounds, &scratch)
 	if sounds_error {
 		note(&viewer.journal, "couldn't read the regions' sounds here: ")
 		note_error(&viewer.journal, sounds_error)
@@ -1371,23 +1369,18 @@ weathers_at_camera :: fun(viewer: ^Viewer, plugin: ^Plugin) -> bool {
 		viewer.region_sounds.len = 0
 	}
 	for &region_sound in viewer.region_sounds do _ = scene_sound_kind(&viewer.shown, plugin, region_sound.sound)
-	same := found.len == viewer.weathers_here.len
-	if same {
-		for possible, k in found {
-			if possible.weather != viewer.weathers_here[k].weather do same = false
-		}
-	}
-	viewer.weathers_here = found
-	return not same
 }
 
-// Brings in the next weather, chosen by its chance among those that may
-// come here: at once, or over its coming-in time. Its clouds go on the card.
-change_weather :: fun(viewer: ^Viewer, plugin: ^Plugin, at_once: bool) {
-	viewer.weather_due = false
-	viewer.weather_hours_left = WEATHER_LEAST_HOURS + (WEATHER_MOST_HOURS - WEATHER_LEAST_HOURS) * random_share(&viewer.weather_seed)
-	chosen := pick_weather(&viewer.weathers_here, random_share(&viewer.weather_seed))
-	if chosen == viewer.weather.form_id and not at_once do return
+// Shows the world's weather when it isn't the one shown: its record read,
+// its clouds and rain or snow on the card, its sounds; coming in over the
+// one shown, or at once (when the world has it go out to itself).
+show_weather :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	state := &viewer.world
+	if state.weather == viewer.weather.form_id and state.last_weather == viewer.last_weather.form_id do return
+	// (At once too when what's shown isn't the one the world's going out:
+	// the first shown, or one the viewer missed.)
+	at_once := state.last_weather == state.weather or state.last_weather != viewer.weather.form_id
+	chosen := state.weather
 	scratch : [256 * KB]byte
 	weather, weather_error := read_weather(plugin, chosen, &scratch)
 	if weather_error {
@@ -1395,6 +1388,7 @@ change_weather :: fun(viewer: ^Viewer, plugin: ^Plugin, at_once: bool) {
 		note_error(&viewer.journal, weather_error)
 		note_end(&viewer.journal)
 		weather = default_weather()
+		weather.form_id = chosen   // (shown, as it can be)
 	}
 	look := &viewer.look
 	room := &viewer.room
@@ -1415,7 +1409,6 @@ change_weather :: fun(viewer: ^Viewer, plugin: ^Plugin, at_once: bool) {
 	}
 	if at_once do look.last_precipitation.len = 0
 	viewer.weather = weather
-	viewer.weather_share = if at_once do 1 else 0
 	look.cloud_lower = texture_for(&viewer.renderer, &viewer.archives, weather.cloud_lower, &room.texture)
 	look.cloud_upper = texture_for(&viewer.renderer, &viewer.archives, weather.cloud_upper, &room.texture)
 	if at_once {
@@ -1813,6 +1806,7 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	journal := &viewer.journal
 	for true {
 		placed_this_frame := false
+		run_world(viewer, plugin)
 		match view_frame(viewer) {
 		nothing
 		quit
@@ -1823,8 +1817,15 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 			start := time_now()
 			show_error := show_exterior(&viewer.shown, plugin, viewer.shown.world, x, y)
 			choose_music(viewer, plugin, exterior_cell(plugin, viewer.shown.world, x, y), viewer.shown.world)
-			// Into another region: its weather soon.
-			if weathers_at_camera(viewer, plugin) do viewer.weather_hours_left = min(viewer.weather_hours_left, 0.1)
+			// Into other cells: their weathers (if they're others', the next
+			// soon), and their regions' sounds.
+			crossed_error := world_player_crossed(&viewer.world, plugin)
+			if crossed_error {
+				note(journal, "couldn't read the regions here: the climate's weathers instead; ")
+				note_error(journal, crossed_error)
+				note_end(journal)
+			}
+			take_region_sounds(viewer, plugin)
 			note(journal, "into ")
 			note(journal, x)
 			note(journal, " ")
@@ -1898,8 +1899,6 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 			note_missed(viewer, plugin)
 			viewer.missed = false
 		}
-		// A weather's time up: the next one comes in.
-		if viewer.weather_due do change_weather(viewer, plugin, false)
 		// (Not on the frame that placed cells: it's had its share of work.)
 		if not placed_this_frame do load_some(viewer, plugin)
 	}
@@ -1955,6 +1954,7 @@ ready_exit :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 go_inside :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
 	shown := &viewer.shown
 	start := time_now()
+	viewer.world.player_world = 0
 	viewer.exit_readied = false
 	viewer.exit_door = -1
 	show_error := show_interior(shown, plugin, cell, viewer_loader(viewer))
@@ -1994,6 +1994,9 @@ go_inside :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
 go_outside :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32, place: Vec3) {
 	shown := &viewer.shown
 	start := time_now()
+	// (The player's there, for the sky's weathers and sounds where they are.)
+	viewer.world.player_world = world_id
+	viewer.world.player_feet = place - Vec3{0, 0, EYE_HEIGHT}
 	take_sky(viewer, plugin, world_id)
 	if viewer.renderer.distant_world != world_id do begin_distant_land(&viewer.renderer, world_id)
 	if viewer.shown.distant_world != world_id do begin_distant_objects(&viewer.shown, world_id)

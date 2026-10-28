@@ -365,7 +365,7 @@ fill_map_menu :: fun(viewer: ^Viewer) {
 	x, y := map_place(map, viewer.camera.position)
 	// Its title: where the player is, and the day.
 	_ = book_set_text(book, "MapMenu", "user1", viewer.place)
-	_ = book_set_text(book, "MapMenu", "user2", date_text(viewer.start_date, viewer.day))
+	_ = book_set_text(book, "MapMenu", "user2", date_text(viewer.start_date, viewer.world.day))
 	_ = book_set(book, "map_world_map", "user10", x * MAP_ZOOM)
 	_ = book_set(book, "map_world_map", "user11", y * MAP_ZOOM)
 	// The player's arrow: a copy of the menu's world icon, made once.

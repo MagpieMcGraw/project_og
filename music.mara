@@ -11,6 +11,7 @@ use mara.math
 use mara.os
 use mara.string
 use mp3
+use world
 
 // The kinds of music, numbered as the cells' XCMT and the worlds' SNAM
 // number them; none, for silence.
