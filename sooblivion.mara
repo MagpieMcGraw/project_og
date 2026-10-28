@@ -2678,17 +2678,18 @@ command_npc :: fun(name: []utf8) {
 	model_room : [64 * MB]byte
 	texture_room : [1 * KB]byte
 	room := load_room(&file_room, &block_room, &model_room, &texture_room)
-	bones : [MAX_POSE_BONES]Pose_Bone
-	pose_error := read_skeleton_pose(&archives, &room, look.skeleton, &bones)
-	if pose_error {
-		print("couldn't pose its skeleton: %", pose_error)
+	skeleton : Npc_Skeleton
+	skeleton_error := read_skeleton(&archives, &room, look.skeleton, &skeleton)
+	if skeleton_error {
+		print("couldn't read its skeleton: %", skeleton_error)
 		return
 	}
+	print("% bones; its idle % s long, % tracks", skeleton.rig.len, skeleton.stop - skeleton.start, skeleton.tracks.len)
 	report := Npc_Report{failures = 0, first = [], reason = Not_In_Archive}
 	skins : [4]Face_Skin
 	skin_storage : [2 * MB]byte
 	started := time_now()
-	whole := assemble_npc(&archives, &room, &look, bones, &report, &skins, &skin_storage)
+	whole := assemble_npc(&archives, &room, &look, skeleton.bones, false, &report, &skins, &skin_storage)
 	print("% shapes, from % to %, put together in % ms (% skins made)", whole.parts.len, whole.bounds_min, whole.bounds_max, elapsed_ms(started), skins.len)
 	for &part in whole.parts {
 		low := Vec3{1000000, 1000000, 1000000}
@@ -2702,6 +2703,66 @@ command_npc :: fun(name: []utf8) {
 		print("    % from % to %", part.texture, low, high)
 	}
 	if report.failures > 0 do print("% parts left out; the first: %, %", report.failures, report.first, report.reason)
+
+	// Rigged, as the card moves it: posed by its idle where it starts, each
+	// vertex where its palette puts it, against where it's put together above
+	// (the same, but for rounding); then half way through its idle, how far
+	// they've gone. Then how long posing it takes.
+	placed : [262144]Vec3
+	for &part in whole.parts {
+		for &vertex in part.vertices {
+			if placed.len < placed.cap do &placed + vertex.position
+		}
+	}
+	skin_storage.len = 0
+	rigged_report := Npc_Report{failures = 0, first = [], reason = Not_In_Archive}
+	rigged_model := assemble_npc(&archives, &room, &look, skeleton.bones, true, &rigged_report, &skins, &skin_storage)
+	places : [MAX_POSE_BONES]Mat4
+	pose_rig(skeleton.rig, &skeleton.tracks, skeleton.start, &places)
+	height := mat4_scale(Vec3{look.height, look.height, look.height})
+	farthest : f32 = 0
+	compared : i64 = 0
+	for &part in rigged_model.parts {
+		for &vertex, v in part.vertices {
+			if v >= part.influences.len do break
+			moved := posed_vertex(&rigged_model, part.influences[v], places, height, vertex.position)
+			if compared < placed.len do farthest = max(farthest, vec3_length(moved - placed[compared]))
+			compared += 1
+		}
+	}
+	print("rigged: % palette entries, % of % vertices; at the idle's start, % units at most from the above",
+		rigged_model.palette.len, compared, placed.len, farthest)
+	pose_rig(skeleton.rig, &skeleton.tracks, (skeleton.start + skeleton.stop) / 2, &places)
+	farthest = 0
+	compared = 0
+	for &part in rigged_model.parts {
+		for &vertex, v in part.vertices {
+			if v >= part.influences.len do break
+			moved := posed_vertex(&rigged_model, part.influences[v], places, height, vertex.position)
+			if compared < placed.len do farthest = max(farthest, vec3_length(moved - placed[compared]))
+			compared += 1
+		}
+	}
+	print("half way through its idle, % units at most from there", farthest)
+	posing_start := time_now()
+	for k in 0:1000 do pose_rig(skeleton.rig, &skeleton.tracks, skeleton.start + f32(k) * 0.005, &places)
+	print("posed 1000 times in % ms", elapsed_ms(posing_start))
+}
+
+// Where a rigged model's vertex is put (as the card puts it): moved by
+// its influence's palette entries, their bones placed as places has them,
+// then made height tall.
+posed_vertex :: fun(rigged_model: ^Model, influence: Skin_Influence, places: []Mat4, height: Mat4, position: Vec3) -> Vec3 {
+	moved := Vec3{0, 0, 0}
+	for k in 0:4 {
+		if influence.weights[k] == 0 do continue
+		entry := rigged_model.palette[i64(influence.entries[k])]
+		moving := entry.offset
+		if entry.bone >= 0 do moving = mat4_mul(places[entry.bone], entry.offset)
+		at := mat4_mul_vec4(mat4_mul(height, moving), Vec4{position.x, position.y, position.z, 1})
+		moved = moved + Vec3{at.x, at.y, at.z} * (f32(influence.weights[k]) / 65535)
+	}
+	return moved
 }
 
 // `sooblivion tree <name.spt> [seed]`: a SpeedTree file (in trees\) read

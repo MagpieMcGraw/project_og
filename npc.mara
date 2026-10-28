@@ -102,11 +102,37 @@ Face_Skin :: struct {
 	height: i64
 }
 
-// A skeleton's pose, kept: its path, and its bones posed.
+// A skeleton NPCs are put together on, kept: its path; its bones as its
+// idle animation starts (the pose their parts are rigged to); the same
+// bones as a rig, with the idle's tracks (their keys in track_room) and
+// its span, start to stop, to pose it at any time (pose_npcs).
 Npc_Skeleton :: struct {
 	path: [256]utf8
 	bones: [MAX_POSE_BONES]Pose_Bone
+	rig: [MAX_POSE_BONES]Rig_Bone
+	tracks: [256]Track
+	track_room: [1 * MB]byte
+	start: f32
+	stop: f32
 }
+
+// The most entries an NPC's model's palette has (its parts' together).
+NPC_PALETTE :: 2048
+
+// An NPC's model made for the card to move: the scene's model, the
+// skeleton it's posed on, how tall (a share of the skeleton's height), and
+// its palette's entries (in the scene's rig_entries).
+Npc_Rig :: struct {
+	model: i64
+	skeleton: i64
+	height: f32
+	first_entry: i64
+	entry_count: i64
+}
+
+// How long, at most, an NPC's idle is put off at the start, so no two
+// breathe together (seconds).
+IDLE_SPREAD :: 10
 
 // The bones a skeleton has, at most.
 MAX_POSE_BONES :: 128
@@ -387,41 +413,84 @@ level_item :: fun(plugin: ^Plugin, item: u32, npc_id: u32, depth: i64) -> u32 {
 
 // The pose of a skeleton (its path), as its idle animation starts: read
 // the first time it's asked for, then kept. Empty when it can't be read.
-skeleton_pose :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> []Pose_Bone {
-	for &kept in scene.npc_skeletons {
-		if kept.path == path do return kept.bones[:]
+// The skeleton at path (its index among the scene's kept ones): read the
+// first time it's asked for, then kept. -1 when it can't be read.
+npc_skeleton :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64 {
+	for &kept, k in scene.npc_skeletons {
+		if kept.path == path do return k
 	}
-	if scene.npc_skeletons.len == scene.npc_skeletons.cap do return scene.npc_skeletons[0].bones[0:0]
+	if scene.npc_skeletons.len == scene.npc_skeletons.cap do return -1
 	kept := next(&scene.npc_skeletons)
 	kept.path.len = 0
 	&kept.path + path
-	pose_error := read_skeleton_pose(loader.archives, loader.room, path, &kept.bones)
-	if pose_error do note_failure(scene, path, pose_error)
-	return kept.bones[:]
+	skeleton_error := read_skeleton(loader.archives, loader.room, path, kept)
+	if skeleton_error {
+		note_failure(scene, path, skeleton_error)
+		scene.npc_skeletons.len -= 1
+		return -1
+	}
+	return scene.npc_skeletons.len - 1
 }
 
-// A skeleton's pose as its idle animation (IDLE_ANIMATION) starts: its
-// bones' places, into bones. (The idle read first, its tracks copied out of
-// the file, then the skeleton, into room.)
-read_skeleton_pose :: fun(archives: ^Archives, room: ^Load_Room, path: []utf8, bones: ^[]Pose_Bone) -> err {
-	bones.len = 0
-	tracks : [256]Track
-	track_room : [1 * MB]byte
+// A skeleton (at path) and its idle animation (IDLE_ANIMATION), read into
+// skeleton (see Npc_Skeleton): the idle's tracks and span first, then the
+// skeleton's bones, posed as the idle starts and as a rig. (Their files
+// go through room.)
+read_skeleton :: fun(archives: ^Archives, room: ^Load_Room, path: []utf8, skeleton: ^Npc_Skeleton) -> err {
+	skeleton.bones.len = 0
+	skeleton.rig.len = 0
+	skeleton.tracks.len = 0
+	skeleton.track_room.len = 0
+	skeleton.start = 0
+	skeleton.stop = 0
 	room.file.len = 0
 	room.blocks.len = 0
 	idle := read_archived_nif(archives, IDLE_ANIMATION, &room.file, &room.blocks)?
 	for &block, index in idle.blocks {
 		match block^ {
 		Sequence sequence
-			read_tracks(&idle, index, &tracks, &track_room, true)
+			read_tracks(&idle, index, &skeleton.tracks, &skeleton.track_room, true)
+			skeleton.start, skeleton.stop = sequence_span(&idle, index)
 			break
 		else
 		}
 	}
 	room.file.len = 0
 	room.blocks.len = 0
-	skeleton := read_archived_nif(archives, path, &room.file, &room.blocks)?
-	pose_nodes(&skeleton, &tracks, 0, bones)
+	mesh := read_archived_nif(archives, path, &room.file, &room.blocks)?
+	pose_nodes(&mesh, &skeleton.tracks, skeleton.start, &skeleton.bones)
+	rig_nodes(&mesh, &skeleton.tracks, &skeleton.rig)
+}
+
+// Poses each NPC as its idle has it at a time (seconds; each NPC's own
+// time is put off by up to IDLE_SPREAD, by its reference): its palette
+// made, into the renderer's, and the instance pointed at it.
+pose_npcs :: fun(scene: ^Scene, renderer: ^Renderer, time: f32) {
+	renderer.palette.len = 0
+	places : [MAX_POSE_BONES]Mat4
+	for &instance in scene.instances {
+		instance.palette_base = -1
+		rig_index, rigged := index_get(&scene.model_rigs, u64(instance.model + 1))
+		if not rigged do continue
+		rig := &scene.npc_rigs[rig_index - 1]
+		if renderer.palette.len + rig.entry_count > renderer.palette.cap do continue
+		skeleton := &scene.npc_skeletons[rig.skeleton]
+		// Where in its idle it is.
+		span := skeleton.stop - skeleton.start
+		own_time := time + f32((instance.reference *% 2654435761) >> 22) / 1024 * IDLE_SPREAD
+		at := skeleton.start
+		if span > 0 do at += own_time - floor_f32(own_time / span) * span
+		pose_rig(skeleton.rig, &skeleton.tracks, at, &places)
+		height := mat4_scale(Vec3{rig.height, rig.height, rig.height})
+		instance.palette_base = renderer.palette.len
+		for e in rig.first_entry : rig.first_entry + rig.entry_count {
+			entry := &scene.rig_entries[e]
+			moving := entry.offset
+			if entry.bone >= 0 and entry.bone < places.len do moving = mat4_mul(places[entry.bone], entry.offset)
+			&renderer.palette + mat4_mul(height, moving)
+		}
+	}
+	upload_palette(renderer)
 }
 
 // A NIF from the archives, read: its file into file_storage, its blocks
@@ -454,15 +523,25 @@ build_npc_model :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, npc_id: u
 	if scene.models.len == scene.models.cap do return -1, No_Room_For_Models
 	look : Npc_Look
 	read_npc_look(plugin, npc_id, &look)?
-	pose := skeleton_pose(scene, loader, look.skeleton)
+	skeleton := npc_skeleton(scene, loader, look.skeleton)
+	if skeleton < 0 do return -1, No_Skeleton
+	pose := scene.npc_skeletons[skeleton].bones[:]
 	report := Npc_Report{failures = 0, first = [], reason = Not_In_Archive}
 	skins : [4]Face_Skin
 	skin_storage : [2 * MB]byte
-	whole := assemble_npc(loader.archives, loader.room, &look, pose, &report, &skins, &skin_storage)
+	whole := assemble_npc(loader.archives, loader.room, &look, pose, true, &report, &skins, &skin_storage)
 	if report.failures > 0 do note_failure(scene, report.first, report.reason)
 	// Its faces' skins, on the card first: the model's parts are drawn with them.
 	for &skin in skins do _ = texture_from_pixels(loader.renderer, skin.path, skin.pixels, skin.width, skin.height)
 	gpu := upload_model(loader.renderer, &whole, loader.archives, &loader.room.texture)?
+	// Its palette, kept: posed again each frame (pose_npcs).
+	if scene.npc_rigs.len == scene.npc_rigs.cap or scene.rig_entries.len + whole.palette.len > scene.rig_entries.cap {
+		return -1, No_Room_For_Models
+	}
+	&scene.npc_rigs + Npc_Rig{model = scene.models.len, skeleton = skeleton, height = look.height,
+		first_entry = scene.rig_entries.len, entry_count = whole.palette.len}
+	for entry in whole.palette do &scene.rig_entries + entry
+	_ = index_put(&scene.model_rigs, u64(scene.models.len + 1), scene.npc_rigs.len)
 	// (No collision: walking goes through people for now.)
 	&scene.model_collision + Collision_Range{first = scene.collision_points.len, count = 0}
 	&scene.models + gpu
@@ -482,12 +561,16 @@ Npc_Report :: struct {
 // left out, into report.
 // Its faces' skins go into skins (their pixels into skin_storage), named
 // for the parts drawn with them: they're put on the card before the model.
-assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose: []Pose_Bone, report: ^Npc_Report,
+// Rigged, its parts are made for the card to move (build_rigged_model),
+// their palettes one, the model's; it's left as tall as the skeleton (the
+// height goes into the palette).
+assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose: []Pose_Bone, rigged: bool, report: ^Npc_Report,
 	skins: ^[]Face_Skin, skin_storage: ^[]byte) -> Model
 {
 	room.model.len = 0
 	// (The parts' list in the model's room, as their vertices are.)
 	built := slice([:NPC_MODEL_PARTS]Model_Part, &room.model)
+	palette := slice([:if rigged do NPC_PALETTE else 0]Palette_Entry, &room.model)
 	low := Vec3{1000000, 1000000, 1000000}
 	high := Vec3{-1000000, -1000000, -1000000}
 	morph_file : [2 * MB]byte
@@ -513,6 +596,7 @@ assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose
 		}
 		// Hung from its bone, unless it's skinned (then its bones place it).
 		hang := mat4_identity()
+		hang_bone : i64 = -1
 		if not skinned_mesh(&mesh) {
 			bone := part.bone[:]
 			parent := hanging_bone(&mesh)
@@ -521,15 +605,36 @@ assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose
 				place, posed := pose_place(pose, bone)
 				if compare_folded(bone, HEAD_BONE) == 0 do place, posed = head_hang(&mesh, pose)
 				if posed do hang = place
+				hang_bone = pose_index(pose, bone)
 			}
 		}
-		made, model_error := build_shaped_model(&mesh, pose, hang, moves, &room.model)
+		// (Rigged, it hangs from its bone from where it is now: the bone's
+		// place undone.)
+		hang_offset := hang
+		if hang_bone >= 0 do hang_offset = mat4_mul(mat4_inverse(pose[hang_bone].place), hang)
+		made : Model
+		model_error : err
+		if rigged {
+			made, model_error = build_rigged_model(&mesh, pose, moves, hang_bone, hang_offset, &room.model)
+		else
+			made, model_error = build_shaped_model(&mesh, pose, hang, moves, &room.model)
+		}
 		if model_error {
 			note_npc_failure(report, part.mesh, model_error)
 			continue
 		}
+		// Its palette into the model's, its parts' influences counted on.
+		palette_base := palette.len
+		if rigged and palette.len + made.palette.len > palette.cap {
+			note_npc_failure(report, part.mesh, Too_Many_Parts)
+			continue
+		}
+		for entry in made.palette do &palette + entry
 		for &made_part, made_index in made.parts {
 			if built.len == built.cap do break
+			for &influence in made_part.influences {
+				for k in 0:4 do influence.entries[k] += u16(palette_base)
+			}
 			if part.texture.len > 0 {
 				made_part.texture.len = 0
 				&made_part.texture + part.texture[0 : min(part.texture.len, made_part.texture.cap)]
@@ -574,15 +679,18 @@ assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose
 			high[axis] = max(high[axis], made.bounds_max[axis])
 		}
 	}
-	// As tall as its race is.
-	if look.height != 1 {
+	// As tall as its race is. (Rigged, the palette makes it so.)
+	if look.height != 1 and rigged {
+		low = low * look.height
+		high = high * look.height
+	elif look.height != 1
 		for &made_part in built {
 			for &vertex in made_part.vertices do vertex.position = vertex.position * look.height
 		}
 		low = low * look.height
 		high = high * look.height
 	}
-	return Model{parts = built, flips = [], particles = [], motions = [], bounds_min = low, bounds_max = high}
+	return Model{parts = built, flips = [], particles = [], motions = [], bounds_min = low, bounds_max = high, palette = palette}
 }
 
 // How far a part's vertices move for a face, into moves: by its morphs,

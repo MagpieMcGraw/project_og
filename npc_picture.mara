@@ -53,10 +53,10 @@ command_npc_picture :: fun(name: []utf8, out_path: []utf8) {
 	model_room : [64 * MB]byte
 	texture_room : [1 * KB]byte
 	room := load_room(&file_room, &block_room, &model_room, &texture_room)
-	bones : [MAX_POSE_BONES]Pose_Bone
-	pose_error := read_skeleton_pose(&archives, &room, look.skeleton, &bones)
-	if pose_error {
-		print("couldn't pose its skeleton: %", pose_error)
+	skeleton : Npc_Skeleton
+	skeleton_error := read_skeleton(&archives, &room, look.skeleton, &skeleton)
+	if skeleton_error {
+		print("couldn't read its skeleton: %", skeleton_error)
 		return
 	}
 
@@ -81,7 +81,7 @@ command_npc_picture :: fun(name: []utf8, out_path: []utf8) {
 		look.has_face = shaped and side == 1
 		report := Npc_Report{failures = 0, first = [], reason = Not_In_Archive}
 		skin_storage.len = 0
-		whole := assemble_npc(&archives, &room, &look, bones, &report, &skins, &skin_storage)
+		whole := assemble_npc(&archives, &room, &look, skeleton.bones, false, &report, &skins, &skin_storage)
 		if report.failures > 0 do print("% parts left out; the first: %, %", report.failures, report.first, report.reason)
 		// Framed on the head: the top of the NPC, HEAD_PICTURE_SPAN high.
 		middle := Vec3{0, 0, whole.bounds_max.z - HEAD_PICTURE_SPAN / 2}

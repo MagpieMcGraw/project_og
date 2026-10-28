@@ -181,6 +181,7 @@ Load_Error :: error {
 	Not_In_Archive     // no file of that path in the archives
 	No_Room_For_Models // the scene's models are all taken
 	No_Parts           // a part of a mesh with nothing to draw
+	No_Skeleton        // an NPC's skeleton (or its idle) couldn't be read
 }
 
 // A model's collision: its points in the scene's collision, three a triangle.
@@ -285,6 +286,12 @@ Scene :: struct {
 	waiting_land_next: i64
 	// Skeletons NPCs are posed on (npc_model), their poses kept.
 	npc_skeletons: [4]Npc_Skeleton
+	// NPCs' models made for the card to move (assemble_npc, rigged): each
+	// one's skeleton, height and palette entries; found by their model + 1
+	// (an index's keys can't be 0), as their place + 1.
+	npc_rigs: [512]Npc_Rig
+	rig_entries: [131072]Palette_Entry
+	model_rigs: Key_Index
 }
 
 // A kind of tree: its look, its billboard's texture slot.
@@ -332,6 +339,9 @@ scene_clear :: fun(scene: ^Scene, storage: ^[]byte) {
 	scene.world = 0
 	scene.grows_grass = true
 	scene.npc_skeletons.len = 0
+	scene.npc_rigs.len = 0
+	scene.rig_entries.len = 0
+	scene.model_rigs = key_index(1 << 10, storage)
 	scene.parent_world = 0
 	scene.tree_kinds = key_index(1 << 11, storage)
 	scene.kinds.len = 0

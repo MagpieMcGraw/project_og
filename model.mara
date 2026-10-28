@@ -49,7 +49,29 @@ Model_Part :: struct {
 	lighting_mode: u32      // 0 lit by its own light only, 1 by the scene's lights too
 	leaf_cards: bool        // a tree's leaves: each four vertices a card at their place, turned to face
 	                        // the camera, each corner set off across and up by its tangent's first two
+	influences: []Skin_Influence  // rigged (Build_Options): one for each vertex, its vertices as they are
+	                              // before the card moves them; else none
 }
+
+// What moves a vertex of a rigged part (Build_Options): up to four entries
+// of its model's palette, and how much each (out of 65535, all four adding
+// up to that).
+Skin_Influence :: struct {
+	entries: [4!]u16
+	weights: [4!]u16
+}
+
+// An entry of a rigged model's palette: a bone (its place in the pose the
+// model was rigged to; -1 for none) and where a part is from it. Its matrix
+// at a time is the bone's place then times offset (offset alone, without
+// a bone).
+Palette_Entry :: struct {
+	bone: i64
+	offset: Mat4
+}
+
+// The most entries a rigged model's palette has.
+MODEL_PALETTE :: 1024
 
 // A whole model: its parts, its particle systems, and a box around them.
 Model :: struct {
@@ -59,6 +81,7 @@ Model :: struct {
 	motions: []Model_Motion
 	bounds_min: Vec3
 	bounds_max: Vec3
+	palette: []Palette_Entry   // a rigged model's (Build_Options): what its parts' influences pick from
 }
 
 // The keys a part's changing value holds, at most.
@@ -207,36 +230,79 @@ inherit :: fun(mesh: ^Nif, parent: Inherited, properties: Refs) -> Inherited {
 // Makes a model of a NIF: its parts' vertices and indexes, and the parts
 // themselves, carved from storage.
 build_model :: fun(mesh: ^Nif, storage: ^[]byte) -> Model, err {
-	return build_model_with(mesh, -1, [], [], mat4_identity(), [], storage)
+	return build_model_with(mesh, -1, [], plain_build(), storage)
+}
+
+// How a model of a NIF is made (build_model_with). Its skinned shapes are
+// moved with their bones as pose has them (no pose: as the file has them);
+// the rest are placed by root. Its first shape's vertices are moved first,
+// each as far as moves says, where there's a move for each (a face's shape:
+// facegen.mara). Rigged, its vertices are kept as they are and the card
+// moves them, each part's by the entries of the model's palette its
+// influences pick: a skinned shape's by its bones (in pose, by name, its
+// skin's transforms), any other wholly by hang_bone (in pose; -1: none),
+// from where hang_offset says.
+Build_Options :: struct {
+	pose: []Pose_Bone
+	root: Mat4
+	moves: []Vec3
+	rigged: bool
+	hang_bone: i64
+	hang_offset: Mat4
+}
+
+// A model made as the file has it.
+plain_build :: fun() -> Build_Options {
+	return Build_Options{pose = [], root = mat4_identity(), moves = [], rigged = false, hang_bone = -1, hang_offset = mat4_identity()}
 }
 
 // Makes a model of part of a NIF: the objects under a node, in the node's
 // own space (as if it were the model's origin, unturned); or, for node -1,
 // the whole tree but for what's under the nodes left out.
 build_model_part :: fun(mesh: ^Nif, node: i64, left_out: []i64, storage: ^[]byte) -> Model, err {
-	return build_model_with(mesh, node, left_out, [], mat4_identity(), [], storage)
+	return build_model_with(mesh, node, left_out, plain_build(), storage)
 }
 
 // Makes a model of a NIF posed: its skinned shapes moved with their bones
 // as the pose has them (into the skeleton's space); the rest placed by
 // root (where they hang: a bone's place).
 build_posed_model :: fun(mesh: ^Nif, pose: []Pose_Bone, root: Mat4, storage: ^[]byte) -> Model, err {
-	return build_model_with(mesh, -1, [], pose, root, [], storage)
+	how := plain_build()
+	how.pose = pose
+	how.root = root
+	return build_model_with(mesh, -1, [], how, storage)
 }
 
 // Makes a model of a NIF posed (see build_posed_model), its first shape's
 // vertices moved before anything else is done with them: each as far as
 // moves says (a face's shape: facegen.mara), where there's a move for each.
 build_shaped_model :: fun(mesh: ^Nif, pose: []Pose_Bone, root: Mat4, moves: []Vec3, storage: ^[]byte) -> Model, err {
-	return build_model_with(mesh, -1, [], pose, root, moves, storage)
+	how := plain_build()
+	how.pose = pose
+	how.root = root
+	how.moves = moves
+	return build_model_with(mesh, -1, [], how, storage)
 }
 
-// Makes a model of a NIF, or part of one (see build_model_part), posed
-// (see build_posed_model; an empty pose: as the file has it), its first
-// shape's vertices moved (see build_shaped_model; none: as they are).
-build_model_with :: fun(mesh: ^Nif, node: i64, left_out: []i64, pose: []Pose_Bone, root: Mat4, moves: []Vec3, storage: ^[]byte)
-	-> Model, err
-{
+// Makes a model of a NIF rigged to a pose (Build_Options): for the card to
+// move with the pose's bones. Its first shape's vertices moved first (see
+// build_shaped_model); an unskinned shape moved by hang_bone from
+// hang_offset.
+build_rigged_model :: fun(mesh: ^Nif, pose: []Pose_Bone, moves: []Vec3, hang_bone: i64, hang_offset: Mat4, storage: ^[]byte) -> Model, err {
+	how := plain_build()
+	how.pose = pose
+	how.moves = moves
+	how.rigged = true
+	how.hang_bone = hang_bone
+	how.hang_offset = hang_offset
+	return build_model_with(mesh, -1, [], how, storage)
+}
+
+// Makes a model of a NIF, or part of one (see build_model_part), as how
+// says (Build_Options).
+build_model_with :: fun(mesh: ^Nif, node: i64, left_out: []i64, how: Build_Options, storage: ^[]byte) -> Model, err {
+	options := how
+	root := how.root
 	// One part for each shape at most.
 	shape_count : i64 = 0
 	for block in mesh.blocks {
@@ -268,7 +334,8 @@ build_model_with :: fun(mesh: ^Nif, node: i64, left_out: []i64, pose: []Pose_Bon
 		particles = slice([:system_count]Model_Particles, storage),
 		motions = slice([:motion_count]Model_Motion, storage),
 		bounds_min = Vec3{1000000, 1000000, 1000000},
-		bounds_max = Vec3{-1000000, -1000000, -1000000}}
+		bounds_max = Vec3{-1000000, -1000000, -1000000},
+		palette = slice([:if how.rigged do MODEL_PALETTE else 0]Palette_Entry, storage)}
 	none := Inherited{texturing = -1, material = -1, alpha = -1, stencil = -1, z_buffer = -1, vertex_color = -1, billboard_mode = -1, billboard_node = mat4_identity()}
 	if node >= 0 {
 		match mesh.blocks[node] {
@@ -276,7 +343,7 @@ build_model_with :: fun(mesh: ^Nif, node: i64, left_out: []i64, pose: []Pose_Bon
 			properties := inherit(mesh, none, part_node.object.properties)
 			for k in 0:part_node.children.count {
 				child := part_node.children.at(k)
-				if child >= 0 do add_object(mesh, child, root, properties, &model, storage, left_out, pose, moves)?
+				if child >= 0 do add_object(mesh, child, root, properties, &model, storage, left_out, &options)?
 			}
 		else
 		}
@@ -284,7 +351,7 @@ build_model_with :: fun(mesh: ^Nif, node: i64, left_out: []i64, pose: []Pose_Bon
 	}
 	for k in 0:mesh.roots.count {
 		root_object := mesh.roots.at(k)
-		if root_object >= 0 do add_object(mesh, root_object, root, none, &model, storage, left_out, pose, moves)?
+		if root_object >= 0 do add_object(mesh, root_object, root, none, &model, storage, left_out, &options)?
 	}
 	return model
 }
@@ -292,7 +359,7 @@ build_model_with :: fun(mesh: ^Nif, node: i64, left_out: []i64, pose: []Pose_Bon
 // Adds an object of the tree to the model: a node's children, or a shape;
 // nothing under the nodes left out. Skinned shapes posed by pose.
 add_object :: fun(mesh: ^Nif, index: i64, parent: Mat4, inherited: Inherited, model: ^Model, storage: ^[]byte, left_out: []i64,
-	pose: []Pose_Bone, moves: []Vec3) -> err
+	how: ^Build_Options) -> err
 {
 	for out in left_out {
 		if out == index do return
@@ -309,7 +376,7 @@ add_object :: fun(mesh: ^Nif, index: i64, parent: Mat4, inherited: Inherited, mo
 		}
 		for k in 0:node.children.count {
 			child := node.children.at(k)
-			if child >= 0 do add_object(mesh, child, transform, properties, model, storage, left_out, pose, moves)?
+			if child >= 0 do add_object(mesh, child, transform, properties, model, storage, left_out, how)?
 		}
 	Shape shape
 		if shape.object.flags & 1 != 0 do return
@@ -318,7 +385,7 @@ add_object :: fun(mesh: ^Nif, index: i64, parent: Mat4, inherited: Inherited, mo
 		properties := inherit(mesh, inherited, shape.object.properties)
 		match mesh.blocks[shape.data] {
 		Shape_Data data
-			add_shape(mesh, data.geometry, shape.object.extra_data, transform, properties, model, storage, shape.skin, pose, moves)?
+			add_shape(mesh, data.geometry, shape.object.extra_data, transform, properties, model, storage, shape.skin, how)?
 		else
 		}
 	Particle_System system
@@ -331,16 +398,20 @@ add_object :: fun(mesh: ^Nif, index: i64, parent: Mat4, inherited: Inherited, mo
 
 // Adds a shape's geometry to the model as a part: skinned (skin its skin
 // instance) and posed, if the pose has bones; its vertices moved first, if
-// it's the model's first part and there's a move for each.
+// it's the model's first part and there's a move for each; or rigged
+// (Build_Options).
 add_shape :: fun(mesh: ^Nif, geometry: Geometry, extra_data: Refs, transform: Mat4, properties: Inherited, model: ^Model,
-	storage: ^[]byte, skin: i64, pose: []Pose_Bone, moves: []Vec3) -> err
+	storage: ^[]byte, skin: i64, how: ^Build_Options) -> err
 {
 	count := geometry.vertex_count
 	if count == 0 or geometry.vertices.len == 0 do return
 	if model.parts.len == model.parts.cap do return Too_Many_Parts
-	skinned := skin >= 0 and pose.len > 0
-	own_moves := moves[0:0]
-	if model.parts.len == 0 and moves.len >= count do own_moves = moves
+	skinned := skin >= 0 and how.pose.len > 0
+	own_moves := how.moves[0:0]
+	if model.parts.len == 0 and how.moves.len >= count do own_moves = how.moves
+	// (A rigged skinned shape's vertices stay as the file has them: its
+	// bones place it.)
+	place := if how.rigged and skinned do mat4_identity() else transform
 
 	// The vertices, into the model's space. Normals turn with the shape;
 	// its scale is taken out of them by normalizing.
@@ -348,7 +419,7 @@ add_shape :: fun(mesh: ^Nif, geometry: Geometry, extra_data: Refs, transform: Ma
 	for i in 0:count {
 		local_position : Vec3 = geometry.vertices[i * 12]
 		if own_moves.len > 0 do local_position = local_position + own_moves[i]
-		position := mat4_mul_vec4(transform, Vec4{local_position.x, local_position.y, local_position.z, 1})
+		position := mat4_mul_vec4(place, Vec4{local_position.x, local_position.y, local_position.z, 1})
 		vertex := Vertex{
 			position = Vec3{position.x, position.y, position.z},
 			normal = Vec3{0, 0, 1},
@@ -357,16 +428,21 @@ add_shape :: fun(mesh: ^Nif, geometry: Geometry, extra_data: Refs, transform: Ma
 			tangent = [1, 0, 0, 1]}
 		if geometry.normals.len != 0 {
 			local_normal : Vec3 = geometry.normals[i * 12]
-			turned := mat4_mul_vec4(transform, Vec4{local_normal.x, local_normal.y, local_normal.z, 0})
+			turned := mat4_mul_vec4(place, Vec4{local_normal.x, local_normal.y, local_normal.z, 0})
 			vertex.normal = vec3_normalize(Vec3{turned.x, turned.y, turned.z})
 		}
 		if geometry.uv_set_count > 0 do vertex.uv = geometry.uvs[i * 8]
 		if geometry.colors.len != 0 do vertex.color = geometry.colors[i * 16]
 		&vertices + vertex
-		if not skinned do grow_bounds(model, vertex.position)
+		if not skinned and not how.rigged do grow_bounds(model, vertex.position)
 	}
-	if skinned {
-		skin_vertices(mesh, skin, geometry, pose, own_moves, &vertices, storage)
+	influences := slice([:0]Skin_Influence, storage)
+	if how.rigged {
+		influences = slice([:count]Skin_Influence, storage)
+		if skinned do rig_skin(mesh, skin, how, vertices, model, &influences, storage)
+		else do rig_hang(how, vertices, model, &influences)
+	elif skinned
+		skin_vertices(mesh, skin, geometry, how.pose, own_moves, &vertices, storage)
 		for &vertex in vertices do grow_bounds(model, vertex.position)
 	}
 
@@ -386,12 +462,13 @@ add_shape :: fun(mesh: ^Nif, geometry: Geometry, extra_data: Refs, transform: Ma
 		}
 	}
 
-	add_tangents(mesh, extra_data, transform, &vertices, indices)
+	add_tangents(mesh, extra_data, place, &vertices, indices)
 
 	part := next(&model.parts)
 	part^ = part_look(mesh, properties, model)
 	part.vertices = vertices
 	part.indices = indices
+	part.influences = influences
 	add_motions(mesh, properties, model, model.parts.len - 1)
 
 	// The material's color, where the mesh has neither colors of its own
@@ -492,6 +569,61 @@ pose_node :: fun(mesh: ^Nif, index: i64, parent: Mat4, parent_rest: Mat4, tracks
 	}
 }
 
+// A skeleton's bones made to be posed quickly (pose_rig): each after its
+// parent, its parent's index (-1 for none), its place in its parent at
+// rest, and the track that moves it (-1 for none). In pose_nodes' order, so
+// a pose's bone k is the rig's.
+Rig_Bone :: struct {
+	parent: i64
+	local: Mat4
+	track: i64
+}
+
+// A NIF's nodes as a rig, into rig (each track's rest set as pose_nodes
+// sets it).
+rig_nodes :: fun(mesh: ^Nif, tracks: ^[]Track, rig: ^[]Rig_Bone) {
+	rig.len = 0
+	for k in 0:mesh.roots.count {
+		root_object := mesh.roots.at(k)
+		if root_object >= 0 do rig_node(mesh, root_object, -1, tracks, rig)
+	}
+}
+
+rig_node :: fun(mesh: ^Nif, index: i64, parent: i64, tracks: ^[]Track, rig: ^[]Rig_Bone) {
+	match mesh.blocks[index] {
+	Node node
+		if rig.len == rig.cap do return
+		local := local_transform(node.object)
+		track : i64 = -1
+		for k in 0:tracks.len {
+			if compare_folded(tracks[k].node_name, node.object.name) == 0 {
+				tracks[k].rest = local
+				track = k
+				break
+			}
+		}
+		own := rig.len
+		rig + Rig_Bone{parent = parent, local = local, track = track}
+		for k in 0:node.children.count {
+			child := node.children.at(k)
+			if child >= 0 do rig_node(mesh, child, own, tracks, rig)
+		}
+	else
+	}
+}
+
+// A rig's bones' places at a time, each its parent's place times its own
+// in its parent (its track's there, if it has one): into places.
+pose_rig :: fun(rig: []Rig_Bone, tracks: ^[]Track, time: f32, places: ^[]Mat4) {
+	places.len = 0
+	for bone in rig {
+		local := bone.local
+		if bone.track >= 0 do local = track_pose(&tracks[bone.track], time)
+		place := if bone.parent >= 0 do mat4_mul(places[bone.parent], local) else local
+		places + place
+	}
+}
+
 // A node's name; empty for a block that isn't a node.
 node_name :: fun(mesh: ^Nif, index: i64) -> []utf8 {
 	match mesh.blocks[index] {
@@ -506,6 +638,124 @@ node_name :: fun(mesh: ^Nif, index: i64) -> []utf8 {
 // the pose: each the sum of where each of its bones takes it, by its
 // weight. What its bones don't move all the way (a bone the pose hasn't)
 // stays that much where it was. Room for the sums carved from storage.
+// A rigged skinned shape's influences (Build_Options): an entry of the
+// model's palette for each bone of its skin the pose has (by name, the
+// skin's transform for it); each vertex's four heaviest, their weights
+// made to add up to 65535. Vertices no bone moves stay where the file has
+// them (an entry without a bone). Posed, they widen the model's bounds.
+rig_skin :: fun(mesh: ^Nif, skin: i64, how: ^Build_Options, vertices: []Vertex, model: ^Model, influences: ^[]Skin_Influence,
+	storage: ^[]byte)
+{
+	count := vertices.len
+	// Each vertex's heaviest four so far: entries, then weights.
+	heaviest := slice([:count][8!]f32, storage)
+	// (Through a local: an array literal appended doesn't lower, MARA_ISSUES.md.)
+	none_yet : [8!]f32 = [-1, -1, -1, -1, 0, 0, 0, 0]
+	for k in 0:count do &heaviest + none_yet
+	data_index : i64 = -1
+	bones := Refs{count = 0, data = []}
+	match mesh.blocks[skin] {
+	Skin_Instance instance
+		data_index = instance.data
+		bones = instance.bones
+	else
+	}
+	if data_index >= 0 {
+		match mesh.blocks[data_index] {
+		Skin_Data data
+			at : i64 = 0
+			for b in 0:data.bone_count {
+				bone := skin_bone_at(data.bones, at, data.has_weights)
+				at = bone.next_at
+				if not data.has_weights or b >= bones.count or model.palette.len == model.palette.cap do continue
+				node := bones.at(b)
+				if node < 0 do continue
+				bone_index := pose_index(how.pose, node_name(mesh, node))
+				if bone_index < 0 do continue
+				entry := f32(model.palette.len)
+				&model.palette + Palette_Entry{bone = bone_index, offset = bone.transform}
+				for w in 0:bone.weights.len / 6 {
+					index : u16 = bone.weights[w * 6]
+					weight : f32 = bone.weights[w * 6 + 2]
+					v := i64(index)
+					if v >= count or weight <= 0 do continue
+					// Into the four, in place of the lightest, if heavier.
+					lightest := 0
+					for k in 1:4 {
+						if heaviest[v][4 + k] < heaviest[v][4 + lightest] do lightest = k
+					}
+					if weight > heaviest[v][4 + lightest] {
+						heaviest[v][lightest] = entry
+						heaviest[v][4 + lightest] = weight
+					}
+				}
+			}
+		else
+		}
+	}
+	// (An entry without a bone, for vertices nothing moves.)
+	unmoved : i64 = -1
+	for v in 0:count {
+		total := heaviest[v][4] + heaviest[v][5] + heaviest[v][6] + heaviest[v][7]
+		influence := Skin_Influence{entries = [0, 0, 0, 0], weights = [0, 0, 0, 0]}
+		if total <= 0 {
+			if unmoved < 0 and model.palette.len < model.palette.cap {
+				unmoved = model.palette.len
+				&model.palette + Palette_Entry{bone = -1, offset = mat4_identity()}
+			}
+			influence.entries[0] = u16(max(unmoved, 0))
+			influence.weights[0] = 65535
+		else
+			given : i64 = 0
+			for k in 0:4 {
+				if heaviest[v][k] < 0 do continue
+				influence.entries[k] = u16(heaviest[v][k])
+				share := i64(heaviest[v][4 + k] / total * 65535 + 0.5)
+				influence.weights[k] = u16(min(share, 65535 - given))
+				given += i64(influence.weights[k])
+			}
+		}
+		influences + influence
+		grow_bounds(model, rigged_place(how, model, influence, vertices[v].position))
+	}
+}
+
+// A rigged unskinned shape's influences (Build_Options): one new entry of
+// the model's palette, the hanging bone from hang_offset, moves every
+// vertex. Posed, they widen the model's bounds.
+rig_hang :: fun(how: ^Build_Options, vertices: []Vertex, model: ^Model, influences: ^[]Skin_Influence) {
+	if model.palette.len == model.palette.cap do return
+	entry := model.palette.len
+	&model.palette + Palette_Entry{bone = how.hang_bone, offset = how.hang_offset}
+	for vertex in vertices {
+		influence := Skin_Influence{entries = [u16(entry), 0, 0, 0], weights = [65535, 0, 0, 0]}
+		influences + influence
+		grow_bounds(model, rigged_place(how, model, influence, vertex.position))
+	}
+}
+
+// Where a rigged vertex is in the pose it was rigged to.
+rigged_place :: fun(how: ^Build_Options, model: ^Model, influence: Skin_Influence, position: Vec3) -> Vec3 {
+	placed := Vec3{0, 0, 0}
+	for k in 0:4 {
+		if influence.weights[k] == 0 do continue
+		entry := model.palette[i64(influence.entries[k])]
+		moving := entry.offset
+		if entry.bone >= 0 do moving = mat4_mul(how.pose[entry.bone].place, entry.offset)
+		moved := mat4_mul_vec4(moving, Vec4{position.x, position.y, position.z, 1})
+		placed = placed + Vec3{moved.x, moved.y, moved.z} * (f32(influence.weights[k]) / 65535)
+	}
+	return placed
+}
+
+// A bone's place in a pose (its name in any letter case); -1 when it hasn't it.
+pose_index :: fun(pose: []Pose_Bone, name: []utf8) -> i64 {
+	for bone, k in pose {
+		if compare_folded(bone.name, name) == 0 do return k
+	}
+	return -1
+}
+
 skin_vertices :: fun(mesh: ^Nif, skin: i64, geometry: Geometry, pose: []Pose_Bone, moves: []Vec3, vertices: ^[]Vertex, storage: ^[]byte) {
 	data_index : i64 = -1
 	bones := Refs{count = 0, data = geometry.vertices[0:0]}
@@ -844,7 +1094,8 @@ part_look :: fun(mesh: ^Nif, properties: Inherited, model: ^Model) -> Model_Part
 		alpha = 1,
 		vertex_mode = 2,
 		lighting_mode = 1,
-		leaf_cards = false}
+		leaf_cards = false,
+		influences = []}
 	apply_properties(mesh, properties, &part, model)
 	return part
 }

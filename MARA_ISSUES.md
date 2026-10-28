@@ -106,6 +106,23 @@ against Mara at the time written. When one is fixed, move it to Fixed
   Expected: the list's slice, as for a slice; or a checker error saying
   to write `line[:]`. sooblivion writes `line[:]` (command_sky).
 
+- An array literal appended to a slice of arrays taken from storage isn't
+  lowered. Checked against 3a5d0f3:
+
+  ```
+  fill :: fun(count: i64, storage: ^[]byte) -> i64 {
+  	rows := slice([:count][8!]f32, storage)
+  	for k in 0:count do &rows + [-1, -1, -1, -1, 0, 0, 0, 0]
+  	return rows.len
+  }
+  ```
+
+  says "Graph error: lower: an array literal as an operand". Appended to
+  a list (`rows : [4][8!]f32`) it works. Main Mara's Mara.exe (61bf180
+  checked out, 2026-10-28) compiles it and gives 4: fixed there, not in a
+  release yet. sooblivion appends a typed local holding the literal
+  (model.mara, rig_skin) till the release has it.
+
 ## Answered (not issues)
 
 - Struct values can't be compared (`part.diffuse != Vec3{1, 1, 1}`): not

@@ -37,8 +37,10 @@ Oblivion.esm and the base game's archives; sizes are as stored.
   their eyes and hair (tinted by their hair color), a tail for the beast
   races, and what they wear (the clothes and armor they carry, leveled
   lists taken at level 10, one item to a slot) — skinned to their skeleton
-  (NiSkinInstance, NiSkinData) and posed as `idle.kf` starts (its B-spline
-  keys read), as tall as their race. Their faces are their own (FaceGen):
+  (NiSkinInstance, NiSkinData) and playing `idle.kf` over and over (its
+  B-spline keys read; their bones move them on the card, each NPC's idle
+  put off by up to 10 s so no two breathe together), as tall as their
+  race. Their faces are their own (FaceGen):
   the head and what sits on it shaped by their FGGS and FGGA through each
   part's `.egm`; the skin moved by their face map, the game's own in
   `textures\faces` (1,977 of 2,482 NPCs) or made from the head's `.egt`
@@ -57,7 +59,7 @@ Oblivion.esm and the base game's archives; sizes are as stored.
   world's SNAM (the cities public, Oblivion's planes dungeon), a region's
   RDMD.
 - **Animation:** Idle sequences' movement, scrolling textures, glow and
-  opacity changes (see below for what's left).
+  opacity changes, NPCs' idle (see below for what's left).
 
 ## Not used yet
 
@@ -65,11 +67,11 @@ Oblivion.esm and the base game's archives; sizes are as stored.
 
 | What | Data | Notes |
 |---|---|---|
-| NPCs moving | IDLE 650, AI packages | they stand in their idle's first pose |
+| NPCs moving about | IDLE 650 (the idles their conditions pick), AI packages, the walking and turning `.kf` | they stand where they're placed, breathing (`idle.kf`) |
 | Faces' age and expressions | the age maps (`headhuman{m,f}{10..60}.dds` and their normal maps: the skin shader's FaceGenMap1, times 4), which `facegen\si.ctl`'s age control picks; `.tri` 85 (expressions, the mouth for speech); the bodies' `.egt` | shapes and skins are used (see above); the skin is as if of no age |
 | Weapons and shields worn | WEAP, their models on the back or side | |
 | Creatures | ACRE 1,473 placed; CREA 914; 34 creature folders | none drawn |
-| Animations | `.kf` 1,843 (creatures 1,068, characters 775); IDLE 650 | read (B-splines too); NPCs posed by idle.kf's start, nothing plays yet |
+| Animations | `.kf` 1,843 (creatures 1,068, characters 775); IDLE 650 | read (B-splines too); NPCs play idle.kf, nothing else yet |
 | Voices | Voices1/2 BSAs: 38,898 `.mp3` + `.lip`, 1.7 GB; DIAL 3,817, INFO 19,278 | mp3.mara decodes them (checked against ffmpeg); `.lip` drives FaceGen mouth morphs |
 
 ### World and sky

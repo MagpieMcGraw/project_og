@@ -511,7 +511,7 @@ grow_tree :: fun(tree: ^Speed_Tree, seed: i64, leaf_texture: []utf8, fit: Tree_F
 	if growth.bark_indices.len > 0 do &parts + tree_part(&growth, false, bark_texture)
 	if growth.leaf_indices.len > 0 do &parts + tree_part(&growth, true, leaf_texture)
 	report = Growth_Report{branches = growth.branches, leaves = growth.leaves, left_out = growth.left_out}
-	return Model{parts = parts, flips = [], particles = [], motions = [], bounds_min = low, bounds_max = high}, report
+	return Model{parts = parts, flips = [], particles = [], motions = [], bounds_min = low, bounds_max = high, palette = []}, report
 }
 
 // Grows the tree from its trunk, the dice started from the seed.
@@ -817,7 +817,8 @@ tree_part :: fun(growth: ^Growth, leaves: bool, texture: []utf8) -> Model_Part {
 		alpha = 1,
 		vertex_mode = 2,
 		lighting_mode = 1,
-		leaf_cards = leaves}
+		leaf_cards = leaves,
+		influences = []}
 	&part.texture + texture[0 : min(texture.len, part.texture.cap)]
 	return part
 }

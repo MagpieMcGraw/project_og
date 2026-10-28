@@ -448,6 +448,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	noises : [16]Door_Noise
 	swing_doors(shown, f32(seconds), &noises)
 	move_pieces(shown, viewer.look.time)
+	pose_npcs(shown, &viewer.renderer, viewer.look.time)
 	for &noise in noises do play_once(&viewer.audio, &viewer.archives, &shown.sound_kinds[noise.sound], noise.position, listener_of(camera^))
 	if change_lights(shown, f32(seconds)) do shown.lights_changed = true
 	drawing_start := time_now()

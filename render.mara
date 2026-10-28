@@ -53,6 +53,10 @@ NO_LIGHT :: 0xFFFF
 // Room in the shared mesh buffers: vertices (48 bytes each) and indexes.
 MESH_VERTEX_ROOM :: 4194304
 MESH_INDEX_ROOM :: 33554432
+// Room for rigged parts' vertices' bones and weights (16 bytes each), and
+// for the matrices they're posed with each frame (the palette).
+INFLUENCE_ROOM :: 2097152
+PALETTE_ROOM :: 65536
 // Mesh parts on the card, textures loaded, instances drawn in a frame.
 MAX_PARTS :: 65536
 MAX_FLIPS :: 1024
@@ -144,8 +148,8 @@ layout(location = 9) in uvec4 lights_high;
 layout(location = 10) in vec4 material;     // alpha threshold, emissive color
 layout(location = 11) in uvec4 handles;     // its texture's, its glow map's (0 for none; bound: 1 for one)
 layout(location = 12) in uvec4 normal_map;  // its normal map's handle (as the glow map's), its glossiness's bits
-layout(location = 13) in vec4 specular;     // the color it shines
-layout(location = 14) in vec4 motion;       // its texture moved across and up, its opacity (as they change)
+layout(location = 13) in vec4 specular;     // the color it shines; rigged, where its influences start, less its first vertex's id
+layout(location = 14) in vec4 motion;       // its texture moved across and up, its opacity (as they change); rigged, where its palette starts
 
 uniform mat4 view_projection;
 uniform vec3 view_right;    // the camera's right and up, in the world: leaf cards face it
@@ -153,6 +157,22 @@ uniform vec3 view_up;
 
 // An instance's flags (Drawn_Instance's, as PART_*).
 const uint LEAF_CARDS = 1u;
+const uint RIGGED = 2u;
+
+// Rigged parts' vertices' bones (their entries in the palette) and weights,
+// four of each, two to a word: by vertex id.
+layout(std430, binding = 4) readonly buffer Skin_Influences {
+	uvec4 skin_influences[];
+};
+// This frame's palette: the matrices rigged parts' bones move them with.
+layout(std430, binding = 5) readonly buffer Bone_Palette {
+	mat4 bone_palette[];
+};
+
+// The k-th of four 16-bit values, two to a word.
+uint sixteen_bits(uvec2 words, int k) {
+	return (words[k / 2] >> (16u * uint(k & 1))) & 0xFFFFu;
+}
 
 out vec3 world_position;
 out vec3 world_normal;
@@ -172,6 +192,17 @@ flat out uint part_flags;
 
 void main() {
 	mat4 world = mat4(world_x, world_y, world_z, world_w);
+	if ((normal_map.w & RIGGED) != 0u) {
+		// Moved by its bones: their matrices, by their weights, before its own.
+		uvec4 influence = skin_influences[gl_VertexID + int(specular.w)];
+		int palette_start = int(motion.w);
+		mat4 skinning = mat4(0.0);
+		for (int k = 0; k < 4; k++) {
+			float weight = float(sixteen_bits(influence.zw, k)) / 65535.0;
+			if (weight > 0.0) skinning += bone_palette[palette_start + int(sixteen_bits(influence.xy, k))] * weight;
+		}
+		world = world * skinning;
+	}
 	vec4 placed = world * vec4(position, 1.0);
 	world_tangent = mat3(world) * tangent.xyz;
 	if ((normal_map.w & LEAF_CARDS) != 0u) {
@@ -1108,6 +1139,8 @@ Mesh_Part :: struct {
 	flip: i64              // its texture's flipbook (in the renderer's flips), -1 for none
 	billboard: i64         // turned to face the camera: its billboard (in the renderer's), -1 for none
 	leaf_cards: bool       // a tree's leaves, each card turned to face the camera (Model_Part's)
+	rigged: bool           // moved by bones: each vertex's influence in the renderer's, from influence_offset on (by vertex id)
+	influence_offset: i64  // where its influences start, less its first vertex's id (base_vertex)
 }
 
 // A flipbook on the card: its frames' textures (in the renderer's
@@ -1142,6 +1175,7 @@ Gpu_Model :: struct {
 	particles_count: i64
 	center: Vec3
 	radius: f32
+	rigged: bool           // some of its parts are moved by bones (drawn only when posed: an instance's palette_base)
 }
 
 // A particle system of a model on the card: how it plays and looks (the
@@ -1222,6 +1256,7 @@ Instance :: struct {
 	moving_piece: i32
 	placement: Mat4
 	reach: f32             // drawn only this near the camera (along the ground, from its place); 0: at any distance
+	palette_base: i64      // a rigged model's: where its palette starts in this frame's (pose_npcs); -1 for none
 }
 
 // A cell's land on the card: where on the grid, its slot in the land
@@ -1511,13 +1546,14 @@ Drawn_Instance :: struct {
 	normal_map: u64        // its normal map's, as the glow map's
 	glossiness: f32
 	flags: u32             // PART_*
-	specular: [4!]f32      // the color it shines, red, green, blue; the last unused
-	motion: [4!]f32        // its texture moved across and up, its opacity; the last unused
+	specular: [4!]f32      // the color it shines, red, green, blue; rigged, the part's influence_offset
+	motion: [4!]f32        // its texture moved across and up, its opacity; rigged, the instance's palette_base
 }
 
 // A drawn instance's flags (for the mesh program, which reads them as the
 // fourth word of its normal map's).
 PART_LEAF_CARDS :: 1   // its vertices are leaf cards (Model_Part.leaf_cards)
+PART_RIGGED :: 2       // its vertices are moved by bones (Mesh_Part.rigged)
 
 // One draw of MultiDrawElementsIndirect, as OpenGL reads it: 20 bytes.
 Draw_Command :: struct {
@@ -1668,6 +1704,13 @@ Renderer :: struct {
 
 	// The scene's lights as the mesh programs read them (binding 3).
 	light_buffer: u32
+	// Rigged parts' vertices' influences (binding 4), each part's after the
+	// last's; this frame's palette they're posed with (binding 5), made by
+	// pose_npcs.
+	influence_buffer: u32
+	influences_used: i64
+	palette_buffer: u32
+	palette: [PALETTE_ROOM]Mat4
 	land_quadrants: [LAND_QUADRANTS!]Quadrant_Slots
 
 	// Textures, found by their paths' hashes.
@@ -2663,6 +2706,15 @@ setup_mesh_buffers :: fun(renderer: ^Renderer) {
 	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.mesh_index_buffer)
 	BufferData(ELEMENT_ARRAY_BUFFER, MESH_INDEX_ROOM * 2, [], STATIC_DRAW)
 
+	GenBuffers(1, &renderer.influence_buffer)
+	BindBuffer(SHADER_STORAGE_BUFFER, renderer.influence_buffer)
+	BufferData(SHADER_STORAGE_BUFFER, INFLUENCE_ROOM * size_of(Skin_Influence), [], STATIC_DRAW)
+	renderer.influences_used = 0
+	GenBuffers(1, &renderer.palette_buffer)
+	BindBuffer(SHADER_STORAGE_BUFFER, renderer.palette_buffer)
+	BufferData(SHADER_STORAGE_BUFFER, PALETTE_ROOM * size_of(Mat4), [], STREAM_DRAW)
+	renderer.palette.len = 0
+
 	// The instances: one Drawn_Instance each, read once for each instance.
 	GenBuffers(1, &renderer.instance_buffer)
 	BindBuffer(ARRAY_BUFFER, renderer.instance_buffer)
@@ -2879,13 +2931,16 @@ Upload_Error :: error {
 upload_model :: fun(renderer: ^Renderer, built: ^Model, archives: ^Archives, scratch: ^[]byte) -> Gpu_Model, err {
 	vertex_total : i64 = 0
 	index_total : i64 = 0
+	influence_total : i64 = 0
 	for part in built.parts {
 		vertex_total += part.vertices.len
 		index_total += part.indices.len
+		influence_total += part.influences.len
 	}
 	if renderer.vertices_used + vertex_total > MESH_VERTEX_ROOM or renderer.indices_used + index_total > MESH_INDEX_ROOM {
 		return Gpu_Model{0}, No_Room_On_Card
 	}
+	if renderer.influences_used + influence_total > INFLUENCE_ROOM do return Gpu_Model{0}, No_Room_On_Card
 	if renderer.parts.len + built.parts.len > renderer.parts.cap do return Gpu_Model{0}, No_Room_On_Card
 	if renderer.billboards.len + built.parts.len > renderer.billboards.cap do return Gpu_Model{0}, No_Room_On_Card
 	if renderer.particle_kinds.len + built.particles.len > renderer.particle_kinds.cap do return Gpu_Model{0}, No_Room_On_Card
@@ -2937,13 +2992,23 @@ upload_model :: fun(renderer: ^Renderer, built: ^Model, archives: ^Archives, scr
 		first_particles = first_particles,
 		particles_count = built.particles.len,
 		center = (built.bounds_min + built.bounds_max) * 0.5,
-		radius = vec3_length(built.bounds_max - built.bounds_min) * 0.5}
+		radius = vec3_length(built.bounds_max - built.bounds_min) * 0.5,
+		rigged = false}
 	for part, part_index in built.parts {
 		if part.indices.len == 0 or part.vertices.len == 0 do continue
 		BindBuffer(ARRAY_BUFFER, renderer.mesh_vertex_buffer)
 		BufferSubData(ARRAY_BUFFER, isize(renderer.vertices_used * size_of(Vertex)), part.vertices)
 		BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.mesh_index_buffer)
 		BufferSubData(ELEMENT_ARRAY_BUFFER, isize(renderer.indices_used * 2), part.indices)
+		// Rigged, its vertices' influences, by vertex id from its first.
+		rigged := part.influences.len > 0 and part.influences.len == part.vertices.len
+		influence_offset := renderer.influences_used - renderer.vertices_used
+		if rigged {
+			BindBuffer(SHADER_STORAGE_BUFFER, renderer.influence_buffer)
+			BufferSubData(SHADER_STORAGE_BUFFER, isize(renderer.influences_used * size_of(Skin_Influence)), part.influences)
+			renderer.influences_used += part.influences.len
+			gpu.rigged = true
+		}
 
 		threshold : f32 = 0
 		if part.alpha_test do threshold = part.alpha_threshold
@@ -2985,7 +3050,9 @@ upload_model :: fun(renderer: ^Renderer, built: ^Model, archives: ^Archives, scr
 			additive = part.additive,
 			flip = flip,
 			billboard = billboard,
-			leaf_cards = part.leaf_cards}
+			leaf_cards = part.leaf_cards,
+			rigged = rigged,
+			influence_offset = influence_offset}
 		renderer.vertices_used += part.vertices.len
 		renderer.indices_used += part.indices.len
 		gpu.part_count += 1
@@ -3044,7 +3111,8 @@ place_instance :: fun(gpu: Gpu_Model, model_index: i64, placement: Mat4, referen
 		moving_kind = -1,
 		moving_piece = 0,
 		placement = placement,
-		reach = 0}
+		reach = 0,
+		palette_base = -1}
 	for k in 0:LIGHTS_PER_OBJECT do instance.lights[k] = NO_LIGHT
 	return instance
 }
@@ -3095,6 +3163,14 @@ set_scene_lights :: fun(renderer: ^Renderer, lights: ^[]Point_Light) {
 	if records.len == 0 do return
 	BindBuffer(SHADER_STORAGE_BUFFER, renderer.light_buffer)
 	BufferSubData(SHADER_STORAGE_BUFFER, 0, records)
+}
+
+// Puts this frame's palette (pose_npcs's) on the card.
+upload_palette :: fun(renderer: ^Renderer) {
+	if renderer.palette.len == 0 do return
+	BindBuffer(SHADER_STORAGE_BUFFER, renderer.palette_buffer)
+	BufferData(SHADER_STORAGE_BUFFER, PALETTE_ROOM * size_of(Mat4), [], STREAM_DRAW)   // (a fresh buffer: no waiting on last frame's)
+	BufferSubData(SHADER_STORAGE_BUFFER, 0, renderer.palette)
 }
 
 // ---- land ---------------------------------------------------------------------------------
@@ -3272,6 +3348,8 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 	sun := vec3_normalize(lighting.direction)
 
 	BindBufferBase(SHADER_STORAGE_BUFFER, 3, renderer.light_buffer)
+	BindBufferBase(SHADER_STORAGE_BUFFER, 4, renderer.influence_buffer)
+	BindBufferBase(SHADER_STORAGE_BUFFER, 5, renderer.palette_buffer)
 	if look.sky do draw_sky(renderer, look, view_projection, lighting, camera, &stats)
 	// The cells drawn in full: what the far pass leaves out.
 	near_cells := hidden_around(camera.position)
@@ -3680,6 +3758,9 @@ gather_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]In
 		x, y := grid_of(Vec3{instance.world[3][0], instance.world[3][1], 0})
 		if hidden_cell_at(left_out, x, y) do continue
 		placed_model := models[instance.model]
+		// (A rigged model not posed this frame isn't drawn: its vertices are
+		// where its bones would move them from.)
+		if placed_model.rigged and instance.palette_base < 0 do continue
 		if record_count + placed_model.part_count > MAX_DRAWN do break
 		&renderer.visible + index
 		for p in placed_model.first_part:placed_model.first_part + placed_model.part_count {
@@ -3766,6 +3847,11 @@ gather_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]In
 			record.glossiness = max(part.glossiness, 1)
 			record.flags = if part.leaf_cards do PART_LEAF_CARDS else 0
 			record.specular = [part.specular.x, part.specular.y, part.specular.z, 0]
+			if part.rigged {
+				record.flags |= PART_RIGGED
+				record.specular[3] = f32(part.influence_offset)
+				record.motion[3] = f32(instance.palette_base)
+			}
 		}
 	}
 	for key in renderer.touched do renderer.part_counts[key & 0xFFFFF] = 0
