@@ -82,7 +82,9 @@ PICTURE_LOG_PATH :: "picture.log"
 // PICTURE_MOST_FRAMES, whatever's loaded by then. Placed, the camera
 // starts at position, turned by yaw and pitch (radians). The first-person
 // arms are held in one animation (HELD_*; -1: as they'd play) at a time
-// in it (seconds), past its hit striking once.
+// in it (seconds), past its hit striking once. Out, once it's settled it
+// goes through the door out (the one whose outside was readied, else the
+// nearest), and the picture's of the other side, once that's settled.
 Picture :: struct {
 	path: [260]utf8      // empty: no picture, the window shown
 	placed: bool
@@ -94,13 +96,15 @@ Picture :: struct {
 	menu: i64            // a menu open in it (MENU_*); 0 for none
 	menu_page: i64       // the menu's page (1 to 5); 0 for its first
 	timed_frames: i64    // frames drawn and timed once it's settled, before it's taken; 0 for none
+	out: bool            // through the door out once it's settled, the picture taken there
 }
 PICTURE_SETTLE :: 3
 PICTURE_MOST_FRAMES :: 6000
 
 // No picture: the window shown, as usual.
 no_picture :: fun() -> Picture {
-	return Picture{path = [], placed = false, position = Vec3{0, 0, 0}, yaw = 0, pitch = 0, held = -1, held_at = 0, menu = 0, menu_page = 0, timed_frames = 0}
+	return Picture{path = [], placed = false, position = Vec3{0, 0, 0}, yaw = 0, pitch = 0, held = -1, held_at = 0, menu = 0, menu_page = 0,
+		timed_frames = 0, out = false}
 }
 // How much faster than ours the game's day goes (Oblivion's own), and,
 // with T held, how much faster again.
@@ -201,6 +205,11 @@ Viewer :: struct {
 	// Loading after walking into another cell: when it began, over how many frames.
 	loading_since: u64
 	loading_frames: i64
+	// Inside: whether the outside a door leads to has begun to be readied
+	// (ready_exit), once what's inside is loaded; that door (its index in
+	// the scene's doors, -1 for none).
+	exit_readied: bool
+	exit_door: i64
 
 	// Where the last frame's time went, in nanoseconds, and what it drew:
 	// for the journal when it was slow, and the title.
@@ -334,6 +343,8 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.speed = 400
 	viewer.place.len = 0
 	viewer.chosen_door = -1
+	viewer.exit_readied = false
+	viewer.exit_door = -1
 	viewer.missed = false
 	viewer.missed_target = 0
 	viewer.walking = false
@@ -586,8 +597,18 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		viewer.menu_open == 0)
 	draw_open_menu(viewer, platform.width, platform.height)
 	viewer.hud_time = time_now() - hud_start
-	drawn, framebuffer_error := draw_frame(&viewer.renderer, &shown.models, &shown.instances, &shown.distant_instances, &shown.grounds,
-		&shown.waters, &shown.tree_cells, &shown.grass_cells, &viewer.held.instances, &viewer.look, shown.lighting, camera^,
+	// Inside, the land, trees and grass are the outside's, readied for going
+	// out (ready_exit): not drawn.
+	grounds := shown.grounds[0 : shown.grounds.len]
+	tree_cells := shown.tree_cells[0 : shown.tree_cells.len]
+	grass_cells := shown.grass_cells[0 : shown.grass_cells.len]
+	if shown.world == 0 {
+		grounds.len = 0
+		tree_cells.len = 0
+		grass_cells.len = 0
+	}
+	drawn, framebuffer_error := draw_frame(&viewer.renderer, &shown.models, &shown.instances, &shown.distant_instances, &grounds,
+		&shown.waters, &tree_cells, &grass_cells, &viewer.held.instances, &viewer.look, shown.lighting, camera^,
 		platform.width, platform.height)
 	viewer.drawn = drawn
 	if framebuffer_error and not viewer.told_framebuffer {
@@ -601,6 +622,24 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	if viewer.picture.path.len > 0 {
 		viewer.picture_frames += 1
 		viewer.picture_settled = if still_loading(viewer) do 0 else viewer.picture_settled + 1
+		// Out: through the door out, once (it's settled again there).
+		if viewer.picture.out and viewer.picture_settled > PICTURE_SETTLE and shown.doors.len > 0 {
+			viewer.picture.out = false
+			viewer.picture_settled = 0
+			nearest : f32 = 0
+			for way_out, k in shown.doors {
+				away := way_out.position - camera.position
+				distance := away.x * away.x + away.y * away.y + away.z * away.z
+				if k == 0 or distance < nearest {
+					viewer.chosen_door = k
+					nearest = distance
+				}
+			}
+			if viewer.exit_door >= 0 do viewer.chosen_door = viewer.exit_door
+			note(&viewer.journal, "the picture goes through the door out")
+			note_end(&viewer.journal)
+			return .door
+		}
 		// Timed frames: from the one after it settles (the drawing added up is
 		// the frame before's, measured after this point).
 		if viewer.picture_settled == PICTURE_SETTLE + 1 {
@@ -1424,15 +1463,19 @@ count_frame :: fun(viewer: ^Viewer) {
 }
 
 // Whether anything is still to load: what's waiting near the camera, the
-// distant land, or what's seen from afar.
+// outside to be readied or being readied, the distant land, or what's seen
+// from afar.
 still_loading :: fun(viewer: ^Viewer) -> bool {
-	return anything_waiting(&viewer.shown) or viewer.renderer.distant_next >= 0 or viewer.shown.distant_next >= 0
+	shown := &viewer.shown
+	return anything_waiting(shown) or (shown.world == 0 and not viewer.exit_readied) or readying(shown) or
+		viewer.renderer.distant_next >= 0 or shown.distant_next >= 0
 }
 
 // Loads some of what's still to load, a frame's budget of it: a share of
 // it the distant land, then what's waiting near the camera (the nearest of
-// it first), then what's seen from afar. Notes how long each took once it's
-// done.
+// it first), then — inside, once that's all loaded — the outside a door
+// leads to (ready_exit), then what's seen from afar. Notes how long each
+// took once it's done.
 load_some :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	if not still_loading(viewer) do return
 	shown := &viewer.shown
@@ -1470,6 +1513,23 @@ load_some :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 			note(journal, " models loaded")
 			note_end(journal)
 			note_failures(viewer)
+		}
+	}
+	if shown.world == 0 and not viewer.exit_readied and not anything_waiting(shown) {
+		viewer.exit_readied = true
+		ready_exit(viewer, plugin)
+	}
+	spent = time_now() - loading_start
+	if spent < LOAD_BUDGET and readying(shown) {
+		if ready_step(shown, plugin, loader, LOAD_BUDGET - spent) {
+			note(journal, "  the outside readied in ")
+			note(journal, i64((time_now() - shown.ready_started) / 1000000))
+			note(journal, " ms: ")
+			note(journal, shown.grounds.len)
+			note(journal, " land cells, ")
+			note(journal, shown.models.len)
+			note(journal, " models loaded in all")
+			note_end(journal)
 		}
 	}
 	spent = time_now() - loading_start
@@ -1743,11 +1803,58 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	}
 }
 
+// Readies the outside the nearest door out of here leads to (ready_outside),
+// and its world's distant land and what's seen from afar, so going out
+// shows it at once. Nothing when no door here leads outside.
+ready_exit :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	shown := &viewer.shown
+	scratch : [64 * KB]byte
+	world_id : u32 = 0
+	place := Vec3{0, 0, 0}
+	nearest : f32 = 0
+	for way_out, k in shown.doors {
+		scratch.len = 0
+		there, leads, door_error := door_destination(plugin, way_out.reference, &scratch)
+		if door_error or not leads do continue
+		target := cell_of_reference(plugin, there.door)
+		if target == 0 do continue
+		door_world := cell_world(plugin, target)
+		if door_world == 0 do continue
+		away := way_out.position - viewer.camera.position
+		distance := away.x * away.x + away.y * away.y + away.z * away.z
+		if world_id == 0 or distance < nearest {
+			world_id = door_world
+			place = there.position
+			nearest = distance
+			viewer.exit_door = k
+		}
+	}
+	if world_id == 0 do return
+	x, y := grid_of(place)
+	ready_outside(shown, plugin, world_id, x, y)
+	if viewer.renderer.distant_world != world_id do begin_distant_land(&viewer.renderer, world_id)
+	if shown.distant_world != world_id do begin_distant_objects(shown, world_id)
+	journal := &viewer.journal
+	note(journal, "  readying the outside the nearest door leads to: ")
+	note(journal, record_name(plugin, world_id))
+	note(journal, " (")
+	note(journal, x)
+	note(journal, " ")
+	note(journal, y)
+	note(journal, "), ")
+	note(journal, shown.waiting_land.len)
+	note(journal, " land cells")
+	note_end(journal)
+}
+
 // Shows an interior cell, its name in the window's title: what it holds
-// loaded from then on, a little each frame (load_some).
+// loaded from then on, a little each frame (load_some), then the outside
+// a door leads to readied.
 go_inside :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
 	shown := &viewer.shown
 	start := time_now()
+	viewer.exit_readied = false
+	viewer.exit_door = -1
 	show_error := show_interior(shown, plugin, cell, viewer_loader(viewer))
 	take_cell_sky(viewer, plugin, cell)
 	choose_music(viewer, plugin, cell, 0)

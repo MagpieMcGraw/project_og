@@ -293,6 +293,21 @@ Scene :: struct {
 	waiting_next: i64
 	waiting_land: [64]Waiting_Land
 	waiting_land_next: i64
+	// The world whose land is on the card (grounds): the one shown, or —
+	// inside — the one a door out leads to, readied (ready_outside).
+	land_world: u32
+	// The outside readied from inside, so it shows at once when it's gone
+	// out to (0: none being readied): its world; the cells around the one
+	// the door leads to, whose references are still to be read; the models
+	// they need that aren't loaded, still to be (and each one's key, so
+	// none is asked for twice); since when.
+	ready_world: u32
+	ready_cells: [32]Waiting_Land
+	ready_cells_next: i64
+	ready_models: [2048]Waiting_Instance
+	ready_keys: [2048]u64
+	ready_models_next: i64
+	ready_started: u64
 	// Skeletons NPCs are posed on (npc_model), their poses kept.
 	npc_skeletons: [4]Npc_Skeleton
 	// NPCs' models made for the card to move (assemble_npc, rigged): each
@@ -364,6 +379,9 @@ scene_clear :: fun(scene: ^Scene, storage: ^[]byte) {
 	scene.distant_next = -1
 	drop_trees(scene, NOWHERE)
 	scene.trees_world = 0
+	scene.waiting_trees.len = 0
+	scene.waiting_trees_next = 0
+	scene.land_world = 0
 	scene_clear_cell(scene)
 }
 
@@ -382,9 +400,10 @@ scene_clear_cell :: fun(scene: ^Scene) {
 	scene.waiting_next = 0
 	scene.waiting_land.len = 0
 	scene.waiting_land_next = 0
-	scene.waiting_trees.len = 0
-	scene.waiting_trees_next = 0
+	// (The trees waiting are show_trees's to keep or let go: it keeps those
+	// still near what it shows.)
 	scene.swinging.len = 0
+	stop_readying(scene)
 }
 
 // ---- models ---------------------------------------------------------------------
@@ -964,7 +983,8 @@ drop_trees :: fun(scene: ^Scene, area: Grid_Area) {
 show_trees :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, x: i64, y: i64) {
 	area := area_around_by(x, y, TREE_RADIUS)
 	placed := NOWHERE
-	if scene.trees_world == world_id {
+	same_world := scene.trees_world == world_id
+	if same_world {
 		placed = area_around_by(scene.trees_x, scene.trees_y, TREE_RADIUS)
 		drop_trees(scene, area)
 	else
@@ -978,7 +998,7 @@ show_trees :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, x: i64, y: i64)
 	for k in scene.waiting_trees_next:scene.waiting_trees.len {
 		item := scene.waiting_trees[k]
 		inside := item.x >= area.low_x and item.x <= area.high_x and item.y >= area.low_y and item.y <= area.high_y
-		if inside and scene.trees_world == world_id {
+		if inside and same_world {
 			scene.waiting_trees[kept] = item
 			kept += 1
 		}
@@ -1026,6 +1046,7 @@ scene_entrance :: fun(scene: ^Scene, plugin: ^Plugin) -> Door_Destination, bool 
 // what the scene showed, all loaded.
 show_interior :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, loader: Loader) -> err {
 	drop_land(scene, EVERYWHERE, true)
+	scene.land_world = 0
 	scene_clear_cell(scene)
 	scene.world = 0
 	scratch : [1 * MB]byte
@@ -1128,7 +1149,7 @@ load_land :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64, load
 	if land_loaded(scene, x, y) do return
 	slot := free_land_slot(scene)
 	if slot < 0 do return
-	land_at, found := shown_land(plugin, scene.world, scene.parent_world, x, y)
+	land_at, found := shown_land(plugin, scene.land_world, scene.parent_world, x, y)
 	if not found do return
 	room := loader.room
 	room.file.len = 0
@@ -1713,20 +1734,12 @@ show_exterior :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, x: i64, y: i
 		placed = shown_area(scene)
 		drop_outside(scene, area)
 	else
-		drop_land(scene, area, true)
+		// (Land readied for this world from inside stays, where it's in the
+		// area: ready_outside.)
+		drop_land(scene, area, scene.land_world != world_id)
 		scene_clear_cell(scene)
 		scene.lighting = exterior_lighting()
-		// A world that's part of another shows its land (see shown_land). A
-		// small world's land grows no grass: a guess (see ASSETS.md), but
-		// with the cities put back in Tamriel (Open Cities), grass is known
-		// to come up through their streets from the same land.
-		scratch : [1 * MB]byte
-		parent, parent_error := world_parent(plugin, world_id, &scratch)
-		if parent_error do note_failure(scene, "a world's record, for its land", parent_error)
-		scene.parent_world = parent
-		small, small_error := small_world(plugin, world_id, &scratch)
-		if small_error do note_failure(scene, "a world's record, for its grass", small_error)
-		scene.grows_grass = not small
+		take_world_land(scene, plugin, world_id)
 	}
 	scene.world = world_id
 	scene.center_x = x
@@ -1755,6 +1768,192 @@ show_exterior :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, x: i64, y: i
 	if persistent != 0 do add_cell(scene, plugin, persistent, area, placed)?
 	choose_all_lights(scene)
 	scene.lights_changed = true
+}
+
+// Takes a world's land as the land to load (land_world). A world that's
+// part of another shows its land (see shown_land). A small world's land
+// grows no grass: a guess (see ASSETS.md), but with the cities put back in
+// Tamriel (Open Cities), grass is known to come up through their streets
+// from the same land.
+take_world_land :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32) {
+	scene.land_world = world_id
+	scratch : [1 * MB]byte
+	parent, parent_error := world_parent(plugin, world_id, &scratch)
+	if parent_error do note_failure(scene, "a world's record, for its land", parent_error)
+	scene.parent_world = parent
+	small, small_error := small_world(plugin, world_id, &scratch)
+	if small_error do note_failure(scene, "a world's record, for its grass", small_error)
+	scene.grows_grass = not small
+}
+
+// ---- readied from inside ------------------------------------------------------------
+
+// Readies the outside a door leads to while inside, so it shows at once
+// when it's gone out to (show_exterior): a world's land around the cell at
+// x, y loaded as it would be shown (waiting, as show_exterior has it wait),
+// then the models its cells' references need, then its trees (ready_step).
+// Inside, none of it is drawn.
+ready_outside :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, x: i64, y: i64) {
+	drop_land(scene, area_around(x, y), scene.land_world != world_id)
+	take_world_land(scene, plugin, world_id)
+	scene.center_x = x
+	scene.center_y = y
+	scene.waiting_land.len = 0
+	scene.waiting_land_next = 0
+	stop_readying(scene)
+	scene.ready_world = world_id
+	scene.ready_started = time_now()
+	for ring in 0..EXTERIOR_RADIUS {
+		for cell_y in y - ring..y + ring {
+			for cell_x in x - ring..x + ring {
+				on_ring := cell_x == x - ring or cell_x == x + ring or cell_y == y - ring or cell_y == y + ring
+				if not on_ring do continue
+				cell := exterior_cell(plugin, world_id, cell_x, cell_y)
+				if cell == 0 do continue
+				if not land_loaded(scene, cell_x, cell_y) and fits(scene.waiting_land.len + 1, scene.waiting_land.cap) {
+					&scene.waiting_land + Waiting_Land{cell = cell, x = cell_x, y = cell_y}
+				}
+				if fits(scene.ready_cells.len + 1, scene.ready_cells.cap) do &scene.ready_cells + Waiting_Land{cell = cell, x = cell_x, y = cell_y}
+			}
+		}
+	}
+	// The world's persistent references too, those in the area.
+	persistent := persistent_cell(plugin, world_id)
+	if persistent != 0 and fits(scene.ready_cells.len + 1, scene.ready_cells.cap) {
+		&scene.ready_cells + Waiting_Land{cell = persistent, x = x, y = y}
+	}
+}
+
+// Stops readying the outside: what's readied stays loaded.
+stop_readying :: fun(scene: ^Scene) {
+	scene.ready_world = 0
+	scene.ready_cells.len = 0
+	scene.ready_cells_next = 0
+	scene.ready_models.len = 0
+	scene.ready_keys.len = 0
+	scene.ready_models_next = 0
+}
+
+// Whether the outside is being readied (ready_outside), and isn't all yet.
+readying :: fun(scene: ^Scene) -> bool {
+	return scene.ready_world != 0
+}
+
+// Readies a little more of the outside (ready_outside) till budget
+// nanoseconds have gone (a cell's references read or a model loaded, at
+// least): the cells' references read for the models they need, the models
+// loaded, then the trees left waiting to be. True when that's done (the
+// readying stops), false when there's more.
+ready_step :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, budget: u64) -> bool {
+	if scene.ready_world == 0 do return true
+	start := time_now()
+	for scene.ready_cells_next < scene.ready_cells.len {
+		if time_now() - start > budget do return false
+		cell := scene.ready_cells[scene.ready_cells_next].cell
+		scene.ready_cells_next += 1
+		queue_ready_models(scene, plugin, cell)
+	}
+	for scene.ready_models_next < scene.ready_models.len {
+		if time_now() - start > budget do return false
+		item := &scene.ready_models[scene.ready_models_next]
+		scene.ready_models_next += 1
+		item_start := time_now()
+		ready_model(scene, plugin, loader, item)
+		if item.npc != 0 {
+			note_load_time(scene, "an NPC, readied", item_start)
+		elif item.tree != 0
+			note_load_time(scene, "a tree, readied", item_start)
+		else
+			note_load_time(scene, item.path, item_start)
+		}
+	}
+	show_trees(scene, plugin, scene.ready_world, scene.center_x, scene.center_y)
+	scene.ready_world = 0
+	return true
+}
+
+// Queues the models a cell's references in the area need that aren't
+// loaded or queued (the persistent cell has the whole world's references):
+// the models of things, NPCs, trees and doors that open in place, as
+// add_cell has them.
+queue_ready_models :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32) {
+	references : [16384]Reference
+	references_error := cell_references(plugin, cell, &references)
+	if references_error {
+		note_failure(scene, "a cell's references, to ready them", references_error)
+		return
+	}
+	area := shown_area(scene)
+	scratch : [64 * KB]byte
+	door_scratch : [64 * KB]byte
+	for reference in references {
+		if reference.flags & RECORD_DISABLED != 0 or not area_holds(area, reference.position) do continue
+		scratch.len = 0
+		base, base_error := find_record(plugin, reference.base, &scratch)
+		if base_error do continue
+		key : u64 = 0
+		door := false
+		npc : u32 = 0
+		tree : u32 = 0
+		path := model_path(base)
+		if base.header.kind == "TREE" {
+			// (Not checked for: its model is the one of its seed the
+			// reference picks, known once its kind is read.)
+			tree = reference.base
+		elif base.header.kind == "NPC_"
+			npc = reference.base
+			key = u64(npc) | NPC_MODEL_KEY
+			_, known := index_get(&scene.paths, key)
+			if known do continue
+		else
+			if path.len == 0 or is_marker(path) do continue
+			key = text_hash(path)
+			// A door that opens in place, of a kind not read: its kind.
+			if base.header.kind == "DOOR" {
+				door_scratch.len = 0
+				_, leads, door_error := door_destination(plugin, reference.form_id, &door_scratch)
+				_, kind_known := index_get(&scene.door_kind_index, key)
+				door = not door_error and not leads and not kind_known
+			}
+			if not door {
+				_, known := known_model(scene, path)
+				if known do continue
+			}
+		}
+		queued := false
+		if key != 0 {
+			for queued_key in scene.ready_keys {
+				if queued_key == key do queued = true
+			}
+		}
+		if queued or not fits(scene.ready_models.len + 1, scene.ready_models.cap) do continue
+		item := next(&scene.ready_models)
+		item.path.len = 0
+		&item.path + path
+		item.world = reference_transform(reference)
+		item.reference = reference.form_id
+		item.door = door
+		item.npc = npc
+		item.tree = tree
+		&scene.ready_keys + key
+	}
+}
+
+// Loads the model a readied reference needs (as load_waiting_item would),
+// placing nothing.
+ready_model :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, item: ^Waiting_Instance) {
+	if item.door {
+		if door_kind(scene, plugin, loader, item.path) >= 0 do return
+	}
+	if item.npc != 0 {
+		_ = npc_model(scene, plugin, loader, item.npc)
+		return
+	}
+	if item.tree != 0 {
+		_ = tree_model(scene, plugin, loader, item.tree, item.reference)
+		return
+	}
+	_ = scene_model(scene, loader, item.path)
 }
 
 // Lets go of what's placed outside an area: instances, lights and doors by

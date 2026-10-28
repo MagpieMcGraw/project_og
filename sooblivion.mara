@@ -2551,16 +2551,21 @@ usage :: fun() {
 
 // `sooblivion picture <out.png> <view | view-cell | view-world> … [at x y
 // z yaw pitch] [held <idle | right | left> <seconds>] [menu <stats |
-// map>[page]]`: what the view
+// map>[page]] [frames n] [out]`: what the view
 // command shows, drawn by the game's renderer in a window kept hidden,
 // without sound, once it's loaded; written to out.png. `at` places the
 // camera: where, and turned (degrees: yaw from north toward east, pitch
 // up). `held` holds the first-person arms in an animation (the idle, the
-// attack from the right or from the left) at a time in it.
+// attack from the right or from the left) at a time in it. `out` goes
+// through the nearest door once it's loaded, the picture of the other side.
 command_picture :: fun(args: [][]utf8) {
 	picture := no_picture()
 	&picture.path + args[0]
 	view := args[1 : args.len]
+	if view.len >= 2 and view[view.len - 1] == "out" {
+		picture.out = true
+		view = view[0 : view.len - 1]
+	}
 	if view.len >= 3 and view[view.len - 2] == "frames" {
 		count, is_count := parse_number(view[view.len - 1])
 		if not is_count {
