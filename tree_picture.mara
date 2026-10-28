@@ -1,10 +1,10 @@
-// `tools tree-picture <TREE editor id> <out.png> [seed | bare]`: a tree
+// `sooblivion tree-picture <TREE editor id> <out.png> [seed | bare]`: a tree
 // grown as the viewer grows it, drawn by hand (no window) from the front,
 // lit by a sun from the front left, beside the game's billboard of it at
 // the same scale: to see how near the grown trees come to the game's
 // without starting the game. Bare: without its leaves, to see its
 // branches.
-module tools
+module sooblivion
 
 use mara.core
 use mara.os
@@ -17,7 +17,6 @@ use png
 use model
 use world
 use speedtree
-use game_files
 use scene
 
 TREE_PICTURE_SIDE :: 512
@@ -49,7 +48,7 @@ command_tree_picture :: fun(name: []utf8, out_path: []utf8, seed_or_bare: []utf8
 		return
 	}
 	scratch : [1 * MB]byte
-	tree_id, found := game_files.find_by_editor_id(&plugin, name, &scratch)
+	tree_id, found := find_by_editor_id(&plugin, name, &scratch)
 	if not found {
 		print("no record %", name)
 		return

@@ -10,5 +10,3 @@ memory.txt
 *.png
 *.log
 compiler/
-tools/SDL3.dll
-tools/crash.txt

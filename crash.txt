@@ -8,3 +8,6 @@ Expected dst.len + src.len <= dst.cap, but dst.len + src.len was 1039 and dst.ca
 2026-10-27 09:27:38
 sooblivion.mara:1702:37 runtime error: 67 items into a list with room for 64
 
+2026-10-27 20:12:20
+tree_picture.mara:98:2 runtime error: slice len 2097152 not in [0, 0] (cap) for 'slice'
+
