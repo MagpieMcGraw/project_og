@@ -28,8 +28,10 @@ ROUTE_POINTS :: 512
 // ROUTE_RISE up or down (the last: across only).
 ROUTE_NEAR :: 48
 ROUTE_RISE :: 96
-// How far ahead a shut door's looked for, to be opened.
-DOOR_AHEAD :: 64
+// How far ahead a shut door's looked for, to be opened (far enough not to
+// be in its way as it swings); how near a swinging door one waits for it.
+DOOR_AHEAD :: 128
+DOOR_CLEAR :: 192
 
 // A point people can stand at: where (on the floor or the ground there);
 // its links — in its grid's links, links of them from first_link — each
@@ -304,6 +306,22 @@ nearest_point :: fun(grid: ^Path_Grid, place: Vec3) -> i64 {
 	return nearest
 }
 
+// The height of the grid's point nearest a place across the ground (on
+// whatever floor): where one going to x, y, no height given, is going;
+// false for a grid without points.
+grid_height_at :: fun(grid: ^Path_Grid, x: f32, y: f32) -> f32, bool {
+	nearest : i64 = -1
+	nearest_distance : f32 = 0
+	for point, k in grid.points {
+		distance := (point.position.x - x) * (point.position.x - x) + (point.position.y - y) * (point.position.y - y)
+		if nearest >= 0 and distance >= nearest_distance do continue
+		nearest = k
+		nearest_distance = distance
+	}
+	if nearest < 0 do return 0, false
+	return grid.points[nearest].position.z, true
+}
+
 // Adds a point to the open ones (a heap: the least estimate first).
 open_push :: fun(open: ^[]Route_Open, item: Route_Open) {
 	open + item
@@ -368,6 +386,36 @@ door_ahead :: fun(place: ^Scene, feet: Vec3, way: Vec3) -> u32 {
 		if swinging.reference == reference and not swinging.open and not swinging.moving do return reference
 	}
 	return 0
+}
+
+// Whether a door that opens in place is swinging near feet (within
+// DOOR_CLEAR): one walking waits for it, not to be swept aside.
+door_swinging_near :: fun(place: ^Scene, feet: Vec3) -> bool {
+	for swinging in place.swinging {
+		if not swinging.moving do continue
+		hinge := Vec3{swinging.placement[3][0], swinging.placement[3][1], swinging.placement[3][2]}
+		if vec3_length(hinge - feet) < DOOR_CLEAR do return true
+	}
+	return false
+}
+
+// Whether one could walk straight from feet to a place: nothing between at
+// the waist, and no steeper than a slope one walks up (or a step or two up
+// or down, near).
+clear_line :: fun(place: ^Scene, feet: Vec3, to: Vec3) -> bool {
+	across := vec3_length(Vec3{to.x - feet.x, to.y - feet.y, 0})
+	if abs_f32(to.z - feet.z) > max_f32(ROUTE_RISE, across * 0.75) do return false
+	away := to - feet
+	far := vec3_length(away)
+	if far < 1 do return true
+	_, _, in_the_way := pick(place, feet + Vec3{0, 0, WALKER_HEIGHT / 2}, away * (1 / far), far)
+	return not in_the_way
+}
+
+// Skips a route's places one needn't go through from feet: while the one
+// after the next is in a clear line, the next is passed.
+route_shortcut :: fun(route: ^Route, place: ^Scene, feet: Vec3) {
+	for route.next + 1 < route.points.len and clear_line(place, feet, route.points[route.next + 1]) do route.next += 1
 }
 
 // How far a route goes from its next point on, across and up and down.

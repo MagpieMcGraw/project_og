@@ -7,6 +7,7 @@ use mara.core
 use mara.math
 use world
 use world_state
+use scene
 use wire
 use logging
 
@@ -127,6 +128,21 @@ copy_door_open :: fun(copy: ^World_Copy, reference: u32) -> bool {
 		if door.reference == reference do return door.open
 	}
 	return false
+}
+
+// Swings a place's doors that open in place to the server's say: one that
+// isn't at rest as it has it starts swinging; one just placed is put so at
+// once.
+follow_door_states :: fun(place: ^Scene, copy: ^World_Copy) {
+	for &swinging in place.swinging {
+		wanted := copy_door_open(copy, swinging.reference)
+		if swinging.fresh {
+			swinging.fresh = false
+			if wanted != swinging.open do rest_door(place, swinging, wanted)
+			continue
+		}
+		if not swinging.moving and wanted != swinging.open do _ = use_door(place, swinging.reference)
+	}
 }
 
 // Tells the server where the player is now, and how fast they're going.

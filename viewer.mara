@@ -590,7 +590,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 			viewer.chosen_door = leading
 			return .door
 		}
-		// (Asked of the server: the door swings when it says, follow_doors.)
+		// (Asked of the server: the door swings when it says, follow_door_states.)
 		send_use_door(outgoing(viewer), targeted)
 	}
 	if input.pressed[E] and not usable {
@@ -648,7 +648,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	report_player(viewer, input.held[T], f32(seconds))
 	show_time(viewer, f32(seconds))
 	noises : [16]Door_Noise
-	follow_doors(viewer)
+	follow_door_states(shown, &viewer.seen)
 	swing_doors(shown, f32(seconds), &noises)
 	move_pieces(shown, viewer.look.time)
 	// The people posed, the player's arms too: a left click swings.
@@ -1227,21 +1227,6 @@ follow_others :: fun(viewer: ^Viewer, seconds: f32, movers: ^[]Npc_Mover) {
 // Where the player's feet are: the walker's, or flying, below the camera.
 player_feet :: fun(viewer: ^Viewer) -> Vec3 {
 	return if viewer.walking do viewer.walker.position else viewer.camera.position - Vec3{0, 0, EYE_HEIGHT}
-}
-
-// Swings the doors that open in place to the server's say: one that isn't
-// at rest as it has it starts swinging; one just placed is put so at once.
-follow_doors :: fun(viewer: ^Viewer) {
-	shown := &viewer.shown
-	for &swinging in shown.swinging {
-		wanted := copy_door_open(&viewer.seen, swinging.reference)
-		if swinging.fresh {
-			swinging.fresh = false
-			if wanted != swinging.open do rest_door(shown, swinging, wanted)
-			continue
-		}
-		if not swinging.moving and wanted != swinging.open do _ = use_door(shown, swinging.reference)
-	}
 }
 
 // Keeps the people shown where the server has them, as they stand. (They

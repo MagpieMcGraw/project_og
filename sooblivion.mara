@@ -1887,7 +1887,7 @@ command_path_check :: fun(name: []utf8, from: Vec3, to: Vec3) {
 			print("walked it in % s: there, at % (% from where it was going)", seconds, walker.position, vec3_length(walker.position - to))
 			return
 		}
-		// The doors on the way opened, as they swing.
+		// The doors on the way opened, waited for as they swing.
 		shut := door_ahead(&place, walker.position, way)
 		if shut != 0 {
 			_ = use_door(&place, shut)
@@ -1895,7 +1895,9 @@ command_path_check :: fun(name: []utf8, from: Vec3, to: Vec3) {
 		}
 		noises.len = 0
 		swing_doors(&place, step, &noises)
-		walk(&walker, &place, way * WALK_SPEED, false, step)
+		waiting := shut != 0 or door_swinging_near(&place, walker.position)
+		walk(&walker, &place, if waiting do Vec3{0, 0, 0} else way * WALK_SPEED, false, step)
+		if waiting do checked_at = walker.position
 		seconds += step
 		// Stuck: not 40 units further on in 2 seconds.
 		if i64(seconds * 60) % 120 == 0 {
