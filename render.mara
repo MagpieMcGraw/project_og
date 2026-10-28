@@ -1693,6 +1693,15 @@ Renderer :: struct {
 	// textures' handles (bindless), and the texture standing in for a
 	// missing normal map.
 	distant_world: u32
+	// Distant land being loaded a few pieces a frame (load_distant_land_step):
+	// the next of its places (-1: none loading), the box round its pieces so
+	// far, how many, the first that failed, since when.
+	distant_next: i64
+	distant_low: Vec3
+	distant_high: Vec3
+	distant_made: i64
+	distant_failure: err
+	distant_started: u64
 	distant_pieces: [DISTANT_PIECES]Distant_Piece
 	distant_commands: [DISTANT_PIECES]Draw_Command
 	distant_vertex_array: u32
@@ -2401,6 +2410,7 @@ setup_ui_buffers :: fun(renderer: ^Renderer) {
 // No distant land, and no far water. (Their textures stay loaded.)
 clear_distant_land :: fun(renderer: ^Renderer) {
 	renderer.distant_world = 0
+	renderer.distant_next = -1
 	renderer.distant_pieces.len = 0
 	renderer.distant_vertices_used = 0
 	renderer.distant_indices_used = 0
@@ -3502,7 +3512,7 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 	waters: ^[]Water_Cell, tree_cells: ^[]Gpu_Trees, grass_cells: ^[]Gpu_Grass, held: ^[]Instance, look: ^Sky_Look, lighting: Cell_Lighting,
 	camera: Camera, width: i64, height: i64) -> Frame_Stats, err
 {
-	stats := Frame_Stats{instances = instances.len, visible = 0, drawn_parts = 0, draw_calls = 0, land_cells = 0}
+	stats := Frame_Stats{instances = 0, visible = 0, drawn_parts = 0, draw_calls = 0, land_cells = 0}
 	framebuffer_error := size_framebuffers(renderer, width, height)
 	soft := not framebuffer_error
 	if soft do BindFramebuffer(FRAMEBUFFER, renderer.scene_framebuffer)
@@ -3965,8 +3975,9 @@ gather_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]In
 		}
 		record_count += placed_model.part_count
 	}
-	stats.visible = renderer.visible.len
-	stats.drawn_parts = record_count
+	stats.instances += instances.len
+	stats.visible += renderer.visible.len
+	stats.drawn_parts += record_count
 	renderer.commands.len = 0
 	if record_count == 0 do return
 

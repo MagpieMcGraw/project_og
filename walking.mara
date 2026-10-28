@@ -77,8 +77,9 @@ walk :: fun(walker: ^Walker, shown: ^Scene, going: Vec3, jump: bool, seconds: f3
 	// The ground: stepped up onto, landed on, kept to going down; or not there.
 	ground, found := ground_below(walker, shown, &nearby)
 	if not found {
-		// Land that isn't loaded yet: held where it is, not dropped through.
-		if shown.world != 0 and not land_here(shown, walker.position) {
+		// Land or floors that aren't loaded yet: held where it is, not
+		// dropped through.
+		if anything_waiting(shown) or (shown.world != 0 and not land_here(shown, walker.position)) {
 			walker.rising = 0
 			walker.on_ground = true
 			return

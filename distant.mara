@@ -15,6 +15,7 @@ module distant
 use mara.core
 use mara.math
 use mara.string
+use mara.time
 use bsa
 use nif
 use model
@@ -56,54 +57,72 @@ lod_name :: fun(world_id: u32, x: i64, y: i64) -> str64 {
 	return name
 }
 
-// Puts a world's distant land on the card in place of what's there: every
-// piece of it the archives have (Tamriel has 36), then the far water under
-// all of it. A piece whose mesh can't be read is left out, and the first
-// such failure given back with how many pieces went on; one whose normals
-// are missing is lit as if flat.
-load_distant_land :: fun(renderer: ^Renderer, world_id: u32, loader: Loader) -> i64, err {
+// Starts putting a world's distant land on the card in place of what's
+// there: every piece of it the archives have (Tamriel has 36), loaded a few
+// a frame from then on (load_distant_land_step), then the far water under
+// all of it. A piece whose mesh can't be read is left out (the first such
+// failure kept: distant_failure); one whose normals are missing is lit as
+// if flat.
+begin_distant_land :: fun(renderer: ^Renderer, world_id: u32) {
 	clear_distant_land(renderer)
 	renderer.distant_world = world_id
+	renderer.distant_next = 0
+	renderer.distant_low = Vec3{1000000000, 1000000000, 0}
+	renderer.distant_high = Vec3{-1000000000, -1000000000, 0}
+	renderer.distant_made = 0
+	no_failure : err
+	renderer.distant_failure = no_failure
+	renderer.distant_started = time_now()
+}
+
+// Loads the distant land's next pieces till budget nanoseconds have gone
+// (one at least): true when it's all loaded, or none is loading. Done, the
+// far water's put round it.
+load_distant_land_step :: fun(renderer: ^Renderer, loader: Loader, budget: u64) -> bool {
+	if renderer.distant_next < 0 do return true
+	start := time_now()
 	room := loader.room
-	low := Vec3{1000000000, 1000000000, 0}
-	high := Vec3{-1000000000, -1000000000, 0}
-	pieces : i64 = 0
-	first_failure : err
 	steps := LOD_REACH * 2 / LOD_CELLS
-	for row in 0:steps {
-		for column in 0:steps {
-			x := column * LOD_CELLS - LOD_REACH
-			y := row * LOD_CELLS - LOD_REACH
-			name := lod_name(world_id, x, y)
-			piece_file, found := find_archived(loader.archives, lod_mesh_path(name))
-			if not found do continue
-			built, read_error := read_lod_mesh(loader.archives, room, piece_file)
-			if read_error {
-				if not first_failure do first_failure = read_error
-				continue
-			}
-
-			path : [256]utf8
-			&path + "textures\\landscapelod\\generated\\"
-			&path + name
-			&path + ".dds"
-			colors := texture_for(renderer, loader.archives, path, &room.texture)
-			path.len = path.len - 4
-			&path + "_fn.dds"
-			normals := texture_for(renderer, loader.archives, path, &room.texture)
-			if normals == 0 do normals = renderer.flat_normal_texture
-
-			for k in 0:built.parts.len {
-				if upload_distant_piece(renderer, &built.parts[k], colors, normals) do pieces += 1
-			}
-			if built.bounds_min.x < low.x do low.x = built.bounds_min.x
-			if built.bounds_min.y < low.y do low.y = built.bounds_min.y
-			if built.bounds_max.x > high.x do high.x = built.bounds_max.x
-			if built.bounds_max.y > high.y do high.y = built.bounds_max.y
+	for renderer.distant_next < steps * steps {
+		if time_now() - start > budget do return false
+		place := renderer.distant_next
+		renderer.distant_next += 1
+		x := (place % steps) * LOD_CELLS - LOD_REACH
+		y := (place / steps) * LOD_CELLS - LOD_REACH
+		name := lod_name(renderer.distant_world, x, y)
+		piece_file, found := find_archived(loader.archives, lod_mesh_path(name))
+		if not found do continue
+		built, read_error := read_lod_mesh(loader.archives, room, piece_file)
+		if read_error {
+			if not renderer.distant_failure do renderer.distant_failure = read_error
+			continue
 		}
+
+		path : [256]utf8
+		&path + "textures\\landscapelod\\generated\\"
+		&path + name
+		&path + ".dds"
+		colors := texture_for(renderer, loader.archives, path, &room.texture)
+		path.len = path.len - 4
+		&path + "_fn.dds"
+		normals := texture_for(renderer, loader.archives, path, &room.texture)
+		if normals == 0 do normals = renderer.flat_normal_texture
+
+		for k in 0:built.parts.len {
+			if upload_distant_piece(renderer, &built.parts[k], colors, normals) do renderer.distant_made += 1
+		}
+		low := &renderer.distant_low
+		high := &renderer.distant_high
+		if built.bounds_min.x < low.x do low.x = built.bounds_min.x
+		if built.bounds_min.y < low.y do low.y = built.bounds_min.y
+		if built.bounds_max.x > high.x do high.x = built.bounds_max.x
+		if built.bounds_max.y > high.y do high.y = built.bounds_max.y
 	}
-	if pieces > 0 do set_far_water(renderer, low.x, low.y, high.x, high.y, 0)
-	return pieces, first_failure
+	if renderer.distant_made > 0 {
+		set_far_water(renderer, renderer.distant_low.x, renderer.distant_low.y, renderer.distant_high.x, renderer.distant_high.y, 0)
+	}
+	renderer.distant_next = -1
+	return true
 }
 
 // A piece's mesh's archive path, by the piece's name.

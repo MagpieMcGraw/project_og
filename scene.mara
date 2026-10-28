@@ -255,6 +255,10 @@ Scene :: struct {
 	// has about 840.
 	distant_instances: [4096]Instance
 	distant_world: u32
+	// Distant objects being placed a few cells a frame (place_distant_step):
+	// the next of the plugin's exterior cells' slots (-1: none), since when.
+	distant_next: i64
+	distant_started: u64
 	grass_cells: [LAND_SLOTS]Gpu_Grass   // each land's grass, in its land's slot
 	waters: [WATER_SLOTS]Water_Cell
 	waters_changed: bool         // since the renderer was last given them (upload_waters)
@@ -271,6 +275,10 @@ Scene :: struct {
 	kinds: [1024]Tree_Kind
 	waiting_trees: [TREE_CELLS]Waiting_Land
 	waiting_trees_next: i64
+	// The slowest thing the last load_waiting loaded, and how long it took
+	// (nanoseconds): said with a slow frame.
+	slowest_load: u64
+	slowest_what: [256]utf8
 
 	// Grass: each kind's look and model (by its GRAS's form id: its index
 	// + 1; 0 for one that can't be drawn), and each land texture's grasses
@@ -353,6 +361,7 @@ scene_clear :: fun(scene: ^Scene, storage: ^[]byte) {
 	scene.grass_cells.len = 0
 	scene.distant_instances.len = 0
 	scene.distant_world = 0
+	scene.distant_next = -1
 	drop_trees(scene, NOWHERE)
 	scene.trees_world = 0
 	scene_clear_cell(scene)
@@ -682,45 +691,57 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, plac
 }
 
 // Loads what's waiting until it's all loaded (true) or budget nanoseconds
-// have gone (false) — at least one thing each call. Land first.
-load_waiting :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, budget: u64) -> bool {
+// have gone (false) — at least one thing each call. Land first; then what's
+// nearest near (the camera) of the rest, each time.
+load_waiting :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, budget: u64, near: Vec3) -> bool {
 	start := time_now()
+	scene.slowest_load = 0
+	scene.slowest_what.len = 0
 	for scene.waiting_land_next < scene.waiting_land.len {
 		if time_now() - start > budget do return false
 		item := scene.waiting_land[scene.waiting_land_next]
 		scene.waiting_land_next += 1
 		area := shown_area(scene)
 		inside := item.x >= area.low_x and item.x <= area.high_x and item.y >= area.low_y and item.y <= area.high_y
-		if inside do load_land(scene, plugin, item.cell, item.x, item.y, loader)
+		if inside {
+			item_start := time_now()
+			load_land(scene, plugin, item.cell, item.x, item.y, loader)
+			note_load_time(scene, "a land cell", item_start)
+		}
 	}
 	for scene.waiting_next < scene.waiting.len {
 		if time_now() - start > budget do return false
+		// The nearest of what's left, next.
+		nearest := scene.waiting_next
+		nearest_distance : f32 = 1000000000000
+		for k in scene.waiting_next:scene.waiting.len {
+			placing := &scene.waiting[k].world
+			away := Vec3{placing[3][0] - near.x, placing[3][1] - near.y, placing[3][2] - near.z}
+			distance := away.x * away.x + away.y * away.y + away.z * away.z
+			if distance < nearest_distance {
+				nearest = k
+				nearest_distance = distance
+			}
+		}
+		if nearest != scene.waiting_next {
+			moved := scene.waiting[nearest]
+			scene.waiting[nearest] = scene.waiting[scene.waiting_next]
+			scene.waiting[scene.waiting_next] = moved
+		}
 		item := &scene.waiting[scene.waiting_next]
 		scene.waiting_next += 1
 		// (Outside, the camera may have moved on since it was queued.)
 		place := Vec3{item.world[3][0], item.world[3][1], item.world[3][2]}
 		if scene.world != 0 and not area_holds(shown_area(scene), place) do continue
-		if item.door {
-			kind_index := door_kind(scene, plugin, loader, item.path)
-			if kind_index >= 0 {
-				place_door(scene, kind_index, item.world, item.reference)
-				continue
-			}
-		}
+		item_start := time_now()
+		load_waiting_item(scene, plugin, loader, item)
 		if item.npc != 0 {
-			npc_index := npc_model(scene, plugin, loader, item.npc)
-			if npc_index >= 0 do add_instance(scene, npc_index, item.world, item.reference)
-			continue
+			note_load_time(scene, "an NPC", item_start)
+		elif item.tree != 0
+			note_load_time(scene, "a tree", item_start)
+		else
+			note_load_time(scene, item.path, item_start)
 		}
-		if item.tree != 0 {
-			tree_index := tree_model(scene, plugin, loader, item.tree, item.reference)
-			before := scene.instances.len
-			if tree_index >= 0 do add_instance(scene, tree_index, item.world, item.reference)
-			if scene.instances.len > before do scene.instances[before].reach = TREE_NEAR
-			continue
-		}
-		model_index := scene_model(scene, loader, item.path)
-		if model_index >= 0 do place_model(scene, model_index, item.path, item.world, item.reference)
 	}
 	for scene.waiting_trees_next < scene.waiting_trees.len {
 		if time_now() - start > budget do return false
@@ -728,7 +749,11 @@ load_waiting :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, budget: u64)
 		scene.waiting_trees_next += 1
 		area := area_around_by(scene.trees_x, scene.trees_y, TREE_RADIUS)
 		inside := item.x >= area.low_x and item.x <= area.high_x and item.y >= area.low_y and item.y <= area.high_y
-		if inside do load_trees(scene, plugin, item.cell, item.x, item.y, loader)
+		if inside {
+			item_start := time_now()
+			load_trees(scene, plugin, item.cell, item.x, item.y, loader)
+			note_load_time(scene, "a cell's trees", item_start)
+		}
 	}
 	scene.waiting_trees.len = 0
 	scene.waiting_trees_next = 0
@@ -737,6 +762,41 @@ load_waiting :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, budget: u64)
 	scene.waiting_land.len = 0
 	scene.waiting_land_next = 0
 	return true
+}
+
+// Loads a thing that was waiting, and places it: a door, an NPC, a tree
+// or a model.
+load_waiting_item :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, item: ^Waiting_Instance) {
+	if item.door {
+		kind_index := door_kind(scene, plugin, loader, item.path)
+		if kind_index >= 0 {
+			place_door(scene, kind_index, item.world, item.reference)
+			return
+		}
+	}
+	if item.npc != 0 {
+		npc_index := npc_model(scene, plugin, loader, item.npc)
+		if npc_index >= 0 do add_instance(scene, npc_index, item.world, item.reference)
+		return
+	}
+	if item.tree != 0 {
+		tree_index := tree_model(scene, plugin, loader, item.tree, item.reference)
+		before := scene.instances.len
+		if tree_index >= 0 do add_instance(scene, tree_index, item.world, item.reference)
+		if scene.instances.len > before do scene.instances[before].reach = TREE_NEAR
+		return
+	}
+	model_index := scene_model(scene, loader, item.path)
+	if model_index >= 0 do place_model(scene, model_index, item.path, item.world, item.reference)
+}
+
+// Keeps what was loaded since start if it's the slowest of this load_waiting.
+note_load_time :: fun(scene: ^Scene, what: []utf8, start: u64) {
+	took := time_now() - start
+	if took <= scene.slowest_load do return
+	scene.slowest_load = took
+	scene.slowest_what.len = 0
+	&scene.slowest_what + what[0 : min(what.len, scene.slowest_what.cap)]
 }
 
 // ---- trees ------------------------------------------------------------------------
@@ -970,21 +1030,18 @@ show_interior :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, loader: Loader) 
 	scene.world = 0
 	scratch : [1 * MB]byte
 	scene.lighting = cell_lighting(plugin, cell, &scratch)?
+	// What it holds: placed, or waiting to be loaded (a little each frame,
+	// the nearest first: load_waiting).
 	add_cell(scene, plugin, cell, EVERYWHERE, NOWHERE)?
-	_ = load_waiting(scene, plugin, loader, 0xFFFFFFFFFFFFFFFF)
 	choose_all_lights(scene)
 
-	// Water inside (sewers, caves): a plane under all that's placed.
+	// Water inside (sewers, caves): a plane under all that's there.
 	height, has_water := cell_water(plugin, cell, &scratch)?
-	if has_water and scene.instances.len > 0 {
+	if has_water and scene.instances.len + scene.waiting.len > 0 {
 		low := Vec3{1000000, 1000000, 0}
 		high := Vec3{-1000000, -1000000, 0}
-		for instance in scene.instances {
-			if instance.center.x < low.x do low.x = instance.center.x
-			if instance.center.y < low.y do low.y = instance.center.y
-			if instance.center.x > high.x do high.x = instance.center.x
-			if instance.center.y > high.y do high.y = instance.center.y
-		}
+		for instance in scene.instances do widen_box(&low, &high, instance.center)
+		for &item in scene.waiting do widen_box(&low, &high, Vec3{item.world[3][0], item.world[3][1], 0})
 		water := next(&scene.waters)
 		water.low_x = low.x - 4096
 		water.low_y = low.y - 4096
@@ -994,6 +1051,14 @@ show_interior :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, loader: Loader) 
 		for k in 0:WATER_VERTICES do water.depths[k] = 1000   // (deep: there's no land under it to know)
 		scene.waters_changed = true
 	}
+}
+
+// Widens a box (low to high, across) to take in a place.
+widen_box :: fun(low: ^Vec3, high: ^Vec3, place: Vec3) {
+	if place.x < low.x do low.x = place.x
+	if place.y < low.y do low.y = place.y
+	if place.x > high.x do high.x = place.x
+	if place.y > high.y do high.y = place.y
 }
 
 // ---- outside ------------------------------------------------------------------------
@@ -1489,23 +1554,40 @@ swing_doors :: fun(scene: ^Scene, seconds: f32, noises: ^[]Door_Noise) {
 
 // ---- seen from afar ---------------------------------------------------------------
 
-// Places a world's references seen from afar, in place of the last
-// world's: each with its far mesh (its mesh's name with _far: a few
-// hundred triangles), or its mesh where there's none. Trees are left to
-// their billboards. How many were placed.
-load_distant_objects :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, loader: Loader) -> i64 {
+// Starts placing a world's references seen from afar, in place of the
+// last world's, a few cells a frame (place_distant_step): each with its far
+// mesh (its mesh's name with _far: a few hundred triangles), or its mesh
+// where there's none. Trees are left to their billboards.
+begin_distant_objects :: fun(scene: ^Scene, world_id: u32) {
 	scene.distant_instances.len = 0
 	scene.distant_world = world_id
+	scene.distant_next = 0
+	scene.distant_started = time_now()
+}
+
+// Places the distant objects of the world's next exterior cells till
+// budget nanoseconds have gone (a cell at least): true when they're all
+// placed, or none are being.
+place_distant_step :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, budget: u64) -> bool {
+	if scene.distant_next < 0 do return true
+	start := time_now()
+	world_id := scene.distant_world
 	references : [1024]Reference
 	scratch : [64 * KB]byte
-	for key in plugin.exterior_cells.keys {
+	for scene.distant_next < plugin.exterior_cells.keys.len {
+		if time_now() - start > budget do return false
+		key := plugin.exterior_cells.keys[scene.distant_next]
+		scene.distant_next += 1
 		if key == 0 or u32(key >> 32) != world_id do continue
 		cell := exterior_cell(plugin, world_id, i64(i16(u16((key >> 16) & 0xFFFF))), i64(i16(u16(key & 0xFFFF))))
 		references.len = 0
 		cell_distant_references(plugin, cell, &references)
 		for reference in references {
 			if reference.flags & RECORD_DISABLED != 0 do continue
-			if not fits(scene.distant_instances.len + 1, scene.distant_instances.cap) do return scene.distant_instances.len
+			if not fits(scene.distant_instances.len + 1, scene.distant_instances.cap) {
+				scene.distant_next = -1
+				return true
+			}
 			scratch.len = 0
 			base, base_error := find_record(plugin, reference.base, &scratch)
 			if base_error or base.header.kind == "TREE" do continue
@@ -1520,7 +1602,8 @@ load_distant_objects :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, loade
 			&scene.distant_instances + place_instance(scene.models[model_index], model_index, reference_transform(reference), reference.form_id)
 		}
 	}
-	return scene.distant_instances.len
+	scene.distant_next = -1
+	return true
 }
 
 // ---- grass ----------------------------------------------------------------------

@@ -58,8 +58,11 @@ DOOR_RECESS :: 48
 // Without vsync, frames are kept to this many a second at most: the game
 // has to feel good at 60.
 MOST_FRAMES_A_SECOND :: 60
-// How long a frame may spend loading what's waiting, in nanoseconds.
-LOAD_BUDGET :: 6000000
+// How long a frame may spend loading, in nanoseconds (with the drawing,
+// inside a refresh at 60 a second); while the distant land is loading, the
+// share of it that goes to that first (the horizon's seen from everywhere).
+LOAD_BUDGET :: 10000000
+DISTANT_LAND_SHARE :: 3000000
 // A frame longer than this (in nanoseconds) missed a refresh at 60 a
 // second (the next one is 33 ms on), and goes in the journal with where its
 // time went. (With vsync, frames come 15 to 18 ms apart as the system
@@ -597,7 +600,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	}
 	if viewer.picture.path.len > 0 {
 		viewer.picture_frames += 1
-		viewer.picture_settled = if anything_waiting(shown) do 0 else viewer.picture_settled + 1
+		viewer.picture_settled = if still_loading(viewer) do 0 else viewer.picture_settled + 1
 		// Timed frames: from the one after it settles (the drawing added up is
 		// the frame before's, measured after this point).
 		if viewer.picture_settled == PICTURE_SETTLE + 1 {
@@ -916,6 +919,13 @@ note_slow_frame :: fun(viewer: ^Viewer, frame_length: u64) {
 	note(journal, " draw calls, ")
 	note(journal, drawn.land_cells)
 	note(journal, " land cells")
+	if viewer.loading_time > 0 and viewer.shown.slowest_load > 0 {
+		note(journal, "; the slowest loaded: ")
+		note(journal, viewer.shown.slowest_what)
+		note(journal, ", ")
+		note(journal, i64(viewer.shown.slowest_load / 1000000))
+		note(journal, " ms")
+	}
 	note_end(journal)
 }
 
@@ -1413,27 +1423,67 @@ count_frame :: fun(viewer: ^Viewer) {
 	}
 }
 
-// Loads some of what's waiting, if anything is: a frame's budget of it.
-// Notes how long catching up took once it's done.
+// Whether anything is still to load: what's waiting near the camera, the
+// distant land, or what's seen from afar.
+still_loading :: fun(viewer: ^Viewer) -> bool {
+	return anything_waiting(&viewer.shown) or viewer.renderer.distant_next >= 0 or viewer.shown.distant_next >= 0
+}
+
+// Loads some of what's still to load, a frame's budget of it: a share of
+// it the distant land, then what's waiting near the camera (the nearest of
+// it first), then what's seen from afar. Notes how long each took once it's
+// done.
 load_some :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	if not still_loading(viewer) do return
 	shown := &viewer.shown
-	if not anything_waiting(shown) do return
-	viewer.loading_frames += 1
+	renderer := &viewer.renderer
+	journal := &viewer.journal
+	loader := viewer_loader(viewer)
 	loading_start := time_now()
-	done := load_waiting(shown, plugin, viewer_loader(viewer), LOAD_BUDGET)
-	viewer.loading_time = time_now() - loading_start
-	if done {
-		journal := &viewer.journal
-		note(journal, "  caught up in ")
-		note(journal, i64((time_now() - viewer.loading_since) / 1000000))
-		note(journal, " ms over ")
-		note(journal, viewer.loading_frames)
-		note(journal, " frames: ")
-		note(journal, shown.models.len)
-		note(journal, " models loaded")
-		note_end(journal)
-		note_failures(viewer)
+	if renderer.distant_next >= 0 {
+		if load_distant_land_step(renderer, loader, DISTANT_LAND_SHARE) {
+			note(journal, "  distant land: ")
+			note(journal, renderer.distant_made)
+			note(journal, " pieces, ")
+			note(journal, renderer.distant_vertices_used)
+			note(journal, " vertices, loaded in ")
+			note(journal, i64((time_now() - renderer.distant_started) / 1000000))
+			note(journal, " ms")
+			if renderer.distant_failure {
+				note(journal, " (some pieces couldn't be read: ")
+				note_error(journal, renderer.distant_failure)
+				note(journal, ")")
+			}
+			note_end(journal)
+		}
 	}
+	spent := time_now() - loading_start
+	if spent < LOAD_BUDGET and anything_waiting(shown) {
+		viewer.loading_frames += 1
+		if load_waiting(shown, plugin, loader, LOAD_BUDGET - spent, viewer.camera.position) {
+			note(journal, "  caught up in ")
+			note(journal, i64((time_now() - viewer.loading_since) / 1000000))
+			note(journal, " ms over ")
+			note(journal, viewer.loading_frames)
+			note(journal, " frames: ")
+			note(journal, shown.models.len)
+			note(journal, " models loaded")
+			note_end(journal)
+			note_failures(viewer)
+		}
+	}
+	spent = time_now() - loading_start
+	if spent < LOAD_BUDGET and shown.distant_next >= 0 {
+		if place_distant_step(shown, plugin, loader, LOAD_BUDGET - spent) {
+			note(journal, "  seen from afar: ")
+			note(journal, shown.distant_instances.len)
+			note(journal, " references placed in ")
+			note(journal, i64((time_now() - shown.distant_started) / 1000000))
+			note(journal, " ms")
+			note_end(journal)
+		}
+	}
+	viewer.loading_time = time_now() - loading_start
 }
 
 // What the reticle is on, within reach: the first thing the eyes meet
@@ -1693,7 +1743,8 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	}
 }
 
-// Shows an interior cell, all of it loaded, its name in the window's title.
+// Shows an interior cell, its name in the window's title: what it holds
+// loaded from then on, a little each frame (load_some).
 go_inside :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
 	shown := &viewer.shown
 	start := time_now()
@@ -1711,58 +1762,37 @@ go_inside :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
 	note(journal, shown.lights.len)
 	note(journal, " lights, ")
 	note(journal, shown.doors.len)
-	note(journal, " doors; ")
-	note(journal, shown.models.len)
-	note(journal, " models loaded, in ")
+	note(journal, " doors, in ")
 	note(journal, elapsed_ms(start))
-	note(journal, " ms")
+	note(journal, " ms; ")
+	note(journal, shown.waiting.len)
+	note(journal, " waiting to load")
 	if show_error {
 		note(journal, " (reading the cell stopped early: ")
 		note_error(journal, show_error)
 		note(journal, ")")
 	}
 	note_end(journal)
-	note_failures(viewer)
+	viewer.loading_since = start
+	viewer.loading_frames = 0
 	viewer.frame_start = time_now()
 }
 
-// Shows a world's cells around a place in it, all of them loaded, the
-// world's name in the window's title, the camera there.
+// Shows a world's cells around a place in it, the world's name in the
+// window's title, the camera there: the cells' land and what they hold
+// loaded from then on, a little each frame, and the world's distant land
+// and what's seen from afar after them (load_some).
 go_outside :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32, place: Vec3) {
 	shown := &viewer.shown
 	start := time_now()
 	take_sky(viewer, plugin, world_id)
-	if viewer.renderer.distant_world != world_id {
-		distant_start := time_now()
-		pieces, distant_error := load_distant_land(&viewer.renderer, world_id, viewer_loader(viewer))
-		note(&viewer.journal, "distant land: ")
-		note(&viewer.journal, pieces)
-		note(&viewer.journal, " pieces, ")
-		note(&viewer.journal, viewer.renderer.distant_vertices_used)
-		note(&viewer.journal, " vertices, in ")
-		note(&viewer.journal, elapsed_ms(distant_start))
-		note(&viewer.journal, " ms")
-		if distant_error {
-			note(&viewer.journal, " (some pieces couldn't be read: ")
-			note_error(&viewer.journal, distant_error)
-			note(&viewer.journal, ")")
-		}
-		note_end(&viewer.journal)
-	}
-	if viewer.shown.distant_world != world_id {
-		objects_start := time_now()
-		objects := load_distant_objects(&viewer.shown, plugin, world_id, viewer_loader(viewer))
-		note(&viewer.journal, "seen from afar: ")
-		note(&viewer.journal, objects)
-		note(&viewer.journal, " references placed, in ")
-		note(&viewer.journal, elapsed_ms(objects_start))
-		note(&viewer.journal, " ms")
-		note_end(&viewer.journal)
-	}
+	if viewer.renderer.distant_world != world_id do begin_distant_land(&viewer.renderer, world_id)
+	if viewer.shown.distant_world != world_id do begin_distant_objects(&viewer.shown, world_id)
 	x, y := grid_of(place)
 	show_error := show_exterior(shown, plugin, world_id, x, y)
 	choose_music(viewer, plugin, exterior_cell(plugin, world_id, x, y), world_id)
-	_ = load_waiting(shown, plugin, viewer_loader(viewer), 0xFFFFFFFFFFFFFFFF)
+	viewer.loading_since = start
+	viewer.loading_frames = 0
 	viewer.camera.position = place
 	viewer.speed = 1500
 	name := record_name(plugin, world_id)
@@ -1779,20 +1809,17 @@ go_outside :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32, place: Vec3) 
 	note(journal, shown.lights.len)
 	note(journal, " lights, ")
 	note(journal, shown.doors.len)
-	note(journal, " doors, ")
-	note(journal, shown.grounds.len)
-	note(journal, " land cells; ")
-	note(journal, shown.models.len)
-	note(journal, " models loaded, in ")
+	note(journal, " doors, in ")
 	note(journal, elapsed_ms(start))
-	note(journal, " ms")
+	note(journal, " ms; ")
+	note(journal, shown.waiting.len + shown.waiting_land.len)
+	note(journal, " waiting to load")
 	if show_error {
 		note(journal, " (placing the cells stopped early: ")
 		note_error(journal, show_error)
 		note(journal, ")")
 	}
 	note_end(journal)
-	note_failures(viewer)
 	viewer.frame_start = time_now()
 }
 
