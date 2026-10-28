@@ -27,6 +27,7 @@ use world_state
 use world_server
 use net
 use bot_player
+use pathing
 use scene
 use land
 use sky
@@ -1804,6 +1805,116 @@ command_walk_check :: fun(name: []utf8, start: Vec3, yaw_degrees: f32, seconds: 
 		walker.position + Vec3{0, 0, EYE_HEIGHT}, across, WALK_SPEED * f32(steps) * step)
 }
 
+// `sooblivion path-check <world | interior cell> <x> <y> <z> <to x> <to y>
+// <to z>`: the place's path grid (an interior's, or the world's cells round
+// the first place), the route over it from one place to the other (feet,
+// both), and a walker walking it in the place loaded without drawing:
+// whether it gets there, or where it's stuck.
+command_path_check :: fun(name: []utf8, from: Vec3, to: Vec3) {
+	index_storage : [96 * MB]byte = void
+	index_storage.len = 0
+	plugin, load_error := load_oblivion(&index_storage)
+	if load_error {
+		print("couldn't load the plugin: %", load_error)
+		return
+	}
+	scratch : [16 * MB]byte = void
+	scratch.len = 0
+	world_id := find_world(&plugin, name, &scratch)
+	cell : u32 = 0
+	if world_id == 0 {
+		found, cell_error := find_interior_cell(&plugin, name, &scratch)
+		if cell_error {
+			print("no world or interior cell %", name)
+			return
+		}
+		cell = found
+	}
+	order : Load_Order
+	order_error := read_load_order(&order)
+	directory_storage : [64 * MB]byte = void
+	directory_storage.len = 0
+	archives : Archives
+	archives_error := if order_error do order_error else open_game_archives(&order, &archives, &directory_storage)
+	if archives_error {
+		print("couldn't open the archives: %", archives_error)
+		return
+	}
+	defer close_archives(&archives)
+	table_storage : [16 * MB]byte = void
+	table_storage.len = 0
+	place : Scene
+	scene_clear(&place, &table_storage)
+	// (Never touched: loading doesn't draw.)
+	renderer : render.Renderer = void
+	file_room : [64 * MB]byte = void
+	block_room : [16 * MB]byte = void
+	model_room : [64 * MB]byte = void
+	texture_room : [64 * MB]byte = void
+	room := load_room(&file_room, &block_room, &model_room, &texture_room)
+	loader := Loader{renderer = &renderer, archives = &archives, room = &room, drawing = false}
+	x, y := grid_of(from)
+	show_error := if world_id != 0 do show_exterior(&place, &plugin, world_id, x, y) else show_interior(&place, &plugin, cell, loader)
+	if show_error do print("placing the place stopped early: %", show_error)
+	for not load_waiting(&place, &plugin, loader, 0xFFFFFFFFFFFFFFFF, from) {}
+
+	grid : Path_Grid = void
+	grid_start := time_now()
+	grid_error := if world_id != 0 do exterior_grid(&plugin, world_id, x, y, &grid) else interior_grid(&plugin, cell, &grid)
+	if grid_error do print("couldn't read all of the path grid: %", grid_error)
+	print("the path grid: % points, % links, read in % ms", grid.points.len, grid.links.len, elapsed_ms(grid_start))
+	route : Route = void
+	route_start := time_now()
+	found := find_route(&grid, from, to, &route)
+	if not found {
+		print("no route from % to %", from, to)
+		return
+	}
+	print("the route: % places, % long, found in % microseconds", route.points.len, route_length(&route), (time_now() - route_start) / 1000)
+	for point, k in route.points {
+		if k < 6 or k >= route.points.len - 3 do print("  %", point)
+		elif k == 6 do print("  …")
+	}
+	// Walked, as a person walks it.
+	walker := Walker{position = from, rising = 0, on_ground = false}
+	step : f32 = 1.0 / 60
+	checked_at := from
+	seconds : f32 = 0
+	noises : [16]Door_Noise
+	for seconds < 300 {
+		way, done := route_way(&route, walker.position)
+		if done {
+			print("walked it in % s: there, at % (% from where it was going)", seconds, walker.position, vec3_length(walker.position - to))
+			return
+		}
+		// The doors on the way opened, as they swing.
+		shut := door_ahead(&place, walker.position, way)
+		if shut != 0 {
+			_ = use_door(&place, shut)
+			print("  opened % at %", reference_name(&plugin, shut), walker.position)
+		}
+		noises.len = 0
+		swing_doors(&place, step, &noises)
+		walk(&walker, &place, way * WALK_SPEED, false, step)
+		seconds += step
+		// Stuck: not 40 units further on in 2 seconds.
+		if i64(seconds * 60) % 120 == 0 {
+			moved := walker.position - checked_at
+			if vec3_length(Vec3{moved.x, moved.y, 0}) < 40 {
+				print("stuck after % s at %, going to place % of % (%)", seconds, walker.position, route.next, route.points.len, route.points[route.next])
+				picked, distance, in_the_way := pick(&place, walker.position + Vec3{0, 0, 64}, way, 200)
+				if in_the_way {
+					reference := place.instances[picked].reference
+					print("  in the way, % ahead: % (%, %)", distance, reference_name(&plugin, reference), editor_id_of(&plugin, reference), reference)
+				}
+				return
+			}
+			checked_at = walker.position
+		}
+	}
+	print("still walking after % s, at %", seconds, walker.position)
+}
+
 // `sooblivion serve [port] [seconds] [open]`: the world run as a server,
 // with no window, players connecting to it (`sooblivion connect`): on this
 // machine's own address only, or open to others; for that many seconds
@@ -2791,6 +2902,8 @@ usage :: fun() {
 	print("                                   a bot player, no window: follows you, takes orders from the file")
 	print("sooblivion walk-check <world | cell> <x> <y> <z> <yaw> <seconds>")
 	print("                                   a walker walked forward in a place loaded without drawing")
+	print("sooblivion path-check <world | cell> <x> <y> <z> <to x> <to y> <to z>")
+	print("                                   a route over the place's path grid, walked by a walker")
 	print("sooblivion world-run <world> <hours>")
 	print("                                   the world's clock and weather run headless, as a server would")
 	print("sooblivion tree <name.spt | -all> [seed]")
@@ -3581,6 +3694,16 @@ main :: (args: [][]utf8) {
 		command_map(if args.len > 2 do args[2] else "Tamriel")
 	elif command == "sky"
 		command_sky(if args.len > 2 do args[2] else "Tamriel")
+	elif command == "path-check" and args.len > 8
+		numbers : [6!]f32
+		all_numbers := true
+		for k in 0:6 {
+			number, is_number := parse_number(args[3 + k])
+			numbers[k] = f32(number)
+			if not is_number do all_numbers = false
+		}
+		if all_numbers do command_path_check(args[2], Vec3{numbers[0], numbers[1], numbers[2]}, Vec3{numbers[3], numbers[4], numbers[5]})
+		else do usage()
 	elif command == "walk-check" and args.len > 7
 		numbers : [5!]f32
 		all_numbers := true

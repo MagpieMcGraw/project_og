@@ -1,0 +1,378 @@
+// Paths: the ways people walk, as the game's path grids have them (PGRD).
+// Each cell's grid is points one can stand at, each linked to those one can
+// walk straight to from it; outside, a cell's points are linked to its
+// neighbors' too. A place's grid is an interior's, or a world's cells
+// round a place joined; a route between two places is found over it (A*),
+// and walked a point at a time (route_way), the doors on the way opened
+// (door_ahead).
+module pathing
+
+use mara.core
+use mara.math
+use mara.memory
+use esm
+use world
+use scene
+use walking
+use logging
+
+// The points and links a place's grid holds at most: an interior's, or a
+// world's cells round a place (5 by 5, about a hundred points each).
+PATH_POINTS :: 8192
+PATH_LINKS :: 65536
+// The cells a place's grid is joined from at most.
+PATH_CELLS :: 64
+// The places a route goes through at most.
+ROUTE_POINTS :: 512
+// A route's point is come to within ROUTE_NEAR of it across, and
+// ROUTE_RISE up or down (the last: across only).
+ROUTE_NEAR :: 48
+ROUTE_RISE :: 96
+// How far ahead a shut door's looked for, to be opened.
+DOOR_AHEAD :: 64
+
+// A point people can stand at: where (on the floor or the ground there);
+// its links — in its grid's links, links of them from first_link — each
+// to a point one can walk straight to from it.
+Path_Point :: struct {
+	position: Vec3
+	first_link: i64
+	links: i64
+}
+
+// A place's path grid: its points, and their links (each a point's index).
+Path_Grid :: struct {
+	points: [PATH_POINTS]Path_Point
+	links: [PATH_LINKS]i64
+}
+
+// A route: the places to walk through in turn, the last where it's going;
+// the next to go to.
+Route :: struct {
+	points: [ROUTE_POINTS]Vec3
+	next: i64
+}
+
+// ---- a place's grid --------------------------------------------------------------
+
+// A grid being put together: links between its points (from one to
+// another), links from its points out to other cells' (by where those are:
+// joined once all the cells are read), and which points are whose cell's.
+Grid_Parts :: struct {
+	links: [PATH_LINKS]Path_Link
+	outward: [PATH_LINKS]Path_Outward
+	cells: [PATH_CELLS]Cell_Points
+}
+
+Path_Link :: struct {
+	from: i64
+	to: i64
+}
+
+Path_Outward :: struct {
+	from: i64
+	to: Vec3
+}
+
+// A cell's points in a grid being put together: its place in the world's
+// grid (x, y), and its points (count of them, from first).
+Cell_Points :: struct {
+	x: i64
+	y: i64
+	first: i64
+	count: i64
+}
+
+// An interior's path grid, into grid. Empty when it has none.
+interior_grid :: fun(plugin: ^Plugin, cell: u32, grid: ^Path_Grid) -> err {
+	parts : Grid_Parts = void
+	parts_start(&parts)
+	grid.points.len = 0
+	grid.links.len = 0
+	add_cell_grid(plugin, cell, 0, 0, grid, &parts)?
+	finish_grid(grid, &parts)
+}
+
+// The path grid of a world's cells round the one at x, y (EXTERIOR_RADIUS
+// each way: as many as are loaded round a player), joined, into grid. All
+// its cells are read whatever fails (the first failure given back).
+exterior_grid :: fun(plugin: ^Plugin, world_id: u32, x: i64, y: i64, grid: ^Path_Grid) -> err {
+	parts : Grid_Parts = void
+	parts_start(&parts)
+	grid.points.len = 0
+	grid.links.len = 0
+	area := area_around(x, y)
+	first_error : err
+	for cell_y in area.low_y..area.high_y {
+		for cell_x in area.low_x..area.high_x {
+			cell := exterior_cell(plugin, world_id, cell_x, cell_y)
+			if cell == 0 do continue
+			cell_error := add_cell_grid(plugin, cell, cell_x, cell_y, grid, &parts)
+			if cell_error and not first_error do first_error = cell_error
+		}
+	}
+	finish_grid(grid, &parts)
+	return first_error
+}
+
+parts_start :: fun(parts: ^Grid_Parts) {
+	parts.links.len = 0
+	parts.outward.len = 0
+	parts.cells.len = 0
+}
+
+// Adds a cell's path grid (its PGRD, the one that counts of the plugins'),
+// its place in the world's grid x, y: its points to the grid, its links to
+// the parts. Nothing for a cell without one; what fits of a grid too big.
+add_cell_grid :: fun(plugin: ^Plugin, cell: u32, x: i64, y: i64, grid: ^Path_Grid, parts: ^Grid_Parts) -> err {
+	grid_id := cell_grid_record(plugin, cell)?
+	if grid_id == 0 or not fits(parts.cells.len + 1, parts.cells.cap) do return
+	scratch : [256 * KB]byte = void
+	scratch.len = 0
+	record := find_record(plugin, grid_id, &scratch)?
+	points, has_points := find_field(record.data, "PGRP")
+	if not has_points do return
+	// PGRP: each point's x y z, and how many links it has (PGRR: theirs, in
+	// turn, each a point's index); PGRI: links out to other cells' points,
+	// each a point's index and where the other is.
+	links, _ := find_field(record.data, "PGRR")
+	outward, _ := find_field(record.data, "PGRI")
+	first := grid.points.len
+	count := points.len / 16
+	if not fits(first + count, grid.points.cap) do count = grid.points.cap - first
+	&parts.cells + Cell_Points{x = x, y = y, first = first, count = count}
+	link_at : i64 = 0
+	for k in 0:count {
+		position : Vec3 = points[k * 16]
+		link_count : u8 = points[k * 16 + 12]
+		&grid.points + Path_Point{position = position, first_link = 0, links = 0}
+		for _ in 0:i64(link_count) {
+			if (link_at + 1) * 2 > links.len do break
+			to : u16 = links[link_at * 2]
+			link_at += 1
+			if i64(to) < count and fits(parts.links.len + 1, parts.links.cap) do &parts.links + Path_Link{from = first + k, to = first + i64(to)}
+		}
+	}
+	for k in 0:outward.len / 16 {
+		from : u16 = outward[k * 16]
+		to : Vec3 = outward[k * 16 + 4]
+		if i64(from) < count and fits(parts.outward.len + 1, parts.outward.cap) do &parts.outward + Path_Outward{from = first + i64(from), to = to}
+	}
+}
+
+// A cell's path grid record (PGRD) — the one that counts of the plugins'
+// — by its form id; 0 for none.
+cell_grid_record :: fun(plugin: ^Plugin, cell: u32) -> u32, err {
+	grid_id : u32 = 0
+	for file in 0:plugin.files.len {
+		group_at, found := index_get(&plugin.cell_children, cell_group_key(file, cell))
+		if not found do continue
+		group_header := group_header_at(plugin, group_at)
+		end := group_at + i64(group_header.size)
+		at := group_at + HEADER_SIZE
+		for at < end {
+			header := record_header_at(plugin, at)
+			if header.kind == "GRUP" {
+				at += HEADER_SIZE   // the persistent, temporary and distant groups: into them
+				continue
+			}
+			next_at := at + HEADER_SIZE + i64(header.size)
+			if next_at > end do return 0, World_Error.Broken_Group
+			if header.kind == "PGRD" and winning_copy(plugin, file, header, at) do grid_id = global_form(plugin, file, header.form_id)
+			at = next_at
+		}
+	}
+	return grid_id
+}
+
+// Finishes a grid put together: the links out to other cells' points
+// joined (to the point there, in the cell it's in, where the link says; let
+// go where that cell isn't in the grid), and every point's links put
+// together in the grid's links.
+finish_grid :: fun(grid: ^Path_Grid, parts: ^Grid_Parts) {
+	for outward in parts.outward {
+		x, y := grid_of(outward.to)
+		for cell in parts.cells {
+			if cell.x != x or cell.y != y do continue
+			for k in cell.first:cell.first + cell.count {
+				if vec3_length(grid.points[k].position - outward.to) > 1 do continue
+				if fits(parts.links.len + 1, parts.links.cap) do &parts.links + Path_Link{from = outward.from, to = k}
+				break
+			}
+			break
+		}
+	}
+	// (Counted, each point's place in the links found, then filled.)
+	for link in parts.links do grid.points[link.from].links += 1
+	total : i64 = 0
+	for &point in grid.points {
+		point.first_link = total
+		total += point.links
+		point.links = 0
+	}
+	grid.links.len = total
+	for link in parts.links {
+		point := &grid.points[link.from]
+		grid.links[point.first_link + point.links] = link.to
+		point.links += 1
+	}
+}
+
+// ---- routes ------------------------------------------------------------------------
+
+// A point waiting to be looked at in a route's search: how long the way
+// through it is thought to be, all told.
+Route_Open :: struct {
+	estimate: f32
+	point: i64
+}
+
+// A route over a grid from one place to another (into route): the point
+// nearest from, through the grid's points by the shortest way (A*), to
+// the point nearest to — then to itself. False when the grid has no points
+// or no way between them, or the way's longer than a route holds.
+find_route :: fun(grid: ^Path_Grid, from: Vec3, to: Vec3, route: ^Route) -> bool {
+	route.points.len = 0
+	route.next = 0
+	start := nearest_point(grid, from)
+	goal := nearest_point(grid, to)
+	if start < 0 or goal < 0 do return false
+	count := grid.points.len
+	costs : [PATH_POINTS]f32 = void
+	came_from : [PATH_POINTS]i64 = void
+	done : [PATH_POINTS]bool = void
+	costs.len = count
+	came_from.len = count
+	done.len = count
+	for k in 0:count {
+		costs[k] = -1
+		came_from[k] = -1
+		done[k] = false
+	}
+	open : [PATH_LINKS]Route_Open = void
+	open.len = 0
+	goal_place := grid.points[goal].position
+	costs[start] = 0
+	open_push(&open, Route_Open{estimate = vec3_length(goal_place - grid.points[start].position), point = start})
+	for open.len > 0 {
+		point := open_pop(&open).point
+		if done[point] do continue
+		done[point] = true
+		if point == goal do break
+		here := &grid.points[point]
+		for link in here.first_link:here.first_link + here.links {
+			other := grid.links[link]
+			if done[other] do continue
+			cost := costs[point] + vec3_length(grid.points[other].position - here.position)
+			if costs[other] >= 0 and cost >= costs[other] do continue
+			costs[other] = cost
+			came_from[other] = point
+			if not fits(open.len + 1, open.cap) do return false
+			open_push(&open, Route_Open{estimate = cost + vec3_length(goal_place - grid.points[other].position), point = other})
+		}
+	}
+	if not done[goal] do return false
+	// Back from the goal, then turned round.
+	point := goal
+	for point >= 0 {
+		if not fits(route.points.len + 2, route.points.cap) do return false
+		&route.points + grid.points[point].position
+		point = came_from[point]
+	}
+	for k in 0:route.points.len / 2 {
+		other := route.points.len - 1 - k
+		kept := route.points[k]
+		route.points[k] = route.points[other]
+		route.points[other] = kept
+	}
+	&route.points + to
+	return true
+}
+
+// The grid's point nearest a place (up or down counted twice: a point on
+// its floor before one above or below it); -1 for a grid without points.
+nearest_point :: fun(grid: ^Path_Grid, place: Vec3) -> i64 {
+	nearest : i64 = -1
+	nearest_distance : f32 = 0
+	for point, k in grid.points {
+		away := point.position - place
+		distance := away.x * away.x + away.y * away.y + 4 * away.z * away.z
+		if nearest >= 0 and distance >= nearest_distance do continue
+		nearest = k
+		nearest_distance = distance
+	}
+	return nearest
+}
+
+// Adds a point to the open ones (a heap: the least estimate first).
+open_push :: fun(open: ^[]Route_Open, item: Route_Open) {
+	open + item
+	at := open.len - 1
+	for at > 0 {
+		parent := (at - 1) / 2
+		if open[parent].estimate <= open[at].estimate do break
+		kept := open[parent]
+		open[parent] = open[at]
+		open[at] = kept
+		at = parent
+	}
+}
+
+// Takes the open point of the least estimate out.
+open_pop :: fun(open: ^[]Route_Open) -> Route_Open {
+	least := open[0]
+	open[0] = open[open.len - 1]
+	open.len -= 1
+	at : i64 = 0
+	for true {
+		left := at * 2 + 1
+		right := left + 1
+		smallest := at
+		if left < open.len and open[left].estimate < open[smallest].estimate do smallest = left
+		if right < open.len and open[right].estimate < open[smallest].estimate do smallest = right
+		if smallest == at do break
+		kept := open[smallest]
+		open[smallest] = open[at]
+		open[at] = kept
+		at = smallest
+	}
+	return least
+}
+
+// The way to go along a route from feet: across the ground, its length 1.
+// The points come to are passed (a further one come to, a corner cut, the
+// ones before it too). True when the route's walked: its last point come
+// to (none to go then).
+route_way :: fun(route: ^Route, feet: Vec3) -> Vec3, bool {
+	last := route.points.len - 1
+	for k in route.next:route.points.len {
+		point := route.points[k]
+		across := vec3_length(Vec3{point.x - feet.x, point.y - feet.y, 0})
+		if across < ROUTE_NEAR and (k == last or abs_f32(point.z - feet.z) < ROUTE_RISE) do route.next = k + 1
+	}
+	if route.next > last do return Vec3{0, 0, 0}, true
+	point := route.points[route.next]
+	away := Vec3{point.x - feet.x, point.y - feet.y, 0}
+	if vec3_length(away) < 1 do return Vec3{0, 0, 0}, false
+	return vec3_normalize(away), false
+}
+
+// A door that opens in place, shut and at rest, just ahead of feet the way
+// they're going (within DOOR_AHEAD, at the waist): its reference, for the
+// one walking to open; 0 for none.
+door_ahead :: fun(place: ^Scene, feet: Vec3, way: Vec3) -> u32 {
+	picked, _, in_the_way := pick(place, feet + Vec3{0, 0, WALKER_HEIGHT / 2}, way, DOOR_AHEAD)
+	if not in_the_way do return 0
+	reference := place.instances[picked].reference
+	for swinging in place.swinging {
+		if swinging.reference == reference and not swinging.open and not swinging.moving do return reference
+	}
+	return 0
+}
+
+// How far a route goes from its next point on, across and up and down.
+route_length :: fun(route: ^Route) -> f32 {
+	far : f32 = 0
+	for k in route.next + 1:route.points.len do far += vec3_length(route.points[k] - route.points[k - 1])
+	return far
+}
