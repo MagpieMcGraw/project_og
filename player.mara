@@ -16,6 +16,7 @@ use model
 use world
 use scene
 use animation
+use audio
 use walking
 use logging
 render :: use render
@@ -49,6 +50,12 @@ SOUND_HIT_BLADE_FLESH :: 0x0018B9F1     // WPNHitBladeFlesh
 SOUND_HIT_BLUNT_FLESH :: 0x0018B9F2     // WPNHitBluntFlesh
 SOUND_HIT_BLADE :: 0x00025415           // WPNHitBlade
 SOUND_HIT_BLUNT :: 0x00025414           // WPNHitBlunt
+// How far into its file a swish is loudest, and a blow's sound has begun
+// (seconds; the files' own, about): each is started that much, and the
+// mixer's delay, ahead of the hit, so the swish is loudest as the blow
+// lands, and the blow's sound is heard as it does.
+SWISH_LOUDEST :: 0.13
+BLOW_SOUND_BEGINS :: 0.05
 // A weapon's kind (its DATA's first field), and the weight a one-handed
 // blade swishes small under (a dagger's).
 WEAPON_BLADE_ONE_HAND :: 0
@@ -86,10 +93,12 @@ Held_Animation :: struct {
 // whether its blow is struck yet; the one it took over from (-1 for none),
 // held where it was then, mixed out over HELD_BLEND from the start. A
 // blow struck since the viewer last told of it: swung, and whom it met (a
-// reference; 0 for no one) or whether it met something else. A swing begun
-// since the viewer last told of it. The weapon's sounds (SOUN form ids):
-// its swish, its blows on flesh and on things. What's drawn with the
-// camera: instances (none till it's made: ready).
+// reference; 0 for no one) or whether it met something else. The sounds
+// the viewer's to play since it last did: a swing's swish, a blow's sound
+// (a SOUN form id; 0 for none); whether this swing's swish and blow sound
+// have begun (ahead of its hit: SWISH_LOUDEST). The weapon's sounds (SOUN
+// form ids): its swish, its blows on flesh and on things. What's drawn
+// with the camera: instances (none till it's made: ready).
 First_Person :: struct {
 	ready: bool
 	model: i64
@@ -110,6 +119,9 @@ First_Person :: struct {
 	struck_reference: u32
 	struck_thing: bool
 	swinging: bool
+	blow_sound: u32
+	swished: bool
+	blow_sounded: bool
 	swish_sound: u32
 	flesh_sound: u32
 	thing_sound: u32
@@ -214,6 +226,9 @@ make_first_person :: fun(viewer: ^Viewer, plugin: ^Plugin) -> err {
 	held.struck_reference = 0
 	held.struck_thing = false
 	held.swinging = false
+	held.blow_sound = 0
+	held.swished = false
+	held.blow_sounded = false
 	held.ready = true
 }
 
@@ -269,10 +284,11 @@ read_held_keys :: fun(kf: ^Nif, text_keys: i64, held_animation: ^Held_Animation)
 }
 
 // Starts an animation (HELD_*) at a time: nothing to follow it, its blow
-// not struck; the one playing (if any) mixed out, from where it is. An
-// attack's a swing begun (swinging).
+// not struck, its sounds not begun; the one playing (if any) mixed out,
+// from where it is.
 start_held :: fun(held: ^First_Person, which: i64, now: f32) {
-	if which != HELD_IDLE do held.swinging = true
+	held.swished = false
+	held.blow_sounded = false
 	held.left = held.playing
 	held.left_at = held.at
 	held.playing = which
@@ -318,6 +334,21 @@ step_first_person :: fun(viewer: ^Viewer, clicked: bool) {
 	held_animation := &held.animations[held.playing]
 	at := held_animation.start + (now - held.started)
 	if held.playing != HELD_IDLE {
+		// Its sounds, begun ahead of its hit by the mixer's delay and as far
+		// as each's file takes to sound: the swish loudest as the blow
+		// lands, the blow's sound (on whom or what it'll meet) heard then.
+		hit := held_animation.hit
+		ahead := sound_delay(&viewer.audio)
+		if hit >= 0 and not held.swished and at >= hit - SWISH_LOUDEST - ahead {
+			held.swished = true
+			held.swinging = true
+		}
+		if hit >= 0 and not held.blow_sounded and at >= hit - BLOW_SOUND_BEGINS - ahead {
+			held.blow_sounded = true
+			whom, thing := strike(&viewer.shown, viewer.camera)
+			if whom != 0 do held.blow_sound = held.flesh_sound
+			elif thing do held.blow_sound = held.thing_sound
+		}
 		if not held.struck and held_animation.hit >= 0 and at >= held_animation.hit {
 			held.struck = true
 			held.swung = true

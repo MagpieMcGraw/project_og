@@ -1884,16 +1884,18 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 			viewer.hud.named = viewer.targeted
 			viewer.hud.name = reference_name(plugin, viewer.targeted)
 		}
-		// A swing's swish as it starts; its blow's sound as it lands, on
-		// someone or something.
+		// A swing's sounds, when step_first_person has them begin: its swish,
+		// its blow's on someone or something. The blow told of as it lands.
 		if viewer.held.swinging {
 			play_player_sound(viewer, plugin, viewer.held.swish_sound)
 			viewer.held.swinging = false
 		}
+		if viewer.held.blow_sound != 0 {
+			play_player_sound(viewer, plugin, viewer.held.blow_sound)
+			viewer.held.blow_sound = 0
+		}
 		if viewer.held.swung {
 			note_blow(viewer, plugin)
-			if viewer.held.struck_reference != 0 do play_player_sound(viewer, plugin, viewer.held.flesh_sound)
-			elif viewer.held.struck_thing do play_player_sound(viewer, plugin, viewer.held.thing_sound)
 			viewer.held.swung = false
 		}
 		if viewer.missed {

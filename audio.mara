@@ -369,6 +369,18 @@ hear_sounds :: fun(audio: ^Mixer, archives: ^Archives, sounds: ^[]Placed_Sound, 
 
 // ---- the mix -------------------------------------------------------------------------
 
+// How long the sound device takes to play what it's handed, past what's
+// queued for it (a guess: Windows' shared mode and SDL's buffer).
+DEVICE_DELAY :: 0.02
+
+// How long a sound started now takes to be heard (seconds): what's queued
+// ahead of it, and the device's own delay. 0 with no sound.
+sound_delay :: fun(audio: ^Mixer) -> f32 {
+	if not audio.open do return 0
+	queued := i64(sdl.GetAudioStreamQueued(audio.stream)) / 8
+	return f32(queued) / MIX_RATE + DEVICE_DELAY
+}
+
 // Mixes as much as keeps the stream AHEAD frames ahead of what's heard,
 // and hands it to SDL; voices that ended (or faded out, unwanted) are let go.
 mix_ahead :: fun(audio: ^Mixer) {
