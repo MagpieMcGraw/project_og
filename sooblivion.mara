@@ -2509,6 +2509,8 @@ usage :: fun() {
 	print("                                   a SpeedTree file read and grown (every one: -all)")
 	print("sooblivion tree-picture <TREE editor id> <out.png> [seed | bare]")
 	print("                                   a tree grown and drawn by hand beside its billboard")
+	print("sooblivion npc-picture <editor id> <out.png>")
+	print("                                   an NPC's head drawn by hand: its race's, and with its face")
 	print("sooblivion overlaps <world> <x> <y> <z> [radius]")
 	print("                                   drawn shapes lying on one another near a point (flicker)")
 	print("sooblivion mp3 <file> [raw]        decodes an MP3 (into raw floats, if given)")
@@ -2683,8 +2685,11 @@ command_npc :: fun(name: []utf8) {
 		return
 	}
 	report := Npc_Report{failures = 0, first = [], reason = Not_In_Archive}
-	whole := assemble_npc(&archives, &room, &look, bones, &report)
-	print("% shapes, from % to %", whole.parts.len, whole.bounds_min, whole.bounds_max)
+	skins : [4]Face_Skin
+	skin_storage : [2 * MB]byte
+	started := time_now()
+	whole := assemble_npc(&archives, &room, &look, bones, &report, &skins, &skin_storage)
+	print("% shapes, from % to %, put together in % ms (% skins made)", whole.parts.len, whole.bounds_min, whole.bounds_max, elapsed_ms(started), skins.len)
 	for &part in whole.parts {
 		low := Vec3{1000000, 1000000, 1000000}
 		high := Vec3{-1000000, -1000000, -1000000}
@@ -3179,6 +3184,8 @@ main :: (args: [][]utf8) {
 		else do usage()
 	elif command == "npc" and args.len > 2
 		command_npc(args[2])
+	elif command == "npc-picture" and args.len > 3
+		command_npc_picture(args[2], args[3])
 	elif command == "skin" and args.len > 2
 		command_skin(args[2], if args.len > 3 do args[3] else "meshes/characters/_male/idle.kf")
 	elif command == "music" and args.len > 2

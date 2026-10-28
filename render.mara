@@ -2777,6 +2777,36 @@ texture_for :: fun(renderer: ^Renderer, archives: ^Archives, path: []utf8, scrat
 	return slot
 }
 
+// Puts a texture made of pixels (red, green, blue, alpha, rows from the
+// top) onto the card as path's, so a part naming path is drawn with it (its
+// edges repeating, as most are): its slot. A path it has already keeps the
+// texture it has.
+texture_from_pixels :: fun(renderer: ^Renderer, path: []utf8, pixels: []byte, width: i64, height: i64) -> i64 {
+	key := text_hash(path)
+	known, found := index_get(&renderer.texture_index, key)
+	if found do return known
+	if renderer.textures.len == renderer.textures.cap or pixels.len < width * height * 4 do return 0
+	id : u32 = 0
+	GenTextures(1, &id)
+	BindTexture(TEXTURE_2D, id)
+	TexImage2D(TEXTURE_2D, 0, i32(RGBA8), i32(width), i32(height), 0, RGBA, UNSIGNED_BYTE, pixels)
+	GenerateMipmap(TEXTURE_2D)
+	TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(LINEAR_MIPMAP_LINEAR))
+	TexParameteri(TEXTURE_2D, TEXTURE_MAG_FILTER, i32(LINEAR))
+	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_S, i32(REPEAT))
+	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_T, i32(REPEAT))
+	if renderer.anisotropy > 1 do TexParameterf(TEXTURE_2D, TEXTURE_MAX_ANISOTROPY, renderer.anisotropy)
+	slot := renderer.textures.len
+	entry := next(&renderer.textures)
+	entry.path.len = 0
+	&entry.path + path[0 : min(path.len, entry.path.cap)]
+	entry.id = id
+	entry.handle = resident_handle(renderer, id)
+	entry.has_alpha = false
+	_ = index_put(&renderer.texture_index, key, slot)
+	return slot
+}
+
 // A 64-bit FNV-1a hash of a text, never 0: a path's key in a table.
 text_hash :: fun(text: []utf8) -> u64 {
 	hash : u64 = 0xCBF29CE484222325

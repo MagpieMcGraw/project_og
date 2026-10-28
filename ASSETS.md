@@ -38,7 +38,12 @@ Oblivion.esm and the base game's archives; sizes are as stored.
   races, and what they wear (the clothes and armor they carry, leveled
   lists taken at level 10, one item to a slot) — skinned to their skeleton
   (NiSkinInstance, NiSkinData) and posed as `idle.kf` starts (its B-spline
-  keys read), as tall as their race.
+  keys read), as tall as their race. Their faces are their own (FaceGen):
+  the head and what sits on it shaped by their FGGS and FGGA through each
+  part's `.egm`; the skin moved by their face map, the game's own in
+  `textures\faces` (1,977 of 2,482 NPCs) or made from the head's `.egt`
+  and their FGTS, added as the game's SKIN2000.pso adds it; hair colored
+  as HAIR2000.pso does (a hair mesh's vertex green says how much shows).
 - **Plugins:** Oblivion.esm and the downloaded content DLCList.txt names
   (Knights of the Nine, Battlehorn Castle, Frostcrag Spire, Thieves' Den,
   Vile Lair, the Orrery, Mehrunes' Razor, the Spell Tomes, Horse Armor),
@@ -61,7 +66,7 @@ Oblivion.esm and the base game's archives; sizes are as stored.
 | What | Data | Notes |
 |---|---|---|
 | NPCs moving | IDLE 650, AI packages | they stand in their idle's first pose |
-| Heads (FaceGen) | `.egm` 141, `.tri` 85, `.egt` 20; `textures\faces` 3,854 (each NPC's face tint) | morphs per NPC from NPC_ FaceGen data |
+| Faces' age and expressions | the age maps (`headhuman{m,f}{10..60}.dds` and their normal maps: the skin shader's FaceGenMap1, times 4), which `facegen\si.ctl`'s age control picks; `.tri` 85 (expressions, the mouth for speech); the bodies' `.egt` | shapes and skins are used (see above); the skin is as if of no age |
 | Weapons and shields worn | WEAP, their models on the back or side | |
 | Creatures | ACRE 1,473 placed; CREA 914; 34 creature folders | none drawn |
 | Animations | `.kf` 1,843 (creatures 1,068, characters 775); IDLE 650 | read (B-splines too); NPCs posed by idle.kf's start, nothing plays yet |

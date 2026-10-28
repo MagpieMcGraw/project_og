@@ -1,10 +1,11 @@
 // NPCs: the people placed in cells (ACHR), each put together as the game
 // does — their race's body and head, their hair and eyes, what they wear —
 // skinned to their skeleton and posed as its idle animation starts, then
-// made one model, which every placement of the NPC shares.
+// made one model, which every placement of the NPC shares. Each face is its
+// own (FaceGen: facegen.mara): its head, and what sits on it, shaped by its
+// face values, and its skin's colors moved by them.
 //
-// Not yet: their faces' own shapes and tints (FaceGen), hair colors, and
-// moving.
+// Not yet: moving.
 module scene
 
 use mara.core
@@ -18,6 +19,8 @@ use render
 use world
 use esm
 use animation
+use facegen
+use dds
 
 // The animation every NPC is posed by: its first pose.
 IDLE_ANIMATION :: "meshes/characters/_male/idle.kf"
@@ -64,8 +67,8 @@ NPC_MODEL_PARTS :: 128
 
 // One mesh an NPC is put together from: the texture its shapes are drawn
 // with in place of their own (empty: their own), the bone it hangs from if
-// it isn't skinned (empty: the one it names, Prn, else none), and a color
-// it's drawn tinted by (hair's grey textures take the NPC's hair color).
+// it isn't skinned (empty: the one it names, Prn, else none), and the hair
+// color it takes (hair_tinted): white for all but its hair.
 // Hung from a bone, a part's coordinates are the bone's own axes (a shield
 // on the forearm), except from the head: see head_hang.
 Npc_Part :: struct {
@@ -73,6 +76,7 @@ Npc_Part :: struct {
 	texture: [256]utf8
 	bone: [64]utf8
 	tint: Vec3
+	face_index: i64   // its place among the race's head parts (0 the head, 1 and 2 the ears...); -1 for none
 }
 
 // What an NPC is put together from: whether she's a woman, how tall (a
@@ -82,6 +86,20 @@ Npc_Look :: struct {
 	height: f32
 	skeleton: [256]utf8
 	parts: [NPC_PARTS]Npc_Part
+	has_face: bool        // its face values read (all NPCs have them)
+	face: Face_Values     // how its head and what sits on it are shaped (facegen.mara)
+	npc_id: u32           // (its skins are named after it: Face_Skin)
+	face_maps: [128]utf8  // the start of its made face maps' paths: textures\faces\<plugin>\<form id>_
+}
+
+// A skin made for a face (facegen.mara): a part's texture with its colors
+// moved, named for the part to draw it with (facegen\<NPC>\<part>, which
+// is no file), its pixels (red, green, blue, alpha, rows from the top).
+Face_Skin :: struct {
+	path: [96]utf8
+	pixels: []byte
+	width: i64
+	height: i64
 }
 
 // A skeleton's pose, kept: its path, and its bones posed.
@@ -99,8 +117,19 @@ read_npc_look :: fun(plugin: ^Plugin, npc_id: u32, look: ^Npc_Look) -> err {
 	look.female = false
 	look.height = 1
 	look.skeleton.len = 0
+	look.has_face = false
+	look.face = Face_Values{0}
+	look.npc_id = npc_id
+	look.face_maps.len = 0
 	scratch : [256 * KB]byte
 	npc := find_record(plugin, npc_id, &scratch)?
+	// Its face maps, as the game names them: after the plugin it's from
+	// and its form id there.
+	&look.face_maps + "textures\\faces\\"
+	for c in plugin.files[npc.file].name do &look.face_maps + lower(c)
+	&look.face_maps + "\\"
+	add_hex(&look.face_maps, npc.header.form_id)
+	&look.face_maps + "_"
 	race_id : u32 = 0
 	hair_id : u32 = 0
 	eyes_id : u32 = 0
@@ -124,6 +153,22 @@ read_npc_look :: fun(plugin: ^Plugin, npc_id: u32, look: ^Npc_Look) -> err {
 			eyes_id = record_form(plugin, npc, raw)
 		elif field.kind == "HCLR" and field.data.len >= 3
 			hair_color = byte_color(field.data, 0)
+		elif field.kind == "FGGS" and field.data.len >= 4 * FACE_SYMMETRIC
+			for k in 0:FACE_SYMMETRIC {
+				value : f32 = field.data[4 * k]
+				look.face.symmetric[k] = value
+			}
+			look.has_face = true
+		elif field.kind == "FGGA" and field.data.len >= 4 * FACE_ASYMMETRIC
+			for k in 0:FACE_ASYMMETRIC {
+				value : f32 = field.data[4 * k]
+				look.face.asymmetric[k] = value
+			}
+		elif field.kind == "FGTS" and field.data.len >= 4 * FACE_TEXTURE
+			for k in 0:FACE_TEXTURE {
+				value : f32 = field.data[4 * k]
+				look.face.texture[k] = value
+			}
 		elif field.kind == "CNTO" and field.data.len >= 4 and carried.len < carried.cap
 			raw : u32 = field.data[0]
 			&carried + record_form(plugin, npc, raw)
@@ -230,6 +275,7 @@ read_npc_look :: fun(plugin: ^Plugin, npc_id: u32, look: ^Npc_Look) -> err {
 		if head_meshes[k].len == 0 do continue
 		texture := if k >= 7 and eyes_texture.len > 0 do eyes_texture else head_textures[k]
 		add_npc_part(look, head_meshes[k], texture, HEAD_BONE)
+		look.parts[look.parts.len - 1].face_index = k
 	}
 	// Its hair, unless something worn covers it.
 	if hair_id != 0 and taken & SLOT_HAIR == 0 {
@@ -261,6 +307,7 @@ add_npc_part :: fun(look: ^Npc_Look, mesh: []utf8, texture: []utf8, bone: []utf8
 	part.texture.len = 0
 	part.bone.len = 0
 	part.tint = Vec3{1, 1, 1}
+	part.face_index = -1
 	archive_path_under("meshes\\", mesh, &part.mesh)
 	if texture.len > 0 do archive_path_under("textures\\", texture, &part.texture)
 	&part.bone + bone
@@ -409,8 +456,12 @@ build_npc_model :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, npc_id: u
 	read_npc_look(plugin, npc_id, &look)?
 	pose := skeleton_pose(scene, loader, look.skeleton)
 	report := Npc_Report{failures = 0, first = [], reason = Not_In_Archive}
-	whole := assemble_npc(loader.archives, loader.room, &look, pose, &report)
+	skins : [4]Face_Skin
+	skin_storage : [2 * MB]byte
+	whole := assemble_npc(loader.archives, loader.room, &look, pose, &report, &skins, &skin_storage)
 	if report.failures > 0 do note_failure(scene, report.first, report.reason)
+	// Its faces' skins, on the card first: the model's parts are drawn with them.
+	for &skin in skins do _ = texture_from_pixels(loader.renderer, skin.path, skin.pixels, skin.width, skin.height)
 	gpu := upload_model(loader.renderer, &whole, loader.archives, &loader.room.texture)?
 	// (No collision: walking goes through people for now.)
 	&scene.model_collision + Collision_Range{first = scene.collision_points.len, count = 0}
@@ -429,13 +480,30 @@ Npc_Report :: struct {
 // An NPC's model, its parts posed and put together (see the top), made in
 // room's model room (len set to 0 first). The parts that can't be made
 // left out, into report.
-assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose: []Pose_Bone, report: ^Npc_Report) -> Model {
+// Its faces' skins go into skins (their pixels into skin_storage), named
+// for the parts drawn with them: they're put on the card before the model.
+assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose: []Pose_Bone, report: ^Npc_Report,
+	skins: ^[]Face_Skin, skin_storage: ^[]byte) -> Model
+{
 	room.model.len = 0
 	// (The parts' list in the model's room, as their vertices are.)
 	built := slice([:NPC_MODEL_PARTS]Model_Part, &room.model)
 	low := Vec3{1000000, 1000000, 1000000}
 	high := Vec3{-1000000, -1000000, -1000000}
-	for &part in look.parts {
+	morph_file : [2 * MB]byte
+	moves : [8192]Vec3
+	skin_file : [32 * MB]byte   // (an .egt unpacked and packed: the human head's is 9.8 MB unpacked)
+	skin_base : [2 * MB]byte
+	skins.len = 0
+	for &part, part_index in look.parts {
+		// Its shape for this face: the morphs beside its mesh (.egm), if it
+		// has them.
+		moves.len = 0
+		if look.has_face {
+			morph_file.len = 0
+			face_error := part_face_moves(archives, part.mesh, &look.face, &morph_file, &moves)
+			if face_error do note_npc_failure(report, part.mesh, face_error)
+		}
 		room.file.len = 0
 		room.blocks.len = 0
 		mesh, mesh_error := read_archived_nif(archives, part.mesh, &room.file, &room.blocks)
@@ -455,23 +523,49 @@ assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose
 				if posed do hang = place
 			}
 		}
-		made, model_error := build_posed_model(&mesh, pose, hang, &room.model)
+		made, model_error := build_shaped_model(&mesh, pose, hang, moves, &room.model)
 		if model_error {
 			note_npc_failure(report, part.mesh, model_error)
 			continue
 		}
-		for &made_part in made.parts {
+		for &made_part, made_index in made.parts {
 			if built.len == built.cap do break
 			if part.texture.len > 0 {
 				made_part.texture.len = 0
 				&made_part.texture + part.texture[0 : min(part.texture.len, made_part.texture.cap)]
 			}
-			if part.tint.x != 1 or part.tint.y != 1 or part.tint.z != 1 {
-				for &vertex in made_part.vertices {
-					vertex.color[0] *= part.tint.x
-					vertex.color[1] *= part.tint.y
-					vertex.color[2] *= part.tint.z
+			// Its skin for this face (its colors moved by the .egt beside
+			// its mesh, if it has one): drawn with that instead.
+			if look.has_face and made_index == 0 and skins.len < skins.cap {
+				taken_at := skin_storage.len
+				pixels := slice([:4 * MOST_SKIN_TEXELS]byte, skin_storage)
+				map_path : [160]utf8
+				if part.face_index >= 0 and look.face_maps.len > 0 {
+					&map_path + look.face_maps
+					&map_path + int_text(part.face_index)
+					&map_path + ".dds"
 				}
+				width, height, skin_error := part_face_skin(archives, part.mesh, made_part.texture, map_path, &look.face, &skin_file,
+					&skin_base, &pixels)
+				if skin_error do note_npc_failure(report, part.mesh, skin_error)
+				// (Parts without one give their room back.)
+				if width == 0 do skin_storage.len = taken_at
+				if width > 0 {
+					skin := next(skins)
+					skin.path.len = 0
+					&skin.path + "facegen\\"
+					&skin.path + int_text(i64(look.npc_id))
+					&skin.path + "\\"
+					&skin.path + int_text(part_index)
+					skin.pixels = pixels
+					skin.width = width
+					skin.height = height
+					made_part.texture.len = 0
+					&made_part.texture + skin.path
+				}
+			}
+			if part.tint.x != 1 or part.tint.y != 1 or part.tint.z != 1 {
+				for &vertex in made_part.vertices do vertex.color = hair_tinted(vertex.color, part.tint)
 			}
 			&built + made_part^
 		}
@@ -489,6 +583,82 @@ assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose
 		high = high * look.height
 	}
 	return Model{parts = built, flips = [], particles = [], motions = [], bounds_min = low, bounds_max = high}
+}
+
+// How far a part's vertices move for a face, into moves: by its morphs,
+// the .egm beside its mesh (read into file_storage). None when it has none.
+part_face_moves :: fun(archives: ^Archives, mesh_path: []utf8, face: ^Face_Values, file_storage: ^[]byte, moves: ^[]Vec3) -> err {
+	moves.len = 0
+	if mesh_path.len < 4 do return
+	morph_path : [256]utf8
+	&morph_path + mesh_path[0 : mesh_path.len - 4]
+	&morph_path + ".egm"
+	found, has_morphs := find_archived(archives, morph_path)
+	if not has_morphs do return
+	data := read_archived(archives, found, file_storage)?
+	morphs := read_shape_morphs(data)?
+	face_moves(&morphs, face, moves)
+}
+
+// A part's skin for a face (facegen.mara): its texture (base_path) moved by
+// its face map, the game's made one (map_path) or else one made from the
+// morphs beside its mesh (its .egt). Into pixels: how many columns and
+// rows; none (0) when it has neither. (The files and the texture's pixels
+// go through file_storage and base_storage.)
+part_face_skin :: fun(archives: ^Archives, mesh_path: []utf8, base_path: []utf8, map_path: []utf8, face: ^Face_Values,
+	file_storage: ^[]byte, base_storage: ^[]byte, pixels: ^[]byte) -> i64, i64, err
+{
+	if mesh_path.len < 4 or base_path.len == 0 do return 0, 0
+	map : [4 * MOST_SKIN_TEXELS]byte
+	map_width : i64 = 0
+	map_height : i64 = 0
+	made, has_made := find_archived(archives, map_path)
+	if map_path.len > 0 and has_made {
+		file_storage.len = 0
+		made_file := read_archived(archives, made, file_storage)?
+		made_texture := read_texture(made_file)?
+		if made_texture.mips[0].width * made_texture.mips[0].height <= MOST_SKIN_TEXELS {
+			decode_rgba(made_texture, 0, &map)?
+			map_width = made_texture.mips[0].width
+			map_height = made_texture.mips[0].height
+		}
+	}
+	if map_width == 0 {
+		morph_path : [256]utf8
+		&morph_path + mesh_path[0 : mesh_path.len - 4]
+		&morph_path + ".egt"
+		found, has_morphs := find_archived(archives, morph_path)
+		if not has_morphs do return 0, 0
+		file_storage.len = 0
+		data := read_archived(archives, found, file_storage)?
+		morphs := read_texture_morphs(data)?
+		face_map(&morphs, face, &map)
+		map_width = morphs.columns
+		map_height = morphs.rows
+		if map.len == 0 do return 0, 0
+	}
+	texture := read_archive_texture(archives, base_path, file_storage)?
+	base_storage.len = 0
+	base := decode_rgba(texture, 0, base_storage)?
+	skin_from_map(base, texture.mips[0].width, texture.mips[0].height, map, map_width, map_height, pixels)
+	if pixels.len == 0 do return 0, 0
+	return map_width, map_height
+}
+
+// A form id's eight hex digits (lower case), after what's in text.
+add_hex :: fun(text: ^[128]utf8, value: u32) {
+	digits := "0123456789abcdef"
+	for k in 0:8 do text + digits[i64((value >> u32(28 - 4 * k)) & 15)]
+}
+
+// A hair vertex's color for a hair color (tint), as the game's hair
+// shaders make it (HAIR2000.pso): a hair mesh's vertex colors aren't its
+// colors, its green says how much the hair color shows there; the texture
+// is then times 1 + green x (2 x tint - 1), so 0.5 (128) leaves it as it
+// is. Its alpha stays.
+hair_tinted :: fun(color: [4!]f32, tint: Vec3) -> [4!]f32 {
+	shows := color[1]
+	return [1 + shows * (2 * tint.x - 1), 1 + shows * (2 * tint.y - 1), 1 + shows * (2 * tint.z - 1), color[3]]
 }
 
 note_npc_failure :: fun(report: ^Npc_Report, path: []utf8, reason: err) {

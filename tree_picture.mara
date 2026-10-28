@@ -190,22 +190,22 @@ draw_tree_part :: fun(canvas: ^Canvas, part: ^Model_Part, texture: ^Painted_Text
 		// (As the mesh program lights them: leaves let the sun through.)
 		facing := dot(first.normal, sun)
 		light := 0.45 + 0.6 * (if part.leaf_cards do 0.5 + 0.5 * facing else max(facing, 0))
-		shade := light * first.color[0]
+		shade := Vec3{first.color[0], first.color[1], first.color[2]} * light
 		fill_triangle(canvas, corners, uvs, texture, test, shade)
 	}
 }
 
 // Fills a triangle (corners in pixels, their depths) with its texture,
 // nearest texel, wrapping; pixels nearer than what's drawn, and opaque
-// enough, are drawn, darkened by shade.
-fill_triangle :: fun(canvas: ^Canvas, corners: [3!]Vec3, uvs: [3!][2!]f32, texture: ^Painted_Texture, test: f32, shade: f32) {
+// enough, are drawn, times shade (red, green, blue).
+fill_triangle :: fun(canvas: ^Canvas, corners: [3!]Vec3, uvs: [3!][2!]f32, texture: ^Painted_Texture, test: f32, shade: Vec3) {
 	a := corners[0]
 	b := corners[1]
 	c := corners[2]
 	area := (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
 	if abs_f32(area) < 0.0001 do return
 	low_x := max(i64(floor_f32(min(a.x, min(b.x, c.x)))), 0)
-	high_x := min(i64(ceil_f32(max(a.x, max(b.x, c.x)))), TREE_PICTURE_SIDE - 1)
+	high_x := min(i64(ceil_f32(max(a.x, max(b.x, c.x)))), canvas.width - 1)
 	low_y := max(i64(floor_f32(min(a.y, min(b.y, c.y)))), 0)
 	high_y := min(i64(ceil_f32(max(a.y, max(b.y, c.y)))), canvas.height - 1)
 	for y in low_y..high_y {
@@ -230,7 +230,7 @@ fill_triangle :: fun(canvas: ^Canvas, corners: [3!]Vec3, uvs: [3!][2!]f32, textu
 			if f32(texture.pixels[texel + 3]) / 255 < test do continue
 			canvas.depth[at] = depth
 			for channel in 0:3 {
-				lit := f32(texture.pixels[texel + channel]) * shade
+				lit := f32(texture.pixels[texel + channel]) * shade[channel]
 				canvas.pixels[4 * at + channel] = u8(min(lit, 255))
 			}
 		}

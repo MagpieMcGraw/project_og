@@ -11,3 +11,6 @@ sooblivion.mara:1702:37 runtime error: 67 items into a list with room for 64
 2026-10-27 20:12:20
 tree_picture.mara:98:2 runtime error: slice len 2097152 not in [0, 0] (cap) for 'slice'
 
+2026-10-28 09:36:46
+npc.mara:527:15 runtime error: take overflows storage: 262144 of 1 bytes at 2097152 exceed cap 2097152 for 'skin_storage'
+
