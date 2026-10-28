@@ -128,6 +128,9 @@ SOUND_SPOT :: 1024
 THUNDER_KEY :: 0x7400000000000000
 THUNDER_CHANCE :: 0.25
 LIGHTNING_FADE :: 4
+// Walked into another region's sky, its weather's blended in over this
+// long (seconds).
+REGION_BLEND :: 4
 
 // Weather sounds' keys: high bits no reference's form id has; the last
 // weather's apart from the coming one's.
@@ -186,14 +189,24 @@ Viewer :: struct {
 	others: [MAX_PLAYERS]Other_Shown
 	// The sky as shown: the climate the server says the sky's under, read
 	// (its sun, moons, night sky); the records of the weathers (the one
-	// coming in, the last one going out: show_weather reads them), what's
-	// seen and
-	// heard by chance — the regions' sounds, thunder — rolled alike by every
-	// player (chance_at), the moons' phase on the card (-1: none yet).
+	// coming in, the last one going out: take_weather reads them), what's
+	// seen and heard by chance — the regions' sounds, thunder — rolled alike
+	// by every player (chance_at), the moons' phase on the card (-1: none
+	// yet).
 	climate: Climate
 	weather: Weather
 	last_weather: Weather
 	moon_phase: i64
+	// Whose sky's shown (its source, as the server says) and whether one is
+	// yet; how far the weather coming in is shown in (0 to 1: the server's,
+	// or, blending into another region's sky, the viewer's own); whether
+	// it's blending, and whether, blended, it's held till the server's sky
+	// comes to what it shows (show_weather).
+	sky_source: u32
+	sky_shown: bool
+	weather_share: f32
+	blending: bool
+	weather_held: bool
 	// The weather's sounds: its rain's and wind's loops (heard everywhere,
 	// as loud as the weather has come in), and the last weather's, going;
 	// the sounds the regions here make now and then (birds, insects), and
@@ -396,6 +409,11 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.weather = default_weather()
 	viewer.last_weather = default_weather()
 	viewer.moon_phase = -1
+	viewer.sky_source = 0
+	viewer.sky_shown = false
+	viewer.weather_share = 1
+	viewer.blending = false
+	viewer.weather_held = false
 	viewer.weather_sounds.len = 0
 	viewer.last_weather_sounds.len = 0
 	viewer.region_sounds.len = 0
@@ -725,8 +743,8 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	hour := viewer.seen.hour
 	hear_sounds(&viewer.audio, &viewer.archives, &shown.sounds, listener, hour, heard_at)
 	if viewer.look.outside {
-		for &sound in viewer.weather_sounds do sound.volume = viewer.seen.weather_share
-		for &sound in viewer.last_weather_sounds do sound.volume = 1 - viewer.seen.weather_share
+		for &sound in viewer.weather_sounds do sound.volume = viewer.weather_share
+		for &sound in viewer.last_weather_sounds do sound.volume = 1 - viewer.weather_share
 		hear_sounds(&viewer.audio, &viewer.archives, &viewer.weather_sounds, listener, hour, heard_at)
 		hear_sounds(&viewer.audio, &viewer.archives, &viewer.last_weather_sounds, listener, hour, heard_at)
 		outdoor_sounds(viewer, listener, heard_at)
@@ -1338,6 +1356,14 @@ show_time :: fun(viewer: ^Viewer, seconds: f32) {
 	scale : f32 = if seen.hurried do HURRIED_TIME_SCALE else TIME_SCALE
 	look := &viewer.look
 	look.time += seconds
+	// Blending into another region's sky (show_weather), in the viewer's own time.
+	if viewer.blending {
+		viewer.weather_share = min(1, viewer.weather_share + seconds / REGION_BLEND)
+		if viewer.weather_share >= 1 {
+			viewer.blending = false
+			viewer.weather_held = true
+		}
+	}
 	shown := &viewer.shown
 	look.outside = shown.world != 0
 	look.sky = look.outside or viewer.sky_inside
@@ -1353,9 +1379,9 @@ show_time :: fun(viewer: ^Viewer, seconds: f32) {
 	// Without distant land, the fog ends where the loaded cells do.
 	most_fog : f32 = CELL_SIZE * (EXTERIOR_RADIUS + 0.5)
 	if has_distant_land(viewer) do most_fog = 1000000
-	look.weather_share = seen.weather_share
-	look.state = changing_sky_at(&viewer.climate, &viewer.last_weather, &viewer.weather, seen.weather_share, seen.hour, most_fog)
-	look.wind = mix_number(viewer.last_weather.wind_speed, viewer.weather.wind_speed, seen.weather_share)
+	look.weather_share = viewer.weather_share
+	look.state = changing_sky_at(&viewer.climate, &viewer.last_weather, &viewer.weather, viewer.weather_share, seen.hour, most_fog)
+	look.wind = mix_number(viewer.last_weather.wind_speed, viewer.weather.wind_speed, viewer.weather_share)
 	look.cloud_lower_offset += seconds * scale / TIME_SCALE * viewer.weather.cloud_speed_lower
 	look.cloud_upper_offset += seconds * scale / TIME_SCALE * viewer.weather.cloud_speed_upper
 	// A lightning flash, in its color, fading.
@@ -1410,7 +1436,7 @@ outdoor_sounds :: fun(viewer: ^Viewer, listener: Listener, now: f64) {
 		}
 	}
 	second := i64(seen.seconds)
-	if viewer.weather.thunder > 0 and seen.weather_share > 0.5 and second != viewer.thunder_second {
+	if viewer.weather.thunder > 0 and viewer.weather_share > 0.5 and second != viewer.thunder_second {
 		viewer.thunder_second = second
 		if chance_at(seen.seed, second, 0, 0, THUNDER_KEY) < viewer.weather.thunder * THUNDER_CHANCE {
 			viewer.lightning = 1
@@ -1486,7 +1512,7 @@ move_night_sky :: fun(viewer: ^Viewer) {
 			else do look.secunda = slot
 		}
 	}
-	glare := mix_number(viewer.last_weather.sun_glare, viewer.weather.sun_glare, viewer.seen.weather_share)
+	glare := mix_number(viewer.last_weather.sun_glare, viewer.weather.sun_glare, viewer.weather_share)
 	look.sun_glare_strength = glare * look.state.daylight * min(1, max(0, look.state.sun_direction.z * 4))
 }
 
@@ -1616,17 +1642,94 @@ take_region_sounds :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	for &region_sound in viewer.region_sounds do _ = scene_sound_kind(&viewer.shown, plugin, region_sound.sound)
 }
 
-// Shows the weather the server says is coming in when it isn't the one
-// shown: its record read, its clouds and rain or snow on the card, its
-// sounds; coming in over the one shown, or at once (when the server has it
-// go out to itself).
+// Shows the weather under the sky the server says the player's under, as
+// the server has it come in (take_weather reading one that isn't shown).
+// Walked into another region's sky, the weather coming in there is blended
+// in over REGION_BLEND seconds (blend_weather; show_time moves it on), then
+// held till the server's sky comes to it: settled on it, or another coming
+// in over it (settled on another, that's blended in too). Through a door,
+// or the first sky, the server's weathers are shown at once.
 show_weather :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	seen := &viewer.seen
-	if seen.weather == viewer.weather.form_id and seen.last_weather == viewer.last_weather.form_id do return
-	// (At once too when what's shown isn't the one going out: the first
-	// shown, or one the viewer missed.)
-	at_once := seen.last_weather == seen.weather or seen.last_weather != viewer.weather.form_id
-	chosen := seen.weather
+	if not seen.sky_taken do return
+	if not viewer.sky_shown or seen.sky_source != viewer.sky_source {
+		walked := viewer.sky_shown and seen.walked_into_sky
+		viewer.sky_shown = true
+		viewer.sky_source = seen.sky_source
+		viewer.weather_held = false
+		viewer.blending = false
+		note(&viewer.journal, if walked do "walked under " else "under ")
+		note(&viewer.journal, editor_id_of(plugin, seen.sky_source))
+		note(&viewer.journal, "'s sky")
+		note_end(&viewer.journal)
+		if walked do blend_weather(viewer, plugin, seen.weather)
+		else do take_server_weathers(viewer, plugin)
+		return
+	}
+	if viewer.blending do return
+	if viewer.weather_held {
+		settled := seen.weather_share >= 1
+		if settled and seen.weather != viewer.weather.form_id {
+			viewer.weather_held = false
+			blend_weather(viewer, plugin, seen.weather)
+			return
+		}
+		if not settled and seen.last_weather != viewer.weather.form_id do return
+		viewer.weather_held = false
+	}
+	if seen.weather != viewer.weather.form_id {
+		if seen.last_weather == viewer.weather.form_id do take_weather(viewer, plugin, seen.weather, .coming_goes)
+		else do take_server_weathers(viewer, plugin)
+	elif seen.last_weather != viewer.last_weather.form_id and seen.weather_share < 1
+		take_server_weathers(viewer, plugin)
+	}
+	viewer.weather_share = seen.weather_share
+}
+
+// Shows the server's weathers as they are: the one going out (unless the
+// one coming in is all the way in) and the one coming in, as far in as the
+// server has it.
+take_server_weathers :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	seen := &viewer.seen
+	if seen.weather_share >= 1 or seen.weather == seen.last_weather {
+		take_weather(viewer, plugin, seen.weather, .at_once)
+	else
+		take_weather(viewer, plugin, seen.last_weather, .at_once)
+		take_weather(viewer, plugin, seen.weather, .coming_goes)
+	}
+	viewer.weather_share = seen.weather_share
+}
+
+// Starts blending what's shown into a weather (by form id), over
+// REGION_BLEND seconds (show_time moves it on): on from where it's got to,
+// if it's the one coming in shown; back in, if it's the one going out;
+// else over the weather mostly shown (the other let go).
+blend_weather :: fun(viewer: ^Viewer, plugin: ^Plugin, chosen: u32) {
+	viewer.blending = true
+	if chosen == viewer.weather.form_id do return
+	if chosen == viewer.last_weather.form_id {
+		share := viewer.weather_share
+		take_weather(viewer, plugin, chosen, .coming_goes)
+		viewer.weather_share = 1 - share
+		return
+	}
+	going : Weather_Going = if viewer.weather_share >= 0.5 do .coming_goes else .going_stays
+	take_weather(viewer, plugin, chosen, going)
+	viewer.weather_share = 0
+}
+
+// How a weather comes in, shown (take_weather): over the one coming in
+// shown, that one going out; over the one going out shown, it going on
+// going (the one coming in let go); or at once, nothing going out.
+Weather_Going :: union {
+	at_once = 0
+	coming_goes
+	going_stays
+}
+
+// Shows a weather (by form id) coming in, as going has it: its record
+// read, its clouds and rain or snow on the card, its sounds.
+take_weather :: fun(viewer: ^Viewer, plugin: ^Plugin, chosen: u32, going: Weather_Going) {
 	scratch : [256 * KB]byte
 	weather, weather_error := read_weather(plugin, chosen, &scratch)
 	if weather_error {
@@ -1638,14 +1741,15 @@ show_weather :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	}
 	look := &viewer.look
 	room := &viewer.room
-	viewer.last_weather = if at_once do weather else viewer.weather
-	look.cloud_lower_last = look.cloud_lower
-	look.cloud_upper_last = look.cloud_upper
-	look.last_precipitation = look.precipitation
-	viewer.last_weather_sounds = viewer.weather_sounds
-	for &sound in viewer.last_weather_sounds do sound.key |= LAST_WEATHER_BIT
+	if going == .coming_goes {
+		viewer.last_weather = viewer.weather
+		look.cloud_lower_last = look.cloud_lower
+		look.cloud_upper_last = look.cloud_upper
+		look.last_precipitation = look.precipitation
+		viewer.last_weather_sounds = viewer.weather_sounds
+		for &sound in viewer.last_weather_sounds do sound.key |= LAST_WEATHER_BIT
+	}
 	weather_sound_list(viewer, plugin, &weather, &viewer.weather_sounds, 0)
-	if at_once do viewer.last_weather_sounds.len = 0
 	rain_error := precipitation_of(viewer, &weather, &look.precipitation)
 	if rain_error {
 		note(&viewer.journal, "couldn't read a weather's rain or snow: ")
@@ -1653,17 +1757,19 @@ show_weather :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 		note_end(&viewer.journal)
 		look.precipitation.len = 0
 	}
-	if at_once do look.last_precipitation.len = 0
 	viewer.weather = weather
 	look.cloud_lower = texture_for(&viewer.renderer, &viewer.archives, weather.cloud_lower, &room.texture)
 	look.cloud_upper = texture_for(&viewer.renderer, &viewer.archives, weather.cloud_upper, &room.texture)
-	if at_once {
+	if going == .at_once {
+		viewer.last_weather = weather
+		viewer.last_weather_sounds.len = 0
+		look.last_precipitation.len = 0
 		look.cloud_lower_last = look.cloud_lower
 		look.cloud_upper_last = look.cloud_upper
 	}
 	note(&viewer.journal, "the weather: ")
 	note(&viewer.journal, editor_id_of(plugin, chosen))
-	note(&viewer.journal, if at_once do "" else ", coming in")
+	note(&viewer.journal, if going == .at_once do "" else ", coming in")
 	note_end(&viewer.journal)
 }
 

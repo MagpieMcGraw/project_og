@@ -19,6 +19,8 @@ World_Copy :: struct {
 	hurried: bool
 	climate_id: u32
 	sky_taken: bool
+	sky_source: u32
+	walked_into_sky: bool
 	weather: u32
 	last_weather: u32
 	weather_share: f32
@@ -43,6 +45,8 @@ copy_start :: fun(copy: ^World_Copy) {
 	copy.hurried = false
 	copy.climate_id = 0
 	copy.sky_taken = false
+	copy.sky_source = 0
+	copy.walked_into_sky = false
 	copy.weather = 0
 	copy.last_weather = 0
 	copy.weather_share = 1
@@ -61,7 +65,7 @@ copy_take :: fun(copy: ^World_Copy, queue: ^Wire_Queue) {
 		if not has_message do break
 		if message.kind == MESSAGE_CLOCK {
 			clock, whole := wire_value(message, Clock_Message{seed = 0, hour = 0, day = 0, seconds = 0, hurried = false, climate = 0,
-				sky_taken = false, weather = 0, last_weather = 0, weather_share = 0})
+				sky_taken = false, sky_source = 0, walked_into_sky = false, weather = 0, last_weather = 0, weather_share = 0})
 			if not whole do continue
 			copy.seed = clock.seed
 			copy.hour = clock.hour
@@ -70,6 +74,8 @@ copy_take :: fun(copy: ^World_Copy, queue: ^Wire_Queue) {
 			copy.hurried = clock.hurried
 			copy.climate_id = clock.climate
 			copy.sky_taken = clock.sky_taken
+			copy.sky_source = clock.sky_source
+			copy.walked_into_sky = clock.walked_into_sky
 			copy.weather = clock.weather
 			copy.last_weather = clock.last_weather
 			copy.weather_share = clock.weather_share

@@ -2,12 +2,13 @@
 // own and tell its players, stepped as a server would step it — on a fixed
 // tick (WORLD_TICK), not with the frames drawn.
 //
-// For now: its clock; its sky's climate and weather (by form id: what a
-// weather looks and sounds like is the viewer's to read), rolled from the
-// world's own seed; its players — where each is, as their client reports
-// it, the place they're in and the people in it, as they stand; the doors
-// that open in place, open or shut. (The sky's one for all the players:
-// the climate of the world the last came into.)
+// For now: its clock (one for everyone); its skies, each region's
+// weather (by form id: what a weather looks and sounds like is the
+// viewer's to read), rolled from the world's own seed, all ticking on
+// whether anyone's under them or not; its players — where each is, as
+// their client reports it, the sky they're under, the place they're in and
+// the people in it, as they stand; the doors that open in place, open or
+// shut.
 module world_state
 
 use mara.core
@@ -33,16 +34,25 @@ WEATHER_LEAST_HOURS :: 4
 WEATHER_MOST_HOURS :: 8
 // The hour the world starts at.
 START_HOUR :: 10
-// The players, the people in a player's place, and the doors the world
-// keeps, at most.
+// The players, the people in a player's place, the doors and the skies
+// the world keeps, at most (a sky for each region with weathers a player's
+// come into: Oblivion.esm has 59; and each climate's own).
 MAX_PLAYERS :: 8
 WORLD_ACTORS :: 512
 WORLD_DOORS :: 1024
+MAX_SKIES :: 128
+
+World_State_Error :: error {
+	Too_Many_Skies   // the world keeps MAX_SKIES skies at most
+}
 
 // A player, as their client reports them: their number (0: no one in this
 // slot), the world they're in (0 inside), where their feet are, which way
 // they face (radians from north toward east), how fast they're going
-// (units a second, across), whether they hurry time; the
+// (units a second, across), whether they hurry time; the sky they're under
+// — its climate (a CLMT's form id; 0 the default), which of the world's
+// skies (-1: none yet), whether they walked into it from another's (their
+// client blends it in) or came into it at once (through a door); the
 // place they're in — an interior (place_cell), or a world's cells round
 // place_x, place_y (place_world) — and the people in it (NPCs placed,
 // ACHR), as they stand now: where, turned how, how big.
@@ -53,6 +63,9 @@ Player_State :: struct {
 	yaw: f32
 	speed: f32
 	hurried: bool
+	climate: u32
+	sky: i64
+	walked_into_sky: bool
 	place_world: u32
 	place_cell: u32
 	place_x: i64
@@ -68,6 +81,24 @@ Door_State :: struct {
 	since: f64
 }
 
+// A sky the world keeps: whose it is (its source: a region with weathers,
+// by form id, or a climate's own, where no region's weathers come), the
+// weathers that may come under it; its weather — the one coming in and the
+// one going out (form ids; 0 for the default), how far in the new one is
+// (0 to 1), how long it takes to come in and how long it stays before the
+// next is chosen (the game's hours); the seed its choices are rolled from
+// (its own: the world's, mixed with its source).
+Region_Sky :: struct {
+	source: u32
+	weathers: [16]Weather_Chance
+	weather: u32
+	last_weather: u32
+	share: f32
+	transition: f32
+	hours_left: f32
+	seed: u64
+}
+
 World_State :: struct {
 	// What every chance its players roll alike is rolled from (chance_at:
 	// the birds they hear, thunder).
@@ -80,29 +111,15 @@ World_State :: struct {
 	seconds: f64
 	ticks: i64
 	hurried: bool
-	// The sky: its climate (a CLMT's, read: its form id 0 for the default;
-	// inside an interior lit by the sky, that interior's), and whether one's
-	// been taken yet; the weathers that may come where the player is. Its
-	// weather: the one coming in and the one going out (form ids; 0 for
-	// none yet), how far in the new one is (0 to 1), how long it takes to
-	// come in and how long it stays before the next is chosen (the game's
-	// hours); the seed every choice is rolled from.
-	climate: Climate
-	sky_taken: bool
-	weathers_here: [16]Weather_Chance
-	weather: u32
-	last_weather: u32
-	weather_share: f32
-	weather_transition: f32
-	weather_hours_left: f32
-	weather_seed: u64
+	// The skies: one for each source a player's been under.
+	skies: [MAX_SKIES]Region_Sky
 	// The players: a slot for each that may join.
 	players: [MAX_PLAYERS!]Player_State
 	// The doors that open in place that have been opened (or shut again).
 	doors: [WORLD_DOORS]Door_State
 }
 
-// A world starting: its clock at START_HOUR of its first day, no sky yet,
+// A world starting: its clock at START_HOUR of its first day, no skies yet,
 // its seed from the time it starts.
 world_start :: fun(state: ^World_State) {
 	state.hour = START_HOUR
@@ -110,23 +127,16 @@ world_start :: fun(state: ^World_State) {
 	state.seconds = 0
 	state.ticks = 0
 	state.hurried = false
-	state.climate = default_climate()
-	state.sky_taken = false
-	state.weathers_here.len = 0
-	state.weather = 0
-	state.last_weather = 0
-	state.weather_share = 1
-	state.weather_transition = 1
-	state.weather_hours_left = 0
 	state.seed = time_now() | 1
-	state.weather_seed = state.seed
+	state.skies.len = 0
 	for &player in state.players do player_clear(player, 0)
 	state.doors.len = 0
 }
 
 // Steps the world a tick (WORLD_TICK of real time): the clock on (faster
-// hurried), the weather coming in further, and when its hours are up the
-// next chosen (see world_change_weather for what it fails with).
+// hurried); under every sky, the weather coming in further, and when its
+// hours are up the next chosen. All are stepped whatever fails (the first
+// failure given back: see sky_change_weather).
 world_step :: fun(state: ^World_State, plugin: ^Plugin) -> err {
 	state.ticks += 1
 	state.seconds += WORLD_TICK
@@ -136,10 +146,15 @@ world_step :: fun(state: ^World_State, plugin: ^Plugin) -> err {
 		state.hour -= 24
 		state.day += 1
 	}
-	if not state.sky_taken do return
-	state.weather_share = min(1, state.weather_share + hours / max(state.weather_transition, 0.01))
-	state.weather_hours_left -= hours
-	if state.weather_hours_left <= 0 do world_change_weather(state, plugin, false)?
+	first_error : err
+	for &region_sky in state.skies {
+		region_sky.share = min(1, region_sky.share + hours / max(region_sky.transition, 0.01))
+		region_sky.hours_left -= hours
+		if region_sky.hours_left > 0 do continue
+		change_error := sky_change_weather(region_sky, plugin, false)
+		if change_error and not first_error do first_error = change_error
+	}
+	return first_error
 }
 
 // An hour of the game's day as a clock shows it: 07:03.
@@ -170,6 +185,9 @@ player_clear :: fun(player: ^Player_State, id: i64) {
 	player.yaw = 0
 	player.speed = 0
 	player.hurried = false
+	player.climate = 0
+	player.sky = -1
+	player.walked_into_sky = false
 	player.place_world = 0
 	player.place_cell = 0
 	player.place_x = 0
@@ -177,55 +195,88 @@ player_clear :: fun(player: ^Player_State, id: i64) {
 	player.actors.len = 0
 }
 
-// Takes a climate for the sky: the weathers that may come where a player
-// is. The weather goes on under the same climate (from Tamriel into a
-// city, and back); a first climate, or another, starts one of its own at
-// once. Taken whatever fails (the first failure given back).
-world_take_climate :: fun(state: ^World_State, plugin: ^Plugin, climate: ^Climate, player: ^Player_State) -> err {
-	same := state.sky_taken and climate.form_id == state.climate.form_id
-	state.climate = climate^
-	state.sky_taken = true
-	_, regions_error := world_weathers_here(state, plugin, player)
-	weather_error : err
-	if not same do weather_error = world_change_weather(state, plugin, true)
-	return if regions_error do regions_error else weather_error
-}
-
-// The weathers that may come where a player is: their cell's regions', or
-// the climate's (those too where the regions can't be read: why given
-// back). True when they're not the ones that could before.
-world_weathers_here :: fun(state: ^World_State, plugin: ^Plugin, player: ^Player_State) -> bool, err {
-	scratch : [256 * KB]byte
-	x, y := grid_of(player.feet)
-	found : [16]Weather_Chance
-	region_error := cell_weathers(plugin, player.world, x, y, &found, &scratch)
-	if region_error do found.len = 0
-	if found.len == 0 do found = state.climate.weathers
-	same := found.len == state.weathers_here.len
-	if same {
-		for possible, k in found {
-			if possible.weather != state.weathers_here[k].weather do same = false
-		}
+// Puts a player under the sky where they are, under a climate (by form
+// id): in a world, the sky of the region with weathers at their feet, else
+// the climate's own (that too where the regions can't be read); in an
+// interior lit by the sky, the climate's own — or, the same climate, the
+// sky they were under outside. A sky no one's been under yet is made (its
+// weathers the region's, else the climate's). walked: whether they walked
+// into it (their client blends it in) or came into it at once. Under a sky
+// whatever fails, as it can be (the first failure given back); under the
+// one they were when the world has no room for another.
+player_take_sky :: fun(state: ^World_State, plugin: ^Plugin, player: ^Player_State, climate_id: u32, walked: bool) -> err {
+	if player.world == 0 and player.sky >= 0 and player.climate == climate_id do return
+	player.climate = climate_id
+	source := climate_id
+	first_error : err
+	if player.world != 0 {
+		scratch : [256 * KB]byte
+		x, y := grid_of(player.feet)
+		region, region_error := cell_weather_region(plugin, player.world, x, y, &scratch)
+		if region_error do first_error = region_error
+		elif region != 0 do source = region
 	}
-	state.weathers_here = found
-	return not same, region_error
+	at := find_sky(state, source)
+	if at < 0 {
+		weathers : [16]Weather_Chance
+		if source != climate_id {
+			weathers_error := region_weathers(plugin, source, &weathers)
+			if weathers_error and not first_error do first_error = weathers_error
+		}
+		if weathers.len == 0 {
+			scratch : [256 * KB]byte
+			climate, climate_error := read_climate(plugin, climate_id, &scratch)
+			if climate_error and not first_error do first_error = climate_error
+			if not climate_error do weathers = climate.weathers
+		}
+		made, made_error := make_sky(state, plugin, source, &weathers)
+		if made_error and not first_error do first_error = made_error
+		at = made
+	}
+	if at >= 0 and at != player.sky {
+		player.sky = at
+		player.walked_into_sky = walked
+	}
+	return first_error
 }
 
-// Chooses the next weather among those that may come here, by their
-// chances, and how long it stays: coming in over its own time, or at once.
-// (A weather whose record can't be read comes in as the default would;
-// why's given back.)
-world_change_weather :: fun(state: ^World_State, plugin: ^Plugin, at_once: bool) -> err {
-	state.weather_hours_left = WEATHER_LEAST_HOURS + (WEATHER_MOST_HOURS - WEATHER_LEAST_HOURS) * random_share(&state.weather_seed)
-	chosen := pick_weather(&state.weathers_here, random_share(&state.weather_seed))
-	if chosen == state.weather and not at_once do return
+// Which of the world's skies is a source's (a region's, or a climate's
+// own); -1 for none yet.
+find_sky :: fun(state: ^World_State, source: u32) -> i64 {
+	for region_sky, k in state.skies {
+		if region_sky.source == source do return k
+	}
+	return -1
+}
+
+// A sky made for a source, with the weathers that may come under it: its
+// seed its own, its first weather in at once. Its index; -1 when the world
+// has no room for another (Too_Many_Skies). Made though its first weather
+// can't be read (why given back).
+make_sky :: fun(state: ^World_State, plugin: ^Plugin, source: u32, weathers: ^[]Weather_Chance) -> i64, err {
+	if not fits(state.skies.len + 1, state.skies.cap) do return -1, World_State_Error.Too_Many_Skies
+	&state.skies + Region_Sky{source = source, weathers = weathers^, weather = 0, last_weather = 0, share = 1, transition = 1, hours_left = 0,
+		seed = (state.seed ~ (u64(source) *% 0x9E3779B97F4A7C15)) | 1}
+	at := state.skies.len - 1
+	weather_error := sky_change_weather(&state.skies[at], plugin, true)
+	return at, weather_error
+}
+
+// Chooses a sky's next weather among those that may come under it, by
+// their chances, and how long it stays: coming in over its own time, or at
+// once. (A weather whose record can't be read comes in as the default
+// would; why's given back.)
+sky_change_weather :: fun(region_sky: ^Region_Sky, plugin: ^Plugin, at_once: bool) -> err {
+	region_sky.hours_left = WEATHER_LEAST_HOURS + (WEATHER_MOST_HOURS - WEATHER_LEAST_HOURS) * random_share(&region_sky.seed)
+	chosen := pick_weather(&region_sky.weathers, random_share(&region_sky.seed))
+	if chosen == region_sky.weather and not at_once do return
 	scratch : [256 * KB]byte
 	weather, weather_error := read_weather(plugin, chosen, &scratch)
 	if weather_error do weather = default_weather()
-	state.last_weather = if at_once do chosen else state.weather
-	state.weather = chosen
-	state.weather_transition = weather.transition
-	state.weather_share = if at_once do 1 else 0
+	region_sky.last_weather = if at_once do chosen else region_sky.weather
+	region_sky.weather = chosen
+	region_sky.transition = weather.transition
+	region_sky.share = if at_once do 1 else 0
 	return weather_error
 }
 
@@ -316,12 +367,4 @@ world_door_open :: fun(state: ^World_State, reference: u32) -> bool {
 		if door.reference == reference do return door.open
 	}
 	return false
-}
-
-// A player moved into other cells: the weathers that may come there, and
-// if they're others, the next soon.
-world_player_crossed :: fun(state: ^World_State, plugin: ^Plugin, player: ^Player_State) -> err {
-	others, regions_error := world_weathers_here(state, plugin, player)
-	if others do state.weather_hours_left = min(state.weather_hours_left, 0.1)
-	return regions_error
 }

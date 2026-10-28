@@ -219,16 +219,15 @@ add_weather_chances :: fun(plugin: ^Plugin, record: Record, pairs: []byte, chanc
 	}
 }
 
-// The weathers that may come at an exterior cell (its grid place in a
-// world): its regions' (XCLR) — the region with weathers of the highest
-// priority — else none (the climate's then). Into chances.
-cell_weathers :: fun(plugin: ^Plugin, world_id: u32, x: i64, y: i64, chances: ^[]Weather_Chance, scratch: ^[]byte) -> err {
-	chances.len = 0
+// The region whose weathers come at an exterior cell (its grid place in a
+// world): of the cell's regions (XCLR), the one with weathers of the
+// highest priority; 0 for none (the climate's weathers come there).
+cell_weather_region :: fun(plugin: ^Plugin, world_id: u32, x: i64, y: i64, scratch: ^[]byte) -> u32, err {
 	cell := exterior_cell(plugin, world_id, x, y)
-	if cell == 0 do return
+	if cell == 0 do return 0
 	cell_record := find_record(plugin, cell, scratch)?
 	regions, has_regions := find_field(cell_record.data, "XCLR")
-	if not has_regions do return
+	if not has_regions do return 0
 	best_priority : i64 = -1
 	best_region : u32 = 0
 	for k in 0:regions.len / 4 {
@@ -240,9 +239,14 @@ cell_weathers :: fun(plugin: ^Plugin, world_id: u32, x: i64, y: i64, chances: ^[
 			best_region = region
 		}
 	}
-	if best_region == 0 do return
+	return best_region
+}
+
+// The weathers that may come in a region (its RDWT), into chances.
+region_weathers :: fun(plugin: ^Plugin, region: u32, chances: ^[]Weather_Chance) -> err {
+	chances.len = 0
 	region_scratch : [65536]byte
-	record := find_record(plugin, best_region, &region_scratch)?
+	record := find_record(plugin, region, &region_scratch)?
 	fields := Fields{data = record.data, at = 0, broken = false}
 	for field in next_field(&fields) {
 		if field.kind == "RDWT" do add_weather_chances(plugin, record, field.data, chances)

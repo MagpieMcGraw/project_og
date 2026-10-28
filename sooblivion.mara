@@ -1839,9 +1839,11 @@ command_serve :: fun(port: i64, seconds: f64, open: bool) {
 }
 
 // `sooblivion world-run <world> <hours>`: the world's state run as a server
-// would run it, with no window: its clock and its sky's weather, the player
-// standing in the world's cell 0 0, stepped on its ticks (hurried) for that
-// many of the game's hours. Each weather that comes in is told of.
+// would run it, with no window: its clock and its skies, a player standing
+// in each of a few of the world's cells (under their regions' skies, or the
+// climate's), stepped on its ticks (hurried) for that many of the game's
+// hours. Each sky made, and each weather that comes in under one, is told
+// of.
 command_world_run :: fun(name: []utf8, hours: f32) {
 	index_storage : [96 * MB]byte = void
 	index_storage.len = 0
@@ -1862,28 +1864,39 @@ command_world_run :: fun(name: []utf8, hours: f32) {
 	if climate_error do climate = default_climate()
 	state : World_State
 	world_start(&state)
-	player := &state.players[0]
-	player_clear(player, 1)
-	player.world = world_id
 	state.hurried = true
 	start := time_now()
-	take_error := world_take_climate(&state, &plugin, &climate, player)
-	if take_error do print("couldn't read the regions or a weather: %", take_error)
-	print("climate %, % of day %: % comes in at once", editor_id_of(&plugin, climate.form_id), clock_text(state.hour), state.day,
-		editor_id_of(&plugin, state.weather))
+	print("climate %, % of day %", editor_id_of(&plugin, climate.form_id), clock_text(state.hour), state.day)
+	for place, k in [[-48, -9], [8, 30], [30, -30], [0, 0], [-20, 20], [1, 1]] {
+		player := &state.players[k]
+		player_clear(player, k + 1)
+		player.world = world_id
+		player.feet = Vec3{(f32(place[0]) + 0.5) * CELL_SIZE, (f32(place[1]) + 0.5) * CELL_SIZE, 0}
+		skies_before := state.skies.len
+		sky_error := player_take_sky(&state, &plugin, player, climate.form_id, false)
+		if sky_error do print("  at %: couldn't read the regions or a weather: %", place, sky_error)
+		if player.sky < 0 do continue
+		region_sky := &state.skies[player.sky]
+		print("  player % at %: under %'s sky%", player.id, place, editor_id_of(&plugin, region_sky.source),
+			if state.skies.len > skies_before do ", made: its weather comes in at once" else "")
+	}
+	for &region_sky in state.skies do print("  %: %", editor_id_of(&plugin, region_sky.source), editor_id_of(&plugin, region_sky.weather))
 	steps := i64(hours / world_tick_hours(&state))
 	changes : i64 = 0
 	for _ in 0:steps {
-		was := state.weather
+		was : [MAX_SKIES]u32
+		for region_sky in state.skies do &was + region_sky.weather
 		step_error := world_step(&state, &plugin)
 		if step_error do print("couldn't read a weather: %", step_error)
-		if state.weather != was {
+		for &region_sky, k in state.skies {
+			if region_sky.weather == was[k] do continue
 			changes += 1
-			print("  % of day %: % coming in over % hours, staying % more", clock_text(state.hour), state.day,
-				editor_id_of(&plugin, state.weather), state.weather_transition, state.weather_hours_left)
+			print("  % of day %, %: % coming in over % hours, staying % more", clock_text(state.hour), state.day,
+				editor_id_of(&plugin, region_sky.source), editor_id_of(&plugin, region_sky.weather), region_sky.transition, region_sky.hours_left)
 		}
 	}
-	print("% ticks (% of the game's hours) in % ms: % weathers came in", steps, hours, elapsed_ms(start), changes)
+	print("% ticks (% of the game's hours) in % ms: % weathers came in under % skies", steps, hours, elapsed_ms(start), changes,
+		state.skies.len)
 }
 
 // `sooblivion sky [world]`: the sky outside at hours through a day — its
@@ -1930,8 +1943,13 @@ command_sky :: fun(name: []utf8) {
 	// The weathers that may come at a few places: their regions'.
 	for place in [[-48, -9], [8, 30], [30, -30], [0, 0], [-20, 20]] {
 		chances : [16]Weather_Chance
-		region_error := cell_weathers(&plugin, world_id, place[0], place[1], &chances, &scratch)
+		region, region_error := cell_weather_region(&plugin, world_id, place[0], place[1], &scratch)
+		if region != 0 and not region_error do region_error = region_weathers(&plugin, region, &chances)
 		line : str1024
+		if region != 0 {
+			&line + editor_id_of(&plugin, region)
+			&line + ": "
+		}
 		for chance in chances {
 			&line + editor_id_of(&plugin, chance.weather)
 			&line + " "

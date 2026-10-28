@@ -143,11 +143,7 @@ server_run :: fun(server: ^World_Server, plugin: ^Plugin) {
 	state := &server.state
 	for &client, slot in server.clients {
 		if not client.here do continue
-		if server.clock_due {
-			wire_put(&client.to_client, MESSAGE_CLOCK, Clock_Message{seed = state.seed, hour = state.hour, day = state.day, seconds = state.seconds,
-				hurried = state.hurried, climate = state.climate.form_id, sky_taken = state.sky_taken, weather = state.weather,
-				last_weather = state.last_weather, weather_share = state.weather_share})
-		}
+		if server.clock_due do wire_put(&client.to_client, MESSAGE_CLOCK, clock_for(state, &state.players[slot]))
 		if client.people_due {
 			wire_put_list(&client.to_client, MESSAGE_PEOPLE, state.players[slot].actors)
 			client.people_due = false
@@ -170,6 +166,21 @@ server_run :: fun(server: ^World_Server, plugin: ^Plugin) {
 	}
 	server.clock_due = false
 	server.doors_due = false
+}
+
+// The clock, and the sky a player's under, as their client's told them.
+clock_for :: fun(state: ^World_State, player: ^Player_State) -> Clock_Message {
+	told := Clock_Message{seed = state.seed, hour = state.hour, day = state.day, seconds = state.seconds, hurried = state.hurried,
+		climate = player.climate, sky_taken = player.sky >= 0, sky_source = 0, walked_into_sky = player.walked_into_sky, weather = 0,
+		last_weather = 0, weather_share = 1}
+	if player.sky >= 0 {
+		region_sky := &state.skies[player.sky]
+		told.sky_source = region_sky.source
+		told.weather = region_sky.weather
+		told.last_weather = region_sky.last_weather
+		told.weather_share = region_sky.share
+	}
+	return told
 }
 
 // Takes in a message from a client (one the server doesn't take, or that
@@ -197,9 +208,10 @@ server_take :: fun(server: ^World_Server, plugin: ^Plugin, slot: i64, message: W
 }
 
 // A client's player has come into a place: the world takes it for them
-// (its people) and its sky — a world's climate as they come into it, again
-// its regions' weathers as they cross into other cells; an interior lit by
-// the sky, its own climate or the one outside's (a first sky: the fallback).
+// (its people) and puts them under its sky (player_take_sky) — coming into
+// a world, its climate's, at once; crossing into other cells, walked into;
+// an interior lit by the sky, under its own climate or the one outside's
+// (a first sky: the fallback).
 server_take_place :: fun(server: ^World_Server, plugin: ^Plugin, slot: i64, place: Place_Message) {
 	state := &server.state
 	player := &state.players[slot]
@@ -215,11 +227,11 @@ server_take_place :: fun(server: ^World_Server, plugin: ^Plugin, slot: i64, plac
 				server_note(server, slot, "couldn't read the world's climate: the default instead; ", climate_error)
 				climate = default_climate()
 			}
-			sky_error := world_take_climate(state, plugin, &climate, player)
+			sky_error := player_take_sky(state, plugin, player, climate.form_id, false)
 			if sky_error do server_note(server, slot, "couldn't read the regions here or a weather: the climate's or the default instead; ", sky_error)
 		else
-			crossed_error := world_player_crossed(state, plugin, player)
-			if crossed_error do server_note(server, slot, "couldn't read the regions here: the climate's weathers instead; ", crossed_error)
+			crossed_error := player_take_sky(state, plugin, player, player.climate, true)
+			if crossed_error do server_note(server, slot, "couldn't read the regions here or a weather: the climate's or the default instead; ", crossed_error)
 		}
 		people_error := player_take_area(player, plugin, place.world_id, place.x, place.y)
 		if people_error do server_note(server, slot, "couldn't read all of the place's people: ", people_error)
@@ -230,16 +242,9 @@ server_take_place :: fun(server: ^World_Server, plugin: ^Plugin, slot: i64, plac
 		behaves, climate_id, cell_error := cell_sky(plugin, place.cell, &scratch)
 		if cell_error do server_note(server, slot, "couldn't tell whether the cell is lit by the sky: ", cell_error)
 		if behaves and not cell_error {
-			if climate_id == 0 and not state.sky_taken do climate_id = fallback_climate(plugin, &scratch)
-			if climate_id != 0 {
-				climate, climate_error := read_climate(plugin, climate_id, &scratch)
-				if climate_error {
-					server_note(server, slot, "couldn't read the cell's climate: the default instead; ", climate_error)
-					climate = default_climate()
-				}
-				sky_error := world_take_climate(state, plugin, &climate, player)
-				if sky_error do server_note(server, slot, "couldn't read the regions here or a weather: the climate's or the default instead; ", sky_error)
-			}
+			if climate_id == 0 do climate_id = if player.sky >= 0 do player.climate else fallback_climate(plugin, &scratch)
+			sky_error := player_take_sky(state, plugin, player, climate_id, false)
+			if sky_error do server_note(server, slot, "couldn't read the cell's climate or a weather: the default instead; ", sky_error)
 		}
 	}
 	server.clients[slot].people_due = true
