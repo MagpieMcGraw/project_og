@@ -88,13 +88,15 @@ Picture :: struct {
 	pitch: f32
 	held: i64
 	held_at: f32
+	menu: i64            // a menu open in it (MENU_*); 0 for none
+	menu_page: i64       // the menu's page (1 to 5); 0 for its first
 }
 PICTURE_SETTLE :: 3
 PICTURE_MOST_FRAMES :: 6000
 
 // No picture: the window shown, as usual.
 no_picture :: fun() -> Picture {
-	return Picture{path = [], placed = false, position = Vec3{0, 0, 0}, yaw = 0, pitch = 0, held = -1, held_at = 0}
+	return Picture{path = [], placed = false, position = Vec3{0, 0, 0}, yaw = 0, pitch = 0, held = -1, held_at = 0, menu = 0, menu_page = 0}
 }
 // How much faster than ours the game's day goes (Oblivion's own), and,
 // with T held, how much faster again.
@@ -230,8 +232,21 @@ Viewer :: struct {
 	held: First_Person
 	// The HUD, and what it names: the reference the reticle is on (0 for none).
 	hud: Hud
-	// The game's menus read (the HUD's among them).
+	// The game's menus read (the HUD's among them); which one is open
+	// (MENU_*; 0 for none), the stats and map menus' roots (-1 till read),
+	// the player's arrow on the map (-1 till made), whether the mouse looked
+	// round before a menu took it.
 	book: Menu_Book
+	menu_open: i64
+	stats_menu: i64
+	map_menu: i64
+	map_arrow: i64
+	looking_before_menu: bool
+	// The player's stats, and the map of the world shown (map_world's).
+	player_stats: Player_Stats
+	world_map: World_Map
+	map_world: u32
+	start_date: Game_Date   // the day the game starts on (the map menu's date counts from it)
 	targeted: u32
 }
 
@@ -292,6 +307,13 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.held.instances.len = 0
 	viewer.hud.ready = false
 	viewer.targeted = 0
+	viewer.menu_open = 0
+	viewer.stats_menu = -1
+	viewer.map_menu = -1
+	viewer.map_arrow = -1
+	viewer.looking_before_menu = false
+	viewer.world_map.picture.len = 0
+	viewer.map_world = 0
 	renderer_init(&viewer.renderer, table_storage)?
 	note(&viewer.journal, if viewer.renderer.bindless_available do "the card draws bindless" else "the card can't draw bindless: textures are bound")
 	note(&viewer.journal, "; anisotropy ")
@@ -420,7 +442,27 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	input := &viewer.input
 
 	read_input(platform, input)
-	if input.quit or input.pressed[Escape] do return .quit
+	if input.quit do return .quit
+	// The menus: F1 the character's, F4 the map (its key again, or Escape,
+	// closes it; Escape with none open quits). While one is open its clicks
+	// are its, and nothing else of the keyboard or mouse reaches the game.
+	if input.pressed[F1] do toggle_menu(viewer, MENU_STATS)
+	if input.pressed[F4] do toggle_menu(viewer, MENU_MAP)
+	if input.pressed[Escape] {
+		if viewer.menu_open == 0 do return .quit
+		close_menu(viewer)
+	}
+	if viewer.menu_open != 0 {
+		if input.mouse_pressed[1] do click_menu(viewer, input.mouse_x, input.mouse_y)
+		for &down in input.held do down^ = false
+		for &down in input.pressed do down^ = false
+		for k in 0:6 {
+			input.mouse_pressed[k] = false
+			input.mouse_held[k] = false
+		}
+		input.mouse_moved_x = 0
+		input.mouse_moved_y = 0
+	}
 	if input.mouse_pressed[3] do set_mouse_look(platform, not platform.mouse_look)
 	if input.pressed[V] {
 		set_vsync(platform, not platform.vsync)
@@ -529,7 +571,9 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		shown.lights_changed = false
 	}
 	ui_begin(&viewer.renderer)
-	draw_hud(&viewer.hud, &viewer.book, &viewer.renderer, &viewer.archives, platform.width, platform.height, camera.yaw)
+	draw_hud(&viewer.hud, &viewer.book, &viewer.renderer, &viewer.archives, platform.width, platform.height, camera.yaw,
+		viewer.menu_open == 0)
+	draw_open_menu(viewer, platform.width, platform.height)
 	drawn, framebuffer_error := draw_frame(&viewer.renderer, &shown.models, &shown.instances, &shown.distant_instances, &shown.grounds,
 		&shown.waters, &shown.tree_cells, &shown.grass_cells, &viewer.held.instances, &viewer.look, shown.lighting, camera^,
 		platform.width, platform.height)
@@ -658,6 +702,20 @@ take_first_person :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	scratch : [32 * MB]byte
 	hud_error := book_open(&viewer.book, &viewer.renderer, &viewer.archives, &scratch)
 	if not hud_error do hud_error = load_hud(&viewer.hud, &viewer.book, &viewer.archives, viewer.held.weapon_icon, &scratch)
+	viewer.start_date = read_start_date(plugin)
+	stats_error := read_player_stats(plugin, &viewer.player_stats)
+	if stats_error {
+		note(&viewer.journal, "the player's stats couldn't be read: ")
+		note_error(&viewer.journal, stats_error)
+		note_end(&viewer.journal)
+	}
+	// A picture of a menu: it's open from the start.
+	if viewer.picture.menu != 0 {
+		toggle_menu(viewer, viewer.picture.menu)
+		page := f32(viewer.picture.menu_page)
+		if page > 0 and viewer.picture.menu == MENU_STATS do _ = book_set(&viewer.book, "StatsMenu", "user0", page)
+		if page > 0 and viewer.picture.menu == MENU_MAP do _ = book_set(&viewer.book, "map_background", "user0", page)
+	}
 	if hud_error {
 		note(&viewer.journal, "no HUD: ")
 		note_error(&viewer.journal, hud_error)
@@ -1559,6 +1617,11 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 			viewer.camera.yaw = there.rotation.z
 			viewer.camera.pitch = 0
 			place_walker(viewer)
+		}
+		// The map of the world shown, read when it changes.
+		if viewer.shown.world != 0 and viewer.shown.world != viewer.map_world {
+			viewer.map_world = viewer.shown.world
+			read_world_map(plugin, viewer.shown.world, &viewer.world_map)
 		}
 		// What the reticle is on, named for the HUD when it changes.
 		if viewer.targeted != viewer.hud.named {

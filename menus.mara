@@ -1080,6 +1080,103 @@ draw_menu_text :: fun(book: ^Menu_Book, item: Menu_Drawn, renderer: ^render.Rend
 	}
 }
 
+// Sets a trait of a tile (by index: a template's copy, say) as book_set
+// does one by name.
+book_set_on :: fun(book: ^Menu_Book, tile: i64, trait_name: []utf8, number: f32) {
+	if tile < 0 do return
+	trait := find_trait(book, tile, trait_name)
+	if trait < 0 do trait = new_trait(book, tile, trait_name)
+	if trait < 0 do return
+	held := &book.traits[trait]
+	held.set = true
+	held.value.number = number
+	held.value.is_text = false
+	held.value.text.len = 0
+}
+
+// The tile of a name in a menu (its root), not a template's; -1 for none.
+menu_tile :: fun(book: ^Menu_Book, menu: i64, name: []utf8) -> i64 {
+	if menu < 0 do return -1
+	if book.tiles[menu].name == name do return menu
+	found := named_child(book, menu, name, true)
+	if found >= 0 and book.tiles[found].in_template do return -1
+	return found
+}
+
+// A copy of a menu's template (by its name) put under a tile, as the
+// game makes the items of a list: the template's tile, its traits (their
+// operations shared) and what's under it. The copy's index; -1 when
+// there's no such template or no room.
+copy_template :: fun(book: ^Menu_Book, menu: i64, template_name: []utf8, parent: i64) -> i64 {
+	template := named_child(book, menu, template_name, true)
+	if template < 0 or book.tiles[template].kind != TILE_TEMPLATE do return -1
+	first := book.tiles[template].first_child
+	if first < 0 do return -1
+	return copy_tile(book, first, parent)
+}
+
+// A tile copied under a parent, its traits and its children with it.
+copy_tile :: fun(book: ^Menu_Book, tile: i64, parent: i64) -> i64 {
+	original := book.tiles[tile]
+	made := new_tile(book, original.kind, original.name, parent, false)
+	if made < 0 do return -1
+	// Its traits in the same order (new_trait puts each first: copied last first).
+	names : [256]i64
+	trait := original.first_trait
+	for trait >= 0 and fits(names.len + 1, names.cap) {
+		&names + trait
+		trait = book.traits[trait].next
+	}
+	for k in 0:names.len {
+		from := names[names.len - 1 - k]
+		copied := new_trait(book, made, book.traits[from].name)
+		if copied < 0 do break
+		book.traits[copied].first_operation = book.traits[from].first_operation
+		if book.traits[from].set {
+			book.traits[copied].set = true
+			book.traits[copied].value = book.traits[from].value
+		}
+	}
+	child := original.first_child
+	for child >= 0 {
+		_ = copy_tile(book, child, made)
+		child = book.tiles[child].next_sibling
+	}
+	return made
+}
+
+// What a click at x, y (the menus' units) would be on in a menu: the
+// deepest visible tile there with target &true;, by index; -1 for none.
+tile_at :: fun(book: ^Menu_Book, menu: i64, x: f32, y: f32, renderer: ^render.Renderer, archives: ^Archives) -> i64 {
+	found : i64 = -1
+	found_depth : f32 = -1000000
+	find_target(book, menu, 0, 0, 0, x, y, renderer, archives, &found, &found_depth)
+	return found
+}
+
+find_target :: fun(book: ^Menu_Book, tile: i64, parent_x: f32, parent_y: f32, parent_depth: f32, x: f32, y: f32,
+	renderer: ^render.Renderer, archives: ^Archives, found: ^i64, found_depth: ^f32)
+{
+	if book.tiles[tile].in_template do return
+	if trait_number(book, tile, "visible", renderer, archives) != MENU_TRUE do return
+	left := parent_x + trait_number(book, tile, "x", renderer, archives)
+	top := parent_y + trait_number(book, tile, "y", renderer, archives)
+	depth := parent_depth + trait_number(book, tile, "depth", renderer, archives)
+	if trait_number(book, tile, "target", renderer, archives) == MENU_TRUE {
+		width := trait_number(book, tile, "width", renderer, archives)
+		height := trait_number(book, tile, "height", renderer, archives)
+		if x >= left and x < left + width and y >= top and y < top + height and depth >= found_depth^ {
+			found^ = tile
+			found_depth^ = depth
+		}
+	}
+	child := book.tiles[tile].first_child
+	for child >= 0 {
+		find_target(book, child, left, top, depth, x, y, renderer, archives, found, found_depth)
+		child = book.tiles[child].next_sibling
+	}
+}
+
 // Starts a frame of the book's menus: their values worked out afresh.
 book_frame :: fun(book: ^Menu_Book) {
 	book.frame += 1

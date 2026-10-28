@@ -2550,7 +2550,8 @@ usage :: fun() {
 }
 
 // `sooblivion picture <out.png> <view | view-cell | view-world> … [at x y
-// z yaw pitch] [held <idle | right | left> <seconds>]`: what the view
+// z yaw pitch] [held <idle | right | left> <seconds>] [menu <stats |
+// map>[page]]`: what the view
 // command shows, drawn by the game's renderer in a window kept hidden,
 // without sound, once it's loaded; written to out.png. `at` places the
 // camera: where, and turned (degrees: yaw from north toward east, pitch
@@ -2560,6 +2561,18 @@ command_picture :: fun(args: [][]utf8) {
 	picture := no_picture()
 	&picture.path + args[0]
 	view := args[1 : args.len]
+	if view.len >= 3 and view[view.len - 2] == "menu" {
+		// A menu, and maybe its page: stats, stats2, map4...
+		which := view[view.len - 1]
+		page := which
+		if which.len > 0 and which[which.len - 1] >= '1' and which[which.len - 1] <= '5' {
+			picture.menu_page = i64(which[which.len - 1]) - i64('0')
+			page = which[0 : which.len - 1]
+		}
+		if page == "stats" do picture.menu = MENU_STATS
+		if page == "map" do picture.menu = MENU_MAP
+		view = view[0 : view.len - 2]
+	}
 	if view.len >= 4 and view[view.len - 3] == "held" {
 		which := view[view.len - 2]
 		picture.held = HELD_IDLE

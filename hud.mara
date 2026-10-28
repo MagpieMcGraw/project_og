@@ -101,12 +101,15 @@ load_hud :: fun(hud: ^Hud, book: ^Menu_Book, archives: ^Archives, weapon_icon: [
 }
 
 // Puts the HUD on the 2D layer for a screen width by height pixels, the
-// camera turned yaw (radians, from north, clockwise): what the game sets
-// in its menus set, then the menus drawn.
-draw_hud :: fun(hud: ^Hud, book: ^Menu_Book, renderer: ^render.Renderer, archives: ^Archives, width: i64, height: i64, yaw: f32) {
+// camera turned yaw (radians, from north, clockwise), exploring or in a
+// menu (no reticle then): what the game sets in its menus set, then the
+// menus drawn.
+draw_hud :: fun(hud: ^Hud, book: ^Menu_Book, renderer: ^render.Renderer, archives: ^Archives, width: i64, height: i64, yaw: f32,
+	exploring: bool)
+{
 	if not hud.ready do return
 	book_frame(book)
-	_ = book_set(book, "HUDMainMenu", "user3", 1)   // exploring (0: in a menu)
+	_ = book_set(book, "HUDMainMenu", "user3", if exploring do 1 else 0)
 	_ = book_set(book, "hudmain_health_full", "user0", hud.health)
 	_ = book_set(book, "hudmain_magic_full", "user0", hud.magicka)
 	_ = book_set(book, "hudmain_fatigue_full", "user0", hud.fatigue)
@@ -120,9 +123,9 @@ draw_hud :: fun(hud: ^Hud, book: ^Menu_Book, renderer: ^render.Renderer, archive
 	degrees := yaw * 180 / PI
 	degrees -= floor_f32(degrees / 360) * 360
 	_ = book_set(book, "hudmain_compass_window", "user0", degrees)
-	_ = book_set(book, "HUDReticle", "visible", MENU_TRUE)
+	_ = book_set(book, "HUDReticle", "visible", if exploring do MENU_TRUE else MENU_FALSE)
 	_ = book_set(book, "hudreticle_reticle", "user5", f32(hud.activate))
-	_ = book_set(book, "HUDInfoMenu", "visible", if hud.name.len > 0 do MENU_TRUE else MENU_FALSE)
+	_ = book_set(book, "HUDInfoMenu", "visible", if exploring and hud.name.len > 0 do MENU_TRUE else MENU_FALSE)
 	_ = book_set_text(book, "hudinfo_name", "string", hud.name)
 	draw_menu(book, hud.main_menu, renderer, archives, width, height)
 	draw_menu(book, hud.info_menu, renderer, archives, width, height)

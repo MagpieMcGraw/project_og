@@ -1,0 +1,375 @@
+// The menus F1 to F4 open (the game's StatsMenu and MapMenu so far), and
+// what the game fills them with: the player's stats, from their record
+// (Oblivion.esm's NPC_ Player, form id 7), and the world's map (its WRLD's
+// ICON picture and MNAM corners), the player marked on it. While one is
+// open the mouse moves a cursor, clicks pick its tabs, the world stands.
+module sooblivion
+
+use mara.core
+use mara.math
+use mara.memory
+use bsa
+use world
+use esm
+use sdl_platform
+use mara.string
+use logging
+render :: use render
+
+// Which menu is open (0 for none).
+MENU_STATS :: 1
+MENU_MAP :: 2
+// The map menu's world map page, and the zoom its map is drawn at (its
+// XML's: 200, a map texel two of the menus' units).
+MAP_WORLD_PAGE :: 2
+MAP_ZOOM :: 2
+// The world map icon that's the player's arrow (map_world_icon's user5).
+MAP_ICON_PLAYER :: 98
+
+// The player as the stats menu shows them: name, race, class, birthsign
+// (none: chosen when a character's made), level; their attributes
+// (strength, intelligence, willpower, agility, speed, endurance,
+// personality, luck) and skills (as the record has them); their health,
+// magicka and fatigue, now and at most.
+Player_Stats :: struct {
+	name: str64
+	race: str64
+	class_name: str64
+	birthsign: str64
+	level: i64
+	attributes: [8!]i64
+	skills: [21!]i64
+	health: f32
+	most_health: f32
+	magicka: f32
+	most_magicka: f32
+	fatigue: f32
+	most_fatigue: f32
+}
+
+// The player's stats from their record: its FULL name; its race's and
+// class's (RNAM, CNAM) names; its level (ACBS's, at 10); its skills and
+// attributes (DATA: 21 skills, base health, 8 attributes). Health,
+// magicka and fatigue as the game works out a character's first ones:
+// twice the endurance, twice the intelligence, strength, willpower,
+// agility and endurance added; full.
+read_player_stats :: fun(plugin: ^Plugin, stats: ^Player_Stats) -> err {
+	stats.name.len = 0
+	stats.race.len = 0
+	stats.class_name.len = 0
+	stats.birthsign.len = 0
+	stats.level = 1
+	for k in 0:8 do stats.attributes[k] = 0
+	for k in 0:21 do stats.skills[k] = 0
+	scratch : [256 * KB]byte
+	player := find_record(plugin, u32(PLAYER_NPC), &scratch)?
+	fields := Fields{data = player.data, at = 0, broken = false}
+	race_id : u32 = 0
+	class_id : u32 = 0
+	for field in next_field(&fields) {
+		if field.kind == "FULL" {
+			add_what_fits(&stats.name, field_text(field.data))
+		elif field.kind == "RNAM" and field.data.len >= 4
+			raw : u32 = field.data[0]
+			race_id = record_form(plugin, player, raw)
+		elif field.kind == "CNAM" and field.data.len >= 4
+			raw : u32 = field.data[0]
+			class_id = record_form(plugin, player, raw)
+		elif field.kind == "ACBS" and field.data.len >= 12
+			level : i16 = field.data[10]
+			stats.level = max(i64(level), 1)
+		elif field.kind == "DATA" and field.data.len >= 33
+			for k in 0:21 {
+				skill : u8 = field.data[k]
+				stats.skills[k] = i64(skill)
+			}
+			for k in 0:8 {
+				attribute : u8 = field.data[25 + k]
+				stats.attributes[k] = i64(attribute)
+			}
+		}
+	}
+	stats.race = record_full_name(plugin, race_id)
+	stats.class_name = record_full_name(plugin, class_id)
+	stats.most_health = f32(stats.attributes[5] * 2)
+	stats.most_magicka = f32(stats.attributes[1] * 2)
+	stats.most_fatigue = f32(stats.attributes[0] + stats.attributes[2] + stats.attributes[3] + stats.attributes[5])
+	stats.health = stats.most_health
+	stats.magicka = stats.most_magicka
+	stats.fatigue = stats.most_fatigue
+}
+
+// A day of the game's calendar: its day of the month (from 1), its month
+// (from 0: Morning Star), its year (of the third era).
+Game_Date :: struct {
+	day: i64
+	month: i64
+	year: i64
+}
+
+// The day the game starts on: its globals GameDay, GameMonth, GameYear
+// (27 Last Seed 433 in Oblivion.esm).
+read_start_date :: fun(plugin: ^Plugin) -> Game_Date {
+	date := Game_Date{day = 27, month = 7, year = 433}
+	date.day = i64(global_value(plugin, "GameDay", f32(date.day)))
+	date.month = i64(global_value(plugin, "GameMonth", f32(date.month)))
+	date.year = i64(global_value(plugin, "GameYear", f32(date.year)))
+	return date
+}
+
+// A global's value (its FLTV), or otherwise when there's none.
+global_value :: fun(plugin: ^Plugin, name: []utf8, otherwise: f32) -> f32 {
+	scratch : [64 * KB]byte
+	id, found := find_by_editor_id(plugin, name, &scratch)
+	if not found do return otherwise
+	record, record_error := find_record(plugin, id, &scratch)
+	if record_error do return otherwise
+	value_field, has_value := find_field(record.data, "FLTV")
+	if not has_value or value_field.len < 4 do return otherwise
+	value : f32 = value_field[0]
+	return value
+}
+
+// A month's name (from 0: Morning Star) and how many days it has.
+month_name :: fun(month: i64) -> str64 {
+	if month == 0 do return "Morning Star"
+	if month == 1 do return "Sun's Dawn"
+	if month == 2 do return "First Seed"
+	if month == 3 do return "Rain's Hand"
+	if month == 4 do return "Second Seed"
+	if month == 5 do return "Midyear"
+	if month == 6 do return "Sun's Height"
+	if month == 7 do return "Last Seed"
+	if month == 8 do return "Hearthfire"
+	if month == 9 do return "Frostfall"
+	if month == 10 do return "Sun's Dusk"
+	return "Evening Star"
+}
+
+month_days :: fun(month: i64) -> i64 {
+	if month == 1 do return 28
+	if month == 3 or month == 5 or month == 8 or month == 10 do return 30
+	return 31
+}
+
+// A date days after another, as the game writes it: "27th of Last Seed, 3E 433".
+date_text :: fun(start: Game_Date, days_gone: i64) -> str64 {
+	date := start
+	for k in 0:days_gone {
+		date.day += 1
+		if date.day > month_days(date.month) {
+			date.day = 1
+			date.month += 1
+			if date.month == 12 {
+				date.month = 0
+				date.year += 1
+			}
+		}
+	}
+	text : str64
+	add_what_fits(&text, int_text(date.day))
+	ones := date.day % 10
+	teens := date.day >= 11 and date.day <= 13
+	if ones == 1 and not teens {
+		add_what_fits(&text, "st")
+	elif ones == 2 and not teens
+		add_what_fits(&text, "nd")
+	elif ones == 3 and not teens
+		add_what_fits(&text, "rd")
+	else
+		add_what_fits(&text, "th")
+	}
+	add_what_fits(&text, " of ")
+	add_what_fits(&text, month_name(date.month))
+	add_what_fits(&text, ", 3E ")
+	add_what_fits(&text, int_text(date.year))
+	return text
+}
+
+// A record's name (FULL); empty for none.
+record_full_name :: fun(plugin: ^Plugin, form_id: u32) -> str64 {
+	name : str64
+	if form_id == 0 do return name
+	scratch : [64 * KB]byte
+	record, record_error := find_record(plugin, form_id, &scratch)
+	if record_error do return name
+	full_name, has_name := find_field(record.data, "FULL")
+	if has_name do add_what_fits(&name, field_text(full_name))
+	return name
+}
+
+// A world's map as the map menu draws it: its picture (the WRLD's ICON,
+// under textures\), the part of it the world covers (MNAM: its usable
+// width and height in texels) and the cells at its corners, north-west and
+// south-east. No picture: no map.
+World_Map :: struct {
+	picture: [128]utf8
+	usable_width: f32
+	usable_height: f32
+	west: f32
+	north: f32
+	east: f32
+	south: f32
+}
+
+// The map of a world (its record's ICON and MNAM; a world without them
+// shows its parent's, as the cities show Tamriel's).
+read_world_map :: fun(plugin: ^Plugin, world_id: u32, map: ^World_Map) {
+	map.picture.len = 0
+	scratch : [64 * KB]byte
+	at := world_id
+	for tries in 0:4 {
+		if at == 0 do return
+		record, record_error := find_record(plugin, at, &scratch)
+		if record_error do return
+		icon, has_icon := find_field(record.data, "ICON")
+		corners, has_corners := find_field(record.data, "MNAM")
+		if has_icon and has_corners and corners.len >= 16 {
+			&map.picture + "textures\\"
+			add_what_fits(&map.picture, field_text(icon))
+			width : u32 = corners[0]
+			height : u32 = corners[4]
+			west : i16 = corners[8]
+			north : i16 = corners[10]
+			east : i16 = corners[12]
+			south : i16 = corners[14]
+			map.usable_width = f32(width)
+			map.usable_height = f32(height)
+			map.west = f32(west)
+			map.north = f32(north)
+			map.east = f32(east)
+			map.south = f32(south)
+			return
+		}
+		parent, has_parent := find_field(record.data, "WNAM")
+		if not has_parent or parent.len < 4 do return
+		raw : u32 = parent[0]
+		at = record_form(plugin, record, raw)
+	}
+}
+
+// Where a place in the world is on its map, in texels from the map's top
+// left: its cell's place between the map's corners, across its usable part.
+map_place :: fun(map: ^World_Map, place: Vec3) -> f32, f32 {
+	cell_x := place.x / CELL_SIZE
+	cell_y := place.y / CELL_SIZE
+	across := map.usable_width / max_f32(map.east - map.west, 1)
+	down := map.usable_height / max_f32(map.north - map.south, 1)
+	return (cell_x - map.west) * across, (map.north - cell_y) * down
+}
+
+// Opens a menu (MENU_*), or closes it if it's the one open: read into the
+// book the first time; the cursor freed for it, the camera's mouse look
+// put back after.
+toggle_menu :: fun(viewer: ^Viewer, which: i64) {
+	if viewer.menu_open == which {
+		close_menu(viewer)
+		return
+	}
+	scratch : [16 * MB]byte
+	if which == MENU_STATS and viewer.stats_menu < 0 {
+		viewer.stats_menu, _ = book_read(&viewer.book, &viewer.archives, "menus\\main\\stats_menu.xml", &scratch)
+		if viewer.stats_menu < 0 do return
+	}
+	if which == MENU_MAP and viewer.map_menu < 0 {
+		viewer.map_menu, _ = book_read(&viewer.book, &viewer.archives, "menus\\main\\map_menu.xml", &scratch)
+		if viewer.map_menu < 0 do return
+	}
+	if viewer.menu_open == 0 do viewer.looking_before_menu = viewer.platform.mouse_look
+	viewer.menu_open = which
+	set_mouse_look(&viewer.platform, false)
+	if which == MENU_STATS do _ = book_set(&viewer.book, "StatsMenu", "user0", 1)
+	if which == MENU_MAP do _ = book_set(&viewer.book, "map_background", "user0", MAP_WORLD_PAGE)
+}
+
+close_menu :: fun(viewer: ^Viewer) {
+	if viewer.menu_open == 0 do return
+	viewer.menu_open = 0
+	set_mouse_look(&viewer.platform, viewer.looking_before_menu)
+}
+
+// The open menu's root tile; -1 for none.
+open_menu_tile :: fun(viewer: ^Viewer) -> i64 {
+	if viewer.menu_open == MENU_STATS do return viewer.stats_menu
+	if viewer.menu_open == MENU_MAP do return viewer.map_menu
+	return -1
+}
+
+// A click in the open menu at the mouse (window pixels): a page's tab
+// turns to that page (the tabs' ids are their pages).
+click_menu :: fun(viewer: ^Viewer, mouse_x: f32, mouse_y: f32) {
+	menu := open_menu_tile(viewer)
+	if menu < 0 do return
+	scale := f32(viewer.platform.height) / MENU_HEIGHT
+	book := &viewer.book
+	tile := tile_at(book, menu, mouse_x / scale, mouse_y / scale, &viewer.renderer, &viewer.archives)
+	if tile < 0 do return
+	name := book.tiles[tile].name[:]
+	page := i64(trait_number(book, tile, "id", &viewer.renderer, &viewer.archives))
+	if page < 1 or page > 5 do return
+	if viewer.menu_open == MENU_STATS and starts_with(name, "stat_tabs_p") do _ = book_set(book, "StatsMenu", "user0", f32(page))
+	if viewer.menu_open == MENU_MAP and starts_with(name, "map_tabs_p") do _ = book_set(book, "map_background", "user0", f32(page))
+}
+
+// Fills the open menu with what the game knows, then draws it.
+draw_open_menu :: fun(viewer: ^Viewer, width: i64, height: i64) {
+	menu := open_menu_tile(viewer)
+	if menu < 0 do return
+	if viewer.menu_open == MENU_STATS do fill_stats_menu(&viewer.book, &viewer.player_stats)
+	if viewer.menu_open == MENU_MAP do fill_map_menu(viewer)
+	draw_menu(&viewer.book, menu, &viewer.renderer, &viewer.archives, width, height)
+}
+
+// The stats menu's pages filled: the first (name, race, birthsign, class,
+// level, health, magicka and fatigue now and at most: stat_p1's user1 to
+// user11), the second (the attributes: stat_p2's user1 to user8, and as
+// they were made, user9 to user16).
+fill_stats_menu :: fun(book: ^Menu_Book, stats: ^Player_Stats) {
+	_ = book_set_text(book, "stat_p1", "user1", stats.name)
+	_ = book_set_text(book, "stat_p1", "user2", stats.race)
+	_ = book_set_text(book, "stat_p1", "user3", stats.birthsign)
+	_ = book_set_text(book, "stat_p1", "user4", stats.class_name)
+	_ = book_set(book, "stat_p1", "user5", f32(stats.level))
+	_ = book_set(book, "stat_p1", "user6", stats.health)
+	_ = book_set(book, "stat_p1", "user7", stats.most_health)
+	_ = book_set(book, "stat_p1", "user8", stats.magicka)
+	_ = book_set(book, "stat_p1", "user9", stats.most_magicka)
+	_ = book_set(book, "stat_p1", "user10", stats.fatigue)
+	_ = book_set(book, "stat_p1", "user11", stats.most_fatigue)
+	attribute_traits :: [16!][]utf8{"user1", "user2", "user3", "user4", "user5", "user6", "user7", "user8",
+		"user9", "user10", "user11", "user12", "user13", "user14", "user15", "user16"}
+	for k in 0:8 {
+		_ = book_set(book, "stat_p2", attribute_traits[k], f32(stats.attributes[k]))
+		_ = book_set(book, "stat_p2", attribute_traits[k + 8], f32(stats.attributes[k]))
+	}
+}
+
+// The map menu's world map filled: the world's picture, as big as its
+// texels at the map's zoom, centered on the player, their arrow on it.
+fill_map_menu :: fun(viewer: ^Viewer) {
+	book := &viewer.book
+	map := &viewer.world_map
+	if map.picture.len == 0 do return
+	picture := map.picture[9 : map.picture.len]   // (the filename trait is under textures\)
+	_ = book_set_text(book, "map_world_map", "filename", picture)
+	scratch : [16 * MB]byte
+	texture := render.texture_for(&viewer.renderer, &viewer.archives, map.picture, &scratch, render.CLAMP_BOTH)
+	if texture <= 0 do return
+	cached := &viewer.renderer.textures[texture]
+	_ = book_set(book, "map_world_map", "width", f32(cached.width * MAP_ZOOM))
+	_ = book_set(book, "map_world_map", "height", f32(cached.height * MAP_ZOOM))
+	x, y := map_place(map, viewer.camera.position)
+	// Its title: where the player is, and the day.
+	_ = book_set_text(book, "MapMenu", "user1", viewer.place)
+	_ = book_set_text(book, "MapMenu", "user2", date_text(viewer.start_date, viewer.day))
+	_ = book_set(book, "map_world_map", "user10", x * MAP_ZOOM)
+	_ = book_set(book, "map_world_map", "user11", y * MAP_ZOOM)
+	// The player's arrow: a copy of the menu's world icon, made once.
+	if viewer.map_arrow < 0 {
+		on := menu_tile(book, viewer.map_menu, "map_world_map")
+		if on >= 0 do viewer.map_arrow = copy_template(book, viewer.map_menu, "map_world_icon", on)
+	}
+	book_set_on(book, viewer.map_arrow, "user5", MAP_ICON_PLAYER)
+	book_set_on(book, viewer.map_arrow, "user1", x * MAP_ZOOM)
+	book_set_on(book, viewer.map_arrow, "user2", y * MAP_ZOOM)
+}
