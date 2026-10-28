@@ -18,6 +18,7 @@ use world
 use land
 use render
 use scene
+use logging
 
 // The body: its radius, its height, how high a step it climbs.
 WALKER_RADIUS :: 24
@@ -101,10 +102,10 @@ walk :: fun(walker: ^Walker, shown: ^Scene, going: Vec3, jump: bool, seconds: f3
 find_nearby :: fun(walker: ^Walker, shown: ^Scene, reach: f32, nearby: ^[]Nearby) {
 	middle := walker.position + Vec3{0, 0, WALKER_HEIGHT * 0.5}
 	for &instance in shown.instances {
-		if nearby.len == nearby.cap do return
 		range := shown.model_collision[instance.model]
 		if range.count == 0 do continue
 		if vec3_length(instance.center - middle) > instance.radius + reach do continue
+		if not fits(nearby.len + 1, nearby.cap) do return
 		nearby + Nearby{first = range.first, count = range.count, world = instance.world,
 			to_model = mat4_inverse(instance.world),
 			scale = vec3_length(Vec3{instance.world[0][0], instance.world[0][1], instance.world[0][2]})}

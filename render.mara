@@ -41,6 +41,7 @@ use world
 use land
 use sky
 use particles
+use logging
 
 // ---- sizes ---------------------------------------------------------------------
 
@@ -2314,7 +2315,7 @@ upload_distant_piece :: fun(renderer: ^Renderer, part: ^Model_Part, color_textur
 	vertex_count := part.vertices.len
 	index_count := part.indices.len
 	if vertex_count == 0 or index_count == 0 do return false
-	if renderer.distant_pieces.len == renderer.distant_pieces.cap do return false
+	if not fits(renderer.distant_pieces.len + 1, renderer.distant_pieces.cap) do return false
 	if renderer.distant_vertices_used + vertex_count > DISTANT_VERTEX_ROOM do return false
 	if renderer.distant_indices_used + index_count > DISTANT_INDEX_ROOM do return false
 
@@ -2398,13 +2399,13 @@ upload_trees :: fun(renderer: ^Renderer, trees: ^[]Placed_Tree, x: i64, y: i64, 
 		for run in placed.runs {
 			if run.texture == texture do seen = true
 		}
-		if seen or placed.runs.len == placed.runs.cap do continue
+		if seen or not fits(placed.runs.len + 1, placed.runs.cap) do continue
 		run := next(&placed.runs)
 		run.first = u32(instances.len)
 		run.count = 0
 		run.texture = texture
 		for tree in trees[k : trees.len] {
-			if tree.texture != texture or instances.len == instances.cap do continue
+			if tree.texture != texture or not fits(instances.len + 1, instances.cap) do continue
 			&instances + Tree_Instance{position = tree.position, width = tree.width, height = tree.height,
 				brightness = tree.brightness, handle = renderer.textures[texture].handle}
 			run.count += 1
@@ -2441,7 +2442,7 @@ draw_trees :: fun(renderer: ^Renderer, tree_cells: ^[]Gpu_Trees, hidden: ^Hidden
 		if hidden_cell_at(hidden, cell.x, cell.y) != near do continue
 		if not sphere_in_view(planes, cell.center, cell.radius) do continue
 		for run in cell.runs {
-			if renderer.tree_commands.len == renderer.tree_commands.cap do break
+			if not fits(renderer.tree_commands.len + 1, renderer.tree_commands.cap) do break
 			&renderer.tree_commands + Draw_Command{count = 6, instance_count = run.count, first_index = 0,
 				base_vertex = 0, base_instance = u32(cell.slot * TREES_PER_CELL) + run.first}
 		}
@@ -2532,7 +2533,7 @@ upload_grass :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, blades: ^[]Placed
 		if seen do continue
 		gpu := models[blade_model]
 		for p in 0:gpu.part_count {
-			if placed.runs.len == placed.runs.cap do break
+			if not fits(placed.runs.len + 1, placed.runs.cap) do break
 			part_index := gpu.first_part + p
 			part := renderer.parts[part_index]
 			// Grass is cut out of its texture, whatever its alpha says.
@@ -2545,7 +2546,7 @@ upload_grass :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, blades: ^[]Placed
 			run.first = u32(instances.len)
 			run.count = 0
 			for &blade in blades[k : blades.len] {
-				if blade.model != blade_model or instances.len == instances.cap do continue
+				if blade.model != blade_model or not fits(instances.len + 1, instances.cap) do continue
 				&instances + Grass_Instance{position = blade.position, angle = blade.angle, up = blade.up,
 					width = blade.width, normal = blade.normal, height = blade.height, brightness = blade.brightness,
 					threshold = threshold, wave_period = blade.wave_period, unused = 0, handle = handle}
@@ -2578,7 +2579,7 @@ draw_grass :: fun(renderer: ^Renderer, grass_cells: ^[]Gpu_Grass, planes: ^View_
 		if vec3_length(cell.center - camera.position) > fade_end + cell.radius do continue
 		if not sphere_in_view(planes, cell.center, cell.radius) do continue
 		for run in cell.runs {
-			if renderer.grass_commands.len == renderer.grass_commands.cap do break
+			if not fits(renderer.grass_commands.len + 1, renderer.grass_commands.cap) do break
 			part := &renderer.parts[run.part]
 			&renderer.grass_commands + Draw_Command{count = part.index_count, instance_count = run.count,
 				first_index = part.first_index, base_vertex = part.base_vertex,
@@ -2806,14 +2807,14 @@ texture_for :: fun(renderer: ^Renderer, archives: ^Archives, path: []utf8, scrat
 	if clamp_mode != REPEAT_BOTH do key = (key ~ (u64(clamp_mode + 1) *% 0x9E3779B97F4A7C15)) | 1
 	known, found := index_get(&renderer.texture_index, key)
 	if found do return known
-	if renderer.textures.len == renderer.textures.cap do return 0
+	if not fits(renderer.textures.len + 1, renderer.textures.cap) do return 0
 	id, has_alpha, load_error := load_texture(renderer, archives, path, scratch, clamp_mode)
 	slot : i64 = 0
 	if load_error {
 		renderer.texture_failures += 1
 		if renderer.texture_failures == 1 {
 			renderer.first_texture_failure.len = 0
-			&renderer.first_texture_failure + path[0 : min(path.len, renderer.first_texture_failure.cap)]
+			add_what_fits(&renderer.first_texture_failure, path)
 			renderer.first_texture_reason = load_error
 		}
 	else
@@ -2837,7 +2838,7 @@ texture_from_pixels :: fun(renderer: ^Renderer, path: []utf8, pixels: []byte, wi
 	key := text_hash(path)
 	known, found := index_get(&renderer.texture_index, key)
 	if found do return known
-	if renderer.textures.len == renderer.textures.cap or pixels.len < width * height * 4 do return 0
+	if not fits(renderer.textures.len + 1, renderer.textures.cap) or pixels.len < width * height * 4 do return 0
 	id : u32 = 0
 	GenTextures(1, &id)
 	BindTexture(TEXTURE_2D, id)
@@ -2851,7 +2852,7 @@ texture_from_pixels :: fun(renderer: ^Renderer, path: []utf8, pixels: []byte, wi
 	slot := renderer.textures.len
 	entry := next(&renderer.textures)
 	entry.path.len = 0
-	&entry.path + path[0 : min(path.len, entry.path.cap)]
+	add_what_fits(&entry.path, path)
 	entry.id = id
 	entry.handle = resident_handle(renderer, id)
 	entry.has_alpha = false
@@ -3155,7 +3156,7 @@ Light_Record :: struct {
 set_scene_lights :: fun(renderer: ^Renderer, lights: ^[]Point_Light) {
 	records : [SCENE_LIGHTS]Light_Record
 	for &light in lights {
-		if records.len == records.cap do break
+		if not fits(records.len + 1, records.cap) do break
 		at := light.position + light.drift
 		shown := light.color * light.brightness
 		&records + Light_Record{place = [at.x, at.y, at.z, light.radius], color = [shown.x, shown.y, shown.z, 0]}
@@ -3947,7 +3948,7 @@ draw_particles :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]I
 		seed := instance.reference
 		if seed == 0 do seed = u32(index)
 		for kind_index in placed_model.first_particles:placed_model.first_particles + placed_model.particles_count {
-			if renderer.particle_runs.len == renderer.particle_runs.cap do break
+			if not fits(renderer.particle_runs.len + 1, renderer.particle_runs.cap) do break
 			first := renderer.particle_vertices.len / 4
 			add_particle_squares(&renderer.particle_kinds[kind_index].system, instance.world, f64(time),
 				seed ~ u32(kind_index * 7919), camera_right, camera_up, lighting.ambient, lighting.directional,

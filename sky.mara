@@ -14,6 +14,7 @@ use mara.math
 use mara.string
 use world
 use esm
+use logging
 
 // The weather's colors, as NAM0 lists them.
 SKY_UPPER    :: 0
@@ -203,7 +204,7 @@ read_climate :: fun(plugin: ^Plugin, climate_id: u32, scratch: ^[]byte) -> Clima
 // into chances.
 add_weather_chances :: fun(plugin: ^Plugin, record: Record, pairs: []byte, chances: ^[]Weather_Chance) {
 	for k in 0:pairs.len / 8 {
-		if chances.len == chances.cap do return
+		if not fits(chances.len + 1, chances.cap) do return
 		weather : u32 = pairs[k * 8]
 		chance : i32 = pairs[k * 8 + 4]
 		if weather != 0 and chance > 0 do chances + Weather_Chance{weather = record_form(plugin, record, weather), chance = i64(chance)}
@@ -282,7 +283,7 @@ cell_region_sounds :: fun(plugin: ^Plugin, world_id: u32, x: i64, y: i64, sounds
 		for field in next_field(&fields) {
 			if field.kind != "RDSD" do continue
 			for e in 0:field.data.len / 12 {
-				if sounds.len == sounds.cap do return
+				if not fits(sounds.len + 1, sounds.cap) do return
 				sound : u32 = field.data[e * 12]
 				weathers : u32 = field.data[e * 12 + 4]
 				chance : u32 = field.data[e * 12 + 8]
@@ -298,7 +299,7 @@ mesh_path_of :: fun(name: []utf8, path: ^[160]utf8) {
 	if name.len == 0 do return
 	path + "meshes\\"
 	for c in name {
-		if path.len == path.cap do break
+		if not fits(path.len + 1, path.cap) do break
 		if c == '/' do path + '\\'
 		else do path + lower(c)
 	}
@@ -357,7 +358,7 @@ texture_path_of :: fun(name: []utf8, path: ^[160]utf8) {
 	if name.len == 0 do return
 	path + "textures\\"
 	for c in name {
-		if path.len == path.cap do break
+		if not fits(path.len + 1, path.cap) do break
 		if c == '/' do path + '\\'
 		else do path + lower(c)
 	}
@@ -421,7 +422,7 @@ read_weather :: fun(plugin: ^Plugin, weather_id: u32, scratch: ^[]byte) -> Weath
 	}
 	sounds := Fields{data = record.data, at = 0, broken = false}
 	for field in next_field(&sounds) {
-		if field.kind != "SNAM" or field.data.len < 8 or weather.sounds.len == weather.sounds.cap do continue
+		if field.kind != "SNAM" or field.data.len < 8 or not fits(weather.sounds.len + 1, weather.sounds.cap) do continue
 		sound : u32 = field.data[0]
 		role : u32 = field.data[4]
 		&weather.sounds + Weather_Sound{sound = record_form(plugin, record, sound), role = role}

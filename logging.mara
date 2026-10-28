@@ -89,3 +89,82 @@ note_end :: fun(journal: ^Journal) {
 	}
 	journal.line.len = 0
 }
+
+// ---- lists found full -----------------------------------------------------------
+
+// Where lists found full are told: a line each time, saying where the
+// check is (and the fun it's in), how much room the list has and how much
+// was wanted. The game starts it afresh (full_log_start); the commands add
+// to it. It stops growing at FULL_LOG_MOST bytes.
+FULL_LOG_PATH :: "full.log"
+FULL_LOG_MOST :: 1048576
+
+// Whether wanted items fit in a list's room (its len, plus what's to go
+// in; its cap). When they don't, the full log says so:
+//
+//     if not fits(lights.len + 1, lights.cap) do return
+//
+// (Not a generic fun taking the list: a generic's params can't have
+// defaults yet, and site and caller need theirs.)
+fits :: fun(wanted: i64, room: i64, site: atom = #caller_span, caller: atom = #caller_name) -> bool {
+	if wanted <= room do return true
+	note_full(room, wanted, site, caller)
+	return false
+}
+
+// Adds as much of more to text as there's room for. When some is left off,
+// the full log says so.
+add_what_fits :: fun(text: ^[]utf8, more: []utf8, site: atom = #caller_span, caller: atom = #caller_name) {
+	if text.len + more.len <= text.cap {
+		text + more
+		return
+	}
+	note_full(text.cap, text.len + more.len, site, caller)
+	text + more[0 : text.cap - text.len]
+}
+
+// A line in the full log: what's checked at site (in caller) has room for
+// room, and wanted as much as wanted.
+note_full :: fun(room: i64, wanted: i64, site: atom = #caller_span, caller: atom = #caller_name) {
+	line : str1024
+	&line + site
+	&line + " in "
+	&line + caller
+	&line + ": full at "
+	&line + int_text(room)
+	&line + ", wanted "
+	&line + int_text(wanted)
+	&line + "\n"
+	_ = add_to_file(FULL_LOG_PATH, line, FULL_LOG_MOST)   // (a log that can't be written has nowhere to say so)
+}
+
+// Starts the full log afresh.
+full_log_start :: fun() {
+	file, open_error := file_open_write(FULL_LOG_PATH)
+	if not open_error do file_close(file)
+}
+
+// CreateFileW, to open a file for adding to its end: mara.os opens files
+// to read or to write over, and binds CreateFileA itself (MARA_ISSUES.md).
+foreign static_lib "kernel32" {
+	fun CreateFileW(name: ^u16, access: u32, share: u32, security: ^byte, disposition: u32, flags: u32, template: File_Id) -> File_Id
+}
+FILE_APPEND_DATA :: 0x0004
+
+// Adds text to the end of the file at path (made if it isn't there), unless
+// that would make it longer than most bytes. (The path's letters are taken
+// one to a UTF-16 unit: ASCII paths only.)
+add_to_file :: fun(path: []utf8, text: []utf8, most: i64) -> err {
+	wide : [261]u16
+	for c in path {
+		if wide.len == wide.cap - 1 do return File_Error.Open_Failed
+		&wide + u16(c)
+	}
+	&wide + u16(0)
+	id := CreateFileW(wide.ptr, FILE_APPEND_DATA, FILE_SHARE_READ, void, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NO_FILE)
+	if id == INVALID_HANDLE_VALUE do return File_Error.Open_Failed
+	defer file_close(id)
+	size := file_size(id)?
+	if size + text.len > most do return
+	file_write_text(id, text)?
+}

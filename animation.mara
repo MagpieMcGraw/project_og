@@ -11,6 +11,7 @@ use mara.core
 use mara.math
 use mara.string
 use nif
+use logging
 
 // A node's movement in one sequence: its keys (times in seconds; each kind
 // carved from a room as long as the file has it), and its pose where they
@@ -31,17 +32,17 @@ Track :: struct {
 // Room for a track's keys of a kind, count of them, carved from room
 // (empty, its len 0): none when room hasn't that much left.
 key_times_room :: fun(room: ^[]byte, count: i64) -> []f32 {
-	if room.cap - room.len < count * 4 + 16 do return slice([:0]f32, room)
+	if not fits(room.len + count * 4 + 16, room.cap) do return slice([:0]f32, room)
 	return slice([:count]f32, room)
 }
 
 rotations_room :: fun(room: ^[]byte, count: i64) -> [][4!]f32 {
-	if room.cap - room.len < count * 16 + 16 do return slice([:0][4!]f32, room)
+	if not fits(room.len + count * 16 + 16, room.cap) do return slice([:0][4!]f32, room)
 	return slice([:count][4!]f32, room)
 }
 
 translations_room :: fun(room: ^[]byte, count: i64) -> []Vec3 {
-	if room.cap - room.len < count * 12 + 16 do return slice([:0]Vec3, room)
+	if not fits(room.len + count * 12 + 16, room.cap) do return slice([:0]Vec3, room)
 	return slice([:count]Vec3, room)
 }
 
@@ -75,7 +76,7 @@ read_tracks :: fun(mesh: ^Nif, sequence_index: i64, tracks: ^[]Track, room: ^[]b
 	match mesh.blocks[sequence_index] {
 	Sequence sequence
 		for b in 0:sequence.block_count {
-			if sequence.blocks.len < (b + 1) * CONTROLLED_BLOCK_SIZE or tracks.len == tracks.cap do return
+			if sequence.blocks.len < (b + 1) * CONTROLLED_BLOCK_SIZE or not fits(tracks.len + 1, tracks.cap) do return
 			at := b * CONTROLLED_BLOCK_SIZE
 			interpolator : i32 = sequence.blocks[at]
 			palette : i32 = sequence.blocks[at + 9]
@@ -109,7 +110,7 @@ palette_name :: fun(mesh: ^Nif, palette_index: i64, offset: i64, name: ^[64]utf8
 		at := offset
 		for at < palette.text.len {
 			c : u8 = palette.text[at]
-			if c == 0 or name.len == name.cap do return
+			if c == 0 or not fits(name.len + 1, name.cap) do return
 			name + utf8(c)
 			at += 1
 		}
@@ -146,7 +147,7 @@ read_track_keys :: fun(mesh: ^Nif, interpolator_index: i64, track: ^Track, room:
 			Transform_Data data
 				rotation_size := rotation_key_bytes(data.rotation_type)
 				for k in 0:data.rotation_count {
-					if track.rotations.len == track.rotations.cap do break
+					if not fits(track.rotations.len + 1, track.rotations.cap) do break
 					time : f32 = data.rotations[k * rotation_size]
 					rotation : [4!]f32 = data.rotations[k * rotation_size + 4]
 					&track.rotation_times + time
@@ -155,7 +156,7 @@ read_track_keys :: fun(mesh: ^Nif, interpolator_index: i64, track: ^Track, room:
 				read_angle_keys(data.angles, track, room)
 				translation_size := key_bytes(data.translation_type, 12)
 				for k in 0:data.translation_count {
-					if track.translations.len == track.translations.cap do break
+					if not fits(track.translations.len + 1, track.translations.cap) do break
 					time : f32 = data.translations[k * translation_size]
 					translation : Vec3 = data.translations[k * translation_size + 4]
 					&track.translation_times + time
@@ -221,7 +222,7 @@ read_spline_keys :: fun(mesh: ^Nif, spline: Spline_Transform, track: ^Track, roo
 	for s in 0:samples {
 		share := f32(s) / f32(samples - 1)
 		time := spline.start_time + duration * share
-		if rotating and track.rotations.len < track.rotations.cap {
+		if rotating and fits(track.rotations.len + 1, track.rotations.cap) {
 			q := spline_value(spline, data, control_points, 1, 4, share)
 			size := sqrt_f32(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3])
 			if size > 0 {
@@ -230,7 +231,7 @@ read_spline_keys :: fun(mesh: ^Nif, spline: Spline_Transform, track: ^Track, roo
 			&track.rotation_times + time
 			&track.rotations + q
 		}
-		if shifting and track.translations.len < track.translations.cap {
+		if shifting and fits(track.translations.len + 1, track.translations.cap) {
 			p := spline_value(spline, data, control_points, 0, 3, share)
 			&track.translation_times + time
 			&track.translations + Vec3{p[0], p[1], p[2]}
@@ -307,7 +308,7 @@ read_angle_keys :: fun(angles: []byte, track: ^Track, room: ^[]byte) {
 			if at + size > angles.len do return
 			time : f32 = angles[at]
 			angle : f32 = angles[at + 4]
-			if track.angles[axis].len < track.angles[axis].cap {
+			if fits(track.angles[axis].len + 1, track.angles[axis].cap) {
 				&track.angle_times[axis] + time
 				&track.angles[axis] + angle
 			}

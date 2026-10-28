@@ -13,6 +13,7 @@ use mara.math
 use mara.string
 use esm
 use world
+use logging
 
 LAND_SIDE :: 33        // vertices along a cell's side
 LAND_SPACING :: 128    // units between them
@@ -83,7 +84,7 @@ read_land :: fun(plugin: ^Plugin, record: Record, land: ^Land) {
 			quadrant : u8 = bytes[4]
 			layer_quadrant = -1
 			layers := &land.quadrants[i64(quadrant) & 3].layers
-			if quadrant < 4 and layers.len < layers.cap {
+			if quadrant < 4 and fits(layers.len + 1, layers.cap) {
 				layer_quadrant = i64(quadrant)
 				layer := next(layers)
 				layer.texture = record_form(plugin, record, texture)
@@ -174,7 +175,7 @@ land_texture_path :: fun(plugin: ^Plugin, texture: u32, path: ^[160]utf8, scratc
 			if has_icon {
 				path + "textures\\landscape\\"
 				for c in field_text(icon) {
-					if path.len == path.cap do break
+					if not fits(path.len + 1, path.cap) do break
 					if c == '/' do path + '\\'
 					else do path + lower(c)
 				}

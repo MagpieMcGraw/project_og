@@ -12,6 +12,7 @@ use mara.core
 use mara.math
 use model
 use nif
+use logging
 
 // A corner of a particle's square, as the particle program reads it: where
 // it is in the world, its texture coordinates, its color (the light it
@@ -85,6 +86,7 @@ add_particle_squares :: fun(system: ^Model_Particles, world: Mat4, seconds: f64,
 		if system.random_sign and chance(seed, number, 11) < 0.5 do turning = -turning
 		angle += turning * age
 
+		if not fits(vertices.len + 4, vertices.cap) do break
 		center := mat4_mul_vec4(world, Vec4{position.x, position.y, position.z, 1})
 		add_square(vertices, Vec3{center.x, center.y, center.z}, radius, angle, camera_right, camera_up,
 			[light.x, light.y, light.z, opacity])

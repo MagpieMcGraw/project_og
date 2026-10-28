@@ -10,6 +10,7 @@ use mara.core
 use mara.math
 use mara.string
 use esm
+use logging
 
 // What finding things in the world can fail with.
 World_Error :: error {
@@ -343,7 +344,7 @@ cell_references :: fun(plugin: ^Plugin, cell: u32, references: ^[]Reference) -> 
 			next_at := at + HEADER_SIZE + i64(header.size)
 			if next_at > end do return Broken_Group
 			placed := header.kind == "REFR" or header.kind == "ACHR"
-			if placed and references.len < references.cap and winning_copy(plugin, file, header, at) {
+			if placed and fits(references.len + 1, references.cap) and winning_copy(plugin, file, header, at) {
 				body := plugin.data[at + HEADER_SIZE : next_at]
 				references + read_reference(plugin, file, header, body)
 			}
@@ -379,7 +380,7 @@ cell_distant_references :: fun(plugin: ^Plugin, cell: u32, references: ^[]Refere
 				for place < inner_end {
 					header : Record_Header = plugin.data[place]
 					next_place := place + HEADER_SIZE + i64(header.size)
-					if header.kind == "REFR" and references.len < references.cap and winning_copy(plugin, file, header, place) {
+					if header.kind == "REFR" and fits(references.len + 1, references.cap) and winning_copy(plugin, file, header, place) {
 						references + read_reference(plugin, file, header, plugin.data[place + HEADER_SIZE : next_place])
 					}
 					place = next_place
@@ -426,7 +427,7 @@ model_path :: fun(record: Record) -> [256]utf8 {
 	if name.len == 0 do return path
 	&path + "meshes\\"
 	for c in name {
-		if path.len == path.cap do break
+		if not fits(path.len + 1, path.cap) do break
 		if c == '/' do &path + '\\'
 		else do &path + lower(c)
 	}
@@ -607,7 +608,7 @@ sound_kind_of :: fun(base: Record) -> Sound_Kind, bool {
 	if name.len == 0 do return kind, false
 	&kind.path + "sound\\"
 	for c in name {
-		if kind.path.len == kind.path.cap do break
+		if not fits(kind.path.len + 1, kind.path.cap) do break
 		if c == '/' do &kind.path + '\\'
 		else do &kind.path + lower(c)
 	}
@@ -662,7 +663,9 @@ place_music :: fun(plugin: ^Plugin, cell: u32, world_id: u32, scratch: ^[]byte) 
 		if has_own and own.len > 0 and own[0] != 0 do return i64(own[0])
 		region_ids, has_regions := find_field(cell_record.data, "XCLR")
 		if has_regions {
-			for k in 0:min(region_ids.len / 4, regions.cap) {
+			count := region_ids.len / 4
+			if not fits(regions.len + count, regions.cap) do count = regions.cap - regions.len
+			for k in 0:count {
 				region : u32 = region_ids[k * 4]
 				&regions + record_form(plugin, cell_record, region)
 			}
@@ -883,7 +886,7 @@ tree_look :: fun(base: Record) -> Tree_Look, bool {
 	seeds, has_seeds := find_field(base.data, "SNAM")
 	if has_seeds {
 		for k in 0:seeds.len / 4 {
-			if look.seeds.len == look.seeds.cap do break
+			if not fits(look.seeds.len + 1, look.seeds.cap) do break
 			seed : u32 = seeds[4 * k]
 			&look.seeds + i64(seed)
 		}

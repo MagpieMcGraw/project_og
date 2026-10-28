@@ -20,6 +20,7 @@ module facegen
 
 use mara.core
 use mara.math
+use logging
 
 FACE_SYMMETRIC :: 50
 FACE_ASYMMETRIC :: 30
@@ -65,8 +66,9 @@ morph_size :: fun(morphs: ^Shape_Morphs) -> i64 {
 // How far each vertex moves for a face, into moves (len set: as many as
 // the morphs have vertices, or as moves holds).
 face_moves :: fun(morphs: ^Shape_Morphs, face: ^Face_Values, moves: ^[]Vec3) {
-	count := min(morphs.vertex_count, moves.cap)
 	moves.len = 0
+	count := morphs.vertex_count
+	if not fits(moves.len + count, moves.cap) do count = moves.cap
 	for k in 0:count do moves + Vec3{0, 0, 0}
 	for m in 0:morphs.symmetric + morphs.asymmetric {
 		value : f32 = 0
@@ -148,7 +150,7 @@ face_map :: fun(morphs: ^Texture_Morphs, face: ^Face_Values, out: ^[]byte) {
 // all red, green, blue, alpha, rows from the top. The base's alpha stays.
 skin_from_map :: fun(base: []byte, base_width: i64, base_height: i64, map: []byte, map_width: i64, map_height: i64, out: ^[]byte) {
 	out.len = 0
-	if map_width * map_height * 4 > out.cap or map.len < map_width * map_height * 4 do return
+	if not fits(out.len + map_width * map_height * 4, out.cap) or map.len < map_width * map_height * 4 do return
 	for row in 0:map_height {
 		for column in 0:map_width {
 			color := base_color(base, base_width, base_height, (f32(column) + 0.5) / f32(map_width), (f32(row) + 0.5) / f32(map_height))

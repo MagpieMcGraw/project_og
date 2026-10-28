@@ -27,6 +27,7 @@ use mara.core
 use mara.math
 use mara.string
 use model
+use logging
 
 MAX_TREE_LEVELS :: 8
 MAX_TREE_LEAVES :: 8
@@ -308,7 +309,7 @@ bark_name :: fun(path: []utf8, name: ^[64]utf8) {
 		if path[k] == '.' do end = k
 	}
 	for k in start:end {
-		if name.len < name.cap do name + lower(path[k])
+		if fits(name.len + 1, name.cap) do name + lower(path[k])
 	}
 }
 
@@ -329,7 +330,7 @@ read_curve :: fun(text: []utf8, curve: ^Tree_Curve) -> err {
 		tangent_x := next_number(text, &at)?
 		tangent_y := next_number(text, &at)?
 		reach := next_number(text, &at)?
-		if curve.points.len < curve.points.cap do &curve.points + Curve_Point{x = x, y = y, tangent = [tangent_x, tangent_y], reach = reach}
+		if fits(curve.points.len + 1, curve.points.cap) do &curve.points + Curve_Point{x = x, y = y, tangent = [tangent_x, tangent_y], reach = reach}
 	}
 	if curve.points.len == 0 do return Bad_Curve
 }
@@ -549,7 +550,9 @@ grow_branch :: fun(growth: ^Growth, level_index: i64, start: Vec3, way: Vec3, br
 	heading := way
 	wander := level.disturbance.variance * PI / 180
 	step := branch_length / f32(along)
-	for k in 0:min(along, spine.cap - 1) {
+	steps := along
+	if not fits(spine.len + steps, spine.cap) do steps = spine.cap - spine.len
+	for k in 0:steps {
 		if wander != 0 {
 			turning := turned_about(square_to(heading), heading, roll(&growth.dice) * 2 * PI)
 			heading = vec3_normalize(turned_about(heading, turning, (2 * roll(&growth.dice) - 1) * wander / f32(along)))
@@ -808,7 +811,7 @@ tree_part :: fun(growth: ^Growth, leaves: bool, texture: []utf8) -> Model_Part {
 		lighting_mode = 1,
 		leaf_cards = leaves,
 		influences = []}
-	&part.texture + texture[0 : min(texture.len, part.texture.cap)]
+	add_what_fits(&part.texture, texture)
 	return part
 }
 

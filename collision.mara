@@ -13,6 +13,7 @@ use mara.core
 use mara.math
 use nif
 use model
+use logging
 
 // Game units in one of Havok's.
 HAVOK_SCALE :: 7
@@ -189,7 +190,7 @@ add_point :: fun(placed: Mat4, local: Vec3, points: ^[]Vec3) {
 
 // Adds a triangle, its corners placed — all three, or none when there's no room.
 add_triangle :: fun(placed: Mat4, a: Vec3, b: Vec3, c: Vec3, points: ^[]Vec3) {
-	if points.len + 3 > points.cap do return
+	if not fits(points.len + 3, points.cap) do return
 	add_point(placed, a, points)
 	add_point(placed, b, points)
 	add_point(placed, c, points)
@@ -256,7 +257,7 @@ add_convex :: fun(vertex_count: i64, vertices: []byte, plane_count: i64, planes:
 		on : [64]Vec3
 		for v in 0:vertex_count {
 			corner : Vec3 = vertices[v * 16]
-			if abs_f32(dot(normal, corner) + plane[3]) < ON_PLANE and on.len < on.cap do &on + corner
+			if abs_f32(dot(normal, corner) + plane[3]) < ON_PLANE and fits(on.len + 1, on.cap) do &on + corner
 		}
 		if on.len < 3 do continue
 		middle := Vec3{0, 0, 0}

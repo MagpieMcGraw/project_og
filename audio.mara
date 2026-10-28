@@ -16,6 +16,7 @@ use mara.string
 use mara.sdl
 use bsa
 use world
+use logging
 
 // The mix: its rate, and how far ahead of what's heard it's kept (frames:
 // what a slow frame of the game can take before the sound stops).
@@ -271,7 +272,7 @@ plays_at_hour :: fun(kind: ^Sound_Kind, hour: f32) -> bool {
 // looping one from a place in its clip at random, so loops of one sound
 // don't play in step): its index, -1 when no voice is free.
 start_voice :: fun(audio: ^Mixer, kind: ^Sound_Kind, clip_index: i64, source: u64, gains: [2!]f32, looping: bool) -> i64 {
-	if audio.voices.len == audio.voices.cap do return -1
+	if not fits(audio.voices.len + 1, audio.voices.cap) do return -1
 	clip := audio.clips[clip_index]
 	if clip.frames == 0 do return -1
 	pitch := 1 + kind.pitch_shift

@@ -207,6 +207,7 @@ View_Event :: union {
 // the scene's tables are carved from table_storage.
 viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^[]byte) -> err {
 	viewer.journal = journal_open(LOG_PATH)
+	full_log_start()   // (lists found full: see logging.mara)
 	read_load_order(&viewer.load_order)?
 	open_game_archives(&viewer.load_order, &viewer.archives, directory_storage)?
 	note(&viewer.journal, "plugins (")
@@ -758,7 +759,7 @@ weather_sound_list :: fun(viewer: ^Viewer, plugin: ^Plugin, weather: ^Weather, s
 	for sound in weather.sounds {
 		if sound.role != WEATHER_SOUND_PRECIPITATION and sound.role != WEATHER_SOUND_WIND do continue
 		kind_index := scene_sound_kind(&viewer.shown, plugin, sound.sound)
-		if kind_index < 0 or sounds.len == sounds.cap do continue
+		if kind_index < 0 or not fits(sounds.len + 1, sounds.cap) do continue
 		kind := viewer.shown.sound_kinds[kind_index]
 		kind.flags |= SOUND_2D
 		// (Keys apart from the references': a weather's own.)
@@ -1031,7 +1032,7 @@ precipitation_of :: fun(viewer: ^Viewer, weather: ^Weather, layers: ^[]Precipita
 	room.model.len = 0
 	built := build_model(&mesh, &room.model)?
 	for &system in built.particles {
-		if layers.len == layers.cap do break
+		if not fits(layers.len + 1, layers.cap) do break
 		emitter := system.emitter
 		// (Only what falls: not the splashes and mist sent up.)
 		if emitter.declination < 2 or emitter.speed <= 0 or emitter.life_span <= 0 do continue

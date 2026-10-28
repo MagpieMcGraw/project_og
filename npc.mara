@@ -21,6 +21,7 @@ use esm
 use animation
 use facegen
 use dds
+use logging
 
 // The animation every NPC is posed by: its first pose.
 IDLE_ANIMATION :: "meshes/characters/_male/idle.kf"
@@ -195,7 +196,7 @@ read_npc_look :: fun(plugin: ^Plugin, npc_id: u32, look: ^Npc_Look) -> err {
 				value : f32 = field.data[4 * k]
 				look.face.texture[k] = value
 			}
-		elif field.kind == "CNTO" and field.data.len >= 4 and carried.len < carried.cap
+		elif field.kind == "CNTO" and field.data.len >= 4 and fits(carried.len + 1, carried.cap)
 			raw : u32 = field.data[0]
 			&carried + record_form(plugin, npc, raw)
 		}
@@ -327,7 +328,7 @@ own_body_section :: fun(section: i64, female: bool) -> bool {
 // Adds a part to a look: its mesh and texture as the records name them
 // (under meshes\ and textures\), the bone it hangs from.
 add_npc_part :: fun(look: ^Npc_Look, mesh: []utf8, texture: []utf8, bone: []utf8) {
-	if mesh.len == 0 or look.parts.len == look.parts.cap do return
+	if mesh.len == 0 or not fits(look.parts.len + 1, look.parts.cap) do return
 	part := next(&look.parts)
 	part.mesh.len = 0
 	part.texture.len = 0
@@ -346,13 +347,13 @@ archive_path_under :: fun(folder: []utf8, name: []utf8, path: ^[256]utf8) {
 	if name.len == 0 do return
 	cleaned : [256]utf8
 	for c in name {
-		if cleaned.len == cleaned.cap do break
+		if not fits(cleaned.len + 1, cleaned.cap) do break
 		if c == '/' do &cleaned + '\\'
 		else do &cleaned + lower(c)
 	}
 	if not starts_with(cleaned, folder) do path + folder
 	for c in cleaned {
-		if path.len == path.cap do break
+		if not fits(path.len + 1, path.cap) do break
 		path + c
 	}
 }
@@ -419,7 +420,7 @@ npc_skeleton :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64 {
 	for &kept, k in scene.npc_skeletons {
 		if kept.path == path do return k
 	}
-	if scene.npc_skeletons.len == scene.npc_skeletons.cap do return -1
+	if not fits(scene.npc_skeletons.len + 1, scene.npc_skeletons.cap) do return -1
 	kept := next(&scene.npc_skeletons)
 	kept.path.len = 0
 	&kept.path + path
@@ -473,7 +474,7 @@ pose_npcs :: fun(scene: ^Scene, renderer: ^Renderer, time: f32) {
 		rig_index, rigged := index_get(&scene.model_rigs, u64(instance.model + 1))
 		if not rigged do continue
 		rig := &scene.npc_rigs[rig_index - 1]
-		if renderer.palette.len + rig.entry_count > renderer.palette.cap do continue
+		if not fits(renderer.palette.len + rig.entry_count, renderer.palette.cap) do continue
 		skeleton := &scene.npc_skeletons[rig.skeleton]
 		// Where in its idle it is.
 		span := skeleton.stop - skeleton.start
@@ -631,17 +632,17 @@ assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose
 		}
 		for entry in made.palette do &palette + entry
 		for &made_part, made_index in made.parts {
-			if built.len == built.cap do break
+			if not fits(built.len + 1, built.cap) do break
 			for &influence in made_part.influences {
 				for k in 0:4 do influence.entries[k] += u16(palette_base)
 			}
 			if part.texture.len > 0 {
 				made_part.texture.len = 0
-				&made_part.texture + part.texture[0 : min(part.texture.len, made_part.texture.cap)]
+				add_what_fits(&made_part.texture, part.texture)
 			}
 			// Its skin for this face (its colors moved by the .egt beside
 			// its mesh, if it has one): drawn with that instead.
-			if look.has_face and made_index == 0 and skins.len < skins.cap {
+			if look.has_face and made_index == 0 and fits(skins.len + 1, skins.cap) {
 				taken_at := skin_storage.len
 				pixels := slice([:4 * MOST_SKIN_TEXELS]byte, skin_storage)
 				map_path : [160]utf8

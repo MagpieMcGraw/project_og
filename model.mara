@@ -12,6 +12,7 @@ use mara.math
 use mara.string
 use nif
 use animation
+use logging
 
 // One vertex as the renderer draws it: 48 bytes.
 Vertex :: struct {
@@ -554,7 +555,7 @@ pose_node :: fun(mesh: ^Nif, index: i64, parent: Mat4, parent_rest: Mat4, tracks
 			}
 		}
 		place := mat4_mul(parent, local)
-		if pose.len < pose.cap {
+		if fits(pose.len + 1, pose.cap) {
 			bone := next(pose)
 			bone.name.len = 0
 			&bone.name + node.object.name[0 : min(node.object.name.len, 64)]
@@ -592,7 +593,7 @@ rig_nodes :: fun(mesh: ^Nif, tracks: ^[]Track, rig: ^[]Rig_Bone) {
 rig_node :: fun(mesh: ^Nif, index: i64, parent: i64, tracks: ^[]Track, rig: ^[]Rig_Bone) {
 	match mesh.blocks[index] {
 	Node node
-		if rig.len == rig.cap do return
+		if not fits(rig.len + 1, rig.cap) do return
 		local := local_transform(node.object)
 		track : i64 = -1
 		for k in 0:tracks.len {
@@ -665,7 +666,7 @@ rig_skin :: fun(mesh: ^Nif, skin: i64, how: ^Build_Options, vertices: []Vertex, 
 			for b in 0:data.bone_count {
 				bone := skin_bone_at(data.bones, at, data.has_weights)
 				at = bone.next_at
-				if not data.has_weights or b >= bones.count or model.palette.len == model.palette.cap do continue
+				if not data.has_weights or b >= bones.count or not fits(model.palette.len + 1, model.palette.cap) do continue
 				node := bones.at(b)
 				if node < 0 do continue
 				bone_index := pose_index(how.pose, node_name(mesh, node))
@@ -697,7 +698,7 @@ rig_skin :: fun(mesh: ^Nif, skin: i64, how: ^Build_Options, vertices: []Vertex, 
 		total := heaviest[v][4] + heaviest[v][5] + heaviest[v][6] + heaviest[v][7]
 		influence := Skin_Influence{entries = [0, 0, 0, 0], weights = [0, 0, 0, 0]}
 		if total <= 0 {
-			if unmoved < 0 and model.palette.len < model.palette.cap {
+			if unmoved < 0 and fits(model.palette.len + 1, model.palette.cap) {
 				unmoved = model.palette.len
 				&model.palette + Palette_Entry{bone = -1, offset = mat4_identity()}
 			}
@@ -722,7 +723,7 @@ rig_skin :: fun(mesh: ^Nif, skin: i64, how: ^Build_Options, vertices: []Vertex, 
 // the model's palette, the hanging bone from hang_offset, moves every
 // vertex. Posed, they widen the model's bounds.
 rig_hang :: fun(how: ^Build_Options, vertices: []Vertex, model: ^Model, influences: ^[]Skin_Influence) {
-	if model.palette.len == model.palette.cap do return
+	if not fits(model.palette.len + 1, model.palette.cap) do return
 	entry := model.palette.len
 	&model.palette + Palette_Entry{bone = how.hang_bone, offset = how.hang_offset}
 	for vertex in vertices {
@@ -846,7 +847,7 @@ add_controller_motions :: fun(mesh: ^Nif, first: i64, model: ^Model, part: i64) 
 			}
 			if made.kind == VALUE_COLOR and made.operation == COLOR_EMISSIVE do what = MOTION_GLOW
 			if made.kind == VALUE_ALPHA do what = MOTION_ALPHA
-			if what >= 0 and model.motions.len < model.motions.cap do add_motion(mesh, at, made, what, model, part)
+			if what >= 0 and fits(model.motions.len + 1, model.motions.cap) do add_motion(mesh, at, made, what, model, part)
 			at = made.next
 		Flip_Controller flip
 			at = flip.next
@@ -916,7 +917,7 @@ add_motion :: fun(mesh: ^Nif, controller_index: i64, controller: Property_Contro
 	Key_Data key_data
 		keys := key_data.keys
 		for k in 0:keys.count {
-			if motion.key_times.len == motion.key_times.cap do break
+			if not fits(motion.key_times.len + 1, motion.key_times.cap) do break
 			value := Vec3{0, 0, 0}
 			if keys.value_size == 12 {
 				point : Vec3 = keys.data[keys.value_at(k)]
@@ -1054,7 +1055,7 @@ add_strip :: fun(strip: []byte, indices: ^[]u16) {
 		b : u16 = strip[(k - 1) * 2]
 		c : u16 = strip[k * 2]
 		if a == b or b == c or a == c do continue
-		if indices.len + 3 > indices.cap do return
+		if not fits(indices.len + 3, indices.cap) do return
 		if k % 2 == 0 {
 			indices + a
 			indices + b
@@ -1163,7 +1164,7 @@ apply_properties :: fun(mesh: ^Nif, properties: Inherited, part: ^Model_Part, mo
 add_particles :: fun(mesh: ^Nif, modifiers: Refs, data_block: i64, first_controller: i64, system_place: Mat4,
 	properties: Inherited, model: ^Model)
 {
-	if model.particles.len == model.particles.cap do return
+	if not fits(model.particles.len + 1, model.particles.cap) do return
 	for k in 0:modifiers.count {
 		at := modifiers.at(k)
 		if at < 0 or at >= mesh.blocks.len do continue
@@ -1316,7 +1317,7 @@ add_color_keys :: fun(mesh: ^Nif, data: i64, entry: ^Model_Particles) {
 		keys := key_data.keys
 		if keys.value_size != 16 do return
 		for k in 0:keys.count {
-			if entry.color_times.len == entry.color_times.cap do return
+			if not fits(entry.color_times.len + 1, entry.color_times.cap) do return
 			at := keys.value_at(k)
 			color : [4!]f32 = [keys.data[at], keys.data[at + 4], keys.data[at + 8], keys.data[at + 12]]
 			&entry.color_times + keys.time(k)
@@ -1339,7 +1340,7 @@ add_birth_rate :: fun(mesh: ^Nif, interpolator: i64, entry: ^Model_Particles) {
 			keys := key_data.keys
 			if keys.value_size != 4 do return
 			for k in 0:keys.count {
-				if entry.birth_times.len == entry.birth_times.cap do return
+				if not fits(entry.birth_times.len + 1, entry.birth_times.cap) do return
 				rate : f32 = keys.data[keys.value_at(k)]
 				&entry.birth_times + keys.time(k)
 				&entry.birth_rates + rate
@@ -1368,7 +1369,7 @@ add_active_keys :: fun(mesh: ^Nif, interpolator: i64, entry: ^Model_Particles) {
 			keys := key_data.keys
 			if keys.value_size != 1 do return
 			for k in 0:keys.count {
-				if entry.active_times.len == entry.active_times.cap do return
+				if not fits(entry.active_times.len + 1, entry.active_times.cap) do return
 				on : u8 = keys.data[keys.value_at(k)]
 				&entry.active_times + keys.time(k)
 				&entry.active_values + (on != 0)
@@ -1392,11 +1393,11 @@ add_flip :: fun(mesh: ^Nif, controller: i64, model: ^Model) -> i64 {
 				at = flip.next
 				continue
 			}
-			if model.flips.len == model.flips.cap or flip.sources.count == 0 do return -1
+			if not fits(model.flips.len + 1, model.flips.cap) or flip.sources.count == 0 do return -1
 			entry := next(&model.flips)
 			entry.frames.len = 0
 			for k in 0:flip.sources.count {
-				if entry.frames.len == entry.frames.cap do break
+				if not fits(entry.frames.len + 1, entry.frames.cap) do break
 				frame := next(&entry.frames)
 				texture_path(mesh, Texture_Slot{used = true, source = flip.sources.at(k), clamp_mode = 0, filter_mode = 0, uv_set = 0}, frame)
 			}
@@ -1426,7 +1427,7 @@ add_flip_keys :: fun(mesh: ^Nif, interpolator: i64, entry: ^Model_Flip) {
 			keys := data.keys
 			if keys.value_size != 4 do return
 			for k in 0:keys.count {
-				if entry.key_times.len == entry.key_times.cap do return
+				if not fits(entry.key_times.len + 1, entry.key_times.cap) do return
 				value : f32 = keys.data[keys.value_at(k)]
 				&entry.key_times + keys.time(k)
 				&entry.key_values + value
@@ -1447,7 +1448,7 @@ texture_path :: fun(mesh: ^Nif, slot: Texture_Slot, path: ^[160]utf8) {
 		name := source.file_name
 		clean : [160]utf8
 		for c in name {
-			if clean.len == clean.cap do break
+			if not fits(clean.len + 1, clean.cap) do break
 			if c == '/' do &clean + '\\'
 			else do &clean + lower(c)
 		}

@@ -11,6 +11,7 @@ module shader_package
 
 use mara.core
 use mara.string
+use logging
 
 // A shader in a package: its name and its bytecode (a view of the package).
 Packaged_Shader :: struct {
@@ -21,7 +22,7 @@ Packaged_Shader :: struct {
 // The shaders in a package, into shaders.
 read_package :: fun(data: []byte, shaders: ^[]Packaged_Shader) {
 	at : i64 = 12
-	for at + 260 <= data.len and shaders.len < shaders.cap {
+	for at + 260 <= data.len and fits(shaders.len + 1, shaders.cap) {
 		names : []utf8 = data
 		name_end := at
 		for name_end < at + 256 and names[name_end] != utf8(0) do name_end += 1
@@ -50,13 +51,13 @@ read_constant_table :: fun(data: []byte, constants: ^[]Named_Constant) {
 	info_at : u32 = data[16]
 	for k in 0:i64(count) {
 		at := i64(info_at) + k * 20
-		if at + 20 > data.len or constants.len == constants.cap do return
+		if at + 20 > data.len or not fits(constants.len + 1, constants.cap) do return
 		name_at : u32 = data[at]
 		constant := next(constants)
 		constant.name.len = 0
 		text : []utf8 = data
 		c := i64(name_at)
-		for c < data.len and text[c] != utf8(0) and constant.name.len < constant.name.cap {
+		for c < data.len and text[c] != utf8(0) and fits(constant.name.len + 1, constant.name.cap) {
 			&constant.name + text[c]
 			c += 1
 		}
@@ -256,7 +257,7 @@ disassemble :: fun(code: []byte, lines: ^[][256]utf8, constants: ^[]Named_Consta
 
 	tokens := code.len / 4
 	k : i64 = 1
-	for k < tokens and lines.len < lines.cap {
+	for k < tokens and fits(lines.len + 1, lines.cap) {
 		token : u32 = code[k * 4]
 		opcode := i64(token & 0xFFFF)
 		if opcode == 0xFFFF do break   // the end

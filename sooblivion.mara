@@ -40,6 +40,7 @@ use sdl_platform
 use mara.sdl
 use mara.open_gl
 use mara.string
+use logging
 
 #allocator Arena_Basic(2 * GB)
 
@@ -284,7 +285,7 @@ command_nifs :: fun(name: []utf8) {
 						counted = true
 					}
 				}
-				if not counted and havok_types.len < havok_types.cap {
+				if not counted and fits(havok_types.len + 1, havok_types.cap) {
 					entry := next(&havok_types)
 					entry.name.len = 0
 					&entry.name + type_name
@@ -518,7 +519,7 @@ command_model :: fun(what: []utf8, name: []utf8) {
 				counted = true
 			}
 		}
-		if not counted and types.len < types.cap {
+		if not counted and fits(types.len + 1, types.cap) {
 			entry := next(&types)
 			entry.name.len = 0
 			&entry.name + type_name
@@ -885,7 +886,7 @@ command_map :: fun(name: []utf8) {
 				}
 				if known >= 0 {
 					water_counts[known] += 1
-				elif water_heights.len < water_heights.cap
+				elif fits(water_heights.len + 1, water_heights.cap)
 					&water_heights + water_height
 					&water_counts + 1
 				}
@@ -1478,10 +1479,10 @@ tally_sequence :: fun(counts: ^[]Sequence_Count, name: []utf8, looping: bool) {
 			return
 		}
 	}
-	if counts.len == counts.cap do return
+	if not fits(counts.len + 1, counts.cap) do return
 	entry := next(counts)
 	entry.name.len = 0
-	&entry.name + name[0 : min(name.len, entry.name.cap)]
+	add_what_fits(&entry.name, name)
 	entry.count = 1
 	entry.looping = if looping do 1 else 0
 }
@@ -1881,7 +1882,7 @@ command_door :: fun(what: []utf8) {
 				for m in moving {
 					if m == node do known = true
 				}
-				if not known and moving.len < moving.cap do &moving + node
+				if not known and fits(moving.len + 1, moving.cap) do &moving + node
 			}
 			at_start := track_pose(track, start)
 			at_stop := track_pose(track, stop)
@@ -2070,7 +2071,7 @@ command_collision :: fun(what: []utf8, through: Vec3, has_point: bool) {
 			collision_hits : [16]f32
 			for t in 0:points.len / 3 {
 				distance, hit := line_hits(start, way, points[t * 3], points[t * 3 + 1], points[t * 3 + 2])
-				if hit and collision_hits.len < collision_hits.cap do &collision_hits + (start[axis] + distance)
+				if hit and fits(collision_hits.len + 1, collision_hits.cap) do &collision_hits + (start[axis] + distance)
 			}
 			drawn_hits : [16]f32
 			for &part in built.parts {
@@ -2163,7 +2164,7 @@ command_grass :: fun(name: []utf8, x: i64, y: i64) {
 			for &entry in textures {
 				if entry.texture == texture do known = true
 			}
-			if known or texture == 0 or textures.len == textures.cap do continue
+			if known or texture == 0 or not fits(textures.len + 1, textures.cap) do continue
 			grasses := Texture_Grasses{texture = texture, kinds = [-1, -1]}
 			scratch.len = 0
 			texture_record, texture_error := find_record(&plugin, texture, &scratch)
@@ -2247,7 +2248,7 @@ survey_distant_objects :: fun(plugin: ^Plugin, world_id: u32, x: i64, y: i64, ar
 			for base in bases {
 				if base == reference.base do known = true
 			}
-			if not known and bases.len < bases.cap do &bases + reference.base
+			if not known and fits(bases.len + 1, bases.cap) do &bases + reference.base
 		}
 	}
 	far_meshes : i64 = 0
@@ -2263,7 +2264,7 @@ survey_distant_objects :: fun(plugin: ^Plugin, world_id: u32, x: i64, y: i64, ar
 				counted = true
 			}
 		}
-		if not counted and kinds.len < kinds.cap do &kinds + Kind_Count{kind = record.header.kind, count = 1}
+		if not counted and fits(kinds.len + 1, kinds.cap) do &kinds + Kind_Count{kind = record.header.kind, count = 1}
 		path := model_path(record)
 		if path.len < 4 do continue
 		far : [256]utf8
@@ -2552,7 +2553,10 @@ command_mp3 :: fun(name: []utf8, raw_path: []utf8) {
 		frames += 1
 		if raw_path.len == 0 do continue
 		for sample in decoder.samples {
-			if written + 4 > pcm.cap do break
+			if written + 4 > pcm.cap {
+				note_full(pcm.cap, written + 4)
+				break
+			}
 			pcm[written] = sample
 			written += 4
 		}
@@ -2711,7 +2715,7 @@ command_npc :: fun(name: []utf8) {
 	placed : [262144]Vec3
 	for &part in whole.parts {
 		for &vertex in part.vertices {
-			if placed.len < placed.cap do &placed + vertex.position
+			if fits(placed.len + 1, placed.cap) do &placed + vertex.position
 		}
 	}
 	skin_storage.len = 0
@@ -2956,7 +2960,7 @@ command_overlaps :: fun(name: []utf8, point: Vec3, radius: f32) {
 				if model_error do continue
 				place := reference_transform(reference)
 				for &part in built.parts {
-					if shapes.len == shapes.cap do break
+					if not fits(shapes.len + 1, shapes.cap) do break
 					kept := false
 					for t in 0:part.indices.len / 3 {
 						corners : [3!]Vec3
@@ -2965,7 +2969,7 @@ command_overlaps :: fun(name: []utf8, point: Vec3, radius: f32) {
 							placed := mat4_mul_vec4(place, Vec4{position.x, position.y, position.z, 1})
 							corners[k] = Vec3{placed[0], placed[1], placed[2]}
 						}
-						if not triangle_near(corners, point, radius) or triangles.len == triangles.cap do continue
+						if not triangle_near(corners, point, radius) or not fits(triangles.len + 1, triangles.cap) do continue
 						facing := cross(vec3_sub(corners[1], corners[0]), vec3_sub(corners[2], corners[0]))
 						if vec3_length(facing) < 0.0001 do continue
 						&triangles + Placed_Triangle{corners = corners, facing = vec3_normalize(facing), shape = shapes.len}
@@ -2999,7 +3003,7 @@ command_overlaps :: fun(name: []utf8, point: Vec3, radius: f32) {
 				if pair.first == first and pair.second == second do index = p
 			}
 			if index < 0 {
-				if found.len == found.cap do continue
+				if not fits(found.len + 1, found.cap) do continue
 				&found + Overlapping_Shapes{first = first, second = second, pairs = 0, lowest = lowest, highest = highest}
 				index = found.len - 1
 			}
@@ -3117,7 +3121,10 @@ command_music :: fun(kind_name: []utf8, raw_path: []utf8) {
 		if mixer.music.tracks_started >= 2 do break
 		if raw_path.len == 0 do continue
 		for sample in mixer.mix {
-			if written + 4 > pcm.cap do break
+			if written + 4 > pcm.cap {
+				note_full(pcm.cap, written + 4)
+				break
+			}
 			pcm[written] = sample
 			written += 4
 		}

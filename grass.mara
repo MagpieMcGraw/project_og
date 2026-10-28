@@ -17,6 +17,7 @@ use esm
 use world
 use land
 use render
+use logging
 
 // The game's settings for grass (Oblivion.ini's [Grass]): the grid's
 // spacing, and how many of a texture's grasses grow. (Where it thins out
@@ -188,7 +189,7 @@ place_grass :: fun(cell_land: ^Land, x: i64, y: i64, water_height: f32, textures
 	cell_seed := (u64(x + 100000) *% 0x9E3779B97F4A7C15) ~ (u64(y + 100000) *% 0xC2B2AE3D27D4EB4F)
 	for row in 0:points {
 		for column in 0:points {
-			if blades.len == blades.cap do return
+			if not fits(blades.len + 1, blades.cap) do return
 			seed := cell_seed +% u64(row * 1000 + column) *% 0x100000001B3
 			local_x := (f32(column) + 0.5) * GRASS_SPACING
 			local_y := (f32(row) + 0.5) * GRASS_SPACING

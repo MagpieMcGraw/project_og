@@ -30,6 +30,7 @@ use collision
 use animation
 use speedtree
 use dds
+use logging
 
 // Room for the models' collision: points, three a triangle. (Tamriel's
 // meshes have 1.8 million triangles in all; a scene's models, a few hundred
@@ -408,7 +409,7 @@ scene_sound_kind :: fun(scene: ^Scene, plugin: ^Plugin, form_id: u32) -> i64 {
 		note_failure(scene, "a sound's record", record_error)
 	else
 		kind, made := sound_kind_of(record)
-		if made and scene.sound_kinds.len < scene.sound_kinds.cap {
+		if made and fits(scene.sound_kinds.len + 1, scene.sound_kinds.cap) {
 			&scene.sound_kinds + kind
 			index = scene.sound_kinds.len - 1
 		}
@@ -429,7 +430,7 @@ scene_sound_kind_known :: fun(scene: ^Scene, form_id: u32) -> i64 {
 // A sound placed where a reference is: the sound of a SOUN record.
 add_placed_sound :: fun(scene: ^Scene, plugin: ^Plugin, sound: u32, reference: Reference) {
 	kind := scene_sound_kind(scene, plugin, sound)
-	if kind < 0 or scene.sounds.len == scene.sounds.cap do return
+	if kind < 0 or not fits(scene.sounds.len + 1, scene.sounds.cap) do return
 	&scene.sounds + Placed_Sound{kind = scene.sound_kinds[kind], position = reference.position,
 		key = u64(reference.form_id), next_play = 0, volume = 1}
 }
@@ -438,7 +439,7 @@ add_placed_sound :: fun(scene: ^Scene, plugin: ^Plugin, sound: u32, reference: R
 add_door_sounds :: fun(scene: ^Scene, plugin: ^Plugin, base: Record, reference: Reference) {
 	opening, opens_loud := form_field(plugin, base, "SNAM")
 	closing, closes_loud := form_field(plugin, base, "ANAM")
-	if not opens_loud and not closes_loud or scene.door_sounds.len == scene.door_sounds.cap do return
+	if not opens_loud and not closes_loud or not fits(scene.door_sounds.len + 1, scene.door_sounds.cap) do return
 	&scene.door_sounds + Door_Sounds{reference = reference.form_id, position = reference.position,
 		opening = if opens_loud do scene_sound_kind(scene, plugin, opening) else -1,
 		closing = if closes_loud do scene_sound_kind(scene, plugin, closing) else -1}
@@ -470,7 +471,7 @@ read_door_cues :: fun(scene: ^Scene, plugin: ^Plugin, mesh: ^Nif, sequence: i64,
 				name := text[6 : text.len]
 				for name.len > 0 and name[0] == ' ' do name = name[1 : name.len]
 				sound := named_sound_kind(scene, plugin, name)
-				if sound >= 0 and cues.len < cues.cap do cues + Door_Cue{time = seconds, sound = sound}
+				if sound >= 0 and fits(cues.len + 1, cues.cap) do cues + Door_Cue{time = seconds, sound = sound}
 			}
 		else
 		}
@@ -518,7 +519,7 @@ note_failure :: fun(scene: ^Scene, what: []utf8, reason: err) {
 	scene.failures += 1
 	if scene.failures > 1 do return
 	scene.first_failure.len = 0
-	&scene.first_failure + what[0 : min(what.len, scene.first_failure.cap)]
+	add_what_fits(&scene.first_failure, what)
 	scene.first_failure_reason = reason
 }
 
@@ -566,7 +567,7 @@ is_marker :: fun(path: []utf8) -> bool {
 // Places an instance of a model, when there's room: lit by the scene's
 // lights as they are now (choose_all_lights does them all again).
 add_instance :: fun(scene: ^Scene, model_index: i64, placement: Mat4, reference: u32 = 0) {
-	if scene.instances.len == scene.instances.cap do return
+	if not fits(scene.instances.len + 1, scene.instances.cap) do return
 	instance := next(&scene.instances)
 	instance^ = place_instance(scene.models[model_index], model_index, placement, reference)
 	choose_lights(instance, &scene.lights)
@@ -595,7 +596,7 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, plac
 		if base_error do continue
 
 		light, gives_light := light_of(base, reference)
-		if gives_light and scene.lights.len < scene.lights.cap {
+		if gives_light and fits(scene.lights.len + 1, scene.lights.cap) {
 			&scene.lights + light
 			scene.lights_changed = true
 		}
@@ -612,14 +613,14 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, plac
 			// (Its own scratch: base's data may be in scratch.)
 			door_scratch : [64 * KB]byte
 			_, leads := door_destination(plugin, reference.form_id, &door_scratch)?
-			if leads and scene.doors.len < scene.doors.cap do &scene.doors + Scene_Door{reference = reference.form_id, position = reference.position}
+			if leads and fits(scene.doors.len + 1, scene.doors.cap) do &scene.doors + Scene_Door{reference = reference.form_id, position = reference.position}
 			in_place = not leads
 		}
 
 		// A tree: grown when it's loaded, drawn so within TREE_NEAR (past it,
 		// its billboard: load_trees).
 		if base.header.kind == "TREE" {
-			if scene.waiting.len < scene.waiting.cap {
+			if fits(scene.waiting.len + 1, scene.waiting.cap) {
 				waiting := next(&scene.waiting)
 				waiting.reference = reference.form_id
 				waiting.door = false
@@ -632,7 +633,7 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, plac
 		}
 		// An NPC: put together when it's loaded.
 		if base.header.kind == "NPC_" {
-			if scene.waiting.len < scene.waiting.cap {
+			if fits(scene.waiting.len + 1, scene.waiting.cap) {
 				waiting := next(&scene.waiting)
 				waiting.reference = reference.form_id
 				waiting.door = false
@@ -652,7 +653,7 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, plac
 				place_door(scene, kind_index - 1, reference_transform(reference), reference.form_id)
 				continue
 			}
-			if not kind_known and scene.waiting.len < scene.waiting.cap {
+			if not kind_known and fits(scene.waiting.len + 1, scene.waiting.cap) {
 				waiting := next(&scene.waiting)
 				waiting.reference = reference.form_id
 				waiting.door = true
@@ -667,7 +668,7 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, plac
 		model_index, known := known_model(scene, path)
 		if known {
 			if model_index >= 0 do place_model(scene, model_index, path, reference_transform(reference), reference.form_id)
-		elif scene.waiting.len < scene.waiting.cap
+		elif fits(scene.waiting.len + 1, scene.waiting.cap)
 			waiting := next(&scene.waiting)
 			waiting.reference = reference.form_id
 			waiting.door = false
@@ -753,7 +754,7 @@ tree_kind :: fun(scene: ^Scene, plugin: ^Plugin, base: u32, loader: Loader) -> i
 	scratch : [64 * KB]byte
 	record, record_error := record_at(plugin, header_at, &scratch)
 	if record_error do note_failure(scene, "a tree's record", record_error)
-	if not record_error and scene.kinds.len < scene.kinds.cap {
+	if not record_error and fits(scene.kinds.len + 1, scene.kinds.cap) {
 		look, is_tree := tree_look(record)
 		if is_tree {
 			// (The picture fills its texture: clamped, its edges don't pick up the far side.)
@@ -816,7 +817,7 @@ load_trees :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64, loa
 	if references_error do note_failure(scene, "a cell's references, for its trees", references_error)
 	trees : [TREES_PER_CELL]Placed_Tree
 	for reference in references {
-		if trees.len == trees.cap do break
+		if not fits(trees.len + 1, trees.cap) do break
 		if reference.flags & RECORD_DISABLED != 0 do continue
 		kind_index := tree_kind(scene, plugin, reference.base, loader)
 		if kind_index < 0 do continue
@@ -932,7 +933,7 @@ show_trees :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, x: i64, y: i64)
 				already := cell_x >= placed.low_x and cell_x <= placed.high_x and cell_y >= placed.low_y and cell_y <= placed.high_y
 				if already do continue
 				cell := exterior_cell(plugin, world_id, cell_x, cell_y)
-				if cell == 0 or scene.waiting_trees.len == scene.waiting_trees.cap do continue
+				if cell == 0 or not fits(scene.waiting_trees.len + 1, scene.waiting_trees.cap) do continue
 				&scene.waiting_trees + Waiting_Land{cell = cell, x = cell_x, y = cell_y}
 			}
 		}
@@ -1228,7 +1229,7 @@ load_door_kind :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, path: []ut
 add_moving_kind :: fun(scene: ^Scene, loader: Loader, mesh: ^Nif, path: []utf8) -> i64, bool, err {
 	idle := find_sequence(mesh, "Idle")
 	if idle < 0 do idle = find_sequence(mesh, "SpecialIdle")
-	if idle < 0 or scene.moving_kinds.len == scene.moving_kinds.cap do return -1, false
+	if idle < 0 or not fits(scene.moving_kinds.len + 1, scene.moving_kinds.cap) do return -1, false
 	tracks : [MOVING_PIECES]Track
 	read_tracks(mesh, idle, &tracks, &scene.track_room, false)
 	// The nodes they move, each found, its rest taken.
@@ -1332,7 +1333,7 @@ place_moving :: fun(scene: ^Scene, kind_index: i64, placement: Mat4, reference: 
 	kind := &scene.moving_kinds[kind_index]
 	add_instance(scene, kind.frame, placement, reference)
 	for p in 0:kind.pieces.len {
-		if scene.instances.len == scene.instances.cap do return
+		if not fits(scene.instances.len + 1, scene.instances.cap) do return
 		add_instance(scene, kind.pieces[p].model, moving_piece_world(kind, p, placement, kind.start), reference)
 		instance := &scene.instances[scene.instances.len - 1]
 		instance.moving_kind = i32(kind_index)
@@ -1413,7 +1414,7 @@ place_door :: fun(scene: ^Scene, kind_index: i64, placement: Mat4, reference: u3
 			return
 		}
 	}
-	if scene.swinging.len < scene.swinging.cap do &scene.swinging + door
+	if fits(scene.swinging.len + 1, scene.swinging.cap) do &scene.swinging + door
 }
 
 // Opens or closes a door that opens in place, if a reference is one (and
@@ -1465,11 +1466,11 @@ swing_doors :: fun(scene: ^Scene, seconds: f32, noises: ^[]Door_Noise) {
 		if cues.len > 0 {
 			for cue in cues {
 				due := cue.time <= at and (before == 0 or cue.time > start + before)
-				if due and noises.len < noises.cap do noises + Door_Noise{sound = cue.sound, position = place}
+				if due and fits(noises.len + 1, noises.cap) do noises + Door_Noise{sound = cue.sound, position = place}
 			}
 		elif (door.opening and before == 0) or shut
 			sound, _ := door_sound(scene, door.reference, door.opening)
-			if sound >= 0 and noises.len < noises.cap do noises + Door_Noise{sound = sound, position = place}
+			if sound >= 0 and fits(noises.len + 1, noises.cap) do noises + Door_Noise{sound = sound, position = place}
 		}
 		for &piece in kind.pieces {
 			track := if door.opening do &piece.opening else &piece.closing
@@ -1504,7 +1505,7 @@ load_distant_objects :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, loade
 		cell_distant_references(plugin, cell, &references)
 		for reference in references {
 			if reference.flags & RECORD_DISABLED != 0 do continue
-			if scene.distant_instances.len == scene.distant_instances.cap do return scene.distant_instances.len
+			if not fits(scene.distant_instances.len + 1, scene.distant_instances.cap) do return scene.distant_instances.len
 			scratch.len = 0
 			base, base_error := find_record(plugin, reference.base, &scratch)
 			if base_error or base.header.kind == "TREE" do continue
@@ -1527,7 +1528,7 @@ load_distant_objects :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, loade
 // Places a cell's grass over its land and puts it on the card, in the
 // land's slot.
 load_grass :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64, cell_land: ^Land, slot: i64, loader: Loader) {
-	if not scene.grows_grass or scene.grass_cells.len == scene.grass_cells.cap do return
+	if not scene.grows_grass or not fits(scene.grass_cells.len + 1, scene.grass_cells.cap) do return
 	// The grasses of each texture in the land.
 	textures : [40]Texture_Grasses
 	for &quadrant in cell_land.quadrants {
@@ -1545,7 +1546,7 @@ load_grass :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64, cel
 
 // Adds a land texture's grasses to textures, unless they're there.
 add_texture_grasses :: fun(scene: ^Scene, plugin: ^Plugin, texture: u32, textures: ^[]Texture_Grasses, loader: Loader) {
-	if texture == 0 or textures.len == textures.cap do return
+	if texture == 0 or not fits(textures.len + 1, textures.cap) do return
 	for &entry in textures {
 		if entry.texture == texture do return
 	}
@@ -1571,7 +1572,7 @@ texture_grasses_of :: fun(scene: ^Scene, plugin: ^Plugin, texture: u32, loader: 
 			count += 1
 		}
 	}
-	if scene.texture_grasses.len < scene.texture_grasses.cap {
+	if fits(scene.texture_grasses.len + 1, scene.texture_grasses.cap) {
 		&scene.texture_grasses + grasses
 		_ = index_put(&scene.texture_grass_index, u64(texture), scene.texture_grasses.len)
 	}
@@ -1587,7 +1588,7 @@ grass_kind :: fun(scene: ^Scene, plugin: ^Plugin, grass_id: u32, loader: Loader)
 	scratch : [64 * KB]byte
 	record, record_error := find_record(plugin, grass_id, &scratch)
 	if record_error do note_failure(scene, "a grass's record", record_error)
-	if not record_error and scene.grass_kinds.len < scene.grass_kinds.cap {
+	if not record_error and fits(scene.grass_kinds.len + 1, scene.grass_kinds.cap) {
 		look, readable := read_grass_look(record)
 		if readable {
 			grass_model := scene_model(scene, loader, look.model)
@@ -1658,7 +1659,7 @@ show_exterior :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, x: i64, y: i
 				if already do continue
 				cell := exterior_cell(plugin, world_id, cell_x, cell_y)
 				if cell == 0 do continue
-				if not land_loaded(scene, cell_x, cell_y) and scene.waiting_land.len < scene.waiting_land.cap {
+				if not land_loaded(scene, cell_x, cell_y) and fits(scene.waiting_land.len + 1, scene.waiting_land.cap) {
 					&scene.waiting_land + Waiting_Land{cell = cell, x = cell_x, y = cell_y}
 				}
 				add_cell_water(scene, plugin, cell, cell_x, cell_y)
@@ -1745,7 +1746,7 @@ add_cell_water :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64)
 	scratch : [256 * KB]byte
 	height, has_water, water_error := cell_water(plugin, cell, &scratch)
 	if water_error do note_failure(scene, "a cell's water", water_error)
-	if not has_water or scene.waters.len == scene.waters.cap do return
+	if not has_water or not fits(scene.waters.len + 1, scene.waters.cap) do return
 	// Deep where there's no land under it to know.
 	depths : [WATER_VERTICES!]f32
 	for k in 0:WATER_VERTICES do depths[k] = 1000

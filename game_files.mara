@@ -9,6 +9,7 @@ use mara.os
 use mara.memory
 use mara.string
 use bsa
+use logging
 
 // The plugins loaded, at most.
 MAX_PLUGINS :: 16
@@ -70,7 +71,7 @@ read_player_plugins :: fun(storage: ^[]byte) -> []utf8, err {
 	if env_error == Env_Error.Not_Set do return []
 	if env_error do return [], env_error
 	ending := "/Oblivion/Plugins.txt"
-	if local.len + ending.len >= local.cap do return []
+	if not fits(local.len + ending.len + 1, local.cap) do return []
 	path := local + ending
 	data, read_error := read_entire_file(path, storage)
 	if read_error == File_Error.Open_Failed do return []
@@ -82,7 +83,7 @@ read_player_plugins :: fun(storage: ^[]byte) -> []utf8, err {
 // (which stays first); not one there already. One the data folder hasn't
 // goes into the missing instead.
 add_plugin :: fun(order: ^Load_Order, name: []utf8) {
-	if order.plugins.len == order.plugins.cap or name.len > 64 do return
+	if not fits(order.plugins.len + 1, order.plugins.cap) or not fits(name.len, 64) do return
 	for &plugin in order.plugins {
 		if compare_folded(plugin.name, name) == 0 do return
 	}
@@ -91,7 +92,7 @@ add_plugin :: fun(order: ^Load_Order, name: []utf8) {
 	path := data_path(name)
 	written := file_mtime(path)
 	if written == 0 {
-		if order.missing.len < order.missing.cap do &order.missing + added
+		if fits(order.missing.len + 1, order.missing.cap) do &order.missing + added
 		return
 	}
 	added.written = written

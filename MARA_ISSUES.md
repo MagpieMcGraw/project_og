@@ -7,7 +7,39 @@ against Mara at the time written. When one is fixed, move it to Fixed
 
 ## Open
 
-None now.
+- A generic fun's param can't have a default, so a generic can't take
+  `#caller_span` or `#caller_name`. Checked against 61bf180:
+
+  ```
+  room_for :: fun(list: ^[]$T, site: atom = #caller_span) -> bool {
+  	if list.len < list.cap do return true
+  	print("full at %", site)
+  	return false
+  }
+  ```
+
+  says "a generic's param with a default is not supported yet". Expected:
+  defaults as on any fun. sooblivion's check takes the numbers instead,
+  `fits(list.len + 1, list.cap)` (logging.mara), where it would take the
+  list (`room_for(&list)`).
+
+- mara.os can't add to the end of a file: file_open_write writes over
+  it, and nothing opens one for appending. A program can't bind
+  CreateFileA itself either, as mara.os binds it (privately). Checked
+  against 61bf180:
+
+  ```
+  foreign static_lib "kernel32" {
+  	fun CreateFileA(name: cstring, access: u32, share: u32, security: ^byte, disposition: u32, flags: u32, template: File_Id) -> File_Id
+  }
+  ```
+
+  says "foreign symbol 'CreateFileA' is already declared in library
+  'kernel32' (first declaration at os.mara:995); each external symbol
+  may be bound by at most one foreign block". Expected: an append open in
+  mara.os (`file_open_append`); and a private binding not keeping others
+  from binding the same symbol. sooblivion binds CreateFileW for its full
+  log (logging.mara, add_to_file).
 
 ## Answered (not issues)
 
