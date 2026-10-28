@@ -1706,6 +1706,87 @@ command_record :: fun(name: []utf8) {
 	}
 }
 
+// `sooblivion walk-check <world | interior cell> <x> <y> <z> <yaw> <seconds>`:
+// a place loaded without drawing — what it collides as, its land's
+// heights, its people and trees' trunks, as a server will have it — and a
+// walker put down with its eyes at x y z, walked forward (yaw: degrees from
+// north toward east) for that many seconds at walking pace, a 60th of a
+// second at a time. Where it got to, and how far across it went.
+command_walk_check :: fun(name: []utf8, start: Vec3, yaw_degrees: f32, seconds: f32) {
+	index_storage : [96 * MB]byte = void
+	index_storage.len = 0
+	plugin, load_error := load_oblivion(&index_storage)
+	if load_error {
+		print("couldn't load the plugin: %", load_error)
+		return
+	}
+	scratch : [16 * MB]byte = void
+	scratch.len = 0
+	world_id := find_world(&plugin, name, &scratch)
+	cell : u32 = 0
+	if world_id == 0 {
+		found, cell_error := find_interior_cell(&plugin, name, &scratch)
+		if cell_error {
+			print("no world or interior cell %", name)
+			return
+		}
+		cell = found
+	}
+	order : Load_Order
+	order_error := read_load_order(&order)
+	directory_storage : [64 * MB]byte = void
+	directory_storage.len = 0
+	archives : Archives
+	archives_error := if order_error do order_error else open_game_archives(&order, &archives, &directory_storage)
+	if archives_error {
+		print("couldn't open the archives: %", archives_error)
+		return
+	}
+	defer close_archives(&archives)
+	table_storage : [16 * MB]byte = void
+	table_storage.len = 0
+	place : Scene
+	scene_clear(&place, &table_storage)
+	// (Never touched: loading doesn't draw.)
+	renderer : render.Renderer = void
+	file_room : [64 * MB]byte = void
+	block_room : [16 * MB]byte = void
+	model_room : [64 * MB]byte = void
+	texture_room : [64 * MB]byte = void
+	room := load_room(&file_room, &block_room, &model_room, &texture_room)
+	loader := Loader{renderer = &renderer, archives = &archives, room = &room, drawing = false}
+
+	load_start := time_now()
+	show_error : err
+	if world_id != 0 {
+		x, y := grid_of(start)
+		show_error = show_exterior(&place, &plugin, world_id, x, y)
+	else
+		show_error = show_interior(&place, &plugin, cell, loader)
+	}
+	if show_error do print("placing the place stopped early: %", show_error)
+	for not load_waiting(&place, &plugin, loader, 0xFFFFFFFFFFFFFFFF, start) {}
+	solid : i64 = 0
+	for &instance in place.instances {
+		range := place.model_collision[instance.model]
+		if range.count > 0 or range.upright > 0 do solid += 1
+	}
+	print("loaded without drawing in % ms: % things placed, % walked into (% triangles), % land cells",
+		elapsed_ms(load_start), place.instances.len, solid, place.collision_points.len / 3, place.grounds.len)
+
+	feet := start - Vec3{0, 0, EYE_HEIGHT}
+	walker := Walker{position = feet, rising = 0, on_ground = false}
+	yaw := yaw_degrees * PI / 180
+	going := Vec3{sin_f32(yaw), cos_f32(yaw), 0} * WALK_SPEED
+	step : f32 = 1.0 / 60
+	steps := i64(seconds / step)
+	for _ in 0:steps do walk(&walker, &place, going, false, step)
+	moved := walker.position - feet
+	across := sqrt_f32(moved.x * moved.x + moved.y * moved.y)
+	print("walked % s at % degrees: its eyes from % to %; % units across of %", seconds, yaw_degrees, start,
+		walker.position + Vec3{0, 0, EYE_HEIGHT}, across, WALK_SPEED * f32(steps) * step)
+}
+
 // `sooblivion world-run <world> <hours>`: the world's state run as a server
 // would run it, with no window: its clock and its sky's weather, the player
 // standing in the world's cell 0 0, stepped on its ticks (hurried) for that
@@ -2582,6 +2663,8 @@ usage :: fun() {
 	print("sooblivion bsa <archive>           an archive's folders and files")
 	print("sooblivion bsa <archive> <file>    one file from an archive, unpacked")
 	print("sooblivion plugins                 the plugins loaded, in order, and the archives")
+	print("sooblivion walk-check <world | cell> <x> <y> <z> <yaw> <seconds>")
+	print("                                   a walker walked forward in a place loaded without drawing")
 	print("sooblivion world-run <world> <hours>")
 	print("                                   the world's clock and weather run headless, as a server would")
 	print("sooblivion tree <name.spt | -all> [seed]")
@@ -3366,6 +3449,16 @@ main :: (args: [][]utf8) {
 		command_map(if args.len > 2 do args[2] else "Tamriel")
 	elif command == "sky"
 		command_sky(if args.len > 2 do args[2] else "Tamriel")
+	elif command == "walk-check" and args.len > 7
+		numbers : [5!]f32
+		all_numbers := true
+		for k in 0:5 {
+			number, is_number := parse_number(args[3 + k])
+			numbers[k] = f32(number)
+			if not is_number do all_numbers = false
+		}
+		if all_numbers do command_walk_check(args[2], Vec3{numbers[0], numbers[1], numbers[2]}, numbers[3], numbers[4])
+		else do usage()
 	elif command == "world-run" and args.len > 3
 		hours, is_number := parse_number(args[3])
 		if is_number do command_world_run(args[2], f32(hours))

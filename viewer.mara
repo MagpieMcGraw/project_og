@@ -439,7 +439,7 @@ load_room :: fun(file_room: ^[]byte, block_room: ^[]byte, model_room: ^[]byte, t
 
 // Where the viewer's scene loads models from.
 viewer_loader :: fun(viewer: ^Viewer) -> Loader {
-	return Loader{renderer = &viewer.renderer, archives = &viewer.archives, room = &viewer.room}
+	return Loader{renderer = &viewer.renderer, archives = &viewer.archives, room = &viewer.room, drawing = true}
 }
 
 // Shows what's shown, how many frames a second, whether vsync is on, and

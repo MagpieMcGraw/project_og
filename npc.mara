@@ -531,6 +531,13 @@ npc_model :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, npc_id: u32) ->
 // Puts an NPC together (see the top) and on the card: its model's index.
 build_npc_model :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, npc_id: u32) -> i64, err {
 	if scene.models.len == scene.models.cap do return -1, No_Room_For_Models
+	// Not drawing: only the upright cylinder they're walked round as.
+	if not loader.drawing {
+		&scene.model_collision + Collision_Range{first = scene.collision_points.len, count = 0, upright = PERSON_RADIUS,
+			upright_height = PERSON_HEIGHT}
+		&scene.models + undrawn_model(Vec3{0, 0, PERSON_HEIGHT * 0.5}, PERSON_HEIGHT * 0.5)
+		return scene.models.len - 1
+	}
 	look : Npc_Look
 	read_npc_look(plugin, npc_id, &look)?
 	skeleton := npc_skeleton(scene, loader, look.skeleton)
