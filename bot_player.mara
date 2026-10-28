@@ -333,14 +333,16 @@ bot_going :: fun(bot: ^Bot, plugin: ^Plugin, seconds: f32) -> Vec3 {
 		if not found do return Vec3{0, 0, 0}
 		away := Vec3{other.feet.x - feet.x, other.feet.y - feet.y, 0}
 		distance := vec3_length(away)
+		// (Beside them on their floor: not under them, nor over.)
+		beside := distance < FOLLOW_NEAR and abs_f32(other.feet.z - feet.z) < TRAIL_RISE
 		far_behind := distance > FOLLOW_JUMP or bot.trail.len == bot.trail.cap
-		if not bot_here(bot, other) or far_behind or bot.stuck and distance > FOLLOW_NEAR * 2 {
+		if not bot_here(bot, other) or far_behind or bot.stuck and not beside {
 			_, join_error := bot_join(bot, plugin, other.id)
 			if join_error do print("bot: couldn't load all of the place: %", join_error)
 			return Vec3{0, 0, 0}
 		}
 		bot_mark_trail(bot, other.feet)
-		if distance < FOLLOW_NEAR {
+		if beside {
 			// Beside them: the way they came is behind it.
 			bot.trail.len = 0
 			bot.trail_end = other.feet
@@ -600,6 +602,10 @@ bot_take_order :: fun(bot: ^Bot, plugin: ^Plugin, line: []utf8) {
 		order.kind = .follow
 		order.player = if has_first do i64(first) else 0
 		order.running = running
+		// (Their way from where they are now.)
+		bot.trail.len = 0
+		other, found := bot_other(bot, order.player)
+		if found do bot.trail_end = other.feet
 	elif verb == "head" and has_first and has_second
 		order.kind = .head
 		order.yaw = first * PI / 180
