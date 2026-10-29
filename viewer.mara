@@ -38,6 +38,9 @@ use particles
 use mara.os
 use png
 use game_settings
+use indexing
+use random
+use game_sound
 gl :: use mara.open_gl
 render :: use render
 
@@ -259,8 +262,10 @@ Viewer :: struct {
 	drawn: Frame_Stats
 	told_framebuffer: bool   // the journal has said the frame's framebuffer couldn't be made
 
-	// The sound: what plays it (its files are in the archives).
+	// The sound: what plays it (its files are in the archives), and how loud
+	// the player has it.
 	audio: Mixer
+	volumes: Volumes
 	told_tracks: i64    // the music's tracks the journal has been told of
 
 	// Since the last summary: frames, refreshes missed, the longest, and
@@ -375,14 +380,13 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	// The volumes as the player last set them (none set yet: every sound as
 	// loud as it's made).
 	settings, settings_error := read_settings()
-	viewer.audio.volumes = settings.volumes
+	viewer.volumes = settings.volumes
+	set_volumes(&viewer.audio, viewer.volumes)
 	if settings_error and settings_error != File_Error.Open_Failed {
 		note(&viewer.journal, "couldn't read the settings: the defaults instead; ")
 		note_error(&viewer.journal, settings_error)
 		note_end(&viewer.journal)
 	}
-	music_folder := data_path("Music")
-	music_open(&viewer.audio, music_folder)
 	viewer.told_tracks = 0
 	if taking_picture {
 		note(&viewer.journal, "no sound: taking a picture")
@@ -2495,7 +2499,7 @@ choose_music :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32, world_id: u32) 
 		note_end(&viewer.journal)
 		kind = MUSIC_EXPLORE
 	}
-	want_music(&viewer.audio, kind)
+	want_music(&viewer.audio, music_kind_folder(data_path("Music"), kind))
 }
 
 // Puts the camera where one arrives in the scene's cell through a door;

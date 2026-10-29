@@ -15,6 +15,7 @@ use mara.memory
 use disk
 use file_cache
 use world
+use indexing
 
 INDEX_CACHE_PATH :: "cache\\plugins.index"
 // (The magic is "SOOINDEX".)

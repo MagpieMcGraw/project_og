@@ -18,6 +18,7 @@ use game_settings
 use sdl_platform
 use mara.string
 use logging
+use game_sound
 render :: use render
 
 // The menus here (after game_menus' MENU_STATS and MENU_MAP).
@@ -194,7 +195,8 @@ press_button :: fun(viewer: ^Viewer, name: []utf8) -> bool {
 	elif name == "pause_return_button" or name == "options_return_button" or name == "audio_return_button"
 		menu_back(viewer)
 	elif name == "audio_defaults_button"
-		viewer.audio.volumes = full_volumes()
+		viewer.volumes = full_volumes()
+		set_volumes(&viewer.audio, viewer.volumes)
 		show_volumes(viewer)
 	else
 		return false
@@ -224,19 +226,20 @@ set_slider_at :: fun(viewer: ^Viewer, slider: i64, x: f32) {
 
 // Moves a volume slider a step (hundredths: up, or down below 0).
 step_slider :: fun(viewer: ^Viewer, slider: i64, step: f32) {
-	set_volume(viewer, slider, volume_of(viewer.audio.volumes, slider) + step / 100)
+	set_volume(viewer, slider, volume_of(viewer.volumes, slider) + step / 100)
 }
 
 // Sets a volume (by Volumes' order; 0 to 1, what's past either kept to
 // it): heard so at once, its slider showing it.
 set_volume :: fun(viewer: ^Viewer, slider: i64, volume: f32) {
 	kept := max(0, min(1, volume))
-	volumes := &viewer.audio.volumes
+	volumes := &viewer.volumes
 	if slider == 0 do volumes.master = kept
 	if slider == 1 do volumes.voice = kept
 	if slider == 2 do volumes.effects = kept
 	if slider == 3 do volumes.footsteps = kept
 	if slider == 4 do volumes.music = kept
+	set_volumes(&viewer.audio, viewer.volumes)
 	_ = book_set(&viewer.book, VOLUME_SLIDERS[slider], "user5", kept * 100)
 }
 
@@ -251,12 +254,12 @@ volume_of :: fun(volumes: Volumes, slider: i64) -> f32 {
 
 // The audio menu's sliders put where the volumes are.
 show_volumes :: fun(viewer: ^Viewer) {
-	for k in 0:VOLUME_SLIDERS.len do _ = book_set(&viewer.book, VOLUME_SLIDERS[k], "user5", volume_of(viewer.audio.volumes, k) * 100)
+	for k in 0:VOLUME_SLIDERS.len do _ = book_set(&viewer.book, VOLUME_SLIDERS[k], "user5", volume_of(viewer.volumes, k) * 100)
 }
 
 // Keeps the volumes in the settings (failing, the journal says why).
 keep_volumes :: fun(viewer: ^Viewer) {
-	write_error := write_settings(Game_Settings{volumes = viewer.audio.volumes})
+	write_error := write_settings(Game_Settings{volumes = viewer.volumes})
 	if write_error {
 		note(&viewer.journal, "couldn't keep the settings: ")
 		note_error(&viewer.journal, write_error)

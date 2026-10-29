@@ -48,6 +48,8 @@ use mara.sdl
 use mara.open_gl
 use mara.string
 use logging
+use indexing
+use game_sound
 
 #allocator Arena_Basic(2 * GB)
 
@@ -1285,8 +1287,8 @@ command_sound :: fun(name: []utf8) {
 	print("clip: % channels at % a second, % frames (% s)", clip.channels, clip.rate, clip.frames, f32(clip.frames) / f32(clip.rate))
 	listener := Listener{position = Vec3{0, 0, 0}, right = Vec3{1, 0, 0}}
 	place := Vec3{kind.min_distance, 0, 0}   // at its near distance, to the right
-	gains := side_gains(&kind, place, listener, loudness(&kind, kind.min_distance))
-	_ = start_voice(&mixer, &kind, clip_index, 0, gains, kind.flags & SOUND_LOOP != 0)
+	gains := sound_gains(&kind, place, listener, loudness(&kind, kind.min_distance))
+	_ = start_sound(&mixer, &kind, clip_index, 0, gains, kind.flags & SOUND_LOOP != 0)
 	peak : [2!]f32 = [0, 0]
 	for block in 0:10 {
 		mixer.mix.len = AHEAD * 2
@@ -3615,9 +3617,8 @@ command_music :: fun(kind_name: []utf8, raw_path: []utf8) {
 	room : [1 * MB]byte
 	mixer : Mixer
 	audio_init(&mixer, 64 * KB, &room)
-	music_folder := data_path("Music")
-	music_open(&mixer, music_folder)
-	want_music(&mixer, kind)
+	set_volumes(&mixer, full_volumes())
+	want_music(&mixer, music_kind_folder(data_path("Music"), kind))
 	pcm : [512 * MB]byte
 	written : i64 = 0
 	start := time_now()

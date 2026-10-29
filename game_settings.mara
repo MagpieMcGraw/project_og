@@ -1,17 +1,15 @@
 // The player's settings, kept between runs in SETTINGS_PATH: for now the
 // volumes the audio menu sets. The file is written as Mara, a Game_Settings
-// value (a `name = value` line a setting, a volume in hundredths), and
-// read back a line at a time: a line it doesn't know is passed over, a
-// setting missing keeps its default.
+// value (og's settings_file: a `name = value` line a setting, a volume in
+// hundredths): a line it doesn't know is passed over, a setting missing
+// keeps its default.
 module game_settings
 
 use mara.core
-use mara.memory
 use mara.math
 use mara.os
-use mara.string
-use audio
-use logging
+use settings_file
+use game_sound
 
 // Where the settings are kept: beside the game.
 SETTINGS_PATH :: "settings.txt"
@@ -26,53 +24,28 @@ Game_Settings :: struct {
 // the defaults (why given back: File_Error.Open_Failed).
 read_settings :: fun() -> Game_Settings, err {
 	settings := Game_Settings{volumes = full_volumes()}
-	storage : [16 * KB]byte = void
-	storage.len = 0
-	data, read_error := read_entire_file(SETTINGS_PATH, &storage)
+	found : [32]Setting
+	read_error := read_settings_file(SETTINGS_PATH, &found)
 	if read_error do return settings, read_error
-	text : []utf8 = data
-	start : i64 = 0
-	for at in 0..text.len {
-		if at < text.len and text[at] != '\n' do continue
-		line := trimmed(text[start : at])
-		start = at + 1
-		equals, has_equals := find_byte(line, '=')
-		if not has_equals do continue
-		name := trimmed(line[0 : equals])
-		number, is_number := parse_number(trimmed(line[equals + 1 : line.len]))
-		if not is_number do continue
-		share := f32(max(0, min(100, number))) / 100
-		if name == "master_volume" do settings.volumes.master = share
-		if name == "voice_volume" do settings.volumes.voice = share
-		if name == "effect_volume" do settings.volumes.effects = share
-		if name == "footstep_volume" do settings.volumes.footsteps = share
-		if name == "music_volume" do settings.volumes.music = share
+	for setting in found {
+		share := f32(max(0, min(100, setting.number))) / 100
+		if setting.name == "master_volume" do settings.volumes.master = share
+		if setting.name == "voice_volume" do settings.volumes.voice = share
+		if setting.name == "effect_volume" do settings.volumes.effects = share
+		if setting.name == "footstep_volume" do settings.volumes.footsteps = share
+		if setting.name == "music_volume" do settings.volumes.music = share
 	}
 	return settings
 }
 
 // Writes the settings to SETTINGS_PATH, over what was there.
 write_settings :: fun(settings: Game_Settings) -> err {
-	text : [2 * KB]utf8
-	&text + "// sooblivion's settings, as the game last wrote them: read at its start.\n"
-	&text + "// The volumes are in hundredths, 0 to 100.\n"
-	&text + "settings :: Game_Settings{\n"
-	add_volume(&text, "master_volume", settings.volumes.master)
-	add_volume(&text, "voice_volume", settings.volumes.voice)
-	add_volume(&text, "effect_volume", settings.volumes.effects)
-	add_volume(&text, "footstep_volume", settings.volumes.footsteps)
-	add_volume(&text, "music_volume", settings.volumes.music)
-	&text + "}\n"
-	file := file_open_write(SETTINGS_PATH)?
-	defer file_close(file)
-	file_write_text(file, text)?
-}
-
-// Adds a volume's line: its name, and it in hundredths.
-add_volume :: fun(text: ^[]utf8, name: []utf8, volume: f32) {
-	text + "\t"
-	text + name
-	text + " = "
-	text + int_text(i64(volume * 100 + 0.5))
-	text + "\n"
+	volumes := settings.volumes
+	write_settings_file(SETTINGS_PATH,
+		"// sooblivion's settings, as the game last wrote them: read at its start.\n// The volumes are in hundredths, 0 to 100.\nsettings :: Game_Settings{\n",
+		[Setting{name = "master_volume", number = f64(volumes.master) * 100},
+		Setting{name = "voice_volume", number = f64(volumes.voice) * 100},
+		Setting{name = "effect_volume", number = f64(volumes.effects) * 100},
+		Setting{name = "footstep_volume", number = f64(volumes.footsteps) * 100},
+		Setting{name = "music_volume", number = f64(volumes.music) * 100}])?
 }

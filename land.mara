@@ -14,6 +14,7 @@ use mara.string
 use esm
 use world
 use logging
+use indexing
 
 LAND_SIDE :: 33        // vertices along a cell's side
 LAND_SPACING :: 128    // units between them

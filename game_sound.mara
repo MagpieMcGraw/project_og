@@ -1,0 +1,209 @@
+// Oblivion's sound, through og's mixer (audio): the SOUN records' sounds —
+// their files (or a folder's, one at random) loaded from the archives, how
+// loud they're heard by how far away they are and their pitch — the
+// scene's placed sounds (heard), one-shots (play_once): a looping sound is
+// played while it's in hearing range, faded in and out at the edge; a
+// placed sound that doesn't loop is played again after a pause. And the
+// kinds of music, each a folder of Data\Music, and the volumes the audio
+// menu sets.
+module game_sound
+
+use mara.core
+use mara.math
+use mara.os
+use mara.string
+use audio
+use bsa
+use world
+use indexing
+use random
+
+// A placed sound that doesn't loop is played again after a pause of this
+// many seconds or up to twice that.
+REPLAY_PAUSE :: 6
+
+Sound_Error :: error {
+	No_Sound_File     // no file (or folder) of the path in the archives
+}
+
+// ---- volumes -------------------------------------------------------------------------
+
+// How loud each kind of sound is heard, 0 to 1 (as the audio menu sets
+// them): all of them, then voices, effects, footsteps and music.
+Volumes :: struct {
+	master: f32
+	voice: f32
+	effects: f32
+	footsteps: f32
+	music: f32
+}
+
+// The kinds of sound a voice plays (the mixer's kinds), each heard as loud
+// as its volume.
+SOUND_VOICE :: 1
+SOUND_EFFECT :: 2
+SOUND_FOOTSTEP :: 3
+
+// Every sound as loud as it's made.
+full_volumes :: fun() -> Volumes {
+	return Volumes{master = 1, voice = 1, effects = 1, footsteps = 1, music = 1}
+}
+
+// Hears the sounds as loud as the player set them (the music as loud
+// beside the other sounds as Oblivion.ini has it).
+set_volumes :: fun(mixer: ^Mixer, volumes: Volumes) {
+	mixer.master = volumes.master
+	mixer.kind_volumes[SOUND_VOICE] = volumes.voice
+	mixer.kind_volumes[SOUND_EFFECT] = volumes.effects
+	mixer.kind_volumes[SOUND_FOOTSTEP] = volumes.footsteps
+	mixer.music_volume = MUSIC_VOLUME * volumes.music
+}
+
+// ---- clips -------------------------------------------------------------------------
+
+// The clip for a sound (its index in the mixer's clips): its file's,
+// loaded from the archives the first time; a folder's, one of its files at
+// random (in the first archive with the folder).
+clip_for :: fun(mixer: ^Mixer, archives: ^Archives, kind: ^Sound_Kind) -> i64, err {
+	path : [256]utf8
+	if kind.folder {
+		folder_path : []utf8 = kind.path
+		if ends_with(folder_path, "\\") do folder_path = folder_path[0 : folder_path.len - 1]
+		archive_at, folder_at, found := find_archived_folder(archives, folder_path)
+		if not found do return -1, No_Sound_File
+		archive := &archives.list[archive_at]
+		folder := archive.folders[folder_at]
+		if folder.file_count == 0 do return -1, Empty_Folder
+		pick := folder.first_file + i64(next_random(&mixer.seed) % u64(folder.file_count))
+		&path + folder_path
+		&path + "\\"
+		&path + file_name(archive, archive.files[pick])
+	else
+		&path + kind.path
+	}
+	key := text_hash(path)
+	known, found := known_clip(mixer, key)
+	if found do return known
+	sound_file, in_archive := find_archived(archives, path)
+	if not in_archive do return -1, No_Sound_File
+	if not clip_fits(mixer, archived_size(archives, sound_file)) do return -1, No_Room_For_Sound
+	data := read_archived(archives, sound_file, &mixer.clip_room)?
+	return add_clip(mixer, key, data)
+}
+
+// ---- what's heard -------------------------------------------------------------------
+
+// How loud a sound is (as a share of full) from a distance: full within
+// its near distance, then falling off with distance, to nothing at its far
+// one; a 2D sound, as loud anywhere. Its quieting (decibels) on top.
+loudness :: fun(kind: ^Sound_Kind, distance: f32) -> f32 {
+	quieting := pow_f32(10, -kind.attenuation / 20)
+	if kind.flags & SOUND_2D != 0 do return quieting
+	return quieting * distance_loudness(distance, kind.min_distance, kind.max_distance)
+}
+
+// The left and right gains of a sound at a place, as loud as given: by
+// which side of the camera it's on (a 2D sound, or one heard all round,
+// on both alike).
+sound_gains :: fun(kind: ^Sound_Kind, position: Vec3, listener: Listener, loud: f32) -> [2!]f32 {
+	return side_gains(position, listener, loud, kind.flags & (SOUND_2D | SOUND_360_LFE) != 0)
+}
+
+// Whether a sound plays at an hour of the day: always, or between its start
+// and stop hours (round midnight, if the stop comes first).
+plays_at_hour :: fun(kind: ^Sound_Kind, hour: f32) -> bool {
+	if kind.start_hour == kind.stop_hour do return true
+	if kind.start_hour < kind.stop_hour do return hour >= kind.start_hour and hour < kind.stop_hour
+	return hour >= kind.start_hour or hour < kind.stop_hour
+}
+
+// Starts a voice playing a sound's clip (start_voice), at its pitch: its
+// own shift, and shifted at random each time for some.
+start_sound :: fun(mixer: ^Mixer, kind: ^Sound_Kind, clip_index: i64, source: u64, gains: [2!]f32, looping: bool) -> i64 {
+	pitch := 1 + kind.pitch_shift
+	if kind.flags & SOUND_RANDOM_PITCH != 0 do pitch *= 1 + (random_share(&mixer.seed) - 0.5) * 0.1
+	return start_voice(mixer, clip_index, source, gains, looping, pitch, SOUND_EFFECT)   // (all effects, so far)
+}
+
+// Plays a sound once at a place (a door opening, say), heard from where the
+// listener is now.
+play_once :: fun(mixer: ^Mixer, archives: ^Archives, kind: ^Sound_Kind, position: Vec3, listener: Listener) {
+	if not mixer.open do return
+	clip_index, clip_error := clip_for(mixer, archives, kind)
+	if clip_error {
+		note_sound_failure(mixer, kind.path, clip_error)
+		return
+	}
+	loud := loudness(kind, vec3_length(position - listener.position))
+	_ = start_sound(mixer, kind, clip_index, 0, sound_gains(kind, position, listener, loud), false)
+}
+
+// A sound placed in the scene, as the audio hears it: what it is, where, its
+// key (the voice playing it is found by it), when it next plays (a sound
+// that doesn't loop: in the mix's seconds), and how loud it is now (a
+// share of its loudness: a weather's rain as the weather comes in).
+Placed_Sound :: struct {
+	kind: Sound_Kind
+	position: Vec3
+	key: u64
+	next_play: f64
+	volume: f32
+}
+
+// Hears placed sounds from the listener at an hour (between the mixer's
+// hear_start and hear_finish): starts the loops in hearing range (and the
+// others when their pause is over), and moves the playing ones' gains to
+// where they are now. The time is the mix's, in seconds.
+hear_sounds :: fun(mixer: ^Mixer, archives: ^Archives, sounds: ^[]Placed_Sound, listener: Listener, hour: f32, now: f64) {
+	if not mixer.open do return
+	for &sound in sounds {
+		loud : f32 = 0
+		if plays_at_hour(&sound.kind, hour) do loud = loudness(&sound.kind, vec3_length(sound.position - listener.position)) * sound.volume
+		if loud <= 0.001 do continue
+		gains := sound_gains(&sound.kind, sound.position, listener, loud)
+		playing := voice_of(mixer, sound.key)
+		if playing >= 0 {
+			keep_hearing(mixer, playing, gains)
+			continue
+		}
+		// Not now: a sound that doesn't loop, before its pause is over; one
+		// whose clip couldn't be loaded.
+		if now < sound.next_play do continue
+		looping := sound.kind.flags & SOUND_LOOP != 0
+		if not looping do sound.next_play = now + f64(REPLAY_PAUSE * (1 + random_share(&mixer.seed)))
+		clip_index, clip_error := clip_for(mixer, archives, &sound.kind)
+		if clip_error {
+			note_sound_failure(mixer, sound.kind.path, clip_error)
+			sound.next_play = now + 1000000   // (not tried again)
+			continue
+		}
+		_ = start_sound(mixer, &sound.kind, clip_index, sound.key, gains, looping)
+	}
+}
+
+// ---- music ---------------------------------------------------------------------------
+
+// The kinds of music, numbered as the cells' XCMT and the worlds' SNAM
+// number them, each a folder of Data\Music — Explore (out in the world),
+// Public (towns, inns, shops) and Dungeon; none, for silence.
+MUSIC_NONE :: -1
+MUSIC_EXPLORE :: 0
+MUSIC_PUBLIC :: 1
+MUSIC_DUNGEON :: 2
+
+// How loud the music is beside the other sounds, as Oblivion.ini has them
+// (fDefaultMusicVolume 0.3 to fDefaultEffectsVolume 0.8).
+MUSIC_VOLUME :: 0.375
+
+// The folder of a kind of music's tracks, in the music's folder (Data\Music);
+// empty for MUSIC_NONE.
+music_kind_folder :: fun(music_folder: []utf8, kind: i64) -> Path {
+	folder : Path
+	if kind == MUSIC_NONE do return folder
+	&folder + music_folder
+	&folder + "\\"
+	if kind == MUSIC_PUBLIC do &folder + "Public"
+	elif kind == MUSIC_DUNGEON do &folder + "Dungeon"
+	else do &folder + "Explore"
+	return folder
+}

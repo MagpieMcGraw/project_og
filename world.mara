@@ -12,67 +12,18 @@ use mara.string
 use mara.memory
 use esm
 use logging
+use indexing
 
 // What finding things in the world can fail with.
 World_Error :: error {
 	No_Such_Cell
 	No_Such_Record
-	Index_Full
 	Broken_Group     // a record in a cell's group runs past the group's end
 	Missing_Master   // a plugin's master isn't among the plugins loaded
 	Not_A_Plugin     // a plugin file that doesn't start with its TES4 record
 }
 
 // ---- finding records ---------------------------------------------------------
-
-// A table from keys — form ids, or a world and a cell's place in it
-// (grid_key) — to values: where a record is, or another form id. A power of
-// two in size, kept under half full; a key is looked for from its hash's
-// slot onward.
-Key_Index :: struct {
-	keys: []u64       // 0 in an empty slot
-	values: []u32
-	count: i64
-}
-
-// An empty index with room for capacity entries (a power of two).
-key_index :: fun(capacity: i64, storage: ^[]byte) -> Key_Index {
-	keys := slice([:capacity]u64, storage)
-	values := slice([:capacity]u32, storage)
-	for i in 0:capacity {
-		&keys + u64(0)
-		&values + u32(0)
-	}
-	return Key_Index{keys = keys, values = values, count = 0}
-}
-
-// The slot a key's search starts at.
-first_slot :: fun(index: ^Key_Index, key: u64) -> i64 {
-	mixed := (key *% 0x9E3779B97F4A7C15) >> 32
-	return i64(mixed) & (index.keys.len - 1)
-}
-
-index_put :: fun(index: ^Key_Index, key: u64, value: i64) -> err {
-	if (index.count + 1) * 2 > index.keys.len do return Index_Full
-	slot := first_slot(index, key)
-	for index.keys[slot] != 0 and index.keys[slot] != key {
-		slot = (slot + 1) & (index.keys.len - 1)
-	}
-	if index.keys[slot] == 0 do index.count += 1
-	index.keys[slot] = key
-	index.values[slot] = u32(value)
-}
-
-// The key's value, and false when the index doesn't have it.
-index_get :: fun(index: ^Key_Index, key: u64) -> i64, bool {
-	if key == 0 do return 0, false
-	slot := first_slot(index, key)
-	for index.keys[slot] != 0 {
-		if index.keys[slot] == key do return i64(index.values[slot]), true
-		slot = (slot + 1) & (index.keys.len - 1)
-	}
-	return 0, false
-}
 
 // The key of an exterior cell: its world, and its place on the world's
 // grid (cells 4096 units square, 0 0 the one north-east of the origin).
@@ -849,38 +800,6 @@ area_around :: fun(x: i64, y: i64) -> Grid_Area {
 	return Grid_Area{everywhere = false,
 		low_x = x - EXTERIOR_RADIUS, low_y = y - EXTERIOR_RADIUS,
 		high_x = x + EXTERIOR_RADIUS, high_y = y + EXTERIOR_RADIUS}
-}
-
-// ---- chance ---------------------------------------------------------------------
-
-// The next number of a seed's run (xorshift), the seed moved on.
-next_random :: fun(seed: ^u64) -> u64 {
-	value := seed^
-	value = value ~ (value << 13)
-	value = value ~ (value >> 7)
-	value = value ~ (value << 17)
-	seed^ = value
-	return value
-}
-
-// A number from 0 up to 1, the seed moved on.
-random_share :: fun(seed: ^u64) -> f32 {
-	return f32(next_random(seed) >> 40) / 16777216
-}
-
-// A number from 0 up to 1 that's always the same for the same seed and the
-// same four numbers (a time's slot, a place, what it's for): chance that
-// every player of a world rolls alike, by itself, with nothing to keep in
-// step but the world's seed and clock.
-chance_at :: fun(seed: u64, a: i64, b: i64, c: i64, d: u64) -> f32 {
-	mixed := seed
-	for part in [u64(a), u64(b), u64(c), d] {
-		mixed = (mixed ~ part) *% 0x9E3779B97F4A7C15
-		mixed = mixed ~ (mixed >> 29)
-		mixed = mixed *% 0xBF58476D1CE4E5B9
-		mixed = mixed ~ (mixed >> 32)
-	}
-	return f32(mixed >> 40) / 16777216
 }
 
 // ---- exterior cells ------------------------------------------------------------

@@ -19,6 +19,8 @@ use animation
 use audio
 use walking
 use logging
+use indexing
+use game_sound
 render :: use render
 
 FIRST_PERSON_SKELETON :: "meshes\\characters\\_1stperson\\skeleton.nif"

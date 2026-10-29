@@ -20,6 +20,7 @@ use mara.os
 use mara.string
 use bsa
 use logging
+use xml
 render :: use render
 
 // Room for all the menus read: their tiles, traits and operations, and
@@ -255,112 +256,34 @@ operation_kind :: fun(name: []utf8) -> i64 {
 	return 0
 }
 
-// An element's tag, read from just past its '<': its name, its src, name
-// and trait attributes, whether it closes (</…>) and whether it closes
-// itself (…/>). at is left past its '>'.
-Menu_Tag :: struct {
-	name: [64]utf8
-	source: [128]utf8
-	tile_name: [64]utf8
-	trait: [32]utf8
-	closing: bool
-	self_closing: bool
-}
-
-// What comes next in the XML from at: a tag (true, read into tag), or
-// text up to the next '<' (false, its view in text_found). Comments are
-// passed over. At the end: false and no text.
-next_piece :: fun(text: []utf8, at: ^i64, tag: ^Menu_Tag) -> bool, []utf8 {
-	for at^ < text.len {
-		if text[at^] != '<' {
-			start := at^
-			for at^ < text.len and text[at^] != '<' do at^ += 1
-			return false, text[start : at^]
-		}
-		// A comment: past its end.
-		if at^ + 3 < text.len and text[at^ + 1] == '!' and text[at^ + 2] == '-' and text[at^ + 3] == '-' {
-			at^ += 4
-			for at^ + 2 < text.len and not (text[at^] == '-' and text[at^ + 1] == '-' and text[at^ + 2] == '>') do at^ += 1
-			at^ = min(at^ + 3, text.len)
-			continue
-		}
-		read_tag(text, at, tag)
-		return true, text[0:0]
+// What comes next in a menu's XML (xml's next_piece), a tag's name in
+// lower case: the game's menus write their names in any case.
+menu_piece :: fun(text: []utf8, at: ^i64, tag: ^Xml_Tag) -> bool, []utf8 {
+	is_tag, piece := next_piece(text, at, tag)
+	if is_tag {
+		for k in 0:tag.name.len do tag.name[k] = lower(tag.name[k])
 	}
-	return false, text[0:0]
-}
-
-// A tag from at (on its '<'), into tag; at past its '>'.
-read_tag :: fun(text: []utf8, at: ^i64, tag: ^Menu_Tag) {
-	tag.name.len = 0
-	tag.source.len = 0
-	tag.tile_name.len = 0
-	tag.trait.len = 0
-	tag.closing = false
-	tag.self_closing = false
-	at^ += 1
-	if at^ < text.len and text[at^] == '/' {
-		tag.closing = true
-		at^ += 1
-	}
-	for at^ < text.len and not is_tag_space(text[at^]) and text[at^] != '>' and text[at^] != '/' {
-		if fits(tag.name.len + 1, tag.name.cap) do &tag.name + lower(text[at^])
-		at^ += 1
-	}
-	// Its attributes: name="value".
-	for at^ < text.len and text[at^] != '>' {
-		if text[at^] == '/' {
-			tag.self_closing = true
-			at^ += 1
-			continue
-		}
-		if is_tag_space(text[at^]) {
-			at^ += 1
-			continue
-		}
-		attribute : [32]utf8
-		for at^ < text.len and text[at^] != '=' and text[at^] != '>' and not is_tag_space(text[at^]) {
-			if fits(attribute.len + 1, attribute.cap) do &attribute + lower(text[at^])
-			at^ += 1
-		}
-		for at^ < text.len and text[at^] != '"' and text[at^] != '>' do at^ += 1
-		if at^ >= text.len or text[at^] != '"' do continue
-		at^ += 1
-		start := at^
-		for at^ < text.len and text[at^] != '"' do at^ += 1
-		value := text[start : at^]
-		if at^ < text.len do at^ += 1
-		if attribute == "src" {
-			add_what_fits(&tag.source, value)
-		elif attribute == "name"
-			add_what_fits(&tag.tile_name, value)
-		elif attribute == "trait"
-			add_what_fits(&tag.trait, value)
-		}
-	}
-	if at^ < text.len do at^ += 1
-}
-
-is_tag_space :: fun(c: utf8) -> bool {
-	return c == ' ' or c == '\t' or c == '\n' or c == '\r'
+	return is_tag, piece
 }
 
 // A tile's children from at, till its closing tag: tiles, includes (a
 // prefab from menus\prefabs\, its tiles and traits as the tile's own) and
 // traits.
 parse_children :: fun(book: ^Menu_Book, archives: ^Archives, text: []utf8, at: ^i64, tile: i64, in_template: bool) {
-	tag : Menu_Tag
+	tag : Xml_Tag
 	for at^ < text.len {
-		is_tag, _ := next_piece(text, at, &tag)
+		is_tag, _ := menu_piece(text, at, &tag)
 		if not is_tag do continue
 		if tag.closing do return
 		kind := tile_kind(tag.name)
 		if kind != 0 {
-			child := new_tile(book, kind, tag.tile_name, tile, in_template or kind == TILE_TEMPLATE)
+			tile_name, _ := attribute(text, &tag, "name")
+			child := new_tile(book, kind, tile_name, tile, in_template or kind == TILE_TEMPLATE)
 			if child < 0 do return
 			if not tag.self_closing do parse_children(book, archives, text, at, child, in_template or kind == TILE_TEMPLATE)
 		elif tag.name == "include"
-			include_prefab(book, archives, tag.source, tile, in_template)
+			source, _ := attribute(text, &tag, "src")
+			include_prefab(book, archives, source, tile, in_template)
 		else
 			trait := new_trait(book, tile, tag.name)
 			if trait >= 0 and not tag.self_closing do parse_operations(book, text, at, &book.traits[trait].first_operation, tag.name)
@@ -408,13 +331,13 @@ new_trait :: fun(book: ^Menu_Book, tile: i64, name: []utf8) -> i64 {
 // closes them too (the game's files have a `<_handonly>` closed by
 // another). Linked from first.
 parse_operations :: fun(book: ^Menu_Book, text: []utf8, at: ^i64, first: ^i64, holder: []utf8) {
-	tag : Menu_Tag
+	tag : Xml_Tag
 	last : i64 = -1
 	for at^ < text.len {
-		is_tag, piece := next_piece(text, at, &tag)
+		is_tag, piece := menu_piece(text, at, &tag)
 		operation : i64 = -1
 		if not is_tag {
-			constant := trim_menu_text(piece)
+			constant := trim_xml_text(piece)
 			if constant.len == 0 do continue
 			operation = new_operation(book, OP_COPY)
 			if operation >= 0 do set_constant(book, operation, constant)
@@ -425,8 +348,10 @@ parse_operations :: fun(book: ^Menu_Book, text: []utf8, at: ^i64, first: ^i64, h
 			operation = new_operation(book, kind)
 			if operation >= 0 {
 				made := &book.operations[operation]
-				add_what_fits(&made.source, tag.source)
-				add_what_fits(&made.trait, tag.trait)
+				source, _ := attribute(text, &tag, "src")
+				trait, _ := attribute(text, &tag, "trait")
+				add_what_fits(&made.source, source)
+				add_what_fits(&made.trait, trait)
 				if not tag.self_closing do parse_argument(book, text, at, operation)
 			}
 		}
@@ -440,12 +365,12 @@ parse_operations :: fun(book: ^Menu_Book, text: []utf8, at: ^i64, first: ^i64, h
 // An operation's content from at, till its closing tag: a constant, or
 // operations (its argument worked out from them).
 parse_argument :: fun(book: ^Menu_Book, text: []utf8, at: ^i64, operation: i64) {
-	tag : Menu_Tag
+	tag : Xml_Tag
 	last : i64 = -1
 	for at^ < text.len {
-		is_tag, piece := next_piece(text, at, &tag)
+		is_tag, piece := menu_piece(text, at, &tag)
 		if not is_tag {
-			constant := trim_menu_text(piece)
+			constant := trim_xml_text(piece)
 			if constant.len > 0 do set_constant(book, operation, constant)
 			continue
 		}
@@ -455,8 +380,10 @@ parse_argument :: fun(book: ^Menu_Book, text: []utf8, at: ^i64, operation: i64) 
 		inner := new_operation(book, kind)
 		if inner < 0 do return
 		made := &book.operations[inner]
-		add_what_fits(&made.source, tag.source)
-		add_what_fits(&made.trait, tag.trait)
+		source, _ := attribute(text, &tag, "src")
+		trait, _ := attribute(text, &tag, "trait")
+		add_what_fits(&made.source, source)
+		add_what_fits(&made.trait, trait)
 		if not tag.self_closing do parse_argument(book, text, at, inner)
 		if last >= 0 do book.operations[last].next = inner
 		else do book.operations[operation].first_argument = inner
@@ -520,15 +447,6 @@ entity_value :: fun(name: []utf8) -> f32 {
 	if name == "xitem" do return 109
 	if compare_folded(name[0 : min(name.len, 7)], "xbutton") == 0 or name == "xboxhint" do return MENU_FALSE
 	return 0
-}
-
-// Text from the XML without the spaces round it.
-trim_menu_text :: fun(text: []utf8) -> []utf8 {
-	start : i64 = 0
-	stop := text.len
-	for start < stop and is_tag_space(text[start]) do start += 1
-	for stop > start and is_tag_space(text[stop - 1]) do stop -= 1
-	return text[start : stop]
 }
 
 // ---- working out traits --------------------------------------------------------------
@@ -601,7 +519,7 @@ trait_value :: fun(book: ^Menu_Book, tile: i64, name: []utf8, renderer: ^render.
 trait_number :: fun(book: ^Menu_Book, tile: i64, name: []utf8, renderer: ^render.Renderer, archives: ^Archives) -> f32 {
 	value := trait_value(book, tile, name, renderer, archives)
 	if not value.is_text do return value.number
-	number, is_number := parse_number(trim_menu_text(value.text))
+	number, is_number := parse_number(trim_xml_text(value.text))
 	return if is_number do f32(number) else 0
 }
 
@@ -964,7 +882,7 @@ gather_drawn :: fun(book: ^Menu_Book, tile: i64, parent_x: f32, parent_y: f32, p
 tile_texture :: fun(book: ^Menu_Book, tile: i64, renderer: ^render.Renderer, archives: ^Archives) -> i64 {
 	name := trait_value(book, tile, "filename", renderer, archives)
 	if not name.is_text do return 0
-	file := trim_menu_text(name.text)
+	file := trim_xml_text(name.text)
 	for file.len > 0 and (file[0] == '\\' or file[0] == '/') do file = file[1 : file.len]
 	if file.len == 0 do return 0
 	path : [256]utf8

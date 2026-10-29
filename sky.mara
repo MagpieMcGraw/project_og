@@ -15,6 +15,7 @@ use mara.string
 use world
 use esm
 use logging
+use indexing
 
 // The weather's colors, as NAM0 lists them.
 SKY_UPPER    :: 0

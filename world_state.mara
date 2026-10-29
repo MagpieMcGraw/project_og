@@ -20,6 +20,8 @@ use esm
 use world
 use sky
 use logging
+use indexing
+use random
 
 // The messages the server and its clients send each other (og's wire
 // carries them), and the port a server listens on unless told another

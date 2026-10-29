@@ -31,6 +31,8 @@ use animation
 use speedtree
 use dds
 use logging
+use indexing
+use game_sound
 
 // Room for the models' collision: points, three a triangle. (Tamriel's
 // meshes have 1.8 million triangles in all; a scene's models, a few hundred
@@ -552,14 +554,6 @@ named_sound_kind :: fun(scene: ^Scene, plugin: ^Plugin, name: []utf8) -> i64 {
 	form_id, found := index_get(&scene.sound_names, folded_hash(name))
 	if not found do return -1
 	return scene_sound_kind(scene, plugin, u32(form_id - 1))
-}
-
-// A hash of a text in lower case, never 0: an editor id's key, any case.
-folded_hash :: fun(text: []utf8) -> u64 {
-	hash : u64 = 0xCBF29CE484222325
-	for c in text do hash = (hash ~ u64(lower(c))) *% 0x100000001B3
-	if hash == 0 do hash = 1
-	return hash
 }
 
 // Notes that something couldn't be loaded (and is left out): counted, the

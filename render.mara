@@ -42,6 +42,7 @@ use land
 use sky
 use particles
 use logging
+use indexing
 
 // ---- sizes ---------------------------------------------------------------------
 
@@ -3036,16 +3037,6 @@ texture_from_pixels :: fun(renderer: ^Renderer, path: []utf8, pixels: []byte, wi
 	wait_for_handle(renderer, slot)
 	_ = index_put(&renderer.texture_index, key, slot)
 	return slot
-}
-
-// A 64-bit FNV-1a hash of a text, never 0: a path's key in a table.
-text_hash :: fun(text: []utf8) -> u64 {
-	hash : u64 = 0xCBF29CE484222325
-	for c in text {
-		hash = (hash ~ u64(c)) *% 0x100000001B3
-	}
-	if hash == 0 do hash = 1
-	return hash
 }
 
 // Reads a texture from the archives onto the card: block compressed ones as

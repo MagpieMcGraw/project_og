@@ -22,6 +22,7 @@ use animation
 use facegen
 use dds
 use logging
+use indexing
 
 // The animation every NPC is posed by: its first pose.
 IDLE_ANIMATION :: "meshes/characters/_male/idle.kf"
