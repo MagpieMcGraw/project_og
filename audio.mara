@@ -163,7 +163,7 @@ read_wave :: fun(data: []byte) -> Clip, err {
 clip_for :: fun(audio: ^Mixer, archives: ^Archives, kind: ^Sound_Kind) -> i64, err {
 	path : [256]utf8
 	if kind.folder {
-		folder_path := kind.path[:]
+		folder_path : []utf8 = kind.path
 		if ends_with(folder_path, "\\") do folder_path = folder_path[0 : folder_path.len - 1]
 		archive_at, folder_at, found := find_archived_folder(archives, folder_path)
 		if not found do return -1, No_Sound_File

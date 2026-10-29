@@ -647,7 +647,7 @@ build_npc_model :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, npc_id: u
 	read_npc_look(plugin, npc_id, &look)?
 	skeleton := npc_skeleton(scene, loader, look.skeleton)
 	if skeleton < 0 do return -1, No_Skeleton
-	pose := scene.npc_skeletons[skeleton].bones[:]
+	pose : []Pose_Bone = scene.npc_skeletons[skeleton].bones
 	report := Npc_Report{failures = 0, first = [], reason = Not_In_Archive}
 	skins : [4]Face_Skin
 	skin_storage : [2 * MB]byte
@@ -723,7 +723,7 @@ assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose
 		if not skinned_mesh(&mesh) {
 			// The bone the part names, else the one the mesh does (a weapon's
 			// names where it's sheathed: drawn, the part says the hand).
-			bone := part.bone[:]
+			bone : []utf8 = part.bone
 			if bone.len == 0 do bone = hanging_bone(&mesh)
 			if bone.len > 0 {
 				place, posed := pose_place(pose, bone)

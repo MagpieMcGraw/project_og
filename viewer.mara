@@ -928,7 +928,7 @@ note_blow :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	}
 	name := reference_name(plugin, struck)
 	note(journal, "struck ")
-	note(journal, if name.len > 0 do name[:] else "someone")
+	note(journal, if name.len > 0 do name[0 : name.len] else "someone")
 	note_end(journal)
 }
 

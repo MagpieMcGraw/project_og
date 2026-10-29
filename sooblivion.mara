@@ -1597,7 +1597,7 @@ command_sounds :: fun() {
 			found := false
 			if kind.folder {
 				folders += 1
-				folder_path := kind.path[:]
+				folder_path : []utf8 = kind.path
 				if ends_with(folder_path, "\\") do folder_path = folder_path[0 : folder_path.len - 1]
 				_, found = find_folder(&sounds, folder_path)
 			else

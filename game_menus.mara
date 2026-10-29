@@ -308,7 +308,7 @@ click_menu :: fun(viewer: ^Viewer, mouse_x: f32, mouse_y: f32) {
 	book := &viewer.book
 	tile := tile_at(book, menu, mouse_x / scale, mouse_y / scale, &viewer.renderer, &viewer.archives)
 	if tile < 0 do return
-	name := book.tiles[tile].name[:]
+	name : []utf8 = book.tiles[tile].name
 	page := i64(trait_number(book, tile, "id", &viewer.renderer, &viewer.archives))
 	if page < 1 or page > 5 do return
 	if viewer.menu_open == MENU_STATS and starts_with(name, "stat_tabs_p") do _ = book_set(book, "StatsMenu", "user0", f32(page))

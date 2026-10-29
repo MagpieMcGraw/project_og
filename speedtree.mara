@@ -355,7 +355,7 @@ next_number :: fun(text: []utf8, at: ^i64) -> f32, err {
 
 // The curve's height (0 to 1) at x (0 to 1).
 curve_height :: fun(curve: ^Tree_Curve, x: f32) -> f32 {
-	points := curve.points[:]
+	points : []Curve_Point = curve.points
 	if x <= points[0].x do return points[0].y
 	last := points[points.len - 1]
 	if x >= last.x do return last.y

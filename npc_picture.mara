@@ -109,7 +109,7 @@ command_npc_picture :: fun(name: []utf8, out_path: []utf8) {
 	png_storage : [16 * MB]byte
 	row_storage : [16 * MB]byte
 	encode_png(canvas.pixels, canvas.width, canvas.height, &png_storage, &row_storage)
-	write_error := write_entire_file(out_path, png_storage[:])
+	write_error := write_entire_file(out_path, png_storage)
 	if write_error {
 		print("couldn't write %: %", out_path, write_error)
 		return
@@ -122,7 +122,7 @@ command_npc_picture :: fun(name: []utf8, out_path: []utf8) {
 		&skin_path + int_text(k)
 		&skin_path + ".png"
 		encode_png(skin.pixels, skin.width, skin.height, &png_storage, &row_storage)
-		skin_error := write_entire_file(skin_path, png_storage[:])
+		skin_error := write_entire_file(skin_path, png_storage)
 		if skin_error do print("couldn't write %: %", skin_path, skin_error)
 		else do print("  its skin for % into %", skin.path, skin_path)
 	}
