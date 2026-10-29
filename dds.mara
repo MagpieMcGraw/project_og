@@ -209,7 +209,7 @@ decode_rgba :: fun(texture: Texture, mip_index: i64, out: ^[]byte) -> []byte, er
 		for i in 0:size do pixels[i] = u8(255)
 	}
 	out.len = start + size
-	return pixels
+	return out[start : out.len]
 }
 
 // Decodes block compressed pixels: each 4x4 block into its place, the

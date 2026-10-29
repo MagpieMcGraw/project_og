@@ -58,14 +58,16 @@ make_folder :: fun(path: []utf8) {
 	if fits_path do _ = CreateDirectoryW(wide.ptr, void)
 }
 
-// Fills view (all its len) from the file's current place, in as many reads
-// as that takes. Read_Failed when the file ends first.
+// Fills view — all of its room, up to its cap: its len is then its cap —
+// from the file's current place, in as many reads as that takes.
+// Read_Failed when the file ends first.
 read_exactly :: fun(file: File_Id, view: ^[]byte) -> err {
 	got : i64 = 0
-	for got < view.len {
-		rest := view[got : view.len]
+	for got < view.cap {
+		rest := view[got : view.cap]
 		file_read(file, &rest)?
 		if rest.len == 0 do return File_Error.Read_Failed
 		got += rest.len
 	}
+	view.len = view.cap
 }

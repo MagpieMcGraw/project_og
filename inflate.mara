@@ -287,7 +287,10 @@ stored_block :: fun(bits: ^Bits, output: ^[]byte) -> err {
 // length are kept in locals, put back for decode's longer codes and when
 // it's done, and the short codes are looked up here.)
 packed_block :: fun(bits: ^Bits, output: ^[]byte, literals: ^Huffman, distances: ^Huffman) -> err {
+	// (All of the room, what's been written as well as what's to be: a match
+	// copies from behind where it writes.)
 	room := output[0 : output.cap]
+	room.len = room.cap
 	written := output.len
 	held := bits.held
 	count := bits.count
@@ -337,7 +340,7 @@ packed_block :: fun(bits: ^Bits, output: ^[]byte, literals: ^Huffman, distances:
 			if overran(bits) do return Input_Ended
 		}
 		if symbol < 256 {
-			if written == room.len do return Output_Full
+			if written == room.cap do return Output_Full
 			room[written] = u8(symbol)
 			written += 1
 			continue
@@ -374,7 +377,7 @@ packed_block :: fun(bits: ^Bits, output: ^[]byte, literals: ^Huffman, distances:
 		held >>= u64(distance_extra)
 		count -= distance_extra
 		if distance > written do return Bad_Distance
-		if written + length > room.len do return Output_Full
+		if written + length > room.cap do return Output_Full
 
 		// At once when it's all behind; byte by byte when it overlaps what it
 		// writes (a run).
