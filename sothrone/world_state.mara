@@ -1,12 +1,13 @@
-// The game's world as its server keeps it: the players in it, where each
-// is and where each is walking to, stepped WORLD_TICK at a time. Players
-// say where they want to go (Go_Message); the server walks them there and
-// tells everyone where everyone is (Player_Seen). Its messages are here too:
-// what travels on the wire (wire.mara) between server and clients.
+// The game's world as its server keeps it: the level it's in, the players
+// in it, where each is and where each is walking to, stepped WORLD_TICK at
+// a time. Players say where they want to go (Go_Message); the server walks
+// them there and tells everyone where everyone is (Player_Seen). Its
+// messages are here too: what travels on the wire (wire.mara) between
+// server and clients.
 //
-// For now the world is one room, ROOM_WIDTH by ROOM_HEIGHT pixels (the
-// Mori shrine's size, as its .lex file says, a guess), and the players are
-// all there is in it.
+// Places are in the level's pixels (its layout's: level.mara), down the
+// screen positive. For now a player may walk anywhere in the level's area —
+// the box round all it shows — and nothing's in their way.
 module world_state
 
 use mara.core
@@ -23,9 +24,15 @@ MOST_TICKS_AT_ONCE :: 10
 // going counts as there.
 WALK_SPEED :: 180.0
 ARRIVED :: 1.0
-// The room, in pixels.
-ROOM_WIDTH :: 800.0
-ROOM_HEIGHT :: 600.0
+// The level a game starts in (World.ini's name for it), and the area used
+// when the game's files can't be read: a room of the original screen's size.
+START_LEVEL :: "Citadel1_Shrine"
+NO_LEVEL_WIDTH :: 800.0
+NO_LEVEL_HEIGHT :: 600.0
+// How far inside the area's edges players are kept, and from its middle
+// where they start, apart from each other.
+AREA_MARGIN :: 32.0
+START_SPACING :: 60.0
 // How players look: one of the seven samurai each (art.mara's SAMURAI),
 // the first player the first.
 LOOKS :: 7
@@ -49,21 +56,32 @@ GAME_PORT :: 27200
 // From a client to its server.
 MESSAGE_GO :: 1          // where the player wants to walk to (Go_Message)
 // From a server to its clients.
-MESSAGE_WELCOME :: 10    // which player the client is (Welcome_Message)
+MESSAGE_WELCOME :: 10    // which player the client is, the level (Welcome_Message)
 MESSAGE_PLAYERS :: 11    // every player, where they are (a list of Player_Seens)
 MESSAGE_NOTE :: 12       // something to tell the player (Note_Message)
 
-// Where a player wants to walk to, in the room.
+// A level's area: where its players may go.
+Area :: struct {
+	left: f32
+	top: f32
+	right: f32
+	bottom: f32
+}
+
+// Where a player wants to walk to, in the level.
 Go_Message :: struct {
 	x: f32
 	y: f32
 }
 
-// Which player a client is (their number), and the world's seed (for
-// chance its players roll alike).
+// Which player a client is (their number), the world's seed (for chance
+// its players roll alike), the level it's in (World.ini's name; empty: none
+// read, players in a bare area) and its area.
 Welcome_Message :: struct {
 	player: i64
 	seed: u64
+	level: [48]utf8
+	area: Area
 }
 
 // A player as every client's told of them: their number, where they are,
@@ -97,27 +115,40 @@ Player_State :: struct {
 	look: i64
 }
 
-// The world: its players in slots (a client's slot is its player's), the
-// steps it's taken, its seed.
+// The world: its level and area, its players in slots (a client's slot is
+// its player's), the steps it's taken, its seed.
 World_State :: struct {
+	level: [48]utf8
+	area: Area
 	players: [MAX_PLAYERS!]Player_State
 	ticks: i64
 	seed: u64
 }
 
-// A world starting: nobody in it.
-world_start :: fun(state: ^World_State) {
-	for &player, slot in state.players do player_clear(player, 0, slot)
+// The area when no level's read: a bare room.
+no_level_area :: fun() -> Area {
+	return Area{left = 0, top = 0, right = f32(NO_LEVEL_WIDTH), bottom = f32(NO_LEVEL_HEIGHT)}
+}
+
+// A world starting in a level (empty: none) and its area: nobody in it.
+world_start :: fun(state: ^World_State, level: []utf8, area: Area) {
+	state.level.len = 0
+	for c in level {
+		if state.level.len < state.level.cap do &state.level + c
+	}
+	state.area = area
+	for &player, slot in state.players do player_clear(player, 0, slot, area)
 	state.ticks = 0
 	state.seed = time_now()
 }
 
 // A slot's player made afresh: the player numbered id (0: none), standing
-// at their slot's start, a little apart from the others'.
-player_clear :: fun(player: ^Player_State, id: i64, slot: i64) {
+// at their slot's start, round the area's middle, a little apart from the
+// others'.
+player_clear :: fun(player: ^Player_State, id: i64, slot: i64, area: Area) {
 	player.id = id
-	player.x = f32(ROOM_WIDTH / 2) + f32(slot % 4) * 60 - 90
-	player.y = f32(ROOM_HEIGHT / 2) + f32(slot / 4) * 60 - 30
+	player.x = (area.left + area.right) / 2 + f32(slot % 4) * f32(START_SPACING) - f32(START_SPACING) * 1.5
+	player.y = (area.top + area.bottom) / 2 + f32(slot / 4) * f32(START_SPACING) - f32(START_SPACING) * 0.5
 	player.to_x = player.x
 	player.to_y = player.y
 	player.walking = false
@@ -134,10 +165,11 @@ facing_toward :: fun(across: f32, down: f32) -> i64 {
 	return if down > 0 do FACING_DOWN_RIGHT else FACING_UP_RIGHT
 }
 
-// A player told to walk to a spot (kept inside the room).
-player_go :: fun(player: ^Player_State, x: f32, y: f32) {
-	player.to_x = min(max(x, 0), f32(ROOM_WIDTH))
-	player.to_y = min(max(y, 0), f32(ROOM_HEIGHT))
+// A player told to walk to a spot, kept AREA_MARGIN inside the area.
+player_go :: fun(player: ^Player_State, x: f32, y: f32, area: Area) {
+	margin := f32(AREA_MARGIN)
+	player.to_x = min(max(x, area.left + margin), area.right - margin)
+	player.to_y = min(max(y, area.top + margin), area.bottom - margin)
 	player.walking = true
 }
 

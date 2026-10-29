@@ -1,0 +1,137 @@
+// The game's levels, as World.ini (in World.lot) lists them: a line each —
+// its name, its folder, its layout's name (LEX), its furniture's (FUR), its
+// music, its ambient light, its kind of place for the sound (castle, cave,
+// wilderness, …), the name the map shows. Its folder holds the layout
+// (<LEX>.lex) and the bundles of what it shows (.rex): a room's furniture
+// set is <FUR>(FUR).rex, the wilderness's pieces <LEX>(x,y).rex.
+module level
+
+use mara.core
+use mara.memory
+use mara.string
+use lot
+use lex
+
+WORLD_ARCHIVE :: "World.lot"
+WORLD_INI :: "world/world.ini"
+// Room to read World.ini and a layout in (the biggest is 644 KB).
+LEVEL_FILE_ROOM :: 2 * MB
+
+Level_Error :: error {
+	No_Level   // World.ini has no level of that name
+	No_Layout  // the level's folder has no layout of the name World.ini gives
+}
+
+// A level's line of World.ini.
+Level_Info :: struct {
+	name: [64]utf8
+	folder: [160]utf8      // its path in World.lot, '/' after it
+	layout_name: [64]utf8
+	furniture_name: [64]utf8
+	music: [64]utf8
+	light: i64
+	environment: i64
+	title: [64]utf8
+}
+
+// The line of World.ini (its text in bytes) for the level named name, its
+// case aside.
+level_info :: fun(ini: []byte, name: []utf8) -> Level_Info, err {
+	info := Level_Info{name = [], folder = [], layout_name = [], furniture_name = [], music = [], light = 0, environment = 0, title = []}
+	line_start : i64 = 0
+	for line_start < ini.len {
+		line_stop := line_start
+		for line_stop < ini.len and letter(ini, line_stop) != '\n' do line_stop += 1
+		if line_matches(ini, line_start, line_stop, name) {
+			read_line(ini, line_start, line_stop, &info)
+			return info
+		}
+		line_start = line_stop + 1
+	}
+	return info, No_Level
+}
+
+// Whether a line's first field is name (case aside): not a comment.
+line_matches :: fun(text: []byte, start: i64, end: i64, name: []utf8) -> bool {
+	field : [64]utf8
+	_ = field_at(text, start, end, 0, &field)
+	if field.len != name.len or field.len == 0 or field[0] == '#' do return false
+	for c, k in name {
+		if lower(field[k]) != lower(c) do return false
+	}
+	return true
+}
+
+lower :: fun(c: utf8) -> utf8 {
+	if c >= 'A' and c <= 'Z' do return c + ('a' - 'A')
+	return c
+}
+
+// A line's fields into info. The folder's '\'s become '/' and it ends with one.
+read_line :: fun(text: []byte, start: i64, end: i64, info: ^Level_Info) {
+	_ = field_at(text, start, end, 0, &info.name)
+	_ = field_at(text, start, end, 1, &info.folder)
+	for c, k in info.folder {
+		if c == '\\' do info.folder[k] = '/'
+	}
+	if info.folder.len > 0 and info.folder[info.folder.len - 1] != '/' and info.folder.len < info.folder.cap do &info.folder + '/'
+	_ = field_at(text, start, end, 2, &info.layout_name)
+	_ = field_at(text, start, end, 3, &info.furniture_name)
+	_ = field_at(text, start, end, 4, &info.music)
+	light : [16]utf8
+	environment : [16]utf8
+	_ = field_at(text, start, end, 5, &light)
+	_ = field_at(text, start, end, 6, &environment)
+	light_number, light_ok := parse_number(light)
+	if light_ok do info.light = i64(light_number)
+	environment_number, environment_ok := parse_number(environment)
+	if environment_ok do info.environment = i64(environment_number)
+	_ = field_at(text, start, end, 7, &info.title)
+}
+
+// The field-th of a line's comma-split fields, its spaces round it taken
+// off, into out (what fits): false when the line hasn't that many.
+field_at :: fun(text: []byte, start: i64, end: i64, field: i64, out: ^[]utf8) -> bool {
+	out.len = 0
+	at := start
+	for k in 0:field {
+		for at < end and letter(text, at) != ',' do at += 1
+		if at >= end do return false
+		at += 1
+	}
+	field_end := at
+	for field_end < end and letter(text, field_end) != ',' do field_end += 1
+	for at < field_end and is_space(letter(text, at)) do at += 1
+	for field_end > at and is_space(letter(text, field_end - 1)) do field_end -= 1
+	for k in at:field_end {
+		if out.len < out.cap do out + letter(text, k)
+	}
+	return true
+}
+
+// A byte of a text file, as a letter.
+letter :: fun(text: []byte, at: i64) -> utf8 {
+	return utf8(text[at])
+}
+
+is_space :: fun(c: utf8) -> bool {
+	return c == ' ' or c == '\t' or c == '\r' or c == '\n'
+}
+
+// A level's line and its layout, read from the world's archive (World.lot,
+// opened); file is room to read them in.
+read_level :: fun(world: ^Lot, name: []utf8, layout: ^Layout, file: ^[]byte) -> Level_Info, err {
+	ini, found := lot_find(world, WORLD_INI)
+	if not found do return Level_Info{name = [], folder = [], layout_name = [], furniture_name = [], music = [], light = 0, environment = 0, title = []}, No_Level
+	lot_read(world, ini, file)?
+	info := level_info(file^, name)?
+	path : [256]utf8
+	&path + info.folder
+	&path + info.layout_name
+	&path + ".lex"
+	layout_file, has_layout := lot_find(world, path)
+	if not has_layout do return info, No_Layout
+	lot_read(world, layout_file, file)?
+	lex_read(layout, file^)?
+	return info
+}

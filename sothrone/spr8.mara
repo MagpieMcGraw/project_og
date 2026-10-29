@@ -70,6 +70,21 @@ spr8_palette :: fun(bytes: []byte) -> Palette, err {
 	return palette
 }
 
+// A palette kept on its own (a level bundle's RPLT): 256 colours, RGB565,
+// nothing else. Colour 0 see-through, the rest solid.
+spr8_bare_palette :: fun(bytes: []byte) -> Palette, err {
+	palette : Palette
+	if bytes.len < 512 do return palette, Not_A_Sprite
+	for k in 0:256 {
+		colour : u16 = bytes[k * 2]
+		red := i64(colour >> 11) & 31
+		green := i64(colour >> 5) & 63
+		blue := i64(colour) & 31
+		palette[k] = [u8((red << 3) | (red >> 2)), u8((green << 2) | (green >> 4)), u8((blue << 3) | (blue >> 2)), u8(if k == 0 do 0 else 255)]
+	}
+	return palette
+}
+
 // Frame k's head: its canvas and box, where its rows are.
 spr8_frame :: fun(bytes: []byte, k: i64) -> Spr8_Frame, err {
 	none := Spr8_Frame{canvas_width = 0, canvas_height = 0, top = 0, bottom = 0, left = 0, right = 0, at = 0, end = 0}

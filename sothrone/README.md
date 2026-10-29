@@ -22,13 +22,17 @@ build named sothrone, optimized). `..\update_compiler.bat` brings the
 compiler from C:\Code\Mara\release, and ..\MARA_VERSION.txt says which it
 is.
 
-For now the program is the game's skeleton: one bare room (800 × 600),
-each player one of the seven samurai, read from the game's Samurai.lot,
+For now the program is the game's skeleton: one level, the Mori shrine
+room, read from the game's World.lot (its layout and furniture set) and
+drawn as the game laid it out, the window following its player; each
+player one of the seven samurai, read from the game's Samurai.lot,
 walking where its player clicks (held, they follow the mouse): running
-the way they go, standing once there. The server keeps the world: players
-say where they want to go, it walks them there 30 times a second, turns
-them the way they're going, and tells everyone where everyone is. Without
-the game's files the players are coloured squares.
+the way they go, standing once there. The server keeps the world: it
+reads the level's area, starts players in its middle, walks them where
+they ask 30 times a second (anywhere in the area for now: walls and walk
+grids aren't read yet), turns them the way they're going, and tells
+everyone where everyone is and which level they're in. Without the game's
+files the level is a bare room and the players coloured squares.
 
     sothrone                            the game: joins one on this machine, else hosts
     sothrone connect <address[:port]>   the game, joining the one at an address
@@ -46,6 +50,8 @@ LOT_FOLDER).
 The modules: `world_state` (the world and its messages), `world_server`,
 `world_copy` (a client's view of the world), `game_link` (join or host),
 `lot` (the archives), `spr8` (the sprites), `art` (the samurai's
+pictures on the card), `rex` (a level's bundles), `lex` (a level's
+layout), `level` (World.ini, a level read), `level_art` (a level's
 pictures on the card), `sothrone` (the commands, the window). From
 ../og, the modules the ports share (build.mara names the folder):
 `wire`, `logging`, `disk`, `sdl_platform`, `png`, `inflate`, `lzo`,
@@ -122,6 +128,10 @@ Python prototypes (run with `python -I`):
   frame of a sprite on one sheet.
 - `rex.py <file.rex>`: a resource bundle's table.
 - `walk_lzw.py <file.walk.sp>`: tries LZW starts on a walk grid.
+- `lex.py <file.lex>`: a layout's table and records.
+- `level.py <World.lot> <level folder> <lex name> <out.png> [file|y]`:
+  draws a whole level from its layout and bundles (the prototype of
+  level_art.mara).
 - `atlas_check.py <archive.lot> <sprite path> <atlas.png>`: builds the
   atlas `sothrone sprite` writes with the Python decoder and counts the
   pixels that differ (the Leader's run: none).

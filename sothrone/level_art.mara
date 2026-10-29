@@ -1,0 +1,143 @@
+// A level's pictures as the window draws them: each thing its layout
+// places (lex.mara) — a picture with the palette it names, or an
+// animation with its own — read from the level's bundles (rex.mara) and put
+// on the card, drawn in the layout's order (its ground first). A picture
+// or palette pair placed several times is put on the card once.
+module level_art
+
+use mara.core
+use mara.math
+use mara.memory
+use mara.string
+use lot
+use rex
+use lex
+use level
+use spr8
+use art
+use sprite_layer
+use logging
+
+// Room for one bundle (the biggest is 10.7 MB), and textures a level's
+// things may need.
+BUNDLE_ROOM :: 12 * MB
+LEVEL_TEXTURES :: 4096
+// How fast a level's animations go at speed 1 (frames a second: a guess).
+LEVEL_FRAME_RATE :: 12.0
+
+// A picture or an animation on the card: what it was made from, its atlas
+// (its frames in one row).
+Level_Texture :: struct {
+	resource: i64
+	palette: i64
+	atlas: Atlas
+}
+
+// A thing placed, as drawn: its texture (-1: not read), where its canvas's
+// top left is in the level, its animation's speed.
+Level_Piece :: struct {
+	texture: i64
+	x: f32
+	y: f32
+	speed: f32
+}
+
+Level_Art :: struct {
+	name: [48]utf8               // the level's (World.ini's name); empty: none
+	pieces: [LEX_PLACED]Level_Piece
+	textures: [LEVEL_TEXTURES]Level_Texture
+	missing: i64                 // things placed whose pictures weren't found
+	ready: bool
+}
+
+// A level's pictures read from the world's archive and put on the card,
+// over what the art held. (A GL context must be current.)
+load_level_art :: fun(view: ^Level_Art, name: []utf8) -> err {
+	view.ready = false
+	view.name.len = 0
+	view.pieces.len = 0
+	view.textures.len = 0
+	view.missing = 0
+	world : Lot
+	directory : [1 * MB]byte = void
+	lot_open(&world, lot_file_path(WORLD_ARCHIVE), &directory)?
+	defer lot_close(&world)
+	layout : Layout
+	file : [LEVEL_FILE_ROOM]byte = void
+	info := read_level(&world, name, &layout, &file)?
+	for thing in layout.placed do &view.pieces + Level_Piece{texture = -1, x = f32(thing.x), y = f32(thing.y), speed = thing.speed}
+	bundle_bytes : [BUNDLE_ROOM]byte = void
+	image : [ATLAS_ROOM]byte = void
+	bundle : Rex
+	for file_number in 0:world.files.len {
+		if not lot_in_folder(&world, file_number, info.folder, ".rex") do continue
+		lot_read(&world, file_number, &bundle_bytes)?
+		rex_open(&bundle, bundle_bytes)?
+		take_from_bundle(view, &layout, &bundle, &image)?
+	}
+	for piece in view.pieces {
+		if piece.texture < 0 do view.missing += 1
+	}
+	for c in name {
+		if view.name.len < view.name.cap do &view.name + c
+	}
+	view.ready = true
+}
+
+// Every thing placed whose picture (and palette) this bundle has, and that
+// hasn't one yet: its texture made, or found among those made.
+take_from_bundle :: fun(view: ^Level_Art, layout: ^Layout, bundle: ^Rex, image: ^[]byte) -> err {
+	for thing, k in layout.placed {
+		if view.pieces[k].texture >= 0 do continue
+		known := known_texture(view, thing.resource, thing.palette)
+		if known >= 0 {
+			view.pieces[k].texture = known
+			continue
+		}
+		sprite_at, has_sprite := rex_find(bundle, resource_name(layout, thing.resource))
+		if not has_sprite do continue
+		sprite := rex_bytes(bundle, sprite_at)
+		palette : Palette
+		if thing.palette >= 0 {
+			palette_at, has_palette := rex_find(bundle, resource_name(layout, thing.palette))
+			if not has_palette do continue
+			palette = spr8_bare_palette(rex_bytes(bundle, palette_at))?
+		else
+			palette = spr8_palette(sprite)?
+		}
+		spr8_check(sprite)?
+		atlas := atlas_shape(sprite, 1)?
+		atlas_draw(sprite, &palette, &atlas, image)?
+		atlas.texture = texture_from_pixels(image^, atlas.width, atlas.height)
+		if not fits(view.textures.len + 1, view.textures.cap) do return
+		view.pieces[k].texture = view.textures.len
+		&view.textures + Level_Texture{resource = thing.resource, palette = thing.palette, atlas = atlas}
+	}
+}
+
+// The texture made from a resource with a palette: its number, -1 when none is.
+known_texture :: fun(view: ^Level_Art, resource: i64, palette: i64) -> i64 {
+	for texture, k in view.textures {
+		if texture.resource == resource and texture.palette == palette do return k
+	}
+	return -1
+}
+
+// Puts the level's things on the layer, in order, those that show in a
+// window width by height: the level's pixel x, y at left + x * scale,
+// top + y * scale; seconds is the game's time, for animations.
+draw_level :: fun(layer: ^Sprite_Layer, view: ^Level_Art, left: f32, top: f32, scale: f32, width: i64, height: i64, seconds: f64) {
+	for piece in view.pieces {
+		if piece.texture < 0 do continue
+		atlas := &view.textures[piece.texture].atlas
+		x := left + (piece.x + f32(atlas.left)) * scale
+		y := top + (piece.y + f32(atlas.top)) * scale
+		cell_width := f32(atlas.cell_width) * scale
+		cell_height := f32(atlas.cell_height) * scale
+		if x > f32(width) or y > f32(height) or x + cell_width < 0 or y + cell_height < 0 do continue
+		column := i64(seconds * LEVEL_FRAME_RATE * f64(piece.speed)) % atlas.columns
+		u0 := f32(column * atlas.cell_width) / f32(atlas.width)
+		u1 := f32((column + 1) * atlas.cell_width) / f32(atlas.width)
+		layer_image(layer, atlas.texture, x, y, cell_width, cell_height, u0, 0, u1, 1, [4!]f32{1, 1, 1, 1})
+	}
+}

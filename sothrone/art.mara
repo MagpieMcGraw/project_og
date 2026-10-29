@@ -81,13 +81,14 @@ lot_file_path :: fun(name: []utf8) -> Path {
 	return path
 }
 
-// An atlas's shape for a sprite: its cells the box round all its frames,
-// a row a direction (one row when its frames don't split into DIRECTIONS).
-atlas_shape :: fun(bytes: []byte) -> Atlas, err {
+// An atlas's shape for a sprite drawn in so many directions (DIRECTIONS for
+// characters, 1 for a level's things): its cells the box round all its
+// frames, a row a direction (one row when its frames don't split so).
+atlas_shape :: fun(bytes: []byte, directions: i64) -> Atlas, err {
 	bounds := spr8_bounds(bytes)?
 	first := spr8_frame(bytes, 0)?
 	frames := spr8_frame_count(bytes)
-	rows := if frames % DIRECTIONS == 0 do DIRECTIONS else 1
+	rows := if frames % directions == 0 do directions else 1
 	atlas := Atlas{texture = 0, width = 0, height = 0, cell_width = bounds[2] - bounds[0], cell_height = bounds[3] - bounds[1],
 		columns = frames / rows, rows = rows, left = bounds[0], top = bounds[1], canvas_width = first.canvas_width,
 		canvas_height = first.canvas_height}
@@ -119,7 +120,7 @@ read_atlas :: fun(archive: ^Lot, folder: []utf8, sprite: ^[]byte, image: ^[]byte
 	lot_read(archive, file, sprite)?
 	spr8_check(sprite^)?
 	palette := spr8_palette(sprite^)?
-	atlas := atlas_shape(sprite^)?
+	atlas := atlas_shape(sprite^, DIRECTIONS)?
 	atlas_draw(sprite^, &palette, &atlas, image)?
 	return atlas
 }

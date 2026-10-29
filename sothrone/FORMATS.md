@@ -118,18 +118,45 @@ the columns. 55 levels: four samurai citadels of four to six rooms each,
 the Dark Warlord's citadel, four wilderness quarters, mountainsides and
 caves.
 
+A level's place is in its own pixels, down the screen positive: an
+isometric picture of it, as the game drew it (the shrine is about 2100 ×
+1200; its floor's diamond tiles, 512 × 256, step 256 across and 128 down).
+The window shows 800 × 600 of it round the player.
+
 A level's folder holds:
 
 - **.rex**, a bundle of what the level shows and plays: `IRES`, u32
   count, then entries (4 letters for the kind: `RSND` sound, `RANI`
-  animated sprite, `RGRA` picture, `RPLT` palette; u8 name length; name;
-  u32 where its data is), then `IDAT` chunks (kind, u32 size, the bytes:
-  a .s8 or a RIFF WAV). A room's `(FUR).rex` is its furniture set. The
-  wilderness comes in pieces, `Quad_01(x,y).rex`, a grid; their entries
-  carry 16 more bytes (where it goes? not decoded).
-- **.lex**, the layout: a header (the shrine's says 800 and 600: its size,
-  guess), a copy of the .rex's table, then placed things: `EGRA` records
-  with x, y, an index into the table and flags (guess).
+  animation, `RGRA` picture, `RPLT` palette; u8 name length; name; u32
+  where its chunk is), then the chunks: `IDAT`, the kind again (where the
+  entry points), u32 size, the bytes. A picture or an animation is a .s8
+  with no palette of its own (its palette offset is its first frame's); a
+  palette is 512 bytes, 256 colours in RGB565 and nothing else; a sound
+  is a RIFF WAV. A room's furniture set is `<FUR>(FUR).rex`. The
+  wilderness also comes in pieces, `Quad_01(x,y).rex`, a grid; their
+  entries carry 16 more bytes (where it goes? not decoded). The biggest
+  bundle is 10.7 MB.
+- **.lex**, the layout: a header (800, 600, 4 in every level: the screen
+  it was made for, a guess), then `IRES` and a table like the bundle's —
+  but in place of where each resource is, its size: a picture (RGRA) its
+  width and height, an animation (RANI) its width, height and frames, a
+  palette or a sound nothing (so in all 55 levels). Then `IGRL` (u32 0),
+  `IOBJ` (u32: how many things follow) and the things, each a 4-letter
+  tag and its fields, drawn in their order:
+  - `EGRA`, a picture placed: i32 x, y (its canvas's top left), 2 numbers
+    (0, 0 or 0, 65536), its resource, its palette (numbers in the table),
+    and some a count after (1–3) with as many `OCOL`s following.
+  - `EANI`, an animation placed: i32 x, y, its kind (u8 length, text:
+    `AnimRunLooped`), 7 bytes, its resource, its speed (f32, 1.0), 1, 0.
+  - `OCOL` looks like a collision outline: a count of points, the points
+    (a wall's runs along its picture's foot), more after.
+  - `ELIT` lights (x, y, a radius?), `ESND` sounds, `ESRT`, `ECOL`, `EGRP`
+    (groups?), `SNDJ`, `CHRW`: not worked out; some hold text and parts of
+    their own, so their sizes aren't known yet. The picture and animation
+    records are found by their tags, each checked against the table.
+  Checked by drawing the shrine (tools/level.py, then the game): every
+  picture where it belongs, the walls on their outlines, nothing missing.
+  The busiest layout (the Oda wilderness) places 8,439 pictures.
 - **.walk.mp / .walk.sp**: u32 0, u32 200, u32 200, then LZW (9-bit codes,
   lowest bit first) over a bitmap, 1 bit per cell: where one can walk.
   My decoder gets 60% through before a code runs ahead of its table, so

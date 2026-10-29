@@ -16,6 +16,8 @@ COPY_NOTES :: 16
 World_Copy :: struct {
 	me: i64                                  // our player's number: 0 till the server says
 	seed: u64
+	level: [48]utf8                          // the level we're in (World.ini's name; empty: none)
+	area: Area                               // where its players may go
 	players: [MAX_PLAYERS]Player_Seen        // every player, as last told
 	players_told: i64                        // how many times they've been told
 	notes: [COPY_NOTES]Note_Message          // the server's notes, not read yet
@@ -24,6 +26,8 @@ World_Copy :: struct {
 copy_start :: fun(copy: ^World_Copy) {
 	copy.me = 0
 	copy.seed = 0
+	copy.level.len = 0
+	copy.area = no_level_area()
 	copy.players.len = 0
 	copy.players_told = 0
 	copy.notes.len = 0
@@ -35,10 +39,12 @@ copy_take :: fun(copy: ^World_Copy, queue: ^Wire_Queue) {
 		message, has_message := wire_take(queue)
 		if not has_message do break
 		if message.kind == MESSAGE_WELCOME {
-			welcome, whole := wire_value(message, Welcome_Message{player = 0, seed = 0})
+			welcome, whole := wire_value(message, Welcome_Message{player = 0, seed = 0, level = [], area = no_level_area()})
 			if not whole do continue
 			copy.me = welcome.player
 			copy.seed = welcome.seed
+			copy.level = welcome.level
+			copy.area = welcome.area
 		elif message.kind == MESSAGE_PLAYERS
 			count, whole := wire_count(message, size_of(Player_Seen), copy.players.cap)
 			if not whole do continue

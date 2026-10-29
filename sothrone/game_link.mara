@@ -32,9 +32,10 @@ Link :: struct {
 }
 
 // Opens the link: to the server at an address (a name or a.b.c.d; :port,
-// else GAME_PORT), or with none, the game on this machine joined or hosted.
+// else GAME_PORT), or with none, the game on this machine joined or hosted —
+// hosted in the level given (World.ini's name; empty: none) and its area.
 // Fails only when an address is given and can't be reached.
-link_open :: fun(link: ^Link, journal: ^Journal, address: []utf8) -> err {
+link_open :: fun(link: ^Link, journal: ^Journal, address: []utf8, level: []utf8, area: Area) -> err {
 	link.connection = no_connection()
 	link.server_lost = false
 	link.hosting = false
@@ -50,7 +51,7 @@ link_open :: fun(link: ^Link, journal: ^Journal, address: []utf8) -> err {
 	}
 	if join_local(link, journal, LOCAL_GAME_WAIT) do return
 	link.hosting = true
-	server_start(&link.server)
+	server_start(&link.server, level, area)
 	_ = server_join(&link.server, no_connection())
 	listen_error := server_listen(&link.server, GAME_PORT, false)
 	if listen_error == Net_Error.Port_Taken {

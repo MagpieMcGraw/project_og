@@ -1,0 +1,99 @@
+// A level's bundle of what it shows and plays (.rex): "IRES", u32 count,
+// then its table — each entry 4 letters for its kind (RGRA a picture, RANI
+// an animation, RPLT a palette, RSND a sound), u8 name length, name, u32
+// where its chunk is — then the chunks: "IDAT", its kind (where the table
+// points), u32 its size, its bytes. A picture or an animation is a sprite
+// (.s8, spr8.mara) with no palette of its own; a palette is 256 colours,
+// RGB565, nothing else; a sound is a RIFF WAV.
+module rex
+
+use mara.core
+use mara.string
+
+REX_ENTRIES :: 4096
+// The 4 letters as a u32 (their bytes read low first).
+KIND_IRES :: 0x53455249
+KIND_PICTURE :: 0x41524752     // RGRA
+KIND_ANIMATION :: 0x494E4152   // RANI
+KIND_PALETTE :: 0x544C5052     // RPLT
+KIND_SOUND :: 0x444E5352       // RSND
+
+Rex_Error :: error {
+	Not_A_Bundle         // no IRES, or its table or a chunk runs outside it
+	Too_Many_Resources   // more than REX_ENTRIES
+}
+
+// A resource in a bundle: its kind; its name (where in the bundle's bytes,
+// how long); its bytes (where, how many).
+Rex_Entry :: struct {
+	kind: u32
+	name_at: i64
+	name_size: i64
+	at: i64
+	size: i64
+}
+
+// A bundle, read from its bytes (the caller's storage: kept while it's used).
+Rex :: struct {
+	bytes: []byte
+	entries: [REX_ENTRIES]Rex_Entry
+}
+
+rex_open :: fun(bundle: ^Rex, bytes: []byte) -> err {
+	bundle.bytes = bytes
+	bundle.entries.len = 0
+	if bytes.len < 8 do return Not_A_Bundle
+	magic : u32 = bytes[0]
+	count : u32 = bytes[4]
+	if magic != KIND_IRES do return Not_A_Bundle
+	at : i64 = 8
+	for k in 0:i64(count) {
+		if at + 5 > bytes.len do return Not_A_Bundle
+		kind : u32 = bytes[at]
+		name_size := i64(bytes[at + 4])
+		name_at := at + 5
+		if name_at + name_size + 4 > bytes.len do return Not_A_Bundle
+		place : u32 = bytes[name_at + name_size]
+		at = name_at + name_size + 4
+		// The chunk: its kind again (where place points), its size, its bytes.
+		chunk := i64(place)
+		if chunk + 8 > bytes.len do return Not_A_Bundle
+		chunk_kind : u32 = bytes[chunk]
+		chunk_size : u32 = bytes[chunk + 4]
+		if chunk_kind != kind or chunk + 8 + i64(chunk_size) > bytes.len do return Not_A_Bundle
+		if bundle.entries.len == bundle.entries.cap do return Too_Many_Resources
+		&bundle.entries + Rex_Entry{kind = kind, name_at = name_at, name_size = name_size, at = chunk + 8, size = i64(chunk_size)}
+	}
+}
+
+// The resource named name (letters' case aside, '\' as '/'): its number in
+// the bundle, false when there's none.
+rex_find :: fun(bundle: ^Rex, name: []utf8) -> i64, bool {
+	for entry, k in bundle.entries {
+		if same_name(bundle.bytes, entry.name_at, entry.name_size, name) do return k, true
+	}
+	return -1, false
+}
+
+// A resource's bytes.
+rex_bytes :: fun(bundle: ^Rex, k: i64) -> []byte {
+	entry := bundle.entries[k]
+	return bundle.bytes[entry.at : entry.at + entry.size]
+}
+
+// Whether the name at at (size bytes) in bytes is name: letters' case aside,
+// '\' as '/'.
+same_name :: fun(bytes: []byte, at: i64, size: i64, name: []utf8) -> bool {
+	if size != name.len do return false
+	for c, k in name {
+		if folded(utf8(bytes[at + k])) != folded(c) do return false
+	}
+	return true
+}
+
+// A letter of a name as names are compared: lowercase, '\' as '/'.
+folded :: fun(c: utf8) -> utf8 {
+	if c == '\\' do return '/'
+	if c >= 'A' and c <= 'Z' do return c + ('a' - 'A')
+	return c
+}

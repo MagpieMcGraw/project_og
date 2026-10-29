@@ -1,0 +1,193 @@
+// A level's layout (.lex): a header (800, 600, 4 in every level: the screen
+// it was made for, a guess), then "IRES" and a table like a bundle's
+// (rex.mara) — but where a bundle gives where each resource is, the layout
+// gives its size: a picture (RGRA) its width and height, an animation (RANI)
+// its width, height and frames, a palette (RPLT) or a sound (RSND) nothing
+// — then records, each a 4-letter tag and its fields. Two are read here,
+// in the order the layout has them (the order they're drawn in):
+//
+//     EGRA  a picture placed: x, y (its canvas's top left), 2 numbers, its
+//           resource, its palette (both numbers in the table)
+//     EANI  an animation placed: x, y, its kind (u8 length, text:
+//           "AnimRunLooped"), 7 bytes, its resource, its speed (f32)
+//
+// The other records (collision outlines, lights, starts, sounds, …) have
+// parts of their own not worked out yet, so the records are found by their
+// tags, each checked: its resource and palette in the table, of their kinds.
+module lex
+
+use mara.core
+use mara.math
+use mara.memory
+use mara.string
+use rex
+
+LEX_RESOURCES :: 2048
+LEX_PLACED :: 16384
+LEX_NAMES :: 256 * KB
+TAG_PICTURE :: 0x41524745     // EGRA
+TAG_ANIMATION :: 0x494E4145   // EANI
+
+Lex_Error :: error {
+	Not_A_Layout      // no IRES, or its table runs outside it
+	Too_Many_Things   // more resources, names or things than there's room for
+}
+
+// A resource the layout names: its kind (rex.mara's KIND_*), its name (in
+// the layout's names), its size and frames.
+Lex_Resource :: struct {
+	kind: u32
+	name_at: i64
+	name_size: i64
+	width: i64
+	height: i64
+	frames: i64
+}
+
+// A thing placed: where its canvas's top left is, its resource (a number in
+// the table), its palette (a number in the table; -1, the sprite's own), an
+// animation's speed (1 as made).
+Placed :: struct {
+	x: i64
+	y: i64
+	resource: i64
+	palette: i64
+	speed: f32
+}
+
+Layout :: struct {
+	resources: [LEX_RESOURCES]Lex_Resource
+	names: [LEX_NAMES]utf8
+	placed: [LEX_PLACED]Placed
+	// The box round all that's placed (their canvases).
+	left: i64
+	top: i64
+	right: i64
+	bottom: i64
+}
+
+lex_read :: fun(layout: ^Layout, bytes: []byte) -> err {
+	layout.resources.len = 0
+	layout.names.len = 0
+	layout.placed.len = 0
+	// The table's start: IRES, in the header's room.
+	table : i64 = -1
+	for at in 0:min(bytes.len - 4, 4096) {
+		magic : u32 = bytes[at]
+		if magic == KIND_IRES {
+			table = at
+			break
+		}
+	}
+	if table < 0 or table + 8 > bytes.len do return Not_A_Layout
+	count : u32 = bytes[table + 4]
+	at := table + 8
+	for k in 0:i64(count) {
+		if at + 5 > bytes.len do return Not_A_Layout
+		kind : u32 = bytes[at]
+		name_size := i64(bytes[at + 4])
+		if at + 5 + name_size > bytes.len do return Not_A_Layout
+		if layout.resources.len == layout.resources.cap or layout.names.len + name_size > layout.names.cap do return Too_Many_Things
+		name_at := layout.names.len
+		for j in 0:name_size do &layout.names + utf8(bytes[at + 5 + j])
+		at += 5 + name_size
+		numbers : i64 = 0
+		if kind == KIND_PICTURE do numbers = 2
+		if kind == KIND_ANIMATION do numbers = 3
+		if at + numbers * 4 > bytes.len do return Not_A_Layout
+		resource := Lex_Resource{kind = kind, name_at = name_at, name_size = name_size, width = 0, height = 0, frames = 1}
+		if numbers >= 2 {
+			width : u32 = bytes[at]
+			height : u32 = bytes[at + 4]
+			resource.width = i64(width)
+			resource.height = i64(height)
+		}
+		if numbers == 3 {
+			frames : u32 = bytes[at + 8]
+			resource.frames = i64(frames)
+		}
+		at += numbers * 4
+		&layout.resources + resource
+	}
+	read_placed(layout, bytes, at)?
+	layout_box(layout)
+}
+
+// The pictures and animations placed, from at on: each record found by its
+// tag, kept when its fields check.
+read_placed :: fun(layout: ^Layout, bytes: []byte, from: i64) -> err {
+	at := from
+	for at + 28 <= bytes.len {
+		tag : u32 = bytes[at]
+		if tag == TAG_PICTURE {
+			x : i32 = bytes[at + 4]
+			y : i32 = bytes[at + 8]
+			resource : i32 = bytes[at + 20]
+			palette : i32 = bytes[at + 24]
+			if is_kind(layout, i64(resource), KIND_PICTURE) and is_kind(layout, i64(palette), KIND_PALETTE) {
+				if layout.placed.len == layout.placed.cap do return Too_Many_Things
+				&layout.placed + Placed{x = i64(x), y = i64(y), resource = i64(resource), palette = i64(palette), speed = 1}
+				at += 28
+				continue
+			}
+		elif tag == TAG_ANIMATION
+			x : i32 = bytes[at + 4]
+			y : i32 = bytes[at + 8]
+			kind_size := i64(bytes[at + 12])
+			fields := at + 13 + kind_size + 7
+			if kind_size > 0 and kind_size < 40 and fields + 8 <= bytes.len and is_text(bytes, at + 13, kind_size) {
+				resource : i32 = bytes[fields]
+				speed : f32 = bytes[fields + 4]
+				if is_kind(layout, i64(resource), KIND_ANIMATION) {
+					if layout.placed.len == layout.placed.cap do return Too_Many_Things
+					if not (speed > 0.01 and speed < 100) do speed = 1
+					&layout.placed + Placed{x = i64(x), y = i64(y), resource = i64(resource), palette = -1, speed = speed}
+					at = fields + 8
+					continue
+				}
+			}
+		}
+		at += 1
+	}
+}
+
+is_kind :: fun(layout: ^Layout, k: i64, kind: u32) -> bool {
+	return k >= 0 and k < layout.resources.len and layout.resources[k].kind == kind
+}
+
+// Whether size bytes at at are all printable letters.
+is_text :: fun(bytes: []byte, at: i64, size: i64) -> bool {
+	for k in 0:size {
+		c := i64(bytes[at + k])
+		if c < 32 or c > 126 do return false
+	}
+	return true
+}
+
+// The box round what's placed, their canvases as the table sizes them.
+layout_box :: fun(layout: ^Layout) {
+	layout.left = 0
+	layout.top = 0
+	layout.right = 0
+	layout.bottom = 0
+	for thing, k in layout.placed {
+		resource := layout.resources[thing.resource]
+		if k == 0 {
+			layout.left = thing.x
+			layout.top = thing.y
+			layout.right = thing.x + resource.width
+			layout.bottom = thing.y + resource.height
+			continue
+		}
+		layout.left = min(layout.left, thing.x)
+		layout.top = min(layout.top, thing.y)
+		layout.right = max(layout.right, thing.x + resource.width)
+		layout.bottom = max(layout.bottom, thing.y + resource.height)
+	}
+}
+
+// A resource's name, as the layout has it (folders split by '\').
+resource_name :: fun(layout: ^Layout, k: i64) -> []utf8 {
+	resource := layout.resources[k]
+	return layout.names[resource.name_at : resource.name_at + resource.name_size]
+}

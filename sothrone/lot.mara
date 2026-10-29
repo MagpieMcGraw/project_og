@@ -159,21 +159,28 @@ lot_find :: fun(lot: ^Lot, path: []utf8) -> i64, bool {
 	return -1, false
 }
 
-// The first file in a folder (its path then '/', as same_path matches it)
-// whose name ends with ending (".s8"): its number, false when there's none.
+// The first file in a folder (its path, with or without a '/' after it, as
+// same_path matches it) whose name ends with ending (".s8"): its number,
+// false when there's none.
 lot_find_in :: fun(lot: ^Lot, folder: []utf8, ending: []utf8) -> i64, bool {
 	for k in 0:lot.files.len {
-		path := lot_path(lot, k)
-		if path.len <= folder.len + 1 or path.len < folder.len + ending.len do continue
-		if not same_path(path[0 : folder.len], folder) or path[folder.len] != '/' do continue
-		// (Only files right in the folder, not in its folders.)
-		in_folder := true
-		for c in path[folder.len + 1 : path.len] {
-			if c == '/' do in_folder = false
-		}
-		if in_folder and same_path(path[path.len - ending.len : path.len], ending) do return k, true
+		if lot_in_folder(lot, k, folder, ending) do return k, true
 	}
 	return -1, false
+}
+
+// Whether a file is right in a folder (not in a folder in it) and its name
+// ends with ending.
+lot_in_folder :: fun(lot: ^Lot, file: i64, folder: []utf8, ending: []utf8) -> bool {
+	path := lot_path(lot, file)
+	base := folder
+	if base.len > 0 and (base[base.len - 1] == '/' or base[base.len - 1] == '\\') do base = base[0 : base.len - 1]
+	if path.len <= base.len + 1 or path.len < base.len + 1 + ending.len do return false
+	if not same_path(path[0 : base.len], base) or path[base.len] != '/' do return false
+	for c in path[base.len + 1 : path.len] {
+		if c == '/' do return false
+	}
+	return same_path(path[path.len - ending.len : path.len], ending)
 }
 
 // A file's bytes, unpacked into out (what it held replaced).
