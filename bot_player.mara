@@ -231,7 +231,7 @@ bot_start :: fun(bot: ^Bot, orders_path: []utf8, status_path: []utf8, loader: Lo
 
 // Connects the bot to the server at an address (wire_connect).
 bot_connect :: fun(bot: ^Bot, address_and_port: []utf8) -> err {
-	bot.connection = wire_connect(address_and_port)?
+	bot.connection = wire_connect(address_and_port, DEFAULT_PORT)?
 }
 
 // Runs the bot till it's told to leave, or the server's gone (why given

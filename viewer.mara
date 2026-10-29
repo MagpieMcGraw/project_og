@@ -1326,7 +1326,7 @@ open_link :: fun(viewer: ^Viewer, join_local_game: bool) -> err {
 	wire_start(&viewer.from_server)
 	viewer.hosting = false
 	if viewer.server_address.len > 0 {
-		viewer.connection = wire_connect(viewer.server_address)?
+		viewer.connection = wire_connect(viewer.server_address, DEFAULT_PORT)?
 		note(&viewer.journal, "connected to the server at ")
 		note(&viewer.journal, viewer.server_address)
 		note_end(&viewer.journal)

@@ -8,7 +8,7 @@
 // whether anyone's under them or not; its players — where each is, as
 // their client reports it, the sky they're under, the place they're in and
 // the people in it, as they stand; the doors that open in place, open or
-// shut.
+// shut. And the messages its server and clients send each other.
 module world_state
 
 use mara.core
@@ -20,6 +20,98 @@ use esm
 use world
 use sky
 use logging
+
+// The messages the server and its clients send each other (og's wire
+// carries them), and the port a server listens on unless told another
+// (each og port has its own, so two games can run at once).
+DEFAULT_PORT :: 27100
+
+// From a client to its server.
+MESSAGE_PLAYER :: 1       // where the player is now (Player_Message)
+MESSAGE_PLACE :: 2        // the place the player's come into (Place_Message)
+MESSAGE_USE_DOOR :: 3     // a door that opens in place, opened or shut (its reference, u32)
+MESSAGE_SAY :: 4          // something the player says to the others (Note_Message)
+// From a server to its clients.
+MESSAGE_CLOCK :: 10       // the clock and the sky (Clock_Message)
+MESSAGE_PEOPLE :: 11      // the people in the player's place (a list of References)
+MESSAGE_DOORS :: 12       // the doors opened or shut (a list of Door_States)
+MESSAGE_NOTE :: 13        // something to tell the player's journal (Note_Message)
+MESSAGE_PLAYERS :: 14     // the other players (a list of Other_Players)
+MESSAGE_SAID :: 15        // words another player said (Said_Message)
+
+// Where a client's player is now: the world they're in (0 inside), their
+// feet, which way they face, how fast they're going (units a second,
+// across), whether they hurry time.
+Player_Message :: struct {
+	world_id: u32
+	feet: Vec3
+	yaw: f32
+	speed: f32
+	hurried: bool
+	swings: i64     // how many times they've swung their weapon (one more: a swing begun)
+	strikes: i64    // how many of their blows met someone
+	struck: u32     // whom the last of those met (their reference)
+}
+
+// Another player, as a server tells a client of them: their number, the
+// world they're in (0 inside) and the interior (0 outside), their feet,
+// which way they face, how fast they're going.
+Other_Player :: struct {
+	id: i64
+	world: u32
+	cell: u32
+	feet: Vec3
+	yaw: f32
+	speed: f32
+	swings: i64
+	strikes: i64
+	struck: u32
+}
+
+// The place a client's player has come into: an interior (cell), or a
+// world's cells round x, y (world_id; told again as they cross into
+// others); where their feet are there.
+Place_Message :: struct {
+	world_id: u32
+	cell: u32
+	x: i64
+	y: i64
+	feet: Vec3
+}
+
+// The clock and the sky, as a server tells a client: the world's seed (for
+// chance its players roll alike); the game's hour and days gone, the
+// seconds the world's run, whether time's hurried; the sky the client's
+// player is under — its climate (its form id; 0 the default) and whether
+// there's one yet, whose sky it is (its source: a region's form id, or the
+// climate's) and whether they walked into it from another's; the weathers
+// coming in and going out under it (form ids), how far in.
+Clock_Message :: struct {
+	seed: u64
+	hour: f32
+	day: i64
+	seconds: f64
+	hurried: bool
+	climate: u32
+	sky_taken: bool
+	sky_source: u32
+	walked_into_sky: bool
+	weather: u32
+	last_weather: u32
+	weather_share: f32
+}
+
+// Words a player said, as the server tells the others: whose (their
+// number), and the words.
+Said_Message :: struct {
+	player: i64
+	text: [200]utf8
+}
+
+// Something a server tells a client's journal: what failed, and why.
+Note_Message :: struct {
+	text: [200]utf8
+}
 
 // The world steps this often (seconds of real time), and at most this
 // many times to catch up after a long frame (more are let go).
