@@ -185,11 +185,14 @@ Viewer :: struct {
 	server_lost: bool
 	seen: World_Copy
 	// The interior the player's in (0 outside); where their feet were when
-	// last told the server (for how fast they're going), and how many times
-	// they've swung; the other players shown here.
+	// last told the server (for how fast they're going), how many times
+	// they've swung, how many of their blows met someone and whom the last
+	// did; the other players shown here.
 	inside_cell: u32
 	reported_feet: Vec3
 	swings: i64
+	strikes: i64
+	struck: u32
 	others: [MAX_PLAYERS]Other_Shown
 	// The sky as shown: the climate the server says the sky's under, read
 	// (its sun, moons, night sky); the records of the weathers (the one
@@ -448,6 +451,8 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.inside_cell = 0
 	viewer.reported_feet = Vec3{0, 0, 0}
 	viewer.swings = 0
+	viewer.strikes = 0
+	viewer.struck = 0
 	viewer.others.len = 0
 	viewer.climate = default_climate()
 	viewer.weather = default_weather()
@@ -943,25 +948,6 @@ take_first_person :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	}
 }
 
-// A reference's name, as the game shows it: its base's (FULL); empty for
-// one without.
-reference_name :: fun(plugin: ^Plugin, reference_id: u32) -> str256 {
-	name : str256
-	if reference_id == 0 do return name
-	scratch : [64 * KB]byte
-	reference, reference_error := find_record(plugin, reference_id, &scratch)
-	if reference_error do return name
-	base, has_base := find_field(reference.data, "NAME")
-	if not has_base or base.len < 4 do return name
-	raw : u32 = base[0]
-	base_scratch : [256 * KB]byte
-	record, record_error := find_record(plugin, record_form(plugin, reference, raw), &base_scratch)
-	if record_error do return name
-	full_name, has_name := find_field(record.data, "FULL")
-	if has_name do add_what_fits(&name, field_text(full_name))
-	return name
-}
-
 // Plays a sound of the player's (a SOUN record's form id) where they are.
 play_player_sound :: fun(viewer: ^Viewer, plugin: ^Plugin, sound: u32) {
 	shown := &viewer.shown
@@ -1166,7 +1152,8 @@ report_player :: fun(viewer: ^Viewer, hurried: bool, seconds: f32) {
 	across := Vec3{feet.x - viewer.reported_feet.x, feet.y - viewer.reported_feet.y, 0}
 	speed := if seconds > 0 do vec3_length(across) / seconds else 0
 	viewer.reported_feet = feet
-	send_player(outgoing(viewer), viewer.shown.world, feet, viewer.camera.yaw, speed, hurried, viewer.swings)
+	send_player(outgoing(viewer), Player_Message{world_id = viewer.shown.world, feet = feet, yaw = viewer.camera.yaw, speed = speed,
+		hurried = hurried, swings = viewer.swings, strikes = viewer.strikes, struck = viewer.struck})
 }
 
 // Another player shown here, as a body: their number and their body's
@@ -1188,10 +1175,6 @@ Other_Shown :: struct {
 // Another player's swing is shown for this long at most (seconds: its
 // animation's own span, if shorter).
 SWING_SHOWN :: 2
-
-// The references other players' bodies are placed with: a top byte no
-// plugin's form id has, and their number.
-OTHER_PLAYER_KEY :: 0xFE000000
 
 // Shows the other players the server's told of that are here (in the same
 // world, or the same interior), each as a body (the player's own record's,
@@ -1250,7 +1233,7 @@ seen_other :: fun(seen: ^World_Copy, id: i64) -> Other_Player, bool {
 	for told in seen.others {
 		if told.id == id do return told, true
 	}
-	return Other_Player{id = 0, world = 0, cell = 0, feet = Vec3{0, 0, 0}, yaw = 0, speed = 0, swings = 0}, false
+	return Other_Player{id = 0, world = 0, cell = 0, feet = Vec3{0, 0, 0}, yaw = 0, speed = 0, swings = 0, strikes = 0, struck = 0}, false
 }
 
 // Whether another player's here: in this world, or in this interior.
@@ -2357,6 +2340,10 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 		if viewer.held.swung {
 			note_blow(viewer, plugin)
 			viewer.held.swung = false
+			if viewer.held.struck_reference != 0 {
+				viewer.strikes += 1
+				viewer.struck = viewer.held.struck_reference
+			}
 		}
 		if viewer.missed {
 			note_missed(viewer, plugin)

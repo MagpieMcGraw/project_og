@@ -46,6 +46,8 @@ Player_Message :: struct {
 	speed: f32
 	hurried: bool
 	swings: i64     // how many times they've swung their weapon (one more: a swing begun)
+	strikes: i64    // how many of their blows met someone
+	struck: u32     // whom the last of those met (their reference)
 }
 
 // Another player, as a server tells a client of them: their number, the
@@ -59,6 +61,8 @@ Other_Player :: struct {
 	yaw: f32
 	speed: f32
 	swings: i64
+	strikes: i64
+	struck: u32
 }
 
 // The place a client's player has come into: an interior (cell), or a

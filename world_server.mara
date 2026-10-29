@@ -160,7 +160,8 @@ server_run :: fun(server: ^World_Server, plugin: ^Plugin) {
 			for &player, other_slot in state.players {
 				if player.id == 0 or other_slot == slot do continue
 				&others + Other_Player{id = player.id, world = player.world, cell = if player.world == 0 do player.place_cell else 0,
-					feet = player.feet, yaw = player.yaw, speed = player.speed, swings = player.swings}
+					feet = player.feet, yaw = player.yaw, speed = player.speed, swings = player.swings, strikes = player.strikes,
+					struck = player.struck}
 			}
 			wire_put_list(&client.to_client, MESSAGE_PLAYERS, others)
 		}
@@ -194,7 +195,8 @@ server_take :: fun(server: ^World_Server, plugin: ^Plugin, slot: i64, message: W
 	state := &server.state
 	player := &state.players[slot]
 	if message.kind == MESSAGE_PLAYER {
-		told, whole := wire_value(message, Player_Message{world_id = 0, feet = Vec3{0, 0, 0}, yaw = 0, speed = 0, hurried = false, swings = 0})
+		told, whole := wire_value(message, Player_Message{world_id = 0, feet = Vec3{0, 0, 0}, yaw = 0, speed = 0, hurried = false, swings = 0,
+			strikes = 0, struck = 0})
 		if not whole do return
 		player.world = told.world_id
 		player.feet = told.feet
@@ -202,6 +204,8 @@ server_take :: fun(server: ^World_Server, plugin: ^Plugin, slot: i64, message: W
 		player.speed = told.speed
 		player.hurried = told.hurried
 		player.swings = told.swings
+		player.strikes = told.strikes
+		player.struck = told.struck
 	elif message.kind == MESSAGE_PLACE
 		place, whole := wire_value(message, Place_Message{world_id = 0, cell = 0, x = 0, y = 0, feet = Vec3{0, 0, 0}})
 		if whole do server_take_place(server, plugin, slot, place)

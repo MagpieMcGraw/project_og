@@ -12,6 +12,10 @@ use scene
 use wire
 use logging
 
+// The references other players' bodies are placed with: a top byte no
+// plugin's form id has, and their number.
+OTHER_PLAYER_KEY :: 0xFE000000
+
 World_Copy :: struct {
 	// The clock and the sky, as the server last told them (Clock_Message).
 	seed: u64
@@ -161,11 +165,11 @@ said_text :: fun(said: Said_Message) -> [256]utf8 {
 	return text
 }
 
-// Tells the server where the player is now, how fast they're going, and
-// how many times they've swung (the others see each new one).
-send_player :: fun(queue: ^Wire_Queue, world_id: u32, feet: Vec3, yaw: f32, speed: f32, hurried: bool, swung: i64) {
-	wire_put(queue, MESSAGE_PLAYER, Player_Message{world_id = world_id, feet = feet, yaw = yaw, speed = speed, hurried = hurried,
-		swings = swung})
+// Tells the server where the player is now, how fast they're going, how
+// many times they've swung (the others see each new one) and whom their
+// blows met.
+send_player :: fun(queue: ^Wire_Queue, told: Player_Message) {
+	wire_put(queue, MESSAGE_PLAYER, told)
 }
 
 // Tells the server the player's come into a place: an interior (cell), or a

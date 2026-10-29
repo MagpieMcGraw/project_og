@@ -344,6 +344,25 @@ record_name :: fun(plugin: ^Plugin, form_id: u32) -> str256 {
 	return name
 }
 
+// A reference's name, as the game shows it: its base's (FULL); empty for
+// one without.
+reference_name :: fun(plugin: ^Plugin, reference_id: u32) -> str256 {
+	name : str256
+	if reference_id == 0 do return name
+	scratch : [64 * KB]byte
+	reference, reference_error := find_record(plugin, reference_id, &scratch)
+	if reference_error do return name
+	base, has_base := find_field(reference.data, "NAME")
+	if not has_base or base.len < 4 do return name
+	raw : u32 = base[0]
+	base_scratch : [256 * KB]byte
+	record, record_error := find_record(plugin, record_form(plugin, reference, raw), &base_scratch)
+	if record_error do return name
+	full_name, has_name := find_field(record.data, "FULL")
+	if has_name do add_what_fits(&name, field_text(full_name))
+	return name
+}
+
 // A record's editor id, as text kept by value.
 editor_id_of :: fun(plugin: ^Plugin, form_id: u32) -> str256 {
 	scratch : [1 * MB]byte
