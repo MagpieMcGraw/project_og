@@ -1,0 +1,156 @@
+// The game's journal: what it does — the places it shows, settings
+// changed, how long loading took — written to a log file and the console,
+// each line stamped with the seconds since the journal opened.
+//
+// A line is written a piece at a time, then ended:
+//
+//     note(&journal, "vsync ")
+//     note(&journal, "on")
+//     note_end(&journal)
+module logging
+
+use mara.core
+use mara.os
+use mara.string
+use mara.time
+use disk
+
+Journal :: struct {
+	file: File_Id      // NO_FILE when the log couldn't be made: the console only
+	started: u64       // when the journal opened (time_now)
+	line: str1024      // the line being written
+}
+
+// A journal writing to a new file at path (over the one there); when the
+// file can't be made, to the console only (and it says so there).
+journal_open :: fun(path: []utf8) -> Journal {
+	file, open_error := file_open_write(path)
+	if open_error {
+		print("the journal can't be written to %: %; the console only", path, open_error)
+		file = NO_FILE
+	}
+	return Journal{file = file, started = time_now(), line = []}
+}
+
+journal_close :: fun(journal: ^Journal) {
+	file_close(journal.file)
+}
+
+// Adds to the line being written: text, or a number. What doesn't fit in
+// the line is left off.
+note :: dispatch{ note_text, note_number }
+
+note_text :: fun(journal: ^Journal, text: []utf8) {
+	room := journal.line.cap - journal.line.len
+	if text.len <= room do &journal.line + text
+	else do &journal.line + text[0 : room]
+}
+
+note_number :: fun(journal: ^Journal, number: i64) {
+	note_text(journal, int_text(number))
+}
+
+// An err in the line: its name, and where it was made ("Archive_Error.Not_Found
+// (scene.mara:310:4 in load_model)").
+note_error :: fun(journal: ^Journal, reason: err) {
+	note_text(journal, reason.text())
+	place : []utf8 = reason.where()
+	if place.len == 0 do return
+	note_text(journal, " (")
+	note_text(journal, place)
+	note_text(journal, ")")
+}
+
+// Ends the line being written: printed, and written to the file after its
+// time stamp, the seconds since the journal opened.
+note_end :: fun(journal: ^Journal) {
+	print(journal.line)
+	milliseconds := i64((time_now() - journal.started) / 1000000)
+	stamped : str1024
+	&stamped + "["
+	&stamped + int_text(milliseconds / 1000)
+	&stamped + "."
+	fraction := milliseconds % 1000
+	if fraction < 100 do &stamped + "0"
+	if fraction < 10 do &stamped + "0"
+	&stamped + int_text(fraction)
+	&stamped + "] "
+	room := stamped.cap - stamped.len - 1
+	if journal.line.len <= room do &stamped + journal.line
+	else do &stamped + journal.line[0 : room]
+	&stamped + "\n"
+	if journal.file != NO_FILE {
+		write_error := file_write_text(journal.file, stamped)
+		if write_error {
+			// Said once, on the console; the journal goes on there only.
+			print("the journal's file can't be written to: %; the console only from here", write_error)
+			file_close(journal.file)
+			journal.file = NO_FILE
+		}
+	}
+	journal.line.len = 0
+}
+
+// ---- lists found full -----------------------------------------------------------
+
+// Where lists found full are told: a line each time, saying where the
+// check is (and the fun it's in), how much room the list has and how much
+// was wanted. The game starts it afresh (full_log_start); the commands add
+// to it. It stops growing at FULL_LOG_MOST bytes.
+FULL_LOG_PATH :: "full.log"
+FULL_LOG_MOST :: 1048576
+
+// Whether wanted items fit in a list's room (its len, plus what's to go
+// in; its cap). When they don't, the full log says so:
+//
+//     if not fits(lights.len + 1, lights.cap) do return
+//
+// (Not a generic fun taking the list: a generic's params can't have
+// defaults yet, and site and caller need theirs.)
+fits :: fun(wanted: i64, room: i64, site: atom = #caller_span, caller: atom = #caller_name) -> bool {
+	if wanted <= room do return true
+	note_full(room, wanted, site, caller)
+	return false
+}
+
+// Adds as much of more to text as there's room for. When some is left off,
+// the full log says so.
+add_what_fits :: fun(text: ^[]utf8, more: []utf8, site: atom = #caller_span, caller: atom = #caller_name) {
+	if text.len + more.len <= text.cap {
+		text + more
+		return
+	}
+	note_full(text.cap, text.len + more.len, site, caller)
+	text + more[0 : text.cap - text.len]
+}
+
+// A line in the full log: what's checked at site (in caller) has room for
+// room, and wanted as much as wanted.
+note_full :: fun(room: i64, wanted: i64, site: atom = #caller_span, caller: atom = #caller_name) {
+	line : str1024
+	&line + site
+	&line + " in "
+	&line + caller
+	&line + ": full at "
+	&line + int_text(room)
+	&line + ", wanted "
+	&line + int_text(wanted)
+	&line + "\n"
+	_ = add_to_file(FULL_LOG_PATH, line, FULL_LOG_MOST)   // (a log that can't be written has nowhere to say so)
+}
+
+// Starts the full log afresh.
+full_log_start :: fun() {
+	file, open_error := file_open_write(FULL_LOG_PATH)
+	if not open_error do file_close(file)
+}
+
+// Adds text to the end of the file at path (made if it isn't there), unless
+// that would make it longer than most bytes.
+add_to_file :: fun(path: []utf8, text: []utf8, most: i64) -> err {
+	id := file_open_append(path)?
+	defer file_close(id)
+	size := file_size(id)?
+	if size + text.len > most do return
+	file_write_text(id, text)?
+}
