@@ -185,10 +185,11 @@ Viewer :: struct {
 	server_lost: bool
 	seen: World_Copy
 	// The interior the player's in (0 outside); where their feet were when
-	// last told the server (for how fast they're going); the other players
-	// shown here.
+	// last told the server (for how fast they're going), and how many times
+	// they've swung; the other players shown here.
 	inside_cell: u32
 	reported_feet: Vec3
+	swings: i64
 	others: [MAX_PLAYERS]Other_Shown
 	// The sky as shown: the climate the server says the sky's under, read
 	// (its sun, moons, night sky); the records of the weathers (the one
@@ -446,6 +447,7 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	copy_start(&viewer.seen)
 	viewer.inside_cell = 0
 	viewer.reported_feet = Vec3{0, 0, 0}
+	viewer.swings = 0
 	viewer.others.len = 0
 	viewer.climate = default_climate()
 	viewer.weather = default_weather()
@@ -1164,7 +1166,7 @@ report_player :: fun(viewer: ^Viewer, hurried: bool, seconds: f32) {
 	across := Vec3{feet.x - viewer.reported_feet.x, feet.y - viewer.reported_feet.y, 0}
 	speed := if seconds > 0 do vec3_length(across) / seconds else 0
 	viewer.reported_feet = feet
-	send_player(outgoing(viewer), viewer.shown.world, feet, viewer.camera.yaw, speed, hurried)
+	send_player(outgoing(viewer), viewer.shown.world, feet, viewer.camera.yaw, speed, hurried, viewer.swings)
 }
 
 // Another player shown here, as a body: their number and their body's
@@ -1179,7 +1181,13 @@ Other_Shown :: struct {
 	feet: Vec3
 	yaw: f32
 	way: f32
+	swings: i64     // the swings of theirs seen
+	swing: f32      // how far into one they are (seconds); below 0 for none
 }
+
+// Another player's swing is shown for this long at most (seconds: its
+// animation's own span, if shorter).
+SWING_SHOWN :: 2
 
 // The references other players' bodies are placed with: a top byte no
 // plugin's form id has, and their number.
@@ -1213,7 +1221,16 @@ place_others :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 		}
 		if known or not fits(viewer.others.len + 1, viewer.others.cap) do continue
 		&viewer.others + Other_Shown{id = told.id, reference = OTHER_PLAYER_KEY | u32(told.id & 0xFFFFFF), told = told,
-			feet = told.feet, yaw = told.yaw, way = 0}
+			feet = told.feet, yaw = told.yaw, way = 0, swings = told.swings, swing = -1}
+	}
+	// A swing of theirs begun: shown from its start, its swish heard there
+	// (the player's own weapon's).
+	for &other in viewer.others {
+		if other.told.swings == other.swings do continue
+		other.swings = other.told.swings
+		other.swing = 0
+		kind := scene_sound_kind(shown, plugin, viewer.held.swish_sound)
+		if kind >= 0 do play_once(&viewer.audio, &viewer.archives, &shown.sound_kinds[kind], other.feet, listener_of(viewer.camera))
 	}
 	// Each one's body: there, or put together and placed.
 	for &other in viewer.others {
@@ -1233,7 +1250,7 @@ seen_other :: fun(seen: ^World_Copy, id: i64) -> Other_Player, bool {
 	for told in seen.others {
 		if told.id == id do return told, true
 	}
-	return Other_Player{id = 0, world = 0, cell = 0, feet = Vec3{0, 0, 0}, yaw = 0, speed = 0}, false
+	return Other_Player{id = 0, world = 0, cell = 0, feet = Vec3{0, 0, 0}, yaw = 0, speed = 0, swings = 0}, false
 }
 
 // Whether another player's here: in this world, or in this interior.
@@ -1264,6 +1281,8 @@ follow_others :: fun(viewer: ^Viewer, seconds: f32, movers: ^[]Npc_Mover) {
 		other.yaw += turn * min_f32(1, seconds * 12)
 		step := Vec3{other.feet.x - before.x, other.feet.y - before.y, 0}
 		other.way += vec3_length(step)
+		if other.swing >= 0 do other.swing += seconds
+		if other.swing > SWING_SHOWN do other.swing = -1
 		for &instance in shown.instances {
 			if instance.reference != other.reference do continue
 			moved := place_instance(shown.models[instance.model], instance.model, other_placement(other), instance.reference)
@@ -1271,7 +1290,8 @@ follow_others :: fun(viewer: ^Viewer, seconds: f32, movers: ^[]Npc_Mover) {
 			instance.center = moved.center
 			instance.radius = moved.radius
 		}
-		if fits(movers.len + 1, movers.cap) do movers + Npc_Mover{reference = other.reference, speed = other.told.speed, way = other.way}
+		if fits(movers.len + 1, movers.cap) do movers + Npc_Mover{reference = other.reference, speed = other.told.speed, way = other.way,
+			swing = other.swing}
 	}
 }
 
@@ -2328,6 +2348,7 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 		if viewer.held.swinging {
 			play_player_sound(viewer, plugin, viewer.held.swish_sound)
 			viewer.held.swinging = false
+			viewer.swings += 1
 		}
 		if viewer.held.blow_sound != 0 {
 			play_player_sound(viewer, plugin, viewer.held.blow_sound)

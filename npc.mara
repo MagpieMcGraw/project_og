@@ -29,6 +29,8 @@ IDLE_ANIMATION :: "meshes/characters/_male/idle.kf"
 // they're shown moving at all, and running from.
 WALK_ANIMATION :: "meshes/characters/_male/walkforward.kf"
 RUN_ANIMATION :: "meshes/characters/_male/walkfastforward.kf"
+// How people swing a weapon (one-handed, from the right).
+ATTACK_ANIMATION :: "meshes/characters/_male/onehandattackright.kf"
 MOVING_LEAST :: 20
 RUNNING_LEAST :: 360
 
@@ -130,7 +132,8 @@ Npc_Skeleton :: struct {
 	stop: f32
 	walk: Npc_Motion
 	run: Npc_Motion
-	motion_failure: err   // why it can't walk or run, if it can't: its people only stand
+	attack: Npc_Motion
+	motion_failure: err   // why it can't walk, run or swing, if it can't: its people only stand
 }
 
 // A way people move along (walking, running): its animation's tracks (their
@@ -154,6 +157,7 @@ Npc_Mover :: struct {
 	reference: u32
 	speed: f32
 	way: f32
+	swing: f32     // how far into a swing they are (seconds); below 0 for none
 }
 
 // The most entries an NPC's model's palette has (its parts' together).
@@ -504,10 +508,14 @@ read_skeleton :: fun(archives: ^Archives, room: ^Load_Room, path: []utf8, skelet
 	mesh := read_archived_nif(archives, path, &room.file, &room.blocks)?
 	pose_nodes(&mesh, &skeleton.tracks, skeleton.start, &skeleton.bones)
 	rig_nodes(&mesh, &skeleton.tracks, &skeleton.rig)
-	// Walking and running (failing, they're shown standing: motion_failure).
+	// Walking, running and swinging (failing, they're shown standing:
+	// motion_failure).
 	walk_error := read_motion(archives, room, path, WALK_ANIMATION, &skeleton.walk)
 	run_error := read_motion(archives, room, path, RUN_ANIMATION, &skeleton.run)
-	skeleton.motion_failure = if walk_error do walk_error else run_error
+	attack_error := read_motion(archives, room, path, ATTACK_ANIMATION, &skeleton.attack)
+	skeleton.motion_failure = attack_error
+	if run_error do skeleton.motion_failure = run_error
+	if walk_error do skeleton.motion_failure = walk_error
 }
 
 // A way of moving: its animation (at motion_path) read, and the skeleton
@@ -583,17 +591,21 @@ pose_npcs :: fun(scene: ^Scene, renderer: ^Renderer, time: f32, movers: []Npc_Mo
 // Poses someone moving (if a mover has their reference and goes fast enough):
 // walking or running, as far into a loop of it as the way they've gone
 // takes them (by time, where it doesn't move), the root's way along it
-// taken back out — they're where they're placed. False when they aren't
-// moving (or there's no way for them to).
+// taken back out — they're where they're placed; swinging, as far into
+// the swing as they are. False when they aren't moving (or there's no way
+// for them to).
 pose_mover :: fun(skeleton: ^Npc_Skeleton, reference: u32, movers: []Npc_Mover, time: f32, places: ^[]Mat4) -> bool {
 	for mover in movers {
 		if mover.reference != reference do continue
-		if mover.speed < MOVING_LEAST do return false
+		swinging := mover.swing >= 0 and skeleton.attack.rig.len > 0 and mover.swing < skeleton.attack.stop - skeleton.attack.start
+		if mover.speed < MOVING_LEAST and not swinging do return false
 		motion := if mover.speed >= RUNNING_LEAST do &skeleton.run else &skeleton.walk
+		if swinging do motion = &skeleton.attack
 		span := motion.stop - motion.start
 		if span <= 0 or motion.rig.len == 0 do return false
 		share := if motion.stride > 0 do mover.way / motion.stride else time / span
 		at := motion.start + (share - floor_f32(share)) * span
+		if swinging do at = motion.start + mover.swing
 		pose_rig(motion.rig, &motion.tracks, at, places)
 		if motion.root >= 0 {
 			root := &motion.tracks[motion.root]

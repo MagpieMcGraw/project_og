@@ -116,6 +116,7 @@ Bot :: struct {
 	yaw: f32
 	speed: f32
 	stood_at: Vec3
+	swings: i64     // how many times it's swung its weapon
 	// Its place's path grid; the route it's walking, and whether it has one
 	// (going somewhere, or following: found anew as they move on); the door
 	// that opens in place it last asked the server to open, and when (not
@@ -171,6 +172,7 @@ bot_start :: fun(bot: ^Bot, orders_path: []utf8, status_path: []utf8, loader: Lo
 	bot.yaw = 0
 	bot.speed = 0
 	bot.stood_at = Vec3{0, 0, 0}
+	bot.swings = 0
 	bot.grid.points.len = 0
 	bot.grid.links.len = 0
 	bot.route.points.len = 0
@@ -343,7 +345,7 @@ bot_step :: fun(bot: ^Bot, plugin: ^Plugin, seconds: f32) {
 		}
 	}
 	_ = load_waiting(place, plugin, bot.loader, BOT_LOAD_BUDGET, feet)
-	send_player(&bot.to_server, bot.world, feet, bot.yaw, bot.speed, false)
+	send_player(&bot.to_server, bot.world, feet, bot.yaw, bot.speed, false, bot.swings)
 }
 
 // The way the bot goes this step by its order (across the ground, units a
@@ -491,7 +493,7 @@ bot_other :: fun(bot: ^Bot, id: i64) -> Other_Player, bool {
 		if other.world == 0 and other.cell == 0 do continue
 		if id == 0 or other.id == id do return other, true
 	}
-	return Other_Player{id = 0, world = 0, cell = 0, feet = Vec3{0, 0, 0}, yaw = 0, speed = 0}, false
+	return Other_Player{id = 0, world = 0, cell = 0, feet = Vec3{0, 0, 0}, yaw = 0, speed = 0, swings = 0}, false
 }
 
 // Whether another player's in the bot's place: the same world, or the
@@ -700,6 +702,7 @@ bot_read_orders :: fun(bot: ^Bot, plugin: ^Plugin) {
 //   to [player]                is beside a player at once, in their place
 //   at <world | interior> <x> <y> <z>   is there at once, standing
 //   door                       goes through the nearest door (within DOOR_REACH), then stands
+//   swing                      swings its weapon (the others see it)
 //   say <words>                says something to the other players
 //   leave                      leaves the world
 // Empty lines and those starting with # are let go; ones it doesn't know
@@ -764,6 +767,8 @@ bot_take_order :: fun(bot: ^Bot, plugin: ^Plugin, line: []utf8) {
 		if door_error do print("bot: couldn't go through the door: %", door_error)
 		elif not used do print("bot: no door near enough that leads anywhere")
 		else do order.kind = .stay
+	elif verb == "swing"
+		bot.swings += 1
 	elif verb == "say" and words.len > 1
 		send_say(&bot.to_server, trimmed(line[3 : line.len]))
 	elif verb == "leave"

@@ -63,6 +63,7 @@ Player_State :: struct {
 	yaw: f32
 	speed: f32
 	hurried: bool
+	swings: i64
 	climate: u32
 	sky: i64
 	walked_into_sky: bool
@@ -185,6 +186,7 @@ player_clear :: fun(player: ^Player_State, id: i64) {
 	player.yaw = 0
 	player.speed = 0
 	player.hurried = false
+	player.swings = 0
 	player.climate = 0
 	player.sky = -1
 	player.walked_into_sky = false
