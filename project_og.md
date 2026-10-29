@@ -10,10 +10,15 @@ them; when a shared part changes in one project, say so here.
 
 ## The projects
 
+All in one repo, project_og (C:\Code\project_og, since 2026-10-29; its
+history keeps each one's from before): the shared modules in og\, each
+game's own code in its folder beside it. og\ and one game's folder are all
+of that game's code.
+
 | Project | Game | Folder | Game data | Port |
 |---|---|---|---|---|
-| sooblivion | The Elder Scrolls IV: Oblivion (3D) | C:\Code\sooblivion | D:\SteamLibrary\steamapps\common\Oblivion\Data | 27100 |
-| sothrone | Throne of Darkness (2D sprites) | C:\Code\sothrone | D:\Games\Disciples 2\Throne of Darkness\LotFiles | 27200 |
+| sooblivion | The Elder Scrolls IV: Oblivion (3D) | C:\Code\project_og\sooblivion | D:\SteamLibrary\steamapps\common\Oblivion\Data | 27100 |
+| sothrone | Throne of Darkness (2D sprites) | C:\Code\project_og\sothrone | D:\Games\Disciples 2\Throne of Darkness\LotFiles | 27200 |
 
 The port is the one a game hosts on: different, so both can run at once.
 
@@ -33,8 +38,11 @@ A module found in two of those folders is an error (373ba2b7): a project
 can't keep its own copy of a module that's also in a folder it names. (A
 project's module may still take the place of one of Mara's own.)
 
-**The shared modules are in C:\Code\og** (since 2026-10-29; its README
-lists them). A port names it in its build.mara's dirs and keeps no copies.
+**The shared modules are in og\** (since 2026-10-29; its README lists
+them). A port names it in its build.mara's dirs and keeps no copies. og\
+has no build.mara (a port naming it would find `module build` twice) and
+nothing one port alone uses. As the search doesn't go into subfolders,
+no port sees another's modules: both have a world_state.
 A change to one of them reaches every port that names the folder at its
 next build: rebuild each and rerun its checks after one.
 
@@ -130,12 +138,17 @@ notes; GL errors noted once each.
 
 ## Ways of working the projects share
 
-- **Building.** Each project builds with its own copy of the compiler
-  (`compiler\`, not checked in), brought from C:\Code\Mara\release by its
-  update_compiler.bat (run as `cmd.exe /c "<path>\update_compiler.bat"`);
-  MARA_VERSION.txt, checked in, says which. build.bat builds, through the
-  project's build.mara (`compiler\Mara.exe build`). Batch files need CRLF
-  line ends. After an update, rerun the project's headless checks.
+- **Building.** One compiler builds every project: project_og's
+  `compiler\` (not checked in), brought from C:\Code\Mara\release by the
+  root's update_compiler.bat (run as
+  `cmd.exe /c "C:\Code\project_og\update_compiler.bat"`);
+  MARA_VERSION.txt at the root, checked in, says which. A project's
+  build.bat builds it through its build.mara (`..\compiler\Mara.exe
+  build`). Batch files need CRLF line ends. After an update, or a change
+  in og\, rebuild every project and rerun its headless checks.
+- **Commits.** Each session commits its own project's files, by path
+  (never `git add -A`), and only with its user's word; a change to og\
+  is told to the other sessions working in project_og.
 - **Server and client from the start.** The world lives on the server
   (World_State); a client knows only what it's told (World_Copy) and says
   what its player does. Started plain, the game joins one hosted on this

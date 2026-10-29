@@ -1,9 +1,9 @@
 @echo off
-rem Updates sothrone's copy of the Mara compiler (compiler\) from Mara's
-rem release folder, which release.sh fills from a clean commit after the
-rem full suite passes. MARA_VERSION.txt says which Mara it is: the one in
-rem compiler\, and the one here, checked in, so each commit says which
-rem compiler built it. (The same as sooblivion's.)
+rem Updates project_og's Mara compiler (compiler\), the one every game
+rem builds with, from Mara's release folder, which release.sh fills from a
+rem clean commit after the full suite passes. MARA_VERSION.txt says which
+rem Mara it is: the one in compiler\, and the one here, checked in, so
+rem each commit says which compiler built it. Rebuild every game after.
 setlocal
 cd /d "%~dp0"
 set RELEASE=C:\Code\Mara\release

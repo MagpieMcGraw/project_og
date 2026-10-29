@@ -1,6 +1,6 @@
-// How sooblivion is built: `compiler\Mara.exe build` (build.bat) builds the
-// one named as the folder. The modules shared with the other og ports are
-// in C:\Code\og (C:\Code\project_og.md); sooblivion keeps no copies of them.
+// How sooblivion is built: `..\compiler\Mara.exe build` (build.bat) builds
+// the one named as the folder. The modules shared with the other og ports
+// are in ../og (../project_og.md); sooblivion keeps no copies of them.
 module build
 
 use mara.build

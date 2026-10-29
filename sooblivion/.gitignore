@@ -9,6 +9,5 @@ memory.txt
 *.dds
 *.png
 *.log
-compiler/
 cache/
 settings.txt

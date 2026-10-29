@@ -1,6 +1,6 @@
-// How sothrone is built: `compiler\Mara.exe build` (build.bat) builds the
-// one named as the folder. The modules shared with the other ports are in
-// C:\Code\og (its project_og.md says more); sothrone keeps no copies of them.
+// How sothrone is built: `..\compiler\Mara.exe build` (build.bat) builds
+// the one named as the folder. The modules shared with the other ports are
+// in ../og (../project_og.md says more); sothrone keeps no copies of them.
 module build
 
 use mara.build

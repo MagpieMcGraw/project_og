@@ -10,7 +10,7 @@
 // it may be anything. Off a network a message may come in parts: one not
 // all come yet waits for the rest (wire_receive, wire_send).
 //
-// Shared by the og ports (project_og.md, beside it); it began as sooblivion's
+// Shared by the og ports (../project_og.md); it began as sooblivion's
 // wire.mara (83fce8a) less its messages. What kinds of messages there are
 // is each game's own: the game's port too (wire_connect).
 module wire

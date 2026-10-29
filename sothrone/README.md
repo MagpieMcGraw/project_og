@@ -10,16 +10,17 @@ ramps, rooms and a wilderness built from placed pictures, up to 8 players
 together. Quests are scripts that wait on events.
 
 What's shared with the other ports (sooblivion so far) is written down in
-C:\Code\og\project_og.md.
+project_og.md, in the folder above (project_og holds og/ and every port).
 
 
 ## Building and running
 
-`build.bat` builds sothrone.exe with the project's own copy of the Mara
-compiler (`compiler\`, not checked in): `compiler\Mara.exe build`, which
-builds what build.mara says (the build named sothrone, optimized).
-`update_compiler.bat` brings the compiler from C:\Code\Mara\release, and
-MARA_VERSION.txt says which it is.
+`build.bat` builds sothrone.exe with project_og's Mara compiler, the one
+every port builds with (`..\compiler\`, not checked in):
+`..\compiler\Mara.exe build`, which builds what build.mara says (the
+build named sothrone, optimized). `..\update_compiler.bat` brings the
+compiler from C:\Code\Mara\release, and ..\MARA_VERSION.txt says which it
+is.
 
 For now the program is the game's skeleton: one bare room (800 × 600),
 each player one of the seven samurai, read from the game's Samurai.lot,
@@ -46,7 +47,7 @@ The modules: `world_state` (the world and its messages), `world_server`,
 `world_copy` (a client's view of the world), `game_link` (join or host),
 `lot` (the archives), `spr8` (the sprites), `art` (the samurai's
 pictures on the card), `sothrone` (the commands, the window). From
-C:\Code\og, the modules the ports share (build.mara names the folder):
+../og, the modules the ports share (build.mara names the folder):
 `wire`, `logging`, `disk`, `sdl_platform`, `png`, `inflate`, `lzo`,
 `sprite_layer`.
 
@@ -107,7 +108,7 @@ and later Bink video.
 The shared layer would be: platform (window, input, GL), the audio mixer,
 codecs (inflate, png, mp3, wav, lzo, lzw, later Bink), disk, logging and
 caches, wire, Key_Index, XML. Each game brings its archives, its formats
-and its rules. C:\Code\og\project_og.md has the details.
+and its rules. ../project_og.md has the details.
 
 
 ## Tools

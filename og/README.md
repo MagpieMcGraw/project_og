@@ -9,7 +9,7 @@ A port then keeps no copy of these modules: a module found in two folders
 is an error. A change here reaches every port that names this folder at
 its next build, so rebuild each and rerun its checks after one.
 
-project_og.md, here, says which ports use which, what else could come
+../project_og.md says which ports use which, what else could come
 here, and the ways of working the ports share.
 
 | Module | What it is |

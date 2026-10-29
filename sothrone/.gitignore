@@ -7,7 +7,6 @@ profile.txt
 memory.txt
 *.png
 *.log
-compiler/
 cache/
 pictures/
 __pycache__/
