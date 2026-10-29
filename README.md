@@ -39,8 +39,8 @@ sothrone_2.log, … not in use.
 
 The modules: `world_state` (the world and its messages), `world_server`,
 `world_copy` (a client's view of the world), `game_link` (join or host),
-`sothrone` (the commands, the window); copied from sooblivion: `wire`
-(cut loose from sooblivion's messages), `logging`, `disk`,
+`sothrone` (the commands, the window). From C:\Code\og, the modules the
+ports share (build.mara names the folder): `wire`, `logging`, `disk`,
 `sdl_platform`, `png`, `inflate`.
 
 

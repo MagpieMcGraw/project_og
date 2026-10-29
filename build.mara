@@ -1,9 +1,8 @@
 // How sothrone is built: `compiler\Mara.exe build` (build.bat) builds the
-// one named as the folder. Its modules are all in this folder for now; the
-// ones shared with the other ports (C:\Code\project_og.md) may move to a
-// folder of their own, named in dirs.
+// one named as the folder. The modules shared with the other ports are in
+// C:\Code\og (C:\Code\project_og.md); sothrone keeps no copies of them.
 module build
 
 use mara.build
 
-sothrone :: Build(){release = true}
+sothrone :: Build(){release = true, dirs = ["../og"]}
