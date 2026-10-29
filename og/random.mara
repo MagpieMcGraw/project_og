@@ -1,7 +1,7 @@
 // Chance: a run of numbers from a seed, and rolls that come out the same
 // for everyone who makes them with the same seed and numbers (so the
 // players of one game roll alike with nothing kept in step but the seed).
-// Came from sooblivion's world.mara (83fce8a).
+// Came from oblivion's world.mara (83fce8a).
 module random
 
 use mara.core

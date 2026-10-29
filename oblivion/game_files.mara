@@ -2,7 +2,7 @@
 // and their archives — the master's (Oblivion.ini's SArchiveList) and each
 // plugin's own, named after it (Knights.bsa; "DLCShiveringIsles -
 // Meshes.bsa").
-module sooblivion
+module oblivion
 
 use mara.core
 use mara.os

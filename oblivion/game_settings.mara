@@ -42,7 +42,7 @@ read_settings :: fun() -> Game_Settings, err {
 write_settings :: fun(settings: Game_Settings) -> err {
 	volumes := settings.volumes
 	write_settings_file(SETTINGS_PATH,
-		"// sooblivion's settings, as the game last wrote them: read at its start.\n// The volumes are in hundredths, 0 to 100.\nsettings :: Game_Settings{\n",
+		"// oblivion's settings, as the game last wrote them: read at its start.\n// The volumes are in hundredths, 0 to 100.\nsettings :: Game_Settings{\n",
 		[Setting{name = "master_volume", number = f64(volumes.master) * 100},
 		Setting{name = "voice_volume", number = f64(volumes.voice) * 100},
 		Setting{name = "effect_volume", number = f64(volumes.effects) * 100},

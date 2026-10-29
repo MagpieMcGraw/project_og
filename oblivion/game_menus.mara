@@ -3,7 +3,7 @@
 // (Oblivion.esm's NPC_ Player, form id 7), and the world's map (its WRLD's
 // ICON picture and MNAM corners), the player marked on it. While one is
 // open the mouse moves a cursor, clicks pick its tabs, the world stands.
-module sooblivion
+module oblivion
 
 use mara.core
 use mara.math

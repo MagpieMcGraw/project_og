@@ -1,5 +1,5 @@
 // Tables from keys to numbers (Key_Index), and the hashes that make keys of
-// text. Came from sooblivion's world.mara (Key_Index) and its three copies
+// text. Came from oblivion's world.mara (Key_Index) and its three copies
 // of the same hash (83fce8a).
 module indexing
 

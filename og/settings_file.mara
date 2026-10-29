@@ -4,7 +4,7 @@
 // passed over, and what the game does with each is its own (a setting
 // missing keeps its default).
 //
-// Came from sooblivion's game_settings.mara (83fce8a), its volumes left
+// Came from oblivion's game_settings.mara (83fce8a), its volumes left
 // there.
 module settings_file
 

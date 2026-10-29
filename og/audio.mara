@@ -10,7 +10,7 @@
 // sound is at a distance and its pitch, its kinds of sound (each heard as
 // loud as its volume) and which music plays where.
 //
-// Came from sooblivion's audio.mara (83fce8a), Oblivion's sound records
+// Came from oblivion's audio.mara (83fce8a), Oblivion's sound records
 // left there.
 module audio
 

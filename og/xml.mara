@@ -6,7 +6,7 @@
 // (&…;) are left as they are: what they mean is each game's (Oblivion's
 // menus have their own).
 //
-// Came from sooblivion's menus.mara (83fce8a), which kept only the
+// Came from oblivion's menus.mara (83fce8a), which kept only the
 // attributes Oblivion's menus use.
 module xml
 

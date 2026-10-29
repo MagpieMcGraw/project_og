@@ -9,7 +9,7 @@
 // records after it are written over. One program at a time adds to it:
 // another runs without it.
 //
-// Came from sooblivion (83fce8a), where it keeps what Oblivion's BSA
+// Came from oblivion (83fce8a), where it keeps what Oblivion's BSA
 // archives unpack.
 module file_cache
 

@@ -1,6 +1,6 @@
-# Oblivion's assets in sooblivion
+# Oblivion's assets in oblivion
 
-What the game's data holds and what sooblivion does with it, as of
+What the game's data holds and what oblivion does with it, as of
 2026-10-27. Scripts (SCPT) are left out on purpose. Counts are from
 Oblivion.esm and the base game's archives; sizes are as stored.
 
@@ -161,12 +161,12 @@ glow or opacity — their own, or an Idle's.
 
 | What | Data | Notes |
 |---|---|---|
-| The player's chosen plugins | `Plugins.txt` in their local app data | sooblivion loads what DLCList.txt names (all the DLC here); the path needs an environment variable Mara can't read yet |
+| The player's chosen plugins | `Plugins.txt` in their local app data | oblivion loads what DLCList.txt names (all the DLC here); the path needs an environment variable Mara can't read yet |
 | Loose files | `Data\Textures` and the like | the game takes them over the archives' |
 
 ### To check against the game (a decompile, later)
 
-How the engine uses data whose meaning the files don't give; sooblivion
+How the engine uses data whose meaning the files don't give; oblivion
 guesses for now.
 
 - The sun's arc from the climate's hours (on the horizon at 6:00 and

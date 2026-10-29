@@ -3,7 +3,7 @@
 The Mara modules the og ports share (og: a source port of every game).
 A port uses them by naming this folder in its build.mara:
 
-    sothrone :: Build(){release = true, dirs = ["../og"]}
+    throne :: Build(){release = true, dirs = ["../og"]}
 
 A port then keeps no copy of these modules: a module found in two folders
 is an error. A change here reaches every port that names this folder at
@@ -30,10 +30,10 @@ here, and the ways of working the ports share.
 | xml | XML read a piece at a time: tags with any attributes, the text between |
 | settings_file | settings kept as a Mara struct literal, a `name = number` line each |
 
-wire, logging, disk, sdl_platform, inflate and png came from sooblivion
-(83fce8a), as they were but for wire, which is sooblivion's less its own
-messages. sprite_layer is sooblivion's 2D layer (render.mara's ui_begin,
+wire, logging, disk, sdl_platform, inflate and png came from oblivion
+(83fce8a), as they were but for wire, which is oblivion's less its own
+messages. sprite_layer is oblivion's 2D layer (render.mara's ui_begin,
 ui_image, draw_ui) with no Renderer round it. lzo was written for
-sothrone (Throne of Darkness's archives). audio, mp3, indexing, random,
-file_cache, xml and settings_file came from sooblivion too, its
+throne (Throne of Darkness's archives). audio, mp3, indexing, random,
+file_cache, xml and settings_file came from oblivion too, its
 Oblivion-only parts left there (its game_sound, menus, game_settings).

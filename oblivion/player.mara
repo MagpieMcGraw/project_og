@@ -4,7 +4,7 @@
 // `a:L` or `a:R` key on has the other follow it. At an attack's Hit key,
 // what's in reach is struck. Drawn with the camera, its eyes on the
 // camera's, in its own depth (draw_frame's held).
-module sooblivion
+module oblivion
 
 use mara.core
 use mara.math

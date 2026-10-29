@@ -4,7 +4,7 @@
 // magicka and fatigue, their weapon's icon, the camera's heading, what the
 // reticle is on and what using it would do. And the game's fonts (Data\Fonts
 // in the Misc archive: a .fnt of glyphs, a .tex picture) the menus write in.
-module sooblivion
+module oblivion
 
 use mara.core
 use mara.math

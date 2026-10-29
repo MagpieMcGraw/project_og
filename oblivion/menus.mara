@@ -11,7 +11,7 @@
 //
 // Its units: a screen MENU_HEIGHT high and as wide as its shape makes it;
 // pictures drawn texel for texel (zoom 100) and cropped to their size.
-module sooblivion
+module oblivion
 
 use mara.core
 use mara.math

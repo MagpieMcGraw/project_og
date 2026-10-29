@@ -7,9 +7,9 @@
 // vsync on and off; B switches between drawing bindless and binding
 // textures (where the card can do both); T, held, hurries the day along;
 // Escape quits. The window's title says where, how many
-// frames a second, and whether vsync is on; sooblivion.log, in the folder
+// frames a second, and whether vsync is on; oblivion.log, in the folder
 // it's run from, keeps what happened.
-module sooblivion
+module oblivion
 
 use mara.core
 use mara.math
@@ -82,10 +82,10 @@ SLOW_FRAME :: 25000000
 SUMMARY_EVERY :: 10000000000
 // Where the viewer's journal goes, in the folder it's run from; taking a
 // picture, where it goes instead (the game's log left as it is).
-LOG_PATH :: "sooblivion.log"
+LOG_PATH :: "oblivion.log"
 PICTURE_LOG_PATH :: "picture.log"
 
-// A picture taken in place of showing the window (`sooblivion picture`):
+// A picture taken in place of showing the window (`oblivion picture`):
 // the window kept hidden, no sound. Once what's waiting has loaded, and
 // PICTURE_SETTLE frames more (textures, weather), the frame drawn is
 // written to path as a PNG and the viewer quits; after
@@ -376,7 +376,7 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 		note_error(&viewer.journal, cache.failure)
 	}
 	note_end(&viewer.journal)
-	viewer.platform = platform_open("sooblivion", 1280, 720, taking_picture)?
+	viewer.platform = platform_open("oblivion", 1280, 720, taking_picture)?
 	audio_init(&viewer.audio, SOUND_ROOM, table_storage)
 	// The volumes as the player last set them (none set yet: every sound as
 	// loud as it's made).
@@ -2089,7 +2089,7 @@ leading_door :: fun(shown: ^Scene, reference: u32) -> i64 {
 	return -1
 }
 
-// `sooblivion view <mesh>`: shows a mesh in the window.
+// `oblivion view <mesh>`: shows a mesh in the window.
 command_view :: fun(what: []utf8, picture: Picture) {
 	directory_storage : [64 * MB]byte = void
 	directory_storage.len = 0
@@ -2136,7 +2136,7 @@ command_view :: fun(what: []utf8, picture: Picture) {
 	for view_frame(&viewer) != .quit {}
 }
 
-// `sooblivion view-cell <editor id>`: shows an interior cell in the
+// `oblivion view-cell <editor id>`: shows an interior cell in the
 // window; its doors lead on, inside and out — after the main menu, when
 // main_menu (the game started with nothing asked: its Exit leaves before
 // anything's loaded). Joins a game hosted on this machine if there is one
@@ -2195,7 +2195,7 @@ command_view_cell :: fun(name: []utf8, picture: Picture, server_address: []utf8 
 	explore(&viewer, &plugin)
 }
 
-// `sooblivion view-world [world] [x y]`: shows a world's land and what's
+// `oblivion view-world [world] [x y]`: shows a world's land and what's
 // on it around the cell at x, y on its grid.
 command_view_world :: fun(name: []utf8, x: i64, y: i64, picture: Picture, server_address: []utf8 = "") {
 	index_storage : [96 * MB]byte = void

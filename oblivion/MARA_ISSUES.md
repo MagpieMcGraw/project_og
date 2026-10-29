@@ -1,9 +1,11 @@
-# Mara issues found in sooblivion
+# Mara issues found in oblivion
+
+(The Oblivion port; it was called sooblivion till 2026-10-29.)
 
 Problems with the Mara compiler, standard library and bindings met while
-writing sooblivion. Each has a small program that shows it, checked
+writing oblivion. Each has a small program that shows it, checked
 against Mara at the time written. When one is fixed, move it to Fixed
-(with the commit) and sooblivion's workaround can come out.
+(with the commit) and oblivion's workaround can come out.
 
 ## Open
 
@@ -20,7 +22,7 @@ against Mara at the time written. When one is fixed, move it to Fixed
   `Codegen error: can't lower 'main' from the program graph: its index ''`.
   `TURNS[1]` and `TURNS[k]` fail the same way. A constant array of text
   works (`WORDS :: ["a", "b"]`, `WORDS[k]`: viewer.mara's MOON_PHASES),
-  and so does the literal written in the loop. sooblivion's bot_join
+  and so does the literal written in the loop. oblivion's bot_join
   loops over the literal (bot_player.mara).
 
 ## Answered (not issues)
@@ -32,13 +34,14 @@ against Mara at the time written. When one is fixed, move it to Fixed
   `room.len = 0`. The view commands' storages are so (viewer.mara).
 - Struct values can't be compared (`part.diffuse != Vec3{1, 1, 1}`): not
   in the language, by design; a compare can be written as an overload, as
-  strings have theirs. sooblivion compares the components (model.mara,
+  strings have theirs. oblivion compares the components (model.mara,
   add_shape).
 
 ## Fixed
 
-sooblivion builds with Mara's release, 9d90101a (MARA_VERSION.txt;
-update_compiler.bat pulls the next), so all of these are in its copy.
+oblivion builds with project_og's Mara release (../MARA_VERSION.txt
+says which; ../update_compiler.bat pulls the next), so all of these are
+in its copy.
 
 - A struct holding a list couldn't be written into a byte buffer (the
   program wasn't made: "can't lower ... its view ''") — 9d90101a. The
@@ -51,7 +54,7 @@ update_compiler.bat pulls the next), so all of these are in its copy.
   files for reading and writing both (CreateFileW), which mara.os
   doesn't.
 - A generic fun's param couldn't have a default, so a generic couldn't
-  take `#caller_span` or `#caller_name` — 2943553. sooblivion's check
+  take `#caller_span` or `#caller_name` — 2943553. oblivion's check
   still takes the numbers, `fits(list.len + 1, list.cap)` (183 calls);
   it could take the list now (`room_for(&list)`).
 - `-profile memory` gave an arena's peak as a number like an address —
@@ -65,7 +68,7 @@ update_compiler.bat pulls the next), so all of these are in its copy.
 - An immutable slice param stored into a struct field (`hold(numbers)`
   giving back `Holder{numbers = numbers}`) made that field read-only in
   every Holder of the program — 61bf180: the copy rule follows values.
-  sooblivion's tree_part still takes the growing tree (it reads as well).
+  oblivion's tree_part still takes the growing tree (it reads as well).
 - A struct made from a pointer to a local struct counted as holding every
   pointer the local held, so a pointer param kept in a local beside lists
   carved from storage was "stored into" the storage — 936e8ec: a struct's
@@ -85,7 +88,7 @@ update_compiler.bat pulls the next), so all of these are in its copy.
   rig_skin (model.mara) appends the literal.
 
 - There was no way to read an environment variable on Windows — 2f840bc
-  (`env(name) -> Path, err`; Not_Set since 3a5d0f3). sooblivion reads the
+  (`env(name) -> Path, err`; Not_Set since 3a5d0f3). oblivion reads the
   player's `%LOCALAPPDATA%\Oblivion\Plugins.txt` (game_files.mara), the
   data folder's DLCList.txt only without one. Oblivion.ini's archive list
   is still a constant.
@@ -93,7 +96,7 @@ update_compiler.bat pulls the next), so all of these are in its copy.
   stopped the program (its value went into a list of room 64) — 29e2911:
   an if-expression of an array and a slice is the slice. command_sky's
   two prints are one again.
-- mara.open_gl had no Uniform4f — 95bb037. sooblivion's sky program
+- mara.open_gl had no Uniform4f — 95bb037. oblivion's sky program
   passes a moon as a vec3 and a float still: it reads as well.
 - A cast assigned into an f32 place let the place's type through to what
   was cast (`table[i] = f32(cos(PI / 72 * f64(i)))` couldn't choose a
@@ -103,20 +106,20 @@ update_compiler.bat pulls the next), so all of these are in its copy.
 - A variable named `all` was accepted, then `if x or all {` read `all {`
   as a broadcast, the errors landing on the next line — b3661d1: `all` is
   a keyword (declaring it is an error), and a condition's `{` is never a
-  broadcast's. sooblivion renamed its two (`every_one`, `everything`).
-- mara.sdl had no audio — 8336222 (SDL3's audio streams). sooblivion's
+  broadcast's. oblivion renamed its two (`every_one`, `everything`).
+- mara.sdl had no audio — 8336222 (SDL3's audio streams). oblivion's
   audio.mara uses it; its stopgap foreign block is gone.
 - An err couldn't be had as text (the journal's log could say what failed,
   not why) — b6926f2 (`e.text()`) and eb25281 (`e.where()`: where it was
-  made, carried by `?`). sooblivion's journal writes both (note_error).
+  made, carried by `?`). oblivion's journal writes both (note_error).
 - An inner loop's index named as the outer loop's was the same variable
   (`for value, i in …` around `for i in 0:2`: the outer loop never ended)
   — 9d5d110: a loop's name hiding an enclosing one is an error, as a
-  declaration's is. sooblivion's map command had loop items named `height`
+  declaration's is. oblivion's map command had loop items named `height`
   under the picture's `height`; renamed.
 - Writing a field of a union variant's value (`box := Box{…}; box.height = 3`)
   failed in lowering ("a write to an unknown field") — 391e74c: the checker
-  says to reach the field in a match arm. sooblivion builds its variants
+  says to reach the field in a match arm. oblivion builds its variants
   from finished values.
 - Float literals with an exponent (`1.5e3`) weren't read — 8a8319d.
   (UNSET_BEYOND in nif_animation.mara is `1e12` now.)
@@ -126,4 +129,4 @@ update_compiler.bat pulls the next), so all of these are in its copy.
 - gl_load handed c_text's views (no room for the 0 after them) to
   GL_GetProcAddress, whose cstring() stopped the program — 4ef56de.
 - Foreign blocks made private, the bindings wrapping them — 48033df
-  (sooblivion converted: 968cd07, d60f499).
+  (oblivion converted: 968cd07, d60f499).

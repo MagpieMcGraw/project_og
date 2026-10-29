@@ -1,12 +1,12 @@
-# `[:]` in sooblivion: an audit
+# `[:]` in oblivion: an audit
 
-2026-10-27, sooblivion at 8edd526, built with Mara release 3a5d0f3.
+2026-10-27, oblivion at 8edd526, built with Mara release 3a5d0f3.
 Applied in 80f92e5: the 266 not needed are out; the 4 needed and the
 declarations stay (12 `[:]` left).
 
 ## In short
 
-276 `[:]` in 20 of sooblivion's 36 files (23,478 lines). Taken out of a
+276 `[:]` in 20 of oblivion's 36 files (23,478 lines). Taken out of a
 copy of the sources, all but 4 build, and every headless check gives
 the same output as before. Those checks cover the plugins, archives,
 models, NPCs, skinning, sky, the NIF survey, all 139 trees, a tree
@@ -25,7 +25,7 @@ run by them.
 | A return | 2 | 2 |
 
 So about 266 are habit: a list already goes into a slice param, an
-append, a compare or a slice field without one. sooblivion grew them by
+append, a compare or a slice field without one. oblivion grew them by
 spelling every list-to-slice place out.
 
 ## The 4 the compiler needs
@@ -36,7 +36,7 @@ spelling every list-to-slice place out.
 - `bsa.mara:110`: `header_view := header_bytes[:]`, a fixed array
   (`[36!]byte`), so that `&header_view` can be the `^[]byte` that
   read_exactly moves the length of.
-- `sooblivion.mara:1729`: `if chances.len == 0 do "the climate's" else
+- `oblivion.mara:1729`: `if chances.len == 0 do "the climate's" else
   line[:]`. Without `[:]` it fails in codegen, not in the checker.
   (Fixed in Mara 9f29045, release 61bf180: it's `line` since.)
 
@@ -45,9 +45,9 @@ spelling every list-to-slice place out.
 Without `[:]`, `x := list` is a copy of the list, not a view of it. It
 builds, but it means something else: a copy costs the list's whole room
 (a Path is 512 bytes), and writes to it don't reach the original. The
-other 6 in sooblivion only read, so they happen to give the same output:
+other 6 in oblivion only read, so they happen to give the same output:
 
-- `audio.mara:165`, `sooblivion.mara:1555`: `folder_path := kind.path[:]`
+- `audio.mara:165`, `oblivion.mara:1555`: `folder_path := kind.path[:]`
 - `game_files.mara:119`: `name := order.plugins[…].name[:]`
 - `npc.mara:449`: `bone := part.bone[:]`, later `bone = parent` (a slice)
 - `speedtree.mara:370`: `points := curve.points[:]`, on every curve read
@@ -60,7 +60,7 @@ unless the type is written: `x : []utf8 = list`.
 ## What it suggests for Mara
 
 - **Passing, appending, comparing:** these need no `[:]`, and they're
-  87% of sooblivion's uses. The compiler could say so: a warning,
+  87% of oblivion's uses. The compiler could say so: a warning,
   or `mara fix`.
 - **Returns and declarations:** these are where `[:]` still means
   something. A return needs it by rule. In a declaration it's the

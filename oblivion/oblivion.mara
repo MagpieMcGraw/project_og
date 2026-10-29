@@ -1,13 +1,13 @@
-// sooblivion: an engine for The Elder Scrolls IV: Oblivion, written in
+// oblivion: an engine for The Elder Scrolls IV: Oblivion, written in
 // Mara. It runs on the game's own data files — the plugins (.esm, .esp)
 // and archives (.bsa) in its Data folder.
 //
 // For now it is a set of commands for looking into those files:
 //
-//     sooblivion esm [plugin]            what a plugin holds, by record type
-//     sooblivion bsa <archive>           an archive's folders and files
-//     sooblivion bsa <archive> <file>    one file from an archive, unpacked
-module sooblivion
+//     oblivion esm [plugin]            what a plugin holds, by record type
+//     oblivion bsa <archive>           an archive's folders and files
+//     oblivion bsa <archive> <file>    one file from an archive, unpacked
+module oblivion
 
 use mara.core
 use mara.os
@@ -75,7 +75,7 @@ contains_separator :: fun(name: []utf8) -> bool {
 	return false
 }
 
-// `sooblivion esm [plugin]`: reads a whole plugin and prints how many
+// `oblivion esm [plugin]`: reads a whole plugin and prints how many
 // records of each type it holds.
 command_esm :: fun(name: []utf8) {
 	path := data_path(name)
@@ -105,7 +105,7 @@ command_esm :: fun(name: []utf8) {
 	print("% records in all", total_records)
 }
 
-// `sooblivion bsa <archive> [file | -test]`: an archive's directory, one
+// `oblivion bsa <archive> [file | -test]`: an archive's directory, one
 // of its files written out to the current folder, or every file unpacked
 // as a test.
 command_bsa :: fun(name: []utf8, what: []utf8) {
@@ -227,7 +227,7 @@ Failure_Count :: struct {
 	example: str256   // the first file it happened in
 }
 
-// `sooblivion nifs [archive]`: reads every NIF in an archive, all its
+// `oblivion nifs [archive]`: reads every NIF in an archive, all its
 // blocks, and counts the ones that don't read cleanly to their end, by the
 // block type where they went wrong.
 command_nifs :: fun(name: []utf8) {
@@ -390,7 +390,7 @@ failure_entry :: fun(failures: ^[]Failure_Count, type_name: []utf8, reason: err)
 	return entry
 }
 
-// `sooblivion textures [archive]`: reads the header of every texture in an
+// `oblivion textures [archive]`: reads the header of every texture in an
 // archive and counts their formats and sizes.
 command_textures :: fun(name: []utf8) {
 	path := data_path(name)
@@ -437,7 +437,7 @@ command_textures :: fun(name: []utf8) {
 	}
 }
 
-// `sooblivion texture <file> [archive]`: decodes a texture's largest image
+// `oblivion texture <file> [archive]`: decodes a texture's largest image
 // and writes it out as a PNG in the current folder, for looking at.
 command_texture :: fun(what: []utf8, name: []utf8) {
 	path := data_path(name)
@@ -483,7 +483,7 @@ command_texture :: fun(what: []utf8, name: []utf8) {
 	else do print("wrote % (% x %, %, % mipmaps)", out_name, texture.width, texture.height, texture.format, texture.mips.len)
 }
 
-// `sooblivion model <file> [archive]`: reads a mesh and prints the parts
+// `oblivion model <file> [archive]`: reads a mesh and prints the parts
 // the renderer would draw.
 command_model :: fun(what: []utf8, name: []utf8) {
 	path := data_path(name)
@@ -696,7 +696,7 @@ load_oblivion :: fun(index_storage: ^[]byte) -> Plugin, err {
 	return plugin
 }
 
-// `sooblivion cells [word]`: the interior cells whose editor ids have word in them.
+// `oblivion cells [word]`: the interior cells whose editor ids have word in them.
 command_cells :: fun(word: []utf8) {
 	index_storage : [64 * MB]byte
 	plugin, load_error := load_oblivion(&index_storage)
@@ -730,7 +730,7 @@ command_cells :: fun(word: []utf8) {
 	print("% cells", shown)
 }
 
-// `sooblivion cell <editor id> [-all]`: what's placed in an interior cell
+// `oblivion cell <editor id> [-all]`: what's placed in an interior cell
 // (the first 25, or all), and the meshes it needs.
 command_cell :: fun(name: []utf8, every_one: bool) {
 	index_storage : [64 * MB]byte
@@ -836,7 +836,7 @@ command_cell :: fun(name: []utf8, every_one: bool) {
 	print("% references' meshes loaded", loaded)
 }
 
-// `sooblivion map [world]`: draws a world's land as a picture, map.png:
+// `oblivion map [world]`: draws a world's land as a picture, map.png:
 // 8 pixels for each cell's side, its heights shaded, below water blue.
 command_map :: fun(name: []utf8) {
 	index_storage : [96 * MB]byte
@@ -959,7 +959,7 @@ command_map :: fun(name: []utf8) {
 	print("% trees; the most in a cell: % in % %", trees, most_trees, most_trees_x, most_trees_y)
 }
 
-// `sooblivion area <world> <x> <y>`: what the viewer would load around a
+// `oblivion area <world> <x> <y>`: what the viewer would load around a
 // cell outside — land models, references, persistent ones nearby — and
 // whether the land's textures are in the archive. No window.
 command_area :: fun(name: []utf8, x: i64, y: i64) {
@@ -1084,7 +1084,7 @@ command_area :: fun(name: []utf8, x: i64, y: i64) {
 	print("the ground in the middle of % % is at %", x, y, ground_height(&plugin, world_id, middle, &scratch))
 }
 
-// `sooblivion walk <world> <x> <y> <cells>`: walks east from a cell, one
+// `oblivion walk <world> <x> <y> <cells>`: walks east from a cell, one
 // cell at a time, and times what each step costs: placing the cells around
 // it, and reading what they need that earlier steps didn't — meshes (read,
 // unpacked, made models), their textures, the land. No window: the
@@ -1198,9 +1198,9 @@ command_walk :: fun(name: []utf8, x: i64, y: i64, steps: i64) {
 	}
 }
 
-// `sooblivion record <editor id or form id>`: a record's fields, each read three ways
+// `oblivion record <editor id or form id>`: a record's fields, each read three ways
 // — as text, as u32s, as f32s — for working out what's in them.
-// `sooblivion records <kind>`: the records of a kind (GRAS, TREE…), by
+// `oblivion records <kind>`: the records of a kind (GRAS, TREE…), by
 // editor id and form id.
 command_records :: fun(kind: []utf8) {
 	index_storage : [96 * MB]byte
@@ -1236,7 +1236,7 @@ command_records :: fun(kind: []utf8) {
 	if kind == "TREE" do check_tree_billboards(&plugin)
 }
 
-// `sooblivion sound <editor id>`: a SOUN record as it's played — how far it's
+// `oblivion sound <editor id>`: a SOUN record as it's played — how far it's
 // heard, its file's clip (channels, rate, length) — and a second of it
 // mixed (without opening the sound device): how loud at its near distance.
 command_sound :: fun(name: []utf8) {
@@ -1366,7 +1366,7 @@ uv_directions :: fun(points: [3!]Vec3, uvs: [3!][2!]f32) -> Vec3, Vec3 {
 	return vec3_normalize(along_u), vec3_normalize(along_v)
 }
 
-// `sooblivion anim <mesh>`: a mesh's animations — each sequence (its
+// `oblivion anim <mesh>`: a mesh's animations — each sequence (its
 // span, how it goes on past its end, its speed) and what it drives: each
 // block's node, controller and property type, and its interpolator's kind
 // — and the controllers on the mesh's objects that run by themselves.
@@ -1547,7 +1547,7 @@ find_by_editor_id :: fun(plugin: ^Plugin, name: []utf8, scratch: ^[]byte) -> u32
 	return 0, false
 }
 
-// `sooblivion sounds`: the game's sounds — how its SOUN records play (their
+// `oblivion sounds`: the game's sounds — how its SOUN records play (their
 // flags, how far they're heard, those naming a folder, files the archive
 // hasn't), and the lights, doors and activators that make them.
 command_sounds :: fun() {
@@ -1718,7 +1718,7 @@ command_record :: fun(name: []utf8) {
 	}
 }
 
-// `sooblivion walk-check <world | interior cell> <x> <y> <z> <yaw> <seconds>`:
+// `oblivion walk-check <world | interior cell> <x> <y> <z> <yaw> <seconds>`:
 // a place loaded without drawing — what it collides as, its land's
 // heights, its people and trees' trunks, as a server will have it — and a
 // walker put down with its eyes at x y z, walked forward (yaw: degrees from
@@ -1807,7 +1807,7 @@ command_walk_check :: fun(name: []utf8, start: Vec3, yaw_degrees: f32, seconds: 
 		walker.position + Vec3{0, 0, EYE_HEIGHT}, across, WALK_SPEED * f32(steps) * step)
 }
 
-// `sooblivion path-check <world | interior cell> <x> <y> <z> <to x> <to y>
+// `oblivion path-check <world | interior cell> <x> <y> <z> <to x> <to y>
 // <to z>`: the place's path grid (an interior's, or the world's cells round
 // the first place), the route over it from one place to the other (feet,
 // both), and a walker walking it in the place loaded without drawing:
@@ -1919,8 +1919,8 @@ command_path_check :: fun(name: []utf8, from: Vec3, to: Vec3) {
 	print("still walking after % s, at %", seconds, walker.position)
 }
 
-// `sooblivion serve [port] [seconds] [open]`: the world run as a server,
-// with no window, players connecting to it (`sooblivion connect`): on this
+// `oblivion serve [port] [seconds] [open]`: the world run as a server,
+// with no window, players connecting to it (`oblivion connect`): on this
 // machine's own address only, or open to others; for that many seconds
 // (0: till it's stopped). Who joins and leaves is told.
 command_serve :: fun(port: i64, seconds: f64, open: bool) {
@@ -1949,7 +1949,7 @@ command_serve :: fun(port: i64, seconds: f64, open: bool) {
 	print("served % ticks", server.state.ticks)
 }
 
-// `sooblivion bot <address[:port]> [orders file] [status file]`: a bot
+// `oblivion bot <address[:port]> [orders file] [status file]`: a bot
 // joins the world served there (a game hosted on this machine, or `serve`)
 // as a player, with no window (bot_player.mara): beside the first other
 // player, following them, till the orders file says otherwise. What it
@@ -1997,7 +1997,7 @@ command_bot :: fun(address: []utf8, orders_path: []utf8, status_path: []utf8) {
 	if run_error do print("bot: lost the server: %", run_error)
 }
 
-// `sooblivion world-run <world> <hours>`: the world's state run as a server
+// `oblivion world-run <world> <hours>`: the world's state run as a server
 // would run it, with no window: its clock and its skies, a player standing
 // in each of a few of the world's cells (under their regions' skies, or the
 // climate's), stepped on its ticks (hurried) for that many of the game's
@@ -2058,7 +2058,7 @@ command_world_run :: fun(name: []utf8, hours: f32) {
 		state.skies.len)
 }
 
-// `sooblivion sky [world]`: the sky outside at hours through a day — its
+// `oblivion sky [world]`: the sky outside at hours through a day — its
 // colors, the sun, the light and fog — as the viewer would draw it.
 command_sky :: fun(name: []utf8) {
 	index_storage : [96 * MB]byte
@@ -2141,10 +2141,10 @@ command_sky :: fun(name: []utf8) {
 	}
 }
 
-// `sooblivion lod <world> <x> <y>`: the piece of distant land a cell is
+// `oblivion lod <world> <x> <y>`: the piece of distant land a cell is
 // in, and its normal map beside the cell's own land's normals at a few of
 // the land's points, to see which way the map's axes go.
-// `sooblivion doors`: the doors placed in all the cells: how many lead
+// `oblivion doors`: the doors placed in all the cells: how many lead
 // somewhere (load doors), and the bases of those that don't (that open
 // in place), the most placed first, with their meshes.
 command_doors :: fun() {
@@ -2202,7 +2202,7 @@ command_doors :: fun() {
 	}
 }
 
-// `sooblivion door <mesh>`: how a door opens in place: its Open and Close
+// `oblivion door <mesh>`: how a door opens in place: its Open and Close
 // sequences' tracks — the nodes they move, their keys, where each node is
 // at the start and the end — and what splitting it there makes: the
 // frame's parts and collision, and each moving node's.
@@ -2295,7 +2295,7 @@ command_door :: fun(what: []utf8) {
 	}
 }
 
-// `sooblivion find <editor id>`: where a base record is placed: each
+// `oblivion find <editor id>`: where a base record is placed: each
 // reference's cell (its grid place, outside) and position.
 command_find :: fun(name: []utf8) {
 	index_storage : [96 * MB]byte
@@ -2346,7 +2346,7 @@ Base_Count :: struct {
 	count: i64
 }
 
-// `sooblivion collision <mesh>`: a mesh's collision, as walking meets it:
+// `oblivion collision <mesh>`: a mesh's collision, as walking meets it:
 // its triangles, and the box around them beside the box around what's
 // drawn. `collision -all`: every mesh's, counted; and how many of the
 // convex hulls' faces are found with the planes' distance added (as
@@ -2507,7 +2507,7 @@ command_collision :: fun(what: []utf8, through: Vec3, has_point: bool) {
 	}
 }
 
-// `sooblivion grass <world> <x> <y>`: the grass a cell's land grows, as
+// `oblivion grass <world> <x> <y>`: the grass a cell's land grows, as
 // the viewer places it: how many blades of each kind, how tall, how high
 // above the water. No window (the kinds' models aren't loaded: each
 // kind's "model" is its index here).
@@ -2824,7 +2824,7 @@ command_lod :: fun(name: []utf8, x: i64, y: i64) {
 	}
 }
 
-// `sooblivion shader [name] [package]`: the shaders in one of the game's
+// `oblivion shader [name] [package]`: the shaders in one of the game's
 // shader packages (Data\Shaders\shaderpackage019.sdp unless named), or
 // one of them disassembled, its constants' names listed first.
 command_shader :: fun(name: []utf8, package: []utf8) {
@@ -2883,42 +2883,42 @@ command_shader :: fun(name: []utf8, package: []utf8) {
 }
 
 usage :: fun() {
-	print("sooblivion                         the game's world, from the Inn of Ill Omen (as when double-clicked)")
-	print("sooblivion view-cell <editor id>   an interior cell; its doors lead on, inside and out")
-	print("sooblivion view-world [world x y]  a world's exterior from a cell (Tamriel 0 0)")
-	print("sooblivion view <mesh>             one mesh")
-	print("sooblivion picture <out.png> <view | view-cell | view-world> ... [at x y z yaw pitch] [held <idle|right|left> <s>]")
-	print("                                   what that view shows, drawn by the game in a hidden window, into a PNG")
-	print("sooblivion esm [plugin]            what a plugin holds, by record type")
-	print("sooblivion bsa <archive>           an archive's folders and files")
-	print("sooblivion bsa <archive> <file>    one file from an archive, unpacked")
-	print("sooblivion plugins                 the plugins loaded, in order, and the archives")
-	print("sooblivion serve [port] [seconds] [open]")
-	print("                                   the world run as a server, no window; open: to other machines")
-	print("sooblivion connect <address[:port]> [view-cell <id> | view-world <world> <x> <y>]")
-	print("                                   play in a world served elsewhere")
-	print("sooblivion bot <address[:port]> [orders file] [status file]")
-	print("                                   a bot player, no window: follows you, takes orders from the file")
-	print("sooblivion walk-check <world | cell> <x> <y> <z> <yaw> <seconds>")
-	print("                                   a walker walked forward in a place loaded without drawing")
-	print("sooblivion path-check <world | cell> <x> <y> <z> <to x> <to y> <to z>")
-	print("                                   a route over the place's path grid, walked by a walker")
-	print("sooblivion world-run <world> <hours>")
-	print("                                   the world's clock and weather run headless, as a server would")
-	print("sooblivion tree <name.spt | -all> [seed]")
-	print("                                   a SpeedTree file read and grown (every one: -all)")
-	print("sooblivion tree-picture <TREE editor id> <out.png> [seed | bare]")
-	print("                                   a tree grown and drawn by hand beside its billboard")
-	print("sooblivion npc-picture <editor id> <out.png>")
-	print("                                   an NPC's head drawn by hand: its race's, and with its face")
-	print("sooblivion overlaps <world> <x> <y> <z> [radius]")
-	print("                                   drawn shapes lying on one another near a point (flicker)")
-	print("sooblivion mp3 <file> [raw]        decodes an MP3 (into raw floats, if given)")
-	print("sooblivion music <kind> [raw]      a kind's first track through the mix, no sound device (explore, public, dungeon)")
-	print("sooblivion help                    this")
+	print("oblivion                         the game's world, from the Inn of Ill Omen (as when double-clicked)")
+	print("oblivion view-cell <editor id>   an interior cell; its doors lead on, inside and out")
+	print("oblivion view-world [world x y]  a world's exterior from a cell (Tamriel 0 0)")
+	print("oblivion view <mesh>             one mesh")
+	print("oblivion picture <out.png> <view | view-cell | view-world> ... [at x y z yaw pitch] [held <idle|right|left> <s>]")
+	print("                                 what that view shows, drawn by the game in a hidden window, into a PNG")
+	print("oblivion esm [plugin]            what a plugin holds, by record type")
+	print("oblivion bsa <archive>           an archive's folders and files")
+	print("oblivion bsa <archive> <file>    one file from an archive, unpacked")
+	print("oblivion plugins                 the plugins loaded, in order, and the archives")
+	print("oblivion serve [port] [seconds] [open]")
+	print("                                 the world run as a server, no window; open: to other machines")
+	print("oblivion connect <address[:port]> [view-cell <id> | view-world <world> <x> <y>]")
+	print("                                 play in a world served elsewhere")
+	print("oblivion bot <address[:port]> [orders file] [status file]")
+	print("                                 a bot player, no window: follows you, takes orders from the file")
+	print("oblivion walk-check <world | cell> <x> <y> <z> <yaw> <seconds>")
+	print("                                 a walker walked forward in a place loaded without drawing")
+	print("oblivion path-check <world | cell> <x> <y> <z> <to x> <to y> <to z>")
+	print("                                 a route over the place's path grid, walked by a walker")
+	print("oblivion world-run <world> <hours>")
+	print("                                 the world's clock and weather run headless, as a server would")
+	print("oblivion tree <name.spt | -all> [seed]")
+	print("                                 a SpeedTree file read and grown (every one: -all)")
+	print("oblivion tree-picture <TREE editor id> <out.png> [seed | bare]")
+	print("                                 a tree grown and drawn by hand beside its billboard")
+	print("oblivion npc-picture <editor id> <out.png>")
+	print("                                 an NPC's head drawn by hand: its race's, and with its face")
+	print("oblivion overlaps <world> <x> <y> <z> [radius]")
+	print("                                 drawn shapes lying on one another near a point (flicker)")
+	print("oblivion mp3 <file> [raw]        decodes an MP3 (into raw floats, if given)")
+	print("oblivion music <kind> [raw]      a kind's first track through the mix, no sound device (explore, public, dungeon)")
+	print("oblivion help                    this")
 }
 
-// `sooblivion picture <out.png> <view | view-cell | view-world> … [at x y
+// `oblivion picture <out.png> <view | view-cell | view-world> … [at x y
 // z yaw pitch] [held <idle | right | left> <seconds>] [menu <stats |
 // map>[page]] [frames n] [out] [walk seconds] [click x y]`: what the view
 // command shows, drawn by the game's renderer in a window kept hidden,
@@ -3033,7 +3033,7 @@ command_picture :: fun(args: [][]utf8) {
 	}
 }
 
-// `sooblivion mp3 <file> [raw]`: decodes an MP3 file (a path, or one in
+// `oblivion mp3 <file> [raw]`: decodes an MP3 file (a path, or one in
 // the data folder), saying its channels and rate, how long it is and how
 // long decoding took; its samples into raw, if given (32-bit floats, the
 // channels interleaved).
@@ -3083,7 +3083,7 @@ command_mp3 :: fun(name: []utf8, raw_path: []utf8) {
 	if write_error do print("couldn't write %: %", raw_path, write_error)
 }
 
-// `sooblivion skin <mesh> [animation]`: a skinned mesh posed — by its own
+// `oblivion skin <mesh> [animation]`: a skinned mesh posed — by its own
 // bones as the file has them (its bind pose: its vertices should stay where
 // they are), then by the skeleton (characters\_male\skeleton.nif) as the
 // animation (characters\_male\idle.kf) has it at its start: how far the
@@ -3158,7 +3158,7 @@ command_skin :: fun(what: []utf8, animation_path: []utf8) {
 	print("  posed by the skeleton (% bones): from % to %", posed_bones.len, posed.bounds_min, posed.bounds_max)
 }
 
-// `sooblivion npc <editor id>`: an NPC as the viewer puts it together: its
+// `oblivion npc <editor id>`: an NPC as the viewer puts it together: its
 // parts (each mesh, the texture it's drawn with, the bone it hangs from),
 // then its model made (no window): how many shapes, the box round them.
 command_npc :: fun(name: []utf8) {
@@ -3282,7 +3282,7 @@ posed_vertex :: fun(rigged_model: ^Model, influence: Skin_Influence, places: []M
 	return moved
 }
 
-// `sooblivion tree <name.spt> [seed]`: a SpeedTree file (in trees\) read
+// `oblivion tree <name.spt> [seed]`: a SpeedTree file (in trees\) read
 // and grown, no window: its size, its levels and leaf pictures, then the
 // tree grown with the seed (its own when not given): how many branches and
 // leaves, the box round it. `-all`: every tree file read and grown, how
@@ -3413,7 +3413,7 @@ Overlapping_Shapes :: struct {
 OVERLAP_GAP :: 0.5     // triangles closer than this to one plane count as on it
 OVERLAP_HAIR :: 0.05   // triangles reaching less than this into each other only touch
 
-// `sooblivion overlaps <world> <x> <y> <z> [radius]`: the drawn triangles
+// `oblivion overlaps <world> <x> <y> <z> [radius]`: the drawn triangles
 // near a point (within radius, 500 when not given) that lie on one
 // another: on one plane, facing the same way, covering some of the same
 // place, from different shapes. Where the frame flickers between two
@@ -3583,7 +3583,7 @@ outside_an_edge :: fun(first: [3!]Vec3, second: [3!]Vec3) -> bool {
 	return false
 }
 
-// `sooblivion plugins`: the plugins the game loads, in its order, and its
+// `oblivion plugins`: the plugins the game loads, in its order, and its
 // archives in the order a file is looked for in them.
 command_plugins :: fun() {
 	order : Load_Order
@@ -3606,7 +3606,7 @@ command_plugins :: fun() {
 	for &archive in archives.list do print("  % files, % folders", archive.files.len, archive.folders.len)
 }
 
-// `sooblivion music <explore | public | dungeon> [raw]`: plays a kind of
+// `oblivion music <explore | public | dungeon> [raw]`: plays a kind of
 // music through the mix without opening the sound device, as the viewer
 // would: its first track whole, saying which it was and how long mixing
 // it took; the mix into raw, if given (32-bit floats, stereo).
@@ -3656,7 +3656,7 @@ wait_for_enter :: fun() {
 	_ = file_read(standard_input(), &line)   // (what's typed, or nothing: done either way)
 }
 
-// Where the game starts when sooblivion is given nothing to do (double-
+// Where the game starts when oblivion is given nothing to do (double-
 // clicked): an inn by the road, its door leading outside.
 START_CELL :: "InnIllOmen"
 

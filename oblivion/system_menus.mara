@@ -6,7 +6,7 @@
 // (game_settings.mara). What the game can't do yet (saves, the credits,
 // the other options) is hidden. The mouse lights what it's over, as the
 // game's menus have it (their tiles' mouseover).
-module sooblivion
+module oblivion
 
 use mara.core
 use mara.math

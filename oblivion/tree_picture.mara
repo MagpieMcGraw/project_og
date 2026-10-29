@@ -1,10 +1,10 @@
-// `sooblivion tree-picture <TREE editor id> <out.png> [seed | bare]`: a tree
+// `oblivion tree-picture <TREE editor id> <out.png> [seed | bare]`: a tree
 // grown as the viewer grows it, drawn by hand (no window) from the front,
 // lit by a sun from the front left, beside the game's billboard of it at
 // the same scale: to see how near the grown trees come to the game's
 // without starting the game. Bare: without its leaves, to see its
 // branches.
-module sooblivion
+module oblivion
 
 use mara.core
 use mara.os

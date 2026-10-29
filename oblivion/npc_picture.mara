@@ -1,9 +1,9 @@
-// `sooblivion npc-picture <editor id> <out.png>`: an NPC's head drawn by
+// `oblivion npc-picture <editor id> <out.png>`: an NPC's head drawn by
 // hand (no window) from the front, lit from the front left: on the left as
 // its race's parts are, on the right shaped by its own face (FaceGen:
 // facegen.mara). To see faces without starting the game. Each skin made
 // for its face goes beside the picture: <out>.skin<k>.png.
-module sooblivion
+module oblivion
 
 use mara.core
 use mara.os

@@ -5,7 +5,7 @@
 // that ends is followed by another of its folder (not the same one again,
 // where the folder has others).
 //
-// Came from sooblivion's music.mara (83fce8a); its kinds of music (which
+// Came from oblivion's music.mara (83fce8a); its kinds of music (which
 // folder plays where) are left there.
 module audio
 

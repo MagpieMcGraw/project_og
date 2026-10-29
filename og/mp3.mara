@@ -1,5 +1,5 @@
 // Decoding MP3 (MPEG-1 audio, Layer III: ISO/IEC 11172-3), as Oblivion's
-// and Throne of Darkness's music is. Came from sooblivion (83fce8a).
+// and Throne of Darkness's music is. Came from oblivion (83fce8a).
 //
 // A file is frames of 1152 samples of each channel, in two granules of 576.
 // A frame is a header, side information (how each granule's channels are

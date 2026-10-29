@@ -17,10 +17,13 @@ of that game's code.
 
 | Project | Game | Folder | Game data | Port |
 |---|---|---|---|---|
-| sooblivion | The Elder Scrolls IV: Oblivion (3D) | C:\Code\project_og\oblivion | D:\SteamLibrary\steamapps\common\Oblivion\Data | 27100 |
-| sothrone | Throne of Darkness (2D sprites) | C:\Code\project_og\throne | D:\Games\Disciples 2\Throne of Darkness\LotFiles | 27200 |
+| oblivion | The Elder Scrolls IV: Oblivion (3D) | C:\Code\project_og\oblivion | D:\SteamLibrary\steamapps\common\Oblivion\Data | 27100 |
+| throne | Throne of Darkness (2D sprites) | C:\Code\project_og\throne | D:\Games\Disciples 2\Throne of Darkness\LotFiles | 27200 |
 
 The port is the one a game hosts on: different, so both can run at once.
+Each project's folder, module and program share its name; till
+2026-10-29 they were sooblivion and sothrone, as older commits and notes
+call them.
 
 
 ## How modules are shared now
@@ -32,7 +35,7 @@ folders its build.mara names (`dirs`):
 
     module build
     use mara.build
-    sothrone :: Build(){release = true, dirs = ["../og"]}
+    throne :: Build(){release = true, dirs = ["../og"]}
 
 A module found in two of those folders is an error (373ba2b7): a project
 can't keep its own copy of a module that's also in a folder it names. (A
@@ -48,25 +51,25 @@ next build: rebuild each and rerun its checks after one.
 
 | Module | What it is | Came from |
 |---|---|---|
-| disk | files opened read+write, folders made, file stamps, read_exactly (Windows, ASCII paths) | sooblivion 83fce8a, unchanged |
-| logging | the journal (log file + console, time-stamped lines), `fits` / `add_what_fits` / full.log | sooblivion 83fce8a, unchanged |
-| sdl_platform | the window, GL 4.5 core context, keyboard and mouse (`Input`), present, vsync, read_pixels; can open hidden | sooblivion 83fce8a, unchanged |
-| inflate, png | deflate decoding; PNG writing (encode_png) | sooblivion 83fce8a, unchanged |
-| wire | messages on a queue or over TCP: Wire_Queue, wire_put / wire_put_list / wire_take / wire_value / wire_count, wire_connect / wire_send / wire_receive | sooblivion 83fce8a, less its messages; `wire_connect(address, game_port)` takes the game's port |
-| lzo | LZO1X unpacking (`lzo_unpack`), every read, write and match checked | written for sothrone |
-| sprite_layer | textured rectangles on the window in pixels, tinted and blended, batched by texture (`layer_open`, `layer_begin`, `layer_image`, `layer_draw`); `texture_from_pixels` | sooblivion's 2D layer (render.mara ui_begin / ui_image / draw_ui) with no Renderer round it |
-| indexing | `Key_Index` (`key_index`, `index_put`, `index_get`: open addressing, u64 key → u32, carved from a storage; `Index_Error.Index_Full`); `text_hash` (FNV-1a, never 0) and `folded_hash` (the same, any case) | sooblivion's world.mara, and its three copies of the hash made one |
-| random | `next_random` (xorshift), `random_share` (0 up to 1), `chance_at` (a roll by hashing: the same for every player with the same seed and numbers) | sooblivion's world.mara |
-| mp3, mp3_tables | MP3 decoding (MPEG-1 Layer III; `mp3_start`, `mp3_next_frame`) | sooblivion, unchanged |
-| audio (audio.mara, music.mara) | the mixer: SDL3 stream kept AHEAD of what's heard, voices resampled with gain ramps (`start_voice` with a pitch and a kind of sound), clips added from WAV bytes the game read into `mixer.clip_room` (`known_clip`, `clip_fits`, `add_clip`), `side_gains`, `distance_loudness`, volumes (`master`, `kind_volumes`, `music_volume`), `hear_start` / `voice_of` / `keep_hearing` / `hear_finish`; music: MP3s streamed from the folder the game wants (`want_music`), a random track not the last, faded between folders | sooblivion's audio.mara and music.mara, Oblivion's sound records, volumes and music kinds left there (game_sound) |
-| file_cache | files unpacked from a game's archives kept on disk (append-only, safe against crashes), found by key | sooblivion, unchanged but for Key_Index's module |
-| xml | XML a piece at a time (`next_piece`, `read_tag`): a tag's name as written and any attributes (`attribute(text, &tag, name)`, any case; values as places in the text), text between, comments passed over; `trim_xml_text` | sooblivion's menus.mara tokenizer, which kept only three attributes and lowered names |
-| settings_file | settings kept as a Mara struct literal, `name = number` lines (`read_settings_file`, `write_settings_file`) | sooblivion's game_settings.mara, its volumes left there |
+| disk | files opened read+write, folders made, file stamps, read_exactly (Windows, ASCII paths) | oblivion 83fce8a, unchanged |
+| logging | the journal (log file + console, time-stamped lines), `fits` / `add_what_fits` / full.log | oblivion 83fce8a, unchanged |
+| sdl_platform | the window, GL 4.5 core context, keyboard and mouse (`Input`), present, vsync, read_pixels; can open hidden | oblivion 83fce8a, unchanged |
+| inflate, png | deflate decoding; PNG writing (encode_png) | oblivion 83fce8a, unchanged |
+| wire | messages on a queue or over TCP: Wire_Queue, wire_put / wire_put_list / wire_take / wire_value / wire_count, wire_connect / wire_send / wire_receive | oblivion 83fce8a, less its messages; `wire_connect(address, game_port)` takes the game's port |
+| lzo | LZO1X unpacking (`lzo_unpack`), every read, write and match checked | written for throne |
+| sprite_layer | textured rectangles on the window in pixels, tinted and blended, batched by texture (`layer_open`, `layer_begin`, `layer_image`, `layer_draw`); `texture_from_pixels` | oblivion's 2D layer (render.mara ui_begin / ui_image / draw_ui) with no Renderer round it |
+| indexing | `Key_Index` (`key_index`, `index_put`, `index_get`: open addressing, u64 key → u32, carved from a storage; `Index_Error.Index_Full`); `text_hash` (FNV-1a, never 0) and `folded_hash` (the same, any case) | oblivion's world.mara, and its three copies of the hash made one |
+| random | `next_random` (xorshift), `random_share` (0 up to 1), `chance_at` (a roll by hashing: the same for every player with the same seed and numbers) | oblivion's world.mara |
+| mp3, mp3_tables | MP3 decoding (MPEG-1 Layer III; `mp3_start`, `mp3_next_frame`) | oblivion, unchanged |
+| audio (audio.mara, music.mara) | the mixer: SDL3 stream kept AHEAD of what's heard, voices resampled with gain ramps (`start_voice` with a pitch and a kind of sound), clips added from WAV bytes the game read into `mixer.clip_room` (`known_clip`, `clip_fits`, `add_clip`), `side_gains`, `distance_loudness`, volumes (`master`, `kind_volumes`, `music_volume`), `hear_start` / `voice_of` / `keep_hearing` / `hear_finish`; music: MP3s streamed from the folder the game wants (`want_music`), a random track not the last, faded between folders | oblivion's audio.mara and music.mara, Oblivion's sound records, volumes and music kinds left there (game_sound) |
+| file_cache | files unpacked from a game's archives kept on disk (append-only, safe against crashes), found by key | oblivion, unchanged but for Key_Index's module |
+| xml | XML a piece at a time (`next_piece`, `read_tag`): a tag's name as written and any attributes (`attribute(text, &tag, name)`, any case; values as places in the text), text between, comments passed over; `trim_xml_text` | oblivion's menus.mara tokenizer, which kept only three attributes and lowered names |
+| settings_file | settings kept as a Mara struct literal, `name = number` lines (`read_settings_file`, `write_settings_file`) | oblivion's game_settings.mara, its volumes left there |
 
 Which ports use og:
 
-- **sothrone:** all of them, through og (build.mara `dirs = ["../og"]`).
-- **sooblivion:** all of them but lzo, through og (build.mara `dirs =
+- **throne:** all of them, through og (build.mara `dirs = ["../og"]`).
+- **oblivion:** all of them but lzo, through og (build.mara `dirs =
   ["../og"]`, since 2026-10-29), keeping no copies. Its messages and
   DEFAULT_PORT are in its world_state. What stays its own on top of og's
   modules: game_sound (SOUN records, their loudness and pitch, placed
@@ -74,20 +77,20 @@ Which ports use og:
   game_settings (its keys), menus (the menu dialect, lowering tag names
   in `menu_piece`).
 - A module named like a local or a param of a file that uses it is an
-  error there (`param 'audio' would hide the module 'audio'`): sooblivion
+  error there (`param 'audio' would hide the module 'audio'`): oblivion
   calls its mixer params `mixer`.
 
 
-## What sooblivion has that could be shared, once cut loose
+## What oblivion has that could be shared, once cut loose
 
-From a survey of sooblivion at 83fce8a. "Ties" are what makes a part
+From a survey of oblivion at 83fce8a. "Ties" are what makes a part
 Oblivion's now; the size is how much cutting it takes.
 
-**Moved to og on 2026-10-29** (the table above; sooblivion a2117d5,
+**Moved to og on 2026-10-29** (the table above; oblivion a2117d5,
 059ba8e): the audio mixer and music, Key_Index and the hash (indexing),
 chance (random), mp3, file_cache, the XML tokenizer (xml), the settings
-file (settings_file), and the 2D layer (sprite_layer: sothrone's cut;
-sooblivion draws its HUD and menus with it). Gaps the audio still has:
+file (settings_file), and the 2D layer (sprite_layer: throne's cut;
+oblivion draws its HUD and menus with it). Gaps the audio still has:
 no 8-bit or ADPCM WAVs; MP3s must be 44100 Hz (not resampled).
 
 What's left, not cut yet because nothing but Oblivion needs it so far:
@@ -125,11 +128,11 @@ animation.mara); particles worked out from the time alone, no state kept
 `server_join`, `server_leave`, the fixed-tick loop (WORLD_TICK 1/30 s,
 late ticks let go), the dirty flags for what's to be told, `copy_take`'s
 shape, `open_link` / `join_local` / `host_listen`, the bot reading orders
-from a file and writing its status to another. sothrone has this cut down
+from a file and writing its status to another. throne has this cut down
 (world_state, world_server, world_copy, game_link); the message tables
 and the state are each game's.
 
-**Pictures and frames (sooblivion.mara, viewer.mara).** The `picture`
+**Pictures and frames (oblivion.mara, viewer.mara).** The `picture`
 command: the game in a hidden window, settled frames counted, the frame
 read back and written as a PNG (`take_picture`); frame pacing
 (`wait_for_next_frame`: sleep, then spin the last millisecond); slow-frame
@@ -158,31 +161,31 @@ notes; GL errors noted once each.
 - **No windows of mine.** Results are checked headless: commands that
   print, and `picture` (a hidden window, a PNG I read). Seeing and feeling
   the game in a window is the user's.
-- **Journal.** Each run writes a log (sothrone picks the first free
-  sothrone.log, sothrone_2.log, … so two copies can run in one folder).
+- **Journal.** Each run writes a log (throne picks the first free
+  throne.log, throne_2.log, … so two copies can run in one folder).
 - **Mara issues.** Problems with Mara met in a project go in its
   MARA_ISSUES.md (Open / Fixed, each with a small program that shows
-  it); another chat works on Mara. sooblivion's is the model.
+  it); another chat works on Mara. oblivion's is the model.
 
 ## Mara notes met in these projects
 
 - Mara finds modules in the project folder, the compiler's code folders
   and build.mara's dirs (above). A module can't be named like a common local
-  (sooblivion: `files`, `cache`, `world`, `scene` as locals clash), nor a
+  (oblivion: `files`, `cache`, `world`, `scene` as locals clash), nor a
   param in a file that uses it (`audio`).
 - A project's folder can't be in another's dirs when both have a
   build.mara: `module build` is then in two folders. A check program in a
   scratch folder copies the project modules it needs instead.
 - An error variant two error types used together both have is ambiguous
   where it's written bare (`Shader_Failed`: sprite_layer's and
-  sooblivion's Render_Error): write `Render_Error.Shader_Failed`.
+  oblivion's Render_Error): write `Render_Error.Shader_Failed`.
 - A struct holding views of an immutable param's text can't be written
   through after (`tag.attributes` in xml): keep places in the text
   (start, stop) and slice when asked.
 - In `for &x in list`, x is already a pointer: pass `x`, not `&x`.
 - Big locals: `x : [N * MB]byte = void` then `x.len = 0`, or they're
   cleared every call.
-- Open in sooblivion's MARA_ISSUES.md: an untyped constant array of numbers
+- Open in oblivion's MARA_ISSUES.md: an untyped constant array of numbers
   (`TURNS :: [180, 135, -135]`) can't be indexed or looped. A typed one
-  indexes fine in sothrone (`PLAYER_COLOURS :: [8!][3!]f32{…}`, Mara
+  indexes fine in throne (`PLAYER_COLOURS :: [8!][3!]f32{…}`, Mara
   6bbdec03) — maybe a way round it.
