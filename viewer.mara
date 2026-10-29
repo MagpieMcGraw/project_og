@@ -37,6 +37,7 @@ use audio
 use particles
 use mara.os
 use png
+use game_settings
 gl :: use mara.open_gl
 render :: use render
 
@@ -105,6 +106,9 @@ Picture :: struct {
 	timed_frames: i64    // frames drawn and timed once it's settled, before it's taken; 0 for none
 	out: bool            // through the door out once it's settled, the picture taken there
 	walk_for: f32        // seconds walked forward first, on foot; 0: flying
+	click: bool          // the left button clicked at click_x, click_y (window pixels) once it's settled
+	click_x: f32
+	click_y: f32
 }
 PICTURE_SETTLE :: 3
 PICTURE_MOST_FRAMES :: 6000
@@ -112,7 +116,7 @@ PICTURE_MOST_FRAMES :: 6000
 // No picture: the window shown, as usual.
 no_picture :: fun() -> Picture {
 	return Picture{path = [], placed = false, position = Vec3{0, 0, 0}, yaw = 0, pitch = 0, held = -1, held_at = 0, menu = 0, menu_page = 0,
-		timed_frames = 0, out = false, walk_for = 0}
+		timed_frames = 0, out = false, walk_for = 0, click = false, click_x = 0, click_y = 0}
 }
 // The room the sounds' clips are loaded into.
 SOUND_ROOM :: 64 * MB
@@ -291,6 +295,21 @@ Viewer :: struct {
 	map_menu: i64
 	map_arrow: i64
 	looking_before_menu: bool
+	// The menus round play (system_menus.mara): their roots (-1 till
+	// read); the menu Options was opened from; what the player's chosen
+	// (CHOSE_*); the tiles the mouse is over (their mouseover set); the
+	// volume slider being dragged (-1 for none); when the main menu opened
+	// (its logo fades in); whether the menus' book is open.
+	main_menu: i64
+	pause_menu: i64
+	options_menu: i64
+	audio_menu: i64
+	options_from: i64
+	menu_choice: i64
+	hovered: [16]i64
+	dragged_slider: i64
+	main_menu_since: u64
+	book_ready: bool
 	// The player's stats, and the map of the world shown (map_world's).
 	player_stats: Player_Stats
 	world_map: World_Map
@@ -349,6 +368,15 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	note_end(&viewer.journal)
 	viewer.platform = platform_open("sooblivion", 1280, 720, taking_picture)?
 	audio_init(&viewer.audio, SOUND_ROOM, table_storage)
+	// The volumes as the player last set them (none set yet: every sound as
+	// loud as it's made).
+	settings, settings_error := read_settings()
+	viewer.audio.volumes = settings.volumes
+	if settings_error and settings_error != File_Error.Open_Failed {
+		note(&viewer.journal, "couldn't read the settings: the defaults instead; ")
+		note_error(&viewer.journal, settings_error)
+		note_end(&viewer.journal)
+	}
 	music_folder := data_path("Music")
 	music_open(&viewer.audio, music_folder)
 	viewer.told_tracks = 0
@@ -377,6 +405,16 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.map_menu = -1
 	viewer.map_arrow = -1
 	viewer.looking_before_menu = false
+	viewer.main_menu = -1
+	viewer.pause_menu = -1
+	viewer.options_menu = -1
+	viewer.audio_menu = -1
+	viewer.options_from = MENU_PAUSE
+	viewer.menu_choice = CHOSE_NOTHING
+	viewer.hovered.len = 0
+	viewer.dragged_slider = -1
+	viewer.main_menu_since = 0
+	viewer.book_ready = false
 	viewer.world_map.picture.len = 0
 	viewer.map_world = 0
 	renderer_init(&viewer.renderer, table_storage)?
@@ -399,7 +437,12 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.eyes = 0
 	viewer.sky_world = 0
 	viewer.sky_inside = false
-	open_link(viewer)?
+	// (No link to a server yet: open_link, once the player's to be somewhere.)
+	viewer.hosting = false
+	viewer.server_lost = false
+	viewer.connection = no_connection()
+	wire_start(&viewer.to_server)
+	wire_start(&viewer.from_server)
 	copy_start(&viewer.seen)
 	viewer.inside_cell = 0
 	viewer.reported_feet = Vec3{0, 0, 0}
@@ -532,17 +575,26 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 
 	read_input(platform, input)
 	if input.quit do return .quit
+	// A picture's click, once it's settled.
+	if viewer.picture.click and viewer.picture_settled == 1 {
+		input.mouse_x = viewer.picture.click_x
+		input.mouse_y = viewer.picture.click_y
+		input.mouse_pressed[1] = true
+	}
 	// The menus: F1 the character's, F4 the map (its key again, or Escape,
-	// closes it; Escape with none open quits). While one is open its clicks
-	// are its, and nothing else of the keyboard or mouse reaches the game.
+	// closes it); Escape with none open, the pause menu (its Quit quits).
+	// While one is open the mouse is its, and nothing else of the keyboard
+	// or mouse reaches the game.
 	if input.pressed[F1] do toggle_menu(viewer, MENU_STATS)
 	if input.pressed[F4] do toggle_menu(viewer, MENU_MAP)
 	if input.pressed[Escape] {
-		if viewer.menu_open == 0 do return .quit
-		close_menu(viewer)
+		if viewer.menu_open == 0 do open_system_menu(viewer, MENU_PAUSE)
+		else do menu_back(viewer)
 	}
 	if viewer.menu_open != 0 {
-		if input.mouse_pressed[1] do click_menu(viewer, input.mouse_x, input.mouse_y)
+		if viewer.menu_open >= MENU_MAIN do system_menu_input(viewer)
+		elif input.mouse_pressed[1] do click_menu(viewer, input.mouse_x, input.mouse_y)
+		if viewer.menu_choice == CHOSE_QUIT do return .quit
 		for &down in input.held do down^ = false
 		for &down in input.pressed do down^ = false
 		for k in 0:6 {
@@ -856,7 +908,7 @@ take_first_person :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	// The HUD too, with the weapon's icon.
 	scratch : [32 * MB]byte = void
 	scratch.len = 0
-	hud_error := book_open(&viewer.book, &viewer.renderer, &viewer.archives, &scratch)
+	hud_error := open_book(viewer)
 	book_at := time_now()
 	if not hud_error do hud_error = load_hud(&viewer.hud, &viewer.book, &viewer.archives, viewer.held.weapon_icon, &scratch)
 	hud_at := time_now()
@@ -1252,37 +1304,69 @@ take_place :: fun(viewer: ^Viewer, world_id: u32, cell: u32, x: i64, y: i64, fee
 	send_place(outgoing(viewer), world_id, cell, x, y, feet)
 }
 
-// Opens this player's link to the world's server: hosting it (the server
-// started, this player its first client), or connecting to it at the
-// address set (a.b.c.d, or localhost; :port, else DEFAULT_PORT).
-open_link :: fun(viewer: ^Viewer) -> err {
+// A game hosted on this machine is looked for this long (milliseconds)
+// before this one hosts its own; and, another starting to host in the same
+// moment (the port taken), waited for this long to be joined.
+LOCAL_GAME_WAIT :: 300
+LOCAL_GAME_STARTING_WAIT :: 2000
+
+// Opens this player's link to the world's server: connecting to it at the
+// address set (a name or a.b.c.d; :port, else DEFAULT_PORT). With none set,
+// joining a game hosted on this machine, if join_local_game and one's
+// there (opening the game twice puts two players in one world); else
+// hosting it — the server started, this player its first client, others
+// on this machine let join (host_listen; not taking a picture).
+open_link :: fun(viewer: ^Viewer, join_local_game: bool) -> err {
 	viewer.connection = no_connection()
 	viewer.server_lost = false
 	wire_start(&viewer.to_server)
 	wire_start(&viewer.from_server)
-	viewer.hosting = viewer.server_address.len == 0
-	if viewer.hosting {
-		server_start(&viewer.server)
-		_ = server_join(&viewer.server, no_connection())
-		if viewer.picture.path.len == 0 do host_listen(viewer)
+	viewer.hosting = false
+	if viewer.server_address.len > 0 {
+		viewer.connection = wire_connect(viewer.server_address)?
+		note(&viewer.journal, "connected to the server at ")
+		note(&viewer.journal, viewer.server_address)
+		note_end(&viewer.journal)
 		return
 	}
-	viewer.connection = wire_connect(viewer.server_address)?
-	note(&viewer.journal, "connected to the server at ")
-	note(&viewer.journal, viewer.server_address)
+	taking_picture := viewer.picture.path.len > 0
+	if join_local_game and not taking_picture and join_local(viewer, LOCAL_GAME_WAIT) do return
+	viewer.hosting = true
+	server_start(&viewer.server)
+	_ = server_join(&viewer.server, no_connection())
+	if taking_picture do return
+	listen_error := host_listen(viewer)
+	if listen_error == Net_Error.Port_Taken and join_local_game {
+		// (Another game began hosting as this one looked: that one's joined.)
+		if join_local(viewer, LOCAL_GAME_STARTING_WAIT) do return
+		viewer.hosting = true
+	}
+}
+
+// Joins the game hosted on this machine, if one answers within wait
+// milliseconds: true when it's joined.
+join_local :: fun(viewer: ^Viewer, wait: i64) -> bool {
+	local, lookup_error := net_lookup("127.0.0.1", DEFAULT_PORT)
+	if lookup_error do return false
+	connection, connect_error := tcp_connect(local, wait)
+	if connect_error do return false
+	viewer.connection = connection
+	viewer.hosting = false
+	note(&viewer.journal, "joined the game hosted on this machine")
 	note_end(&viewer.journal)
+	return true
 }
 
 // Has the world hosted take others joining (a bot, another window), on
 // this machine only (DEFAULT_PORT). When it can't — another game's hosting
-// there — it plays on alone, and says so.
-host_listen :: fun(viewer: ^Viewer) {
+// there — it plays on alone, says so, and gives back why.
+host_listen :: fun(viewer: ^Viewer) -> err {
 	listener, listen_error := tcp_listen(net_local(DEFAULT_PORT))
 	if listen_error {
 		note(&viewer.journal, "others can't join this game: ")
 		note_error(&viewer.journal, listen_error)
 		note_end(&viewer.journal)
-		return
+		return listen_error
 	}
 	viewer.server.listener = listener
 	note(&viewer.journal, "others on this machine can join: port ")
@@ -2002,6 +2086,11 @@ command_view :: fun(what: []utf8, picture: Picture) {
 		return
 	}
 	defer viewer_close(&viewer)
+	link_error := open_link(&viewer, false)
+	if link_error {
+		print("couldn't start the world: %", link_error)
+		return
+	}
 	file_room : [64 * MB]byte = void
 	file_room.len = 0
 	block_room : [16 * MB]byte = void
@@ -2030,9 +2119,12 @@ command_view :: fun(what: []utf8, picture: Picture) {
 }
 
 // `sooblivion view-cell <editor id>`: shows an interior cell in the
-// window; its doors lead on, inside and out. When it can't, it says why
-// on the console, and gives the reason back.
-command_view_cell :: fun(name: []utf8, picture: Picture, server_address: []utf8 = "") -> err {
+// window; its doors lead on, inside and out — after the main menu, when
+// main_menu (the game started with nothing asked: its Exit leaves before
+// anything's loaded). Joins a game hosted on this machine if there is one
+// (open_link). When it can't, it says why on the console, and gives the
+// reason back.
+command_view_cell :: fun(name: []utf8, picture: Picture, server_address: []utf8 = "", main_menu: bool = false) -> err {
 	index_storage : [96 * MB]byte = void
 	index_storage.len = 0
 	plugin, load_error := load_oblivion(&index_storage)
@@ -2070,6 +2162,12 @@ command_view_cell :: fun(name: []utf8, picture: Picture, server_address: []utf8 
 	texture_room.len = 0
 	viewer.room = load_room(&file_room, &block_room, &model_room, &texture_room)
 
+	if main_menu and not run_main_menu(&viewer) do return
+	link_error := open_link(&viewer, true)
+	if link_error {
+		print("couldn't reach the world's server: %", link_error)
+		return link_error
+	}
 	go_inside(&viewer, &plugin, cell)
 	start_in_cell(&viewer, &plugin)
 	if picture.placed do place_camera(&viewer, picture)
@@ -2123,6 +2221,11 @@ command_view_world :: fun(name: []utf8, x: i64, y: i64, picture: Picture, server
 	middle := Vec3{(f32(x) + 0.5) * CELL_SIZE, (f32(y) + 0.5) * CELL_SIZE, 0}
 	middle.z = ground_height(&plugin, world_id, middle, &scratch) + EYE_HEIGHT
 	if picture.placed do middle = picture.position
+	link_error := open_link(&viewer, true)
+	if link_error {
+		print("couldn't reach the world's server: %", link_error)
+		return
+	}
 	go_outside(&viewer, &plugin, world_id, middle)
 	if picture.placed do place_camera(&viewer, picture)
 	take_first_person(&viewer, &plugin)

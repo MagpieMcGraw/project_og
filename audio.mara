@@ -35,6 +35,34 @@ SIDE_SPREAD :: 0.7
 // many seconds or up to twice that.
 REPLAY_PAUSE :: 6
 
+// How loud each kind of sound is heard, 0 to 1 (as the audio menu sets
+// them): all of them, then voices, effects, footsteps and music.
+Volumes :: struct {
+	master: f32
+	voice: f32
+	effects: f32
+	footsteps: f32
+	music: f32
+}
+
+// The kinds of sound a voice plays, each heard as loud as its volume
+// (the music's is the music's own).
+SOUND_VOICE :: 1
+SOUND_EFFECT :: 2
+SOUND_FOOTSTEP :: 3
+
+// Every sound as loud as it's made.
+full_volumes :: fun() -> Volumes {
+	return Volumes{master = 1, voice = 1, effects = 1, footsteps = 1, music = 1}
+}
+
+// How loud a kind of sound is heard (SOUND_*).
+kind_volume :: fun(volumes: Volumes, kind: i64) -> f32 {
+	if kind == SOUND_VOICE do return volumes.voice
+	if kind == SOUND_FOOTSTEP do return volumes.footsteps
+	return volumes.effects
+}
+
 Audio_Error :: error {
 	No_Audio          // SDL's audio couldn't be started
 	No_Device         // no device to play on
@@ -70,6 +98,7 @@ Voice :: struct {
 	source: u64
 	wanted: bool
 	ended: bool
+	sound: i64      // the kind of sound it is (SOUND_*), heard as loud as its volume
 }
 
 // The sound: SDL's stream (when it could be opened), the clips (found by
@@ -89,6 +118,7 @@ Mixer :: struct {
 	first_failure: [160]utf8
 	first_failure_reason: err
 	music: Music
+	volumes: Volumes
 }
 
 // Sets the audio up, closed: no clips, no voices; the clips' room (room_size
@@ -100,6 +130,7 @@ audio_init :: fun(audio: ^Mixer, room_size: i64, storage: ^[]byte) {
 	audio.seed = 0x2545F4914F6CDD1D
 	audio.failures = 0
 	audio.first_failure.len = 0
+	audio.volumes = full_volumes()
 	audio.clip_index = key_index(MAX_CLIPS * 2, storage)
 	audio.clip_room = slice([:room_size]byte, storage)
 	music_reset(&audio.music)
@@ -273,6 +304,7 @@ start_voice :: fun(audio: ^Mixer, kind: ^Sound_Kind, clip_index: i64, source: u6
 	voice.source = source
 	voice.wanted = true
 	voice.ended = false
+	voice.sound = SOUND_EFFECT   // (all of them, so far)
 	return audio.voices.len - 1
 }
 
@@ -377,7 +409,8 @@ mix_ahead :: fun(audio: ^Mixer) {
 	for k in 0:audio.mix.len do audio.mix[k] = 0
 	for &voice in audio.voices do mix_voice(audio, voice, frames)
 	mix_music(audio, frames)
-	for k in 0:audio.mix.len do audio.mix[k] = max(-1, min(1, audio.mix[k] * MASTER_VOLUME))
+	master := MASTER_VOLUME * audio.volumes.master
+	for k in 0:audio.mix.len do audio.mix[k] = max(-1, min(1, audio.mix[k] * master))
 	_ = sdl.PutAudioStreamData(audio.stream, audio.mix)
 
 	// Let go of the voices done: ended, or faded out and not wanted.
@@ -393,12 +426,14 @@ mix_ahead :: fun(audio: ^Mixer) {
 }
 
 // Adds a voice's next frames to the mix: its clip resampled (between two
-// of its frames, in a line), its gains moving to their targets across them.
+// of its frames, in a line), its gains moving to their targets across them,
+// as loud as its kind of sound's volume.
 mix_voice :: fun(audio: ^Mixer, voice: ^Voice, frames: i64) {
 	if voice.ended do return
 	clip := audio.clips[voice.clip]
 	samples := clip.samples
 	stereo := clip.channels == 2
+	volume := kind_volume(audio.volumes, voice.sound)
 	left_step := (voice.targets[0] - voice.gains[0]) / f32(frames)
 	right_step := (voice.targets[1] - voice.gains[1]) / f32(frames)
 	left_gain := voice.gains[0]
@@ -412,8 +447,8 @@ mix_voice :: fun(audio: ^Mixer, voice: ^Voice, frames: i64) {
 		next_left, next_right := clip_frame(samples, after, stereo)
 		left_gain += left_step
 		right_gain += right_step
-		audio.mix[k * 2] += (left + (next_left - left) * share) * left_gain
-		audio.mix[k * 2 + 1] += (right + (next_right - right) * share) * right_gain
+		audio.mix[k * 2] += (left + (next_left - left) * share) * left_gain * volume
+		audio.mix[k * 2 + 1] += (right + (next_right - right) * share) * right_gain * volume
 		voice.at += voice.step
 		if voice.at >= f64(clip.frames) {
 			if not voice.looping {

@@ -266,6 +266,10 @@ map_place :: fun(map: ^World_Map, place: Vec3) -> f32, f32 {
 // book the first time; the cursor freed for it, the camera's mouse look
 // put back after.
 toggle_menu :: fun(viewer: ^Viewer, which: i64) {
+	if which >= MENU_MAIN {
+		open_system_menu(viewer, which)
+		return
+	}
 	if viewer.menu_open == which {
 		close_menu(viewer)
 		return
@@ -296,7 +300,7 @@ close_menu :: fun(viewer: ^Viewer) {
 open_menu_tile :: fun(viewer: ^Viewer) -> i64 {
 	if viewer.menu_open == MENU_STATS do return viewer.stats_menu
 	if viewer.menu_open == MENU_MAP do return viewer.map_menu
-	return -1
+	return system_menu_tile(viewer, viewer.menu_open)
 }
 
 // A click in the open menu at the mouse (window pixels): a page's tab
@@ -321,6 +325,7 @@ draw_open_menu :: fun(viewer: ^Viewer, width: i64, height: i64) {
 	if menu < 0 do return
 	if viewer.menu_open == MENU_STATS do fill_stats_menu(&viewer.book, &viewer.player_stats)
 	if viewer.menu_open == MENU_MAP do fill_map_menu(viewer)
+	fill_system_menu(viewer)
 	draw_menu(&viewer.book, menu, &viewer.renderer, &viewer.archives, width, height)
 }
 

@@ -11,3 +11,4 @@ memory.txt
 *.log
 compiler/
 cache/
+settings.txt

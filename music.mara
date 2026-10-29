@@ -133,7 +133,7 @@ mix_music :: fun(audio: ^Mixer, frames: i64) {
 		}
 		left := music.decoder.samples[music.at * channels]
 		right := music.decoder.samples[music.at * channels + channels - 1]
-		gain := music.volume * MUSIC_VOLUME
+		gain := music.volume * MUSIC_VOLUME * audio.volumes.music
 		audio.mix[k * 2] += left * gain
 		audio.mix[k * 2 + 1] += right * gain
 		music.at += 1

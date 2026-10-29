@@ -686,11 +686,11 @@ select_tile :: fun(book: ^Menu_Book, tile: i64, source: []utf8) -> i64 {
 	// A tile by name: in the tile's own menu first, then in any.
 	root := tile
 	for book.tiles[root].parent >= 0 do root = book.tiles[root].parent
-	if book.tiles[root].name == source do return root
+	if same_name(book.tiles[root].name, source) do return root
 	found := named_child(book, root, source, true)
 	if found >= 0 do return found
 	for menu in book.menus {
-		if book.tiles[menu].name == source do return menu
+		if same_name(book.tiles[menu].name, source) do return menu
 	}
 	for menu in book.menus {
 		if menu == root do continue
@@ -700,12 +700,18 @@ select_tile :: fun(book: ^Menu_Book, tile: i64, source: []utf8) -> i64 {
 	return -1
 }
 
+// Whether two tiles' names are the same, as the game has them: in any
+// letter case (options_menu.xml names its OptionsMenu "Optionsmenu").
+same_name :: fun(a: []utf8, b: []utf8) -> bool {
+	return compare_folded(a, b) == 0
+}
+
 // A tile's child by name (with deep, any descendant), the last first; -1
 // for none.
 named_child :: fun(book: ^Menu_Book, tile: i64, name: []utf8, deep: bool) -> i64 {
 	child := book.tiles[tile].last_child
 	for child >= 0 {
-		if book.tiles[child].name == name do return child
+		if same_name(book.tiles[child].name, name) do return child
 		if deep {
 			found := named_child(book, child, name, true)
 			if found >= 0 do return found
@@ -810,12 +816,37 @@ add_value_text :: fun(text: ^[256]utf8, value: Menu_Value) {
 book_set :: fun(book: ^Menu_Book, tile_name: []utf8, trait_name: []utf8, number: f32) -> bool {
 	trait := settable_trait(book, tile_name, trait_name)
 	if trait < 0 do return false
+	set_number(book, trait, number)
+	return true
+}
+
+// Sets a trait of a tile (by index) as book_set does: made when it hasn't
+// one (the game's own traits: mouseover).
+tile_set :: fun(book: ^Menu_Book, tile: i64, trait_name: []utf8, number: f32) {
+	trait := find_trait(book, tile, trait_name)
+	if trait < 0 do trait = new_trait(book, tile, trait_name)
+	if trait >= 0 do set_number(book, trait, number)
+}
+
+// A trait set to a number by the game: its operations passed over.
+set_number :: fun(book: ^Menu_Book, trait: i64, number: f32) {
 	held := &book.traits[trait]
 	held.set = true
 	held.value.number = number
 	held.value.is_text = false
 	held.value.text.len = 0
-	return true
+}
+
+// Where a tile's left edge is on the screen (the menus' units): its x and
+// its parents' added up.
+tile_left :: fun(book: ^Menu_Book, tile: i64, renderer: ^render.Renderer, archives: ^Archives) -> f32 {
+	left : f32 = 0
+	at := tile
+	for at >= 0 {
+		left += trait_number(book, at, "x", renderer, archives)
+		at = book.tiles[at].parent
+	}
+	return left
 }
 
 // Sets a trait to text, as book_set does a number.
@@ -835,7 +866,7 @@ book_set_text :: fun(book: ^Menu_Book, tile_name: []utf8, trait_name: []utf8, te
 settable_trait :: fun(book: ^Menu_Book, tile_name: []utf8, trait_name: []utf8) -> i64 {
 	tile : i64 = -1
 	for menu in book.menus {
-		if book.tiles[menu].name == tile_name {
+		if same_name(book.tiles[menu].name, tile_name) {
 			tile = menu
 			break
 		}
@@ -934,12 +965,22 @@ tile_texture :: fun(book: ^Menu_Book, tile: i64, renderer: ^render.Renderer, arc
 	name := trait_value(book, tile, "filename", renderer, archives)
 	if not name.is_text do return 0
 	file := trim_menu_text(name.text)
+	for file.len > 0 and (file[0] == '\\' or file[0] == '/') do file = file[1 : file.len]
 	if file.len == 0 do return 0
 	path : [256]utf8
 	&path + "textures\\"
 	add_what_fits(&path, file)
 	known, found := render.known_texture(renderer, path, render.CLAMP_BOTH)
 	if found do return known
+	// (A few name a picture in the menus' own folder: dialog\…)
+	_, archived := find_archived(archives, path)
+	if not archived {
+		path.len = 0
+		&path + "textures\\menus\\"
+		add_what_fits(&path, file)
+		known, found = render.known_texture(renderer, path, render.CLAMP_BOTH)
+		if found do return known
+	}
 	return load_menu_texture(renderer, archives, path)
 }
 

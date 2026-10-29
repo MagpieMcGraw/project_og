@@ -1,0 +1,322 @@
+// The game's own menus round play: the main menu (shown before a world is
+// loaded, over a backdrop: New plays, Options, Exit), the pause menu
+// (Escape in a world: Return, Options, Quit), the options menu (Audio, so
+// far) and the audio menu — its five volume sliders, clicked or dragged,
+// each volume heard at once and kept in the settings when the menu's left
+// (game_settings.mara). What the game can't do yet (saves, the credits,
+// the other options) is hidden. The mouse lights what it's over, as the
+// game's menus have it (their tiles' mouseover).
+module sooblivion
+
+use mara.core
+use mara.math
+use mara.time
+use mara.memory
+use bsa
+use audio
+use game_settings
+use sdl_platform
+use mara.string
+use logging
+render :: use render
+
+// The menus here (after game_menus' MENU_STATS and MENU_MAP).
+MENU_MAIN :: 3
+MENU_PAUSE :: 4
+MENU_OPTIONS :: 5
+MENU_AUDIO :: 6
+
+// What the player's chosen that the game answers: nothing yet, to play
+// (the main menu's New), to quit.
+CHOSE_NOTHING :: 0
+CHOSE_PLAY :: 1
+CHOSE_QUIT :: 2
+
+// The audio menu's sliders, in Volumes' order (master, voice, effects,
+// footsteps, music), and their rows (a click on a row sets its slider too).
+VOLUME_SLIDERS :: ["audio_master_slider", "audio_voice_slider", "audio_effect_slider", "audio_foot_slider", "audio_music_slider"]
+VOLUME_ROWS :: ["audio_master_slider_marker", "audio_voice_slider_marker", "audio_effect_slider_marker", "audio_foot_slider_marker",
+	"audio_music_slider_marker"]
+// A slider's marker's width (its XML's): a slider's value is where the
+// marker's middle is along it. A click on a slider's arrow moves it this
+// much (hundredths).
+SLIDER_MARKER_WIDTH :: 39
+SLIDER_STEP :: 5
+// The main menu's logo fades in from the other over this long (seconds:
+// its user4).
+LOGO_FADE :: 3
+
+// What's hidden of the menus: what the game can't do yet.
+NOT_YET :: ["main_continue", "main_load", "main_credits", "pause_save_button", "pause_load_button", "options_gameplay_button",
+	"options_video_button", "options_controls_button", "options_downloads_button"]
+
+// Opens one of the menus here, read the first time it's opened (what can't
+// be done yet hidden), the mouse a cursor while it's open. Options opened
+// from the main or pause menu goes back to it; the audio menu shows the
+// volumes as they are.
+open_system_menu :: fun(viewer: ^Viewer, which: i64) {
+	book_error := open_book(viewer)
+	if book_error {
+		note(&viewer.journal, "no menus: ")
+		note_error(&viewer.journal, book_error)
+		note_end(&viewer.journal)
+		return
+	}
+	if system_menu_tile(viewer, which) < 0 {
+		scratch : [16 * MB]byte = void
+		scratch.len = 0
+		read, read_error := book_read(&viewer.book, &viewer.archives, system_menu_path(which), &scratch)
+		if read_error {
+			note(&viewer.journal, "couldn't read the menu: ")
+			note_error(&viewer.journal, read_error)
+			note_end(&viewer.journal)
+			return
+		}
+		if which == MENU_MAIN do viewer.main_menu = read
+		if which == MENU_PAUSE do viewer.pause_menu = read
+		if which == MENU_OPTIONS do viewer.options_menu = read
+		if which == MENU_AUDIO do viewer.audio_menu = read
+		for k in 0:NOT_YET.len do _ = book_set(&viewer.book, NOT_YET[k], "visible", MENU_FALSE)
+		// (The options' Audio where Gameplay was, next after Return.)
+		if which == MENU_OPTIONS do _ = book_set(&viewer.book, "options_audio_button", "listindex", 1)
+		// (The main menu has nothing behind it: its backdrop shown.)
+		if which == MENU_MAIN do _ = book_set(&viewer.book, "backdrop", "visible", MENU_TRUE)
+	}
+	if which == MENU_OPTIONS and (viewer.menu_open == MENU_MAIN or viewer.menu_open == MENU_PAUSE) do viewer.options_from = viewer.menu_open
+	if viewer.menu_open == 0 do viewer.looking_before_menu = viewer.platform.mouse_look
+	viewer.menu_open = which
+	viewer.dragged_slider = -1
+	set_mouse_look(&viewer.platform, false)
+	if which == MENU_AUDIO do show_volumes(viewer)
+}
+
+// The root tile of a menu here, -1 till it's read.
+system_menu_tile :: fun(viewer: ^Viewer, which: i64) -> i64 {
+	if which == MENU_MAIN do return viewer.main_menu
+	if which == MENU_PAUSE do return viewer.pause_menu
+	if which == MENU_OPTIONS do return viewer.options_menu
+	if which == MENU_AUDIO do return viewer.audio_menu
+	return -1
+}
+
+// A menu here's XML, in the archives.
+system_menu_path :: fun(which: i64) -> str64 {
+	if which == MENU_MAIN do return "menus\\options\\main_menu.xml"
+	if which == MENU_PAUSE do return "menus\\options\\pause_menu.xml"
+	if which == MENU_OPTIONS do return "menus\\options\\options_menu.xml"
+	return "menus\\options\\audio_menu.xml"
+}
+
+// Opens the menus' book, once: the game's fonts and strings read.
+open_book :: fun(viewer: ^Viewer) -> err {
+	if viewer.book_ready do return
+	scratch : [32 * MB]byte = void
+	scratch.len = 0
+	book_open(&viewer.book, &viewer.renderer, &viewer.archives, &scratch)?
+	viewer.book_ready = true
+}
+
+// Goes back a menu (Escape, or a Return): from the audio menu to the
+// options (the volumes kept in the settings), from the options to the
+// menu they were opened from, from the pause menu (or the stats or map
+// menu) to the game. The main menu stays.
+menu_back :: fun(viewer: ^Viewer) {
+	which := viewer.menu_open
+	if which == MENU_AUDIO {
+		keep_volumes(viewer)
+		open_system_menu(viewer, MENU_OPTIONS)
+	elif which == MENU_OPTIONS
+		open_system_menu(viewer, viewer.options_from)
+	elif which != MENU_MAIN
+		close_menu(viewer)
+	}
+}
+
+// The mouse in a menu here: what it's over lit (that tile's mouseover,
+// and the tiles it's in), a click on a button answered, a slider set where
+// it's clicked and following the mouse while it's dragged (a click on its
+// arrows moves it a step).
+system_menu_input :: fun(viewer: ^Viewer) {
+	input := &viewer.input
+	book := &viewer.book
+	menu := system_menu_tile(viewer, viewer.menu_open)
+	if menu < 0 do return
+	scale := f32(viewer.platform.height) / MENU_HEIGHT
+	x := input.mouse_x / scale
+	target := tile_at(book, menu, x, input.mouse_y / scale, &viewer.renderer, &viewer.archives)
+	for tile in viewer.hovered do tile_set(book, tile, "mouseover", 0)
+	viewer.hovered.len = 0
+	lit := target
+	for lit >= 0 and fits(viewer.hovered.len + 1, viewer.hovered.cap) {
+		tile_set(book, lit, "mouseover", 1)
+		&viewer.hovered + lit
+		lit = book.tiles[lit].parent
+	}
+	if viewer.dragged_slider >= 0 {
+		if input.mouse_held[1] do set_slider_at(viewer, viewer.dragged_slider, x)
+		else do viewer.dragged_slider = -1
+		return
+	}
+	if not input.mouse_pressed[1] or target < 0 do return
+	// What the click's on: the tile, or a slider or button it's in.
+	own : []utf8 = book.tiles[target].name
+	at := target
+	for at >= 0 {
+		name : []utf8 = book.tiles[at].name
+		slider := slider_named(name)
+		if slider >= 0 {
+			if own == "horizontal_scroll_left" {
+				step_slider(viewer, slider, -SLIDER_STEP)
+			elif own == "horizontal_scroll_right"
+				step_slider(viewer, slider, SLIDER_STEP)
+			else
+				set_slider_at(viewer, slider, x)
+				viewer.dragged_slider = slider
+			}
+			return
+		}
+		if press_button(viewer, name) do return
+		at = book.tiles[at].parent
+	}
+}
+
+// Answers a button of the menus here by its tile's name: false when it
+// isn't one.
+press_button :: fun(viewer: ^Viewer, name: []utf8) -> bool {
+	if name == "main_new" {
+		viewer.menu_choice = CHOSE_PLAY
+	elif name == "main_exit" or name == "pause_quit_button"
+		viewer.menu_choice = CHOSE_QUIT
+	elif name == "main_options" or name == "pause_options_button"
+		open_system_menu(viewer, MENU_OPTIONS)
+	elif name == "options_audio_button"
+		open_system_menu(viewer, MENU_AUDIO)
+	elif name == "pause_return_button" or name == "options_return_button" or name == "audio_return_button"
+		menu_back(viewer)
+	elif name == "audio_defaults_button"
+		viewer.audio.volumes = full_volumes()
+		show_volumes(viewer)
+	else
+		return false
+	}
+	return true
+}
+
+// The volume slider a tile is (or its row), by Volumes' order; -1 for none.
+slider_named :: fun(name: []utf8) -> i64 {
+	for k in 0:VOLUME_SLIDERS.len {
+		if name == VOLUME_SLIDERS[k] or name == VOLUME_ROWS[k] do return k
+	}
+	return -1
+}
+
+// Sets a volume slider to where x (the menus' units) is along it: its
+// marker's middle there.
+set_slider_at :: fun(viewer: ^Viewer, slider: i64, x: f32) {
+	book := &viewer.book
+	tile := named_child(book, viewer.audio_menu, VOLUME_SLIDERS[slider], true)
+	if tile < 0 do return
+	left := tile_left(book, tile, &viewer.renderer, &viewer.archives)
+	travel := trait_number(book, tile, "width", &viewer.renderer, &viewer.archives) - SLIDER_MARKER_WIDTH
+	if travel <= 0 do return
+	set_volume(viewer, slider, (x - left - SLIDER_MARKER_WIDTH / 2) / travel)
+}
+
+// Moves a volume slider a step (hundredths: up, or down below 0).
+step_slider :: fun(viewer: ^Viewer, slider: i64, step: f32) {
+	set_volume(viewer, slider, volume_of(viewer.audio.volumes, slider) + step / 100)
+}
+
+// Sets a volume (by Volumes' order; 0 to 1, what's past either kept to
+// it): heard so at once, its slider showing it.
+set_volume :: fun(viewer: ^Viewer, slider: i64, volume: f32) {
+	kept := max(0, min(1, volume))
+	volumes := &viewer.audio.volumes
+	if slider == 0 do volumes.master = kept
+	if slider == 1 do volumes.voice = kept
+	if slider == 2 do volumes.effects = kept
+	if slider == 3 do volumes.footsteps = kept
+	if slider == 4 do volumes.music = kept
+	_ = book_set(&viewer.book, VOLUME_SLIDERS[slider], "user5", kept * 100)
+}
+
+// A volume by Volumes' order.
+volume_of :: fun(volumes: Volumes, slider: i64) -> f32 {
+	if slider == 0 do return volumes.master
+	if slider == 1 do return volumes.voice
+	if slider == 2 do return volumes.effects
+	if slider == 3 do return volumes.footsteps
+	return volumes.music
+}
+
+// The audio menu's sliders put where the volumes are.
+show_volumes :: fun(viewer: ^Viewer) {
+	for k in 0:VOLUME_SLIDERS.len do _ = book_set(&viewer.book, VOLUME_SLIDERS[k], "user5", volume_of(viewer.audio.volumes, k) * 100)
+}
+
+// Keeps the volumes in the settings (failing, the journal says why).
+keep_volumes :: fun(viewer: ^Viewer) {
+	write_error := write_settings(Game_Settings{volumes = viewer.audio.volumes})
+	if write_error {
+		note(&viewer.journal, "couldn't keep the settings: ")
+		note_error(&viewer.journal, write_error)
+		note_end(&viewer.journal)
+	}
+}
+
+// What the game sets in the menus here each frame: the main menu's logo
+// fading in from the other; the pause menu's Options right after Return
+// (Save and Load hidden: Load put where Return is, Options following it).
+fill_system_menu :: fun(viewer: ^Viewer) {
+	book := &viewer.book
+	if viewer.menu_open == MENU_MAIN {
+		since := f32(time_now() - viewer.main_menu_since) / 1000000000
+		_ = book_set(book, "MainMenu", "user3", 255 * max(0, 1 - since / LOGO_FADE))
+	elif viewer.menu_open == MENU_PAUSE
+		back := named_child(book, viewer.pause_menu, "pause_return_button", true)
+		if back < 0 do return
+		_ = book_set(book, "pause_load_button", "_top", trait_number(book, back, "_top", &viewer.renderer, &viewer.archives))
+		_ = book_set(book, "pause_load_button", "height", trait_number(book, back, "height", &viewer.renderer, &viewer.archives))
+	}
+}
+
+// Shows the main menu, with no world behind it, till New or Exit is
+// chosen (or the window's closed): true to play. (With no menu to be had,
+// it plays at once.)
+run_main_menu :: fun(viewer: ^Viewer) -> bool {
+	viewer.menu_choice = CHOSE_NOTHING
+	viewer.main_menu_since = time_now()
+	open_system_menu(viewer, MENU_MAIN)
+	if viewer.menu_open != MENU_MAIN do return true
+	for viewer.menu_choice == CHOSE_NOTHING do menu_only_frame(viewer)
+	close_menu(viewer)
+	choice := viewer.menu_choice
+	viewer.menu_choice = CHOSE_NOTHING
+	return choice == CHOSE_PLAY
+}
+
+// A frame of the menus with no world behind them: the mouse and keys
+// taken (Escape goes back a menu), the open menu drawn.
+menu_only_frame :: fun(viewer: ^Viewer) {
+	platform := &viewer.platform
+	input := &viewer.input
+	read_input(platform, input)
+	if input.quit {
+		viewer.menu_choice = CHOSE_QUIT
+		return
+	}
+	if input.pressed[Escape] do menu_back(viewer)
+	system_menu_input(viewer)
+	ui_begin(&viewer.renderer)
+	book_frame(&viewer.book)
+	draw_open_menu(viewer, platform.width, platform.height)
+	shown := &viewer.shown
+	grounds := shown.grounds[0:0]
+	tree_cells := shown.tree_cells[0:0]
+	grass_cells := shown.grass_cells[0:0]
+	_, _ = draw_frame(&viewer.renderer, &shown.models, &shown.instances, &shown.distant_instances, &grounds, &shown.waters,
+		&tree_cells, &grass_cells, &viewer.held.instances, &viewer.look, shown.lighting, viewer.camera, platform.width, platform.height)
+	wait_for_card()
+	_ = present(platform)
+	if not platform.vsync do wait_for_next_frame(viewer)
+}
