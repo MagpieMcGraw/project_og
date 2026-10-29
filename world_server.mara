@@ -211,7 +211,11 @@ server_take :: fun(server: ^World_Server, plugin: ^Plugin, slot: i64, message: W
 		server.doors_due = true
 	elif message.kind == MESSAGE_SAY
 		said, whole := wire_value(message, Note_Message{text = []})
-		if whole do server_tell_about(server, slot, ": ", said.text)
+		if not whole do return
+		told := Said_Message{player = player.id, text = said.text}
+		for &client, other_slot in server.clients {
+			if client.here and other_slot != slot do wire_put(&client.to_client, MESSAGE_SAID, told)
+		}
 	}
 }
 

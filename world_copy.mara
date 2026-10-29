@@ -5,6 +5,7 @@ module world_copy
 
 use mara.core
 use mara.math
+use mara.string
 use world
 use world_state
 use scene
@@ -32,9 +33,10 @@ World_Copy :: struct {
 	// The other players, where they are.
 	others: [MAX_PLAYERS]Other_Player
 	// Since the viewer last looked (it clears them): whether the people were
-	// told anew; the server's notes for its journal.
+	// told anew; the server's notes for its journal; what the others said.
 	people_changed: bool
 	notes: [8]Note_Message
+	said: [8]Said_Message
 }
 
 // A copy before the server's told it anything: the world as it starts.
@@ -56,6 +58,7 @@ copy_start :: fun(copy: ^World_Copy) {
 	copy.others.len = 0
 	copy.people_changed = false
 	copy.notes.len = 0
+	copy.said.len = 0
 }
 
 // Takes in what the server's told (one the copy doesn't take, or that
@@ -108,6 +111,9 @@ copy_take :: fun(copy: ^World_Copy, queue: ^Wire_Queue) {
 		elif message.kind == MESSAGE_NOTE
 			told, whole := wire_value(message, Note_Message{text = []})
 			if whole and fits(copy.notes.len + 1, copy.notes.cap) do &copy.notes + told
+		elif message.kind == MESSAGE_SAID
+			said, whole := wire_value(message, Said_Message{player = 0, text = []})
+			if whole and fits(copy.said.len + 1, copy.said.cap) do &copy.said + said
 		}
 	}
 }
@@ -143,6 +149,16 @@ follow_door_states :: fun(place: ^Scene, copy: ^World_Copy) {
 		}
 		if not swinging.moving and wanted != swinging.open do _ = use_door(place, swinging.reference)
 	}
+}
+
+// Words a player said as they're shown and heard: "player 2: …".
+said_text :: fun(said: Said_Message) -> [256]utf8 {
+	text : [256]utf8
+	&text + "player "
+	&text + int_text(said.player)
+	&text + ": "
+	add_what_fits(&text, said.text)
+	return text
 }
 
 // Tells the server where the player is now, and how fast they're going.

@@ -215,6 +215,12 @@ bot_run :: fun(bot: ^Bot, plugin: ^Plugin) -> err {
 		copy_take(seen, &bot.from_server)
 		for told in seen.notes do bot_hear(bot, told)
 		seen.notes.len = 0
+		for said in seen.said {
+			heard := Note_Message{text = []}
+			add_what_fits(&heard.text, said_text(said))
+			bot_hear(bot, heard)
+		}
+		seen.said.len = 0
 		if seen.people_changed {
 			seen.people_changed = false
 			if bot.placed do queue_actors(&bot.place, seen.actors)

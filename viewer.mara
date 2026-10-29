@@ -1404,11 +1404,21 @@ run_link :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 	}
 	seen := &viewer.seen
 	copy_take(seen, incoming(viewer))
+	// The server's notes, and what the others said: in the journal, and on
+	// the screen a while.
 	for told in seen.notes {
 		note(&viewer.journal, told.text)
 		note_end(&viewer.journal)
+		hud_notice(&viewer.hud, told.text)
 	}
 	seen.notes.len = 0
+	for said in seen.said {
+		words := said_text(said)
+		note(&viewer.journal, words)
+		note_end(&viewer.journal)
+		hud_say(&viewer.hud, words)
+	}
+	seen.said.len = 0
 	if seen.climate_id != viewer.climate.form_id do show_climate(viewer, plugin)
 	show_weather(viewer, plugin)
 	if seen.people_changed {

@@ -34,6 +34,7 @@ MESSAGE_PEOPLE :: 11      // the people in the player's place (a list of Referen
 MESSAGE_DOORS :: 12       // the doors opened or shut (a list of Door_States)
 MESSAGE_NOTE :: 13        // something to tell the player's journal (Note_Message)
 MESSAGE_PLAYERS :: 14     // the other players (a list of Other_Players)
+MESSAGE_SAID :: 15        // words another player said (Said_Message)
 
 // Where a client's player is now: the world they're in (0 inside), their
 // feet, which way they face, how fast they're going (units a second,
@@ -89,6 +90,13 @@ Clock_Message :: struct {
 	weather: u32
 	last_weather: u32
 	weather_share: f32
+}
+
+// Words a player said, as the server tells the others: whose (their
+// number), and the words.
+Said_Message :: struct {
+	player: i64
+	text: [200]utf8
 }
 
 // Something a server tells a client's journal: what failed, and why.

@@ -10,6 +10,7 @@ use mara.core
 use mara.math
 use mara.memory
 use mara.os
+use mara.time
 use bsa
 use logging
 render :: use render
@@ -58,12 +59,15 @@ Font :: struct {
 // health, magicka and fatigue (shares, 0 to 1), their weapon's icon (its
 // ICON, under textures\menus\icons\; empty: the HUD's own), the name of
 // what the reticle is on (empty for nothing; named: whose) and what using
-// it would do (ICON_*; 0 for nothing usable).
+// it would do (ICON_*; 0 for nothing usable); and what's shown a while
+// (till a time: time_now's): words someone said, at the bottom (the
+// subtitle menu's), and a notice, at the top.
 Hud :: struct {
 	ready: bool
 	main_menu: i64
 	info_menu: i64
 	reticle_menu: i64
+	subtitle_menu: i64
 	health: f32
 	magicka: f32
 	fatigue: f32
@@ -71,7 +75,17 @@ Hud :: struct {
 	name: str256
 	named: u32
 	activate: i64
+	subtitle: [256]utf8
+	subtitle_until: u64
+	notice: [256]utf8
+	notice_until: u64
 }
+
+// Words said are shown this long (seconds), and this much longer for each
+// letter of them; a notice this long.
+SUBTITLE_SHOWN :: 3
+SUBTITLE_LETTER :: 0.06
+NOTICE_SHOWN :: 4
 
 // A font's file's name (1 to 5, as the menus number them).
 font_file :: fun(number: i64) -> str64 {
@@ -89,6 +103,11 @@ load_hud :: fun(hud: ^Hud, book: ^Menu_Book, archives: ^Archives, weapon_icon: [
 	hud.main_menu = book_read(book, archives, "menus\\main\\hud_main_menu.xml", scratch)?
 	hud.info_menu = book_read(book, archives, "menus\\main\\hud_info_menu.xml", scratch)?
 	hud.reticle_menu = book_read(book, archives, "menus\\main\\hud_reticle.xml", scratch)?
+	hud.subtitle_menu = book_read(book, archives, "menus\\main\\hud_subtitle_menu.xml", scratch)?
+	hud.subtitle.len = 0
+	hud.subtitle_until = 0
+	hud.notice.len = 0
+	hud.notice_until = 0
 	hud.health = 1
 	hud.magicka = 1
 	hud.fatigue = 1
@@ -127,9 +146,36 @@ draw_hud :: fun(hud: ^Hud, book: ^Menu_Book, renderer: ^render.Renderer, archive
 	_ = book_set(book, "hudreticle_reticle", "user5", f32(hud.activate))
 	_ = book_set(book, "HUDInfoMenu", "visible", if exploring and hud.name.len > 0 do MENU_TRUE else MENU_FALSE)
 	_ = book_set_text(book, "hudinfo_name", "string", hud.name)
+	// Words said and a notice, while they're shown (the subtitle as low as
+	// it goes: nothing of the info menu's above it; the notice with no icon).
+	now := time_now()
+	_ = book_set(book, "HUDSubtitleMenu", "visible", MENU_TRUE)
+	_ = book_set(book, "hudsubtitle_text", "visible", if now < hud.subtitle_until do MENU_TRUE else MENU_FALSE)
+	_ = book_set_text(book, "hudsubtitle_text", "string", hud.subtitle)
+	_ = book_set(book, "hudsubtitle_text", "user1", MENU_HEIGHT)
+	_ = book_set(book, "hudsubtitle_notice", "visible", if now < hud.notice_until do MENU_TRUE else MENU_FALSE)
+	_ = book_set_text(book, "hudsubtitle_notice", "string", hud.notice)
+	_ = book_set(book, "hudsubtitle_notice", "user2", MENU_FALSE)
 	draw_menu(book, hud.main_menu, renderer, archives, width, height)
 	draw_menu(book, hud.info_menu, renderer, archives, width, height)
 	draw_menu(book, hud.reticle_menu, renderer, archives, width, height)
+	draw_menu(book, hud.subtitle_menu, renderer, archives, width, height)
+}
+
+// Shows words someone said at the bottom of the screen a while (longer
+// for more of them), in place of any shown.
+hud_say :: fun(hud: ^Hud, words: []utf8) {
+	hud.subtitle.len = 0
+	add_what_fits(&hud.subtitle, words)
+	seconds := SUBTITLE_SHOWN + SUBTITLE_LETTER * f64(words.len)
+	hud.subtitle_until = time_now() + u64(seconds * 1000000000)
+}
+
+// Shows a notice at the top of the screen a while, in place of any shown.
+hud_notice :: fun(hud: ^Hud, text: []utf8) {
+	hud.notice.len = 0
+	add_what_fits(&hud.notice, text)
+	hud.notice_until = time_now() + u64(NOTICE_SHOWN * 1000000000)
 }
 
 // A font read from the Misc archive's fonts folder (name: its files'
