@@ -1,7 +1,7 @@
 // A world's server: the world's state (World_State), stepped on its ticks,
 // its clients' messages taken in and the world told back to them
-// (wire.mara). A client's the host's own (in the same program: its queues
-// passed to it directly), or one connected over the network (net.mara):
+// (og's wire). A client's the host's own (in the same program: its queues
+// passed to it directly), or one connected over the network (TCP):
 // for the server they're the same, but for how their messages travel.
 module world_server
 

@@ -1,4 +1,4 @@
-// The world as a client knows it: what its server last told it (wire.mara),
+// The world as a client knows it: what its server last told it (og's wire),
 // and what the client tells the server. The viewer shows this copy, never
 // the server's own state, so a server elsewhere is no different to it.
 module world_copy

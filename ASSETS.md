@@ -67,7 +67,7 @@ Oblivion.esm and the base game's archives; sizes are as stored.
   Hit key, the nearest NPC within 160 units in front, short of a wall,
   is struck (the journal says whom).
 - **Music:** `Data\Music`'s Explore, Public and Dungeon tracks (MP3,
-  decoded by mp3.mara), by the place's kind: an interior cell's XCMT, a
+  decoded by og's mp3), by the place's kind: an interior cell's XCMT, a
   world's SNAM (the cities public, Oblivion's planes dungeon), a region's
   RDMD.
 - **Animation:** Idle sequences' movement, scrolling textures, glow and
@@ -85,7 +85,7 @@ Oblivion.esm and the base game's archives; sizes are as stored.
 | Combat | WEAP damage and reach, health, NPC reactions (stagger, recoil `.kf`), blocking, power attacks, the player's gear and inventory | a blow finds whom or what it meets, and sounds; nothing comes of it yet |
 | Creatures | ACRE 1,473 placed; CREA 914; 34 creature folders | none drawn |
 | Animations | `.kf` 1,843 (creatures 1,068, characters 775); IDLE 650 | read (B-splines too, and text keys); NPCs play idle.kf; the player's first-person idle and two attacks |
-| Voices | Voices1/2 BSAs: 38,898 `.mp3` + `.lip`, 1.7 GB; DIAL 3,817, INFO 19,278 | mp3.mara decodes them (checked against ffmpeg); `.lip` drives FaceGen mouth morphs |
+| Voices | Voices1/2 BSAs: 38,898 `.mp3` + `.lip`, 1.7 GB; DIAL 3,817, INFO 19,278 | og's mp3 decodes them (checked against ffmpeg); `.lip` drives FaceGen mouth morphs |
 
 ### World and sky
 

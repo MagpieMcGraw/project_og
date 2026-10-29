@@ -179,7 +179,7 @@ Viewer :: struct {
 	// elsewhere, over a connection (server_address, set before viewer_open:
 	// empty to host); whether it's been lost. The world as this player's
 	// client knows it — what the server's told it: all that's shown is from
-	// this copy, all the player does is told the server (wire.mara).
+	// this copy, all the player does is told the server (og's wire).
 	hosting: bool
 	server: World_Server
 	server_address: [64]utf8
@@ -342,7 +342,7 @@ View_Event :: union {
 viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^[]byte) -> err {
 	taking_picture := viewer.picture.path.len > 0
 	viewer.journal = journal_open(if taking_picture do PICTURE_LOG_PATH else LOG_PATH)
-	if not taking_picture do full_log_start()   // (lists found full: see logging.mara)
+	if not taking_picture do full_log_start()   // (lists found full: see og's logging)
 	read_load_order(&viewer.load_order)?
 	open_game_archives(&viewer.load_order, &viewer.archives, directory_storage)?
 	note(&viewer.journal, "plugins (")
