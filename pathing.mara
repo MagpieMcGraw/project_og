@@ -337,6 +337,22 @@ point_distance :: fun(point: Vec3, at: Vec3) -> f32 {
 	return away.x * away.x + away.y * away.y + 4 * away.z * away.z
 }
 
+// Where the grid's point nearest a place is (up or down counted twice:
+// point_distance): somewhere to stand by it, a door say. False for a grid
+// without points.
+grid_point_near :: fun(grid: ^Path_Grid, at: Vec3) -> Vec3, bool {
+	nearest : i64 = -1
+	nearest_distance : f32 = 0
+	for point, k in grid.points {
+		distance := point_distance(point.position, at)
+		if nearest >= 0 and distance >= nearest_distance do continue
+		nearest = k
+		nearest_distance = distance
+	}
+	if nearest < 0 do return at, false
+	return grid.points[nearest].position, true
+}
+
 // The height of the grid's point nearest a place across the ground (on
 // whatever floor): where one going to x, y, no height given, is going;
 // false for a grid without points.
