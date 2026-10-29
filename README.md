@@ -16,8 +16,10 @@ C:\Code\project_og.md.
 ## Building and running
 
 `build.bat` builds sothrone.exe with the project's own copy of the Mara
-compiler (`compiler\`, not checked in); `update_compiler.bat` brings it
-from C:\Code\Mara\release, and MARA_VERSION.txt says which it is.
+compiler (`compiler\`, not checked in): `compiler\Mara.exe build`, which
+builds what build.mara says (the build named sothrone, optimized).
+`update_compiler.bat` brings the compiler from C:\Code\Mara\release, and
+MARA_VERSION.txt says which it is.
 
 For now the program is the game's skeleton: one room (800 × 600), players
 as coloured squares, each walking where its player clicks (held, they
