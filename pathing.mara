@@ -440,12 +440,8 @@ clear_line :: fun(place: ^Scene, feet: Vec3, to: Vec3) -> bool {
 	across := vec3_length(Vec3{to.x - feet.x, to.y - feet.y, 0})
 	if abs_f32(to.z - feet.z) > max_f32(ROUTE_RISE, across * 0.75) do return false
 	away := to - feet
-	far := vec3_length(away)
-	if far < 1 do return true
-	for height in [STEP_HEIGHT + 8, WALKER_HEIGHT / 2] {
-		_, _, in_the_way := pick(place, feet + Vec3{0, 0, f32(height)}, away * (1 / far), far)
-		if in_the_way do return false
-	}
+	if vec3_length(away) < 1 do return true
+	if not open_line(place, feet, to) do return false
 	underfoot := feet.z
 	side := Vec3{-away.y, away.x, 0} * (FLOOR_SIDE / across)
 	walked : f32 = FLOOR_STEP
@@ -461,6 +457,19 @@ clear_line :: fun(place: ^Scene, feet: Vec3, to: Vec3) -> bool {
 		underfoot = ground
 		if last do break
 		walked += FLOOR_STEP
+	}
+	return true
+}
+
+// Whether nothing stands between feet and a place: at the knees (just
+// over a step) or the waist.
+open_line :: fun(place: ^Scene, feet: Vec3, to: Vec3) -> bool {
+	away := to - feet
+	far := vec3_length(away)
+	if far < 1 do return true
+	for height in [STEP_HEIGHT + 8, WALKER_HEIGHT / 2] {
+		_, _, in_the_way := pick(place, feet + Vec3{0, 0, f32(height)}, away * (1 / far), far)
+		if in_the_way do return false
 	}
 	return true
 }
@@ -483,10 +492,18 @@ floor_below :: fun(place: ^Scene, from: Vec3, reach: f32) -> f32, bool {
 	return best, found
 }
 
-// Skips a route's places one needn't go through from feet: while the one
-// after the next is in a clear line, the next is passed.
+// Skips a route's places one needn't go through from feet: the next, while
+// the one after it is in a clear line, or the walker's past the next —
+// nearer the one after than it is, with nothing between (not turning back
+// up stairs it's half down, say).
 route_shortcut :: fun(route: ^Route, place: ^Scene, feet: Vec3) {
-	for route.next + 1 < route.points.len and clear_line(place, feet, route.points[route.next + 1]) do route.next += 1
+	for route.next + 1 < route.points.len {
+		next_place := route.points[route.next]
+		after := route.points[route.next + 1]
+		past := vec3_length(after - feet) < vec3_length(after - next_place) and open_line(place, feet, after)
+		if not past and not clear_line(place, feet, after) do break
+		route.next += 1
+	}
 }
 
 // How far a route goes from its next point on, across and up and down.
