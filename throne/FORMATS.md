@@ -100,6 +100,12 @@ right, down-right. A monster's run is 80 = 8 × 10; a samurai's run 96 =
 (`pictures\bake_run.png`: the haunted armour, BakeYoroi, running) and by
 the game: samurai walking left and down-right face that way.
 
+Fonts (Base.lot, `Fonts\ANIM_<name>\000.s8`: AndySmall, ChatFont, Console,
+GameFont, Georgia24, Scar24, ToolTip, …) are sprites of 256 frames, frame
+k the character k; a frame's box on its canvas (8 × 16 for the chat font)
+is the letter, its right edge where the next starts. Empty frames (the
+control characters) still hold one stored pixel, as palettes' frames do.
+
 Where they are: `Characters\<Name>\Weapon<n>\ANIM_<action>\*.s8` for
 monsters and people, `Characters\<Class>\Armor<n>\Weapon<n>\ANIM_<action>`
 for the samurai. Actions: attack, attack2, death, hit, jump, neutral, run,
@@ -157,13 +163,35 @@ A level's folder holds:
   Checked by drawing the shrine (tools/level.py, then the game): every
   picture where it belongs, the walls on their outlines, nothing missing.
   The busiest layout (the Oda wilderness) places 8,439 pictures.
-- **.walk.mp / .walk.sp**: u32 0, u32 200, u32 200, then LZW (9-bit codes,
-  lowest bit first) over a bitmap, 1 bit per cell: where one can walk.
-  My decoder gets 60% through before a code runs ahead of its table, so
-  one dictionary rule is still off. mp and sp differ a little:
-  multiplayer and single player (guess).
-- **.stripped.mp / .sp**: named spots with positions (`MORISHRINE`,
-  `TOPOFSTAIRS`, `DIAMYOITEM01`): what the scripts point at.
+- **.walk.mp / .walk.sp**, where one can walk: u32 0, u32 width, u32
+  height (cells; the shrine 200 × 200, the biggest 1200 × 2300, a
+  wilderness), then blocks to the file's end, each a byte (its size less
+  1: `0xFF` for 256) and its bytes — the same size-less-1 habit as the
+  archives' blocks. The blocks' bytes joined are LZW, from their bit 3:
+  9-bit codes, a bit wider each time the table fills its width (to 12),
+  lowest bit first, new entries from 256, no clear or end codes; at 4096
+  entries the table starts over (9 bits, none past the bytes, the next
+  code a first one). Unpacked: a bit per cell, row by row, the high bit
+  first, 1 blocked — width × height bits exactly, all 110 of the game's
+  files (Mara's lzw.mara and tools/walk.py agree on them, open cell for
+  open cell). The rows run from the level's far end (the first row is the
+  one lowest on the screen).
+  A cell is a 32 × 16 diamond of the level's pixels: cell gx of row up
+  (counted from the far end) has its middle at x0 + (gx − up) × 16,
+  y0 + (gx + up) × 8. Where (x0, y0) lies isn't known yet: for the shrine
+  it's (1552, −256), fitted on its back walls' outlines (the walls meet
+  within 6 pixels of the open area's corner), its named spots (all on
+  open cells) and its floor tiles (tools/walk.py draws it). Fitted by
+  tools/walk_fit.py on walls and spots alone it comes out within a cell
+  of that; the Oda shrine's comes out about 7 cells along from it, so
+  the corner is each level's own — in a field not decoded yet (the lex
+  header holds only 800, 600, 4; `IGRL` is 0). mp and sp
+  differ a little: multiplayer and single player (guess).
+- **.stripped.mp / .sp**: named spots: u32 0, u32 count, then each a u8
+  name length, its name, i32 x, i32 y in the level's pixels (the shrine's:
+  `1` at 813, 689; `DIAMYOITEM01` at 878, 782, beside the dead body;
+  `MORISHRINE` at 1210, 1283, beside the portal; `TOPOFSTAIRS` at 1445,
+  1292, beside the stairs). What the scripts point at.
 - **.order.mp / .sp**: lists of u32 numbers: an order of some kind
   (drawing? spawning?).
 - **Map.map**: the map screen's picture of the level; the same LZW after a

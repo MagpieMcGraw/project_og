@@ -66,10 +66,15 @@ copy_me :: fun(copy: ^World_Copy) -> Player_Seen, bool {
 	for player in copy.players {
 		if player.id == copy.me and copy.me != 0 do return player, true
 	}
-	return Player_Seen{id = 0, x = 0, y = 0, walking = false, facing = 0, look = 0}, false
+	return Player_Seen{id = 0, x = 0, y = 0, walking = false, striking = false, strikes = 0, facing = 0, look = 0}, false
 }
 
 // Tells the server where our player wants to walk to.
 send_go :: fun(queue: ^Wire_Queue, x: f32, y: f32) {
 	wire_put(queue, MESSAGE_GO, Go_Message{x = x, y = y})
+}
+
+// Tells the server our player strikes toward a spot.
+send_strike :: fun(queue: ^Wire_Queue, x: f32, y: f32) {
+	wire_put(queue, MESSAGE_ATTACK, Go_Message{x = x, y = y})
 }

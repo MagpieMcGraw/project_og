@@ -24,22 +24,34 @@ is.
 
 For now the program is the game's skeleton: one level, the Mori shrine
 room, read from the game's World.lot (its layout and furniture set) and
-drawn as the game laid it out, the window following its player; each
-player one of the seven samurai, read from the game's Samurai.lot,
+drawn as the game laid it out, the window following its player (players
+drawn easing toward where the server last said, so walking is smooth at
+any frame rate); each player one of the seven samurai, read from the
+game's Samurai.lot, its name over its head in the game's chat font,
+striking toward where the right button is pressed (its attack, played
+once over STRIKE_SECONDS, seen by everyone; nothing to strike yet),
 walking where its player clicks (held, they follow the mouse): running
-the way they go, standing once there. The server keeps the world: it
-reads the level's area, starts players in its middle, walks them where
-they ask 30 times a second (anywhere in the area for now: walls and walk
-grids aren't read yet), turns them the way they're going, and tells
-everyone where everyone is and which level they're in. Without the game's
-files the level is a bare room and the players coloured squares.
+the way they go, standing once there; the level's music playing (its
+track from Stream.lot, unpacked once into cache\music\). The server keeps
+the world: it reads the level's area, walk grid and named spots, starts
+players on open ground at the level's shrine (MORISHRINE, by the portal),
+walks them where they ask 30 times a second by
+a route round walls and furniture (A* on the grid, straightened) — a
+click on a wall walks to the open spot nearest it — turns them the way
+they're going, and tells everyone where everyone is and which level
+they're in. Without the game's files the level is a bare room, open
+everywhere, and the players coloured squares. Only the shrine's grid is
+used: where a level's grid lies on it is known for the shrine alone
+(fitted: walk_grid.mara).
 
     throne                            the game: joins one on this machine, else hosts
     throne connect <address[:port]>   the game, joining the one at an address
     throne serve [port] [seconds] [open]   a server alone, no window
     throne bot [seconds] [address]    a player with no window, walking about
-    throne picture <out.png> [seconds] [address] [click x y]   the game in a window never shown, its last frame written
+    throne picture <out.png> [seconds] [address] [click x y] [strike]   the game in a window never shown (silent), its last frame written (strike: the click is a right-click)
     throne sprite <archive> <path | folder> <out.png>   a sprite's frames as the game's atlas lays them out
+    throne walk-grid <level>          a level's walk grid: its size and open cells
+    throne music-cache <track>        a track ("music\castle.mp3") unpacked where the game plays it from
 
 Opened twice, the second copy joins the first's game (port 27200, this
 machine only). Each run writes a journal: the first of throne.log,
@@ -52,10 +64,13 @@ The modules: `world_state` (the world and its messages), `world_server`,
 `lot` (the archives), `spr8` (the sprites), `art` (the samurai's
 pictures on the card), `rex` (a level's bundles), `lex` (a level's
 layout), `level` (World.ini, a level read), `level_art` (a level's
-pictures on the card), `throne` (the commands, the window). From
-../og, the modules the ports share (build.mara names the folder):
-`wire`, `logging`, `disk`, `sdl_platform`, `png`, `inflate`, `lzo`,
-`sprite_layer`.
+pictures on the card), `walk_grid` (where one can walk, and routes),
+`music_cache` (a level's track where og's music plays it), `text` (the
+game's fonts, text drawn), `throne` (the commands, the window). From
+../og, the modules the ports share
+(build.mara names the folder): `wire`, `logging`, `disk`,
+`sdl_platform`, `png`, `inflate`, `lzo`, `lzw`, `sprite_layer`,
+`audio` (the mixer and music), `mp3`, `indexing`, `random`.
 
 
 ## What sooblivion already has
@@ -129,6 +144,14 @@ Python prototypes (run with `python -I`):
 - `rex.py <file.rex>`: a resource bundle's table.
 - `walk_lzw.py <file.walk.sp>`: tries LZW starts on a walk grid.
 - `lex.py <file.lex>`: a layout's table and records.
+- `walk.py <World.lot> <level folder> <lex name> <out.png> [cell_w cell_h x0 y0]`:
+  a level's walk grid shaded over its picture (blocked red, open green):
+  how the grid's place on the level was checked.
+- `walk_fit.py <level folder>:<lex name> ...`: fits where levels' walk
+  grids lie, on their walls' outlines and named spots (the shrine: within
+  a cell of the hand fit; the Oda shrine's comes out about 7 cells
+  along from the Mori one's, so each level has its own corner, from
+  somewhere not found yet).
 - `level.py <World.lot> <level folder> <lex name> <out.png> [file|y]`:
   draws a whole level from its layout and bundles (the prototype of
   level_art.mara).

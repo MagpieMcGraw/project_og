@@ -57,6 +57,7 @@ next build: rebuild each and rerun its checks after one.
 | inflate, png | deflate decoding; PNG writing (encode_png) | oblivion 83fce8a, unchanged |
 | wire | messages on a queue or over TCP: Wire_Queue, wire_put / wire_put_list / wire_take / wire_value / wire_count, wire_connect / wire_send / wire_receive | oblivion 83fce8a, less its messages; `wire_connect(address, game_port)` takes the game's port |
 | lzo | LZO1X unpacking (`lzo_unpack`), every read, write and match checked | written for throne |
+| lzw | LZW unpacking, 9- to 12-bit codes lowest bit first, entries from 256, no clear or end codes, the table starting over at 4096 entries (`lzw_unpack(packed, start_bit, &out)`) | written for throne (its walk grids) |
 | sprite_layer | textured rectangles on the window in pixels, tinted and blended, batched by texture (`layer_open`, `layer_begin`, `layer_image`, `layer_draw`); `texture_from_pixels` | oblivion's 2D layer (render.mara ui_begin / ui_image / draw_ui) with no Renderer round it |
 | indexing | `Key_Index` (`key_index`, `index_put`, `index_get`: open addressing, u64 key → u32, carved from a storage; `Index_Error.Index_Full`); `text_hash` (FNV-1a, never 0) and `folded_hash` (the same, any case) | oblivion's world.mara, and its three copies of the hash made one |
 | random | `next_random` (xorshift), `random_share` (0 up to 1), `chance_at` (a roll by hashing: the same for every player with the same seed and numbers) | oblivion's world.mara |

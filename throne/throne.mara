@@ -34,6 +34,10 @@ use art
 use lex
 use level
 use level_art
+use walk_grid
+use audio
+use music_cache
+use text
 use png
 use logging
 
@@ -45,6 +49,8 @@ WINDOW_HEIGHT :: 600
 FRAME_RATE :: 60.0
 // A player as drawn: a square this many room pixels across.
 PLAYER_SIZE :: 24.0
+// How far above a player's feet their name is drawn (level pixels).
+NAME_HEIGHT :: 128.0
 
 // The journal: a log file, the first of throne.log, throne_2.log, …
 // that no other copy of the game is writing; the console only when none.
@@ -94,26 +100,52 @@ fill :: fun(platform: ^Platform, x: f32, y: f32, width: f32, height: f32, colour
 	Clear(COLOR_BUFFER_BIT)
 }
 
-// What the window draws with: the layer pictures go on, the samurai's
-// pictures (if they could be read), the level's (once the server's said
-// which), when the game started (for frames), what the camera looks at.
+// What the window draws and plays with: the layer pictures go on, the
+// samurai's pictures (if they could be read), the level's (once the
+// server's said which), when the game started (for frames), what the
+// camera looks at; the sound (og's mixer, its level's music), when heard.
+AUDIO_STORAGE :: 2 * MB
+AUDIO_CLIP_ROOM :: 1 * MB
 Game_View :: struct {
 	layer: Sprite_Layer
 	white: u32          // a texture of one white pixel, for plain rectangles
 	art: Samurai_Art
+	font: Font          // the chat font, for names over players
 	level: Level_Art
 	started: u64
 	camera_x: f32
 	camera_y: f32
+	shown: [MAX_PLAYERS]Shown_Player   // the players as drawn (ease_players)
+	eased_at: u64
+	sound: bool         // the mixer's open: it's mixed every frame
+	mixer: Mixer
+	mixer_storage: [AUDIO_STORAGE]byte
 }
 
-// The view made ready (a GL context current). When the samurai can't be
-// read, the journal says why and players are drawn as squares.
-view_open :: fun(view: ^Game_View, journal: ^Journal) {
+// The view made ready (a GL context current), and its sound opened when
+// sound is wanted (not for pictures). When the samurai can't be read, the
+// journal says why and players are drawn as squares; without sound, it's
+// silent.
+view_open :: fun(view: ^Game_View, journal: ^Journal, sound: bool) {
 	view.started = time_now()
 	view.art.ready = false
 	view.level.ready = false
 	view.level.name.len = 0
+	view.shown.len = 0
+	view.eased_at = time_now()
+	view.sound = false
+	if sound {
+		view.mixer_storage.len = 0
+		audio_init(&view.mixer, AUDIO_CLIP_ROOM, &view.mixer_storage)
+		audio_error := audio_open(&view.mixer)
+		if audio_error {
+			note(journal, "no sound: ")
+			note_error(journal, audio_error)
+			note_end(journal)
+		else
+			view.sound = true
+		}
+	}
 	layer_error := layer_open(&view.layer)
 	if layer_error {
 		note(journal, "can't draw pictures: ")
@@ -125,16 +157,27 @@ view_open :: fun(view: ^Game_View, journal: ^Journal) {
 	view.white = texture_from_pixels(white[:], 1, 1)
 	start := time_now()
 	art_error := load_samurai_art(&view.art)
-	if art_error {
+	if art_error and not view.art.ready {
 		note(journal, "couldn't read the samurai (players drawn as squares): ")
 		note_error(journal, art_error)
 		note_end(journal)
 		return
 	}
+	if art_error {
+		note(journal, "some samurai's attacks couldn't be read (they stand instead): ")
+		note_error(journal, art_error)
+		note_end(journal)
+	}
 	note(journal, "samurai read in ")
 	note(journal, i64((time_now() - start) / 1000000))
 	note(journal, " ms")
 	note_end(journal)
+	font_error := load_font(&view.font, CHAT_FONT)
+	if font_error {
+		note(journal, "couldn't read the chat font (no names over players): ")
+		note_error(journal, font_error)
+		note_end(journal)
+	}
 }
 
 // Has the level the server says we're in drawn: its pictures read when
@@ -158,6 +201,7 @@ take_level :: fun(seen: ^World_Copy, view: ^Game_View, journal: ^Journal) {
 		view.level.name = seen.level
 		return
 	}
+	play_level_music(view, journal)
 	note(journal, "level ")
 	note(journal, seen.level)
 	note(journal, " read in ")
@@ -175,6 +219,25 @@ take_level :: fun(seen: ^World_Copy, view: ^Game_View, journal: ^Journal) {
 	note_end(journal)
 }
 
+// The level's music playing (its track unpacked to the cache the first
+// time: music_cache.mara), when there's sound.
+play_level_music :: fun(view: ^Game_View, journal: ^Journal) {
+	if not view.sound or view.level.music.len == 0 do return
+	folder, music_error := track_folder(view.level.music)
+	if music_error {
+		note(journal, "no music for the level (")
+		note(journal, view.level.music)
+		note(journal, "): ")
+		note_error(journal, music_error)
+		note_end(journal)
+		return
+	}
+	want_music(&view.mixer, folder)
+	note(journal, "music: ")
+	note(journal, view.level.music)
+	note_end(journal)
+}
+
 same_text :: fun(a: []utf8, b: []utf8) -> bool {
 	if a.len != b.len do return false
 	for c, k in a {
@@ -183,17 +246,55 @@ same_text :: fun(a: []utf8, b: []utf8) -> bool {
 	return true
 }
 
-// The camera on our player, once the server's told where they are (else
-// on the middle of the level's area).
-follow_player :: fun(seen: ^World_Copy, view: ^Game_View) {
-	me, found := copy_me(seen)
-	if found {
-		view.camera_x = me.x
-		view.camera_y = me.y
-	else
-		view.camera_x = (seen.area.left + seen.area.right) / 2
-		view.camera_y = (seen.area.top + seen.area.bottom) / 2
+// A player as drawn: their number, where they're drawn.
+Shown_Player :: struct {
+	id: i64
+	x: f32
+	y: f32
+	strikes: i64          // their strikes as last told
+	strike_started: u64   // when their last strike was first seen (time_now)
+}
+// How fast drawn places catch up with where the server says players are
+// (a share of the way, per second: the server's told 30 times a second, the
+// window drawn more often); a move further than JUMP pixels is drawn at once.
+EASE_RATE :: 20.0
+JUMP :: 200.0
+
+// The players' drawn places, eased toward where the server last said they
+// are, in the order the server lists them (view.shown[k] is seen.players[k]'s).
+ease_players :: fun(seen: ^World_Copy, view: ^Game_View) {
+	now := time_now()
+	gone := f32(f64(now - view.eased_at) / 1000000000)
+	view.eased_at = now
+	share := min(f32(1), gone * f32(EASE_RATE))
+	kept : [MAX_PLAYERS]Shown_Player
+	for player in seen.players {
+		shown := Shown_Player{id = player.id, x = player.x, y = player.y, strikes = player.strikes, strike_started = now}
+		for old in view.shown {
+			if old.id != player.id do continue
+			if abs(player.x - old.x) + abs(player.y - old.y) < f32(JUMP) {
+				shown.x = old.x + (player.x - old.x) * share
+				shown.y = old.y + (player.y - old.y) * share
+			}
+			// (The same strike as before: it started when first seen.)
+			if old.strikes == player.strikes do shown.strike_started = old.strike_started
+		}
+		&kept + shown
 	}
+	view.shown = kept
+}
+
+// The camera on our player as drawn, once the server's told where they are
+// (else on the middle of the level's area).
+follow_player :: fun(seen: ^World_Copy, view: ^Game_View) {
+	for player, k in seen.players {
+		if player.id != seen.me or seen.me == 0 or k >= view.shown.len do continue
+		view.camera_x = view.shown[k].x
+		view.camera_y = view.shown[k].y
+		return
+	}
+	view.camera_x = (seen.area.left + seen.area.right) / 2
+	view.camera_y = (seen.area.top + seen.area.bottom) / 2
 }
 
 // Draws the world as the server's told it: the level (or its bare area,
@@ -216,21 +317,22 @@ draw_world :: fun(platform: ^Platform, seen: ^World_Copy, view: ^Game_View) {
 		rectangle(view, room.left + area.left * room.scale, room.top + area.top * room.scale, (area.right - area.left) * room.scale,
 			(area.bottom - area.top) * room.scale, [4!]f32{0.16, 0.13, 0.1, 1})
 	}
-	// The players by how far down they stand.
+	// The players by how far down they're drawn.
 	order : [MAX_PLAYERS]i64
-	for player, k in seen.players {
+	for shown, k in view.shown {
 		&order + k
 		at := order.len - 1
-		for at > 0 and seen.players[order[at - 1]].y > player.y {
+		for at > 0 and view.shown[order[at - 1]].y > shown.y {
 			order[at] = order[at - 1]
 			at -= 1
 		}
 		order[at] = k
 	}
 	for k in order {
+		if k >= seen.players.len do continue
 		player := seen.players[k]
-		x := room.left + player.x * room.scale
-		y := room.top + player.y * room.scale
+		x := room.left + view.shown[k].x * room.scale
+		y := room.top + view.shown[k].y * room.scale
 		if not view.art.ready {
 			half := f32(PLAYER_SIZE) / 2 * room.scale
 			if player.id == seen.me do rectangle(view, x - half - 2, y - half - 2, half * 2 + 4, half * 2 + 4, [4!]f32{1, 1, 0.85, 1})
@@ -240,7 +342,15 @@ draw_world :: fun(platform: ^Platform, seen: ^World_Copy, view: ^Game_View) {
 		}
 		if player.id == seen.me do rectangle(view, x - 12 * room.scale, y - 2 * room.scale, 24 * room.scale, 4 * room.scale, [4!]f32{1, 1, 0.85, 0.8})
 		action := if player.walking do ACTION_RUN else ACTION_STAND
-		draw_samurai(&view.layer, &view.art, player.look, action, player.facing, seconds, x, y, room.scale)
+		if player.striking do action = ACTION_ATTACK
+		done := f32(f64(time_now() - view.shown[k].strike_started) / 1000000000) / f32(STRIKE_SECONDS)
+		draw_samurai(&view.layer, &view.art, player.look, action, player.facing, seconds, x, y, room.scale, done)
+		// Their samurai's name over their head (ours brighter).
+		name := SAMURAI[player.look % SAMURAI_LOOKS]
+		name_scale := room.scale
+		name_colour := if player.id == seen.me do [4!]f32{1, 1, 0.8, 1} else [4!]f32{0.85, 0.85, 0.85, 0.9}
+		draw_text(&view.layer, &view.font, name, x - text_width(&view.font, name, name_scale) / 2, y - f32(NAME_HEIGHT) * room.scale, name_scale,
+			name_colour)
 	}
 	layer_draw(&view.layer, platform.width, platform.height)
 }
@@ -253,21 +363,28 @@ rectangle :: fun(view: ^Game_View, x: f32, y: f32, width: f32, height: f32, colo
 // One frame of the game: where the left mouse button is pressed the player
 // walks to (held, they follow it), the link run, the world drawn.
 game_frame :: fun(platform: ^Platform, input: ^Input, link: ^Link, journal: ^Journal, view: ^Game_View) {
-	if input.mouse_held[1] {
-		room := view_of(platform, view.camera_x, view.camera_y)
-		send_go(outgoing(link), (input.mouse_x - room.left) / room.scale, (input.mouse_y - room.top) / room.scale)
-	}
+	room := view_of(platform, view.camera_x, view.camera_y)
+	mouse_x := (input.mouse_x - room.left) / room.scale
+	mouse_y := (input.mouse_y - room.top) / room.scale
+	if input.mouse_held[1] do send_go(outgoing(link), mouse_x, mouse_y)
+	// The right button strikes toward the mouse.
+	if input.mouse_pressed[3] do send_strike(outgoing(link), mouse_x, mouse_y)
 	link_run(link, journal)
 	take_level(&link.seen, view, journal)
+	ease_players(&link.seen, view)
 	follow_player(&link.seen, view)
 	Viewport(0, 0, i32(platform.width), i32(platform.height))
 	draw_world(platform, &link.seen, view)
+	if view.sound do mix_ahead(&view.mixer)
 }
 
-// The level a game starts in (START_LEVEL) and its area, read from the
+// The level a game starts in (START_LEVEL), its area, and its walk grid
+// into walk (when its corner is known: walk_grid.mara), read from the
 // game's World.lot: a server hosting the game needs them. When they can't
-// be read, no level (empty) and a bare room's area; the journal says why.
-start_level :: fun(journal: ^Journal) -> [48]utf8, Area {
+// be read, no level (empty), a bare room's area, no grid; the journal says
+// why.
+start_level :: fun(journal: ^Journal, walk: ^Walk_Grid) -> [48]utf8, Area {
+	walk.ready = false
 	name : [48]utf8
 	world : Lot
 	directory : [1 * MB]byte = void
@@ -291,7 +408,66 @@ start_level :: fun(journal: ^Journal) -> [48]utf8, Area {
 		return name, no_level_area()
 	}
 	&name + START_LEVEL
-	return name, Area{left = f32(layout.left), top = f32(layout.top), right = f32(layout.right), bottom = f32(layout.bottom)}
+	read_walk_grid(&world, &info, walk, &file, journal)
+	area := Area{left = f32(layout.left), top = f32(layout.top), right = f32(layout.right), bottom = f32(layout.bottom),
+		start_x = f32(layout.left + layout.right) / 2, start_y = f32(layout.top + layout.bottom) / 2}
+	shrine_x, shrine_y, has_shrine := level_shrine(&world, &info, &file)
+	if has_shrine {
+		area.start_x = shrine_x
+		area.start_y = shrine_y
+		note(journal, "players start at the level's shrine, ")
+		note(journal, i64(shrine_x))
+		note(journal, ", ")
+		note(journal, i64(shrine_y))
+		note_end(journal)
+	}
+	return name, area
+}
+
+// A level's walk grid (its .walk.sp) into walk, when its corner is known;
+// the journal says which it is.
+read_walk_grid :: fun(world: ^Lot, info: ^Level_Info, walk: ^Walk_Grid, file: ^[]byte, journal: ^Journal) {
+	x0, y0, known := walk_corner(info.name)
+	if not known {
+		note(journal, "no walk grid for ")
+		note(journal, info.name)
+		note(journal, " (where its grid lies isn't known yet): walking anywhere in it")
+		note_end(journal)
+		return
+	}
+	path : [256]utf8
+	&path + info.folder
+	&path + info.layout_name
+	&path + ".walk.sp"
+	grid_file, found := lot_find(world, path)
+	read_error : err
+	if found do read_error = lot_read(world, grid_file, file)
+	stream : [WALK_FILE_ROOM]byte = void
+	if found and not read_error do read_error = walk_read(walk, file^, x0, y0, &stream)
+	if not found or read_error {
+		note(journal, "couldn't read the walk grid ")
+		note(journal, path)
+		if read_error {
+			note(journal, ": ")
+			note_error(journal, read_error)
+		}
+		note_end(journal)
+		return
+	}
+	open : i64 = 0
+	for up in 0:walk.height {
+		for gx in 0:walk.width {
+			if not cell_blocked(walk, gx, up) do open += 1
+		}
+	}
+	note(journal, "walk grid ")
+	note(journal, walk.width)
+	note(journal, " x ")
+	note(journal, walk.height)
+	note(journal, ", ")
+	note(journal, open)
+	note(journal, " cells open")
+	note_end(journal)
 }
 
 // The game in a window: joining the game at an address, or with none, the
@@ -300,9 +476,10 @@ start_level :: fun(journal: ^Journal) -> [48]utf8, Area {
 command_play :: fun(address: []utf8) -> bool {
 	journal := open_journal()
 	defer journal_close(&journal)
-	level_name, area := start_level(&journal)
+	walk : Walk_Grid
+	level_name, area := start_level(&journal, &walk)
 	link : Link
-	link_error := link_open(&link, &journal, address, level_name, area)
+	link_error := link_open(&link, &journal, address, level_name, area, &walk)
 	if link_error {
 		note(&journal, "couldn't join the game: ")
 		note_error(&journal, link_error)
@@ -319,7 +496,8 @@ command_play :: fun(address: []utf8) -> bool {
 	}
 	defer platform_close(&platform)
 	view : Game_View
-	view_open(&view, &journal)
+	view_open(&view, &journal, true)
+	defer audio_close(&view.mixer)
 	input : Input
 	for true {
 		work := Timer()
@@ -338,12 +516,13 @@ command_play :: fun(address: []utf8) -> bool {
 // clicked at the start to walk to a spot — x and y shares of the window
 // across and down, 0.8 0.8 unless told. The last frame is written to
 // out.png. For looking at what the game draws without a window.
-command_picture :: fun(path: []utf8, seconds: f64, address: []utf8, click_x: f32, click_y: f32) {
+command_picture :: fun(path: []utf8, seconds: f64, address: []utf8, click_x: f32, click_y: f32, strike: bool) {
 	journal := open_journal()
 	defer journal_close(&journal)
-	level_name, area := start_level(&journal)
+	walk : Walk_Grid
+	level_name, area := start_level(&journal, &walk)
 	link : Link
-	link_error := link_open(&link, &journal, address, level_name, area)
+	link_error := link_open(&link, &journal, address, level_name, area, &walk)
 	if link_error {
 		print("couldn't join the game: %", link_error)
 		return
@@ -356,13 +535,17 @@ command_picture :: fun(path: []utf8, seconds: f64, address: []utf8, click_x: f32
 	}
 	defer platform_close(&platform)
 	view : Game_View
-	view_open(&view, &journal)
+	view_open(&view, &journal, false)
 	input : Input
+	struck := false
 	start := time_now()
 	for true {
 		work := Timer()
 		gone := f64(time_now() - start) / 1000000000
-		input.mouse_held[1] = gone > 0.1 and gone < 0.2
+		// (Striking: the right button pressed once, at 0.1 s.)
+		input.mouse_held[1] = not strike and gone > 0.1 and gone < 0.2
+		input.mouse_pressed[3] = strike and gone > 0.1 and not struck
+		if input.mouse_pressed[3] do struck = true
 		input.mouse_x = f32(platform.width) * click_x
 		input.mouse_y = f32(platform.height) * click_y
 		game_frame(&platform, &input, &link, &journal, &view)
@@ -429,9 +612,10 @@ write_entire_file :: fun(path: []utf8, data: []byte) -> err {
 command_serve :: fun(port: i64, seconds: f64, open: bool) {
 	journal := open_journal()
 	defer journal_close(&journal)
-	level_name, area := start_level(&journal)
+	walk : Walk_Grid
+	level_name, area := start_level(&journal, &walk)
 	server : World_Server
-	server_start(&server, level_name, area, true)
+	server_start(&server, level_name, area, &walk, true)
 	listen_error := server_listen(&server, u16(port), open)
 	if listen_error {
 		print("couldn't listen on port %: %", port, listen_error)
@@ -460,9 +644,10 @@ BOT_STATUS_EVERY :: 1.0
 command_bot :: fun(seconds: f64, address: []utf8) {
 	journal := open_journal()
 	defer journal_close(&journal)
-	level_name, area := start_level(&journal)
+	walk : Walk_Grid
+	level_name, area := start_level(&journal, &walk)
 	link : Link
-	link_error := link_open(&link, &journal, address, level_name, area)
+	link_error := link_open(&link, &journal, address, level_name, area, &walk)
 	if link_error {
 		print("bot couldn't join the game: %", link_error)
 		return
@@ -533,6 +718,69 @@ usage :: fun() {
 	print("throne bot [seconds] [address]         a player with no window, walking about")
 	print("throne picture <out.png> [seconds] [address] [click x y]   the game unseen, its last frame written")
 	print("throne sprite <archive> <path | folder> <out.png>   a sprite's frames as the game's atlas lays them out")
+	print("throne walk-grid <level>               a level's walk grid: its size and open cells")
+	print("throne music-cache <track>             a track (\"music\\castle.mp3\") unpacked where the game plays it from")
+}
+
+// `throne music-cache <track>`: a music track, as World.ini names it,
+// unpacked into the cache as the game does before playing it
+// (music_cache.mara): says where, and how big.
+command_music_cache :: fun(track: []utf8) {
+	folder, music_error := track_folder(track)
+	if music_error {
+		print("couldn't cache %: %", track, music_error)
+		return
+	}
+	print("% plays from %", track, folder)
+}
+
+// `throne walk-grid <level>`: a level's walk grid (World.ini's name for the
+// level) read whether or not where it lies is known: its size and how many
+// cells are open. For checking the grids unpack (tools/walk.py counts the same).
+command_walk_grid :: fun(name: []utf8) {
+	world : Lot
+	directory : [1 * MB]byte = void
+	open_error := lot_open(&world, lot_file_path(WORLD_ARCHIVE), &directory)
+	if open_error {
+		print("couldn't open the world's archive: %", open_error)
+		return
+	}
+	defer lot_close(&world)
+	layout : Layout
+	file : [LEVEL_FILE_ROOM]byte = void
+	info, level_error := read_level(&world, name, &layout, &file)
+	if level_error {
+		print("couldn't read the level %: %", name, level_error)
+		return
+	}
+	path : [256]utf8
+	&path + info.folder
+	&path + info.layout_name
+	&path + ".walk.sp"
+	grid_file, found := lot_find(&world, path)
+	if not found {
+		print("no walk grid at %", path)
+		return
+	}
+	read_error := lot_read(&world, grid_file, &file)
+	if read_error {
+		print("couldn't read %: %", path, read_error)
+		return
+	}
+	walk : Walk_Grid
+	stream : [WALK_FILE_ROOM]byte = void
+	walk_error := walk_read(&walk, file, 0, 0, &stream)
+	if walk_error {
+		print("couldn't read %: %", path, walk_error)
+		return
+	}
+	open : i64 = 0
+	for up in 0:walk.height {
+		for gx in 0:walk.width {
+			if not cell_blocked(&walk, gx, up) do open += 1
+		}
+	}
+	print("% walk grid: % x %, % cells open", name, walk.width, walk.height, open)
 }
 
 // `throne sprite <archive> <path | folder> <out.png>`: a sprite from one
@@ -629,8 +877,14 @@ main :: (args: [][]utf8) {
 		address := args[1][0:0]
 		click_x : f32 = 0.8
 		click_y : f32 = 0.8
+		strike := false
 		k := 3
 		for k < args.len {
+			if args[k] == "strike" {
+				strike = true
+				k += 1
+				continue
+			}
 			if args[k] == "click" and k + 2 < args.len {
 				x, x_ok := parse_number(args[k + 1])
 				y, y_ok := parse_number(args[k + 2])
@@ -646,7 +900,11 @@ main :: (args: [][]utf8) {
 			else do address = args[k]
 			k += 1
 		}
-		command_picture(args[2], seconds, address, click_x, click_y)
+		command_picture(args[2], seconds, address, click_x, click_y, strike)
+	elif command == "walk-grid" and args.len > 2
+		command_walk_grid(args[2])
+	elif command == "music-cache" and args.len > 2
+		command_music_cache(args[2])
 	elif command == "sprite" and args.len > 4
 		command_sprite(args[2], args[3], args[4])
 	elif command == "bot"

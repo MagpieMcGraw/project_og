@@ -1,0 +1,320 @@
+// Where one can walk in a level: its walk grid (<LEX>.walk.sp, single
+// player; .walk.mp for several, a guess), a bit per cell, 1 blocked.
+//
+// The file: u32 0, u32 width, u32 height (cells), then blocks, each a byte
+// (its size less 1: 0xFF for 256) and its bytes, to the file's end. The
+// blocks' bytes together are LZW (og's lzw.mara), from their bit 3.
+// Unpacked: the rows, a bit a cell, the high bit first — width x height
+// bits exactly (so all 110 of the game's). The rows are stored from the
+// level's far end: the first row is the one furthest down the screen.
+//
+// A cell is a 32 x 16 diamond of the level's pixels: cell gx of row
+// (counted from the far end) up has its middle at
+//     x0 + (gx - up) * 16,  y0 + (gx + up) * 8
+// Where the grid's corner (x0, y0) lies on a level isn't known yet: it was
+// fitted for the shrine by its walls and named spots (tools/walk.py), and
+// a level not in WALK_CORNERS has no grid read (one walks anywhere in it).
+module walk_grid
+
+use mara.core
+use mara.math
+use mara.memory
+use lzw
+
+// Room for a grid's bits (the biggest, the Toyotomi wilderness's, 345,000
+// bytes), and for its file.
+WALK_ROOM :: 512 * KB
+WALK_FILE_ROOM :: 64 * KB
+CELL_WIDTH :: 32.0
+CELL_HEIGHT :: 16.0
+WALK_HEAD :: 12
+// The levels whose grid's corner is known (fitted), and where it lies.
+WALK_CORNER_LEVELS :: ["Citadel1_Shrine"]
+WALK_CORNERS :: [8!][2!]f32{{1552, -256}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}}
+
+Walk_Error :: error {
+	Not_A_Grid    // too short, a block running past its end, or too big for WALK_ROOM
+}
+
+Walk_Grid :: struct {
+	ready: bool          // a grid read: else everywhere is walkable
+	width: i64
+	height: i64
+	x0: f32
+	y0: f32
+	bits: [WALK_ROOM]byte
+}
+
+// The grid's corner for a level, if it's known.
+walk_corner :: fun(level: []utf8) -> f32, f32, bool {
+	for name, k in WALK_CORNER_LEVELS {
+		if same_letters(name, level) do return WALK_CORNERS[k][0], WALK_CORNERS[k][1], true
+	}
+	return 0, 0, false
+}
+
+same_letters :: fun(a: []utf8, b: []utf8) -> bool {
+	if a.len != b.len do return false
+	for c, k in a {
+		if b[k] != c do return false
+	}
+	return true
+}
+
+// A walk file's grid (its bytes), its corner at x0, y0. stream is room for
+// its blocks' bytes, joined.
+walk_read :: fun(grid: ^Walk_Grid, file: []byte, x0: f32, y0: f32, stream: ^[]byte) -> err {
+	grid.ready = false
+	if file.len <= WALK_HEAD do return Not_A_Grid
+	width : u32 = file[4]
+	height : u32 = file[8]
+	grid.width = i64(width)
+	grid.height = i64(height)
+	size := (grid.width * grid.height + 7) / 8
+	if size > grid.bits.cap or file.len > stream.cap do return Not_A_Grid
+	stream.len = 0
+	at : i64 = WALK_HEAD
+	for at < file.len {
+		count := i64(file[at]) + 1
+		if at + 1 + count > file.len do return Not_A_Grid
+		for k in 0:count do stream + file[at + 1 + k]
+		at += 1 + count
+	}
+	grid.bits.len = 0
+	lzw_unpack(stream^, 3, &grid.bits)?
+	// (Each of the game's unpacks to its size; should one not, the rest is blocked.)
+	if grid.bits.len > size do grid.bits.len = size
+	for grid.bits.len < size do &grid.bits + u8(255)
+	grid.x0 = x0
+	grid.y0 = y0
+	grid.ready = true
+}
+
+// Whether a cell (gx, and up counted from the far end) is blocked; outside
+// the grid is.
+cell_blocked :: fun(grid: ^Walk_Grid, gx: i64, up: i64) -> bool {
+	if gx < 0 or up < 0 or gx >= grid.width or up >= grid.height do return true
+	k := (grid.height - 1 - up) * grid.width + gx
+	return (i64(grid.bits[k >> 3]) >> (7 - (k & 7))) & 1 == 1
+}
+
+// The cell a level point is in: gx, up.
+cell_of :: fun(grid: ^Walk_Grid, x: f32, y: f32) -> i64, i64 {
+	across := (x - grid.x0) / f32(CELL_WIDTH / 2)
+	down := (y - grid.y0) / f32(CELL_HEIGHT / 2)
+	return i64(floor((across + down) / 2 + 0.5)), i64(floor((down - across) / 2 + 0.5))
+}
+
+// A cell's middle in the level.
+cell_middle :: fun(grid: ^Walk_Grid, gx: i64, up: i64) -> f32, f32 {
+	return grid.x0 + f32(gx - up) * f32(CELL_WIDTH / 2), grid.y0 + f32(gx + up) * f32(CELL_HEIGHT / 2)
+}
+
+// Whether one can stand at a level point (anywhere, with no grid read).
+walkable :: fun(grid: ^Walk_Grid, x: f32, y: f32) -> bool {
+	if not grid.ready do return true
+	gx, up := cell_of(grid, x, y)
+	return not cell_blocked(grid, gx, up)
+}
+
+// The open cell nearest a level point (searching rings of cells out to
+// most cells away): its middle; the point itself when it's open or none is.
+nearest_open :: fun(grid: ^Walk_Grid, x: f32, y: f32, most: i64 = 64) -> f32, f32 {
+	if walkable(grid, x, y) do return x, y
+	gx, up := cell_of(grid, x, y)
+	for ring in 1..most {
+		for a in -ring..ring {
+			for b in -ring..ring {
+				if max(abs(a), abs(b)) != ring do continue
+				if not cell_blocked(grid, gx + a, up + b) do return cell_middle(grid, gx + a, up + b)
+			}
+		}
+	}
+	return x, y
+}
+
+// ---- routes ---------------------------------------------------------------------
+
+// Grids routed at most this many cells (a bigger one's walks are straight);
+// a route's points at most.
+ROUTE_CELLS :: 512 * 512
+ROUTE_POINTS :: 128
+// How far apart a line's points are looked at, walking it (pixels).
+LINE_STEP :: 6.0
+
+// A point of a route, in the level's pixels.
+Route_Point :: struct {
+	x: f32
+	y: f32
+}
+
+// A cell waiting in the search, by what it's thought to cost to the goal through it.
+Waiting_Cell :: struct {
+	guess: i32
+	cell: i32
+}
+
+// Room for searching a grid for routes, kept between searches: what each
+// cell's cost to reach is (-1: not reached), the cell it was reached from,
+// the cells waiting, the cells reached (to set back after).
+Route_Search :: struct {
+	cost: [ROUTE_CELLS]i32
+	from: [ROUTE_CELLS]i32
+	waiting: [ROUTE_CELLS]Waiting_Cell
+	reached: [ROUTE_CELLS]i32
+}
+
+// A search's room made ready: nothing reached.
+route_search_start :: fun(search: ^Route_Search) {
+	search.cost.len = search.cost.cap
+	search.from.len = search.from.cap
+	for k in 0:search.cost.len do search.cost[k] = -1
+	search.waiting.len = 0
+	search.reached.len = 0
+}
+
+// The eight steps from a cell (gx, up), and what each costs: its length
+// in the level's pixels, ten times (the grid's diagonals differ).
+STEP_GX :: [8!]i64{1, -1, 0, 0, 1, -1, 1, -1}
+STEP_UP :: [8!]i64{0, 0, 1, -1, 1, -1, -1, 1}
+STEP_COST :: [8!]i32{179, 179, 179, 179, 160, 160, 320, 320}
+
+// A route from one point of the level to another round what's blocked:
+// its points into route (the last the goal itself), true; false when
+// there's no grid to route on, it's too big, or there's no way.
+find_route :: fun(grid: ^Walk_Grid, search: ^Route_Search, from_x: f32, from_y: f32, to_x: f32, to_y: f32, route: ^[]Route_Point) -> bool {
+	route.len = 0
+	if not grid.ready or grid.width * grid.height > ROUTE_CELLS do return false
+	start_x, start_y := nearest_open(grid, from_x, from_y)
+	start_gx, start_up := cell_of(grid, start_x, start_y)
+	goal_gx, goal_up := cell_of(grid, to_x, to_y)
+	if cell_blocked(grid, start_gx, start_up) or cell_blocked(grid, goal_gx, goal_up) do return false
+	start := start_up * grid.width + start_gx
+	goal := goal_up * grid.width + goal_gx
+	// (What the last search reached, set back.)
+	for cell in search.reached do search.cost[cell] = -1
+	search.reached.len = 0
+	search.waiting.len = 0
+	reach(search, start, 0, start, guess_cost(grid, start, goal))
+	found := false
+	for search.waiting.len > 0 {
+		taken := take_cheapest(search)
+		cell := i64(taken.cell)
+		if cell == goal {
+			found = true
+			break
+		}
+		gx := cell % grid.width
+		up := cell / grid.width
+		here := search.cost[cell]
+		// (A cell waiting twice: its later, dearer turn is let go.)
+		if i64(taken.guess) - i64(guess_cost(grid, cell, goal)) > i64(here) do continue
+		for k in 0:8 {
+			next_gx := gx + STEP_GX[k]
+			next_up := up + STEP_UP[k]
+			if cell_blocked(grid, next_gx, next_up) do continue
+			// (Not between two blocked cells' corners.)
+			if k >= 4 and (cell_blocked(grid, gx + STEP_GX[k], up) or cell_blocked(grid, gx, up + STEP_UP[k])) do continue
+			next_cell := next_up * grid.width + next_gx
+			cost := here + STEP_COST[k]
+			known := search.cost[next_cell]
+			if known >= 0 and known <= cost do continue
+			reach(search, next_cell, cost, cell, cost + guess_cost(grid, next_cell, goal))
+		}
+	}
+	if not found do return false
+	// The cells from the goal back to the start, then straightened: from
+	// each point, on to the furthest one the line to which is walkable.
+	cells : [ROUTE_CELLS]i32 = void
+	cells.len = 0
+	cell := goal
+	for cell != start and cells.len < cells.cap {
+		&cells + i32(cell)
+		cell = i64(search.from[cell])
+	}
+	at_x := start_x
+	at_y := start_y
+	k := cells.len - 1
+	for k >= 0 {
+		furthest := k
+		for j in 0..k {
+			x, y := cell_middle(grid, i64(cells[j]) % grid.width, i64(cells[j]) / grid.width)
+			if line_walkable(grid, at_x, at_y, x, y) {
+				furthest = j
+				break
+			}
+		}
+		x, y := cell_middle(grid, i64(cells[furthest]) % grid.width, i64(cells[furthest]) / grid.width)
+		if furthest == 0 and line_walkable(grid, at_x, at_y, to_x, to_y) {
+			x = to_x
+			y = to_y
+		}
+		if route.len < route.cap do route + Route_Point{x = x, y = y}
+		at_x = x
+		at_y = y
+		k = furthest - 1
+	}
+	if route.len == 0 or route[route.len - 1].x != to_x or route[route.len - 1].y != to_y {
+		if route.len < route.cap do route + Route_Point{x = to_x, y = to_y}
+	}
+	return true
+}
+
+// A cell reached at a cost, from another: waiting its turn by its guess.
+reach :: fun(search: ^Route_Search, cell: i64, cost: i32, from: i64, guess: i32) {
+	if search.cost[cell] < 0 do &search.reached + i32(cell)
+	search.cost[cell] = cost
+	search.from[cell] = i32(from)
+	if search.waiting.len == search.waiting.cap do return
+	// (Into the heap: up from the end while dearer above.)
+	at := search.waiting.len
+	&search.waiting + Waiting_Cell{guess = guess, cell = i32(cell)}
+	for at > 0 {
+		above := (at - 1) / 2
+		if search.waiting[above].guess <= guess do break
+		search.waiting[at] = search.waiting[above]
+		at = above
+	}
+	search.waiting[at] = Waiting_Cell{guess = guess, cell = i32(cell)}
+}
+
+// The cheapest cell waiting, taken off.
+take_cheapest :: fun(search: ^Route_Search) -> Waiting_Cell {
+	cheapest := search.waiting[0]
+	last := search.waiting[search.waiting.len - 1]
+	search.waiting.len -= 1
+	count := search.waiting.len
+	if count == 0 do return cheapest
+	at : i64 = 0
+	for true {
+		child := at * 2 + 1
+		if child >= count do break
+		if child + 1 < count and search.waiting[child + 1].guess < search.waiting[child].guess do child += 1
+		if search.waiting[child].guess >= last.guess do break
+		search.waiting[at] = search.waiting[child]
+		at = child
+	}
+	search.waiting[at] = last
+	return cheapest
+}
+
+// What getting from a cell to the goal costs at least: the straight line's
+// length in the level's pixels, ten times.
+guess_cost :: fun(grid: ^Walk_Grid, cell: i64, goal: i64) -> i32 {
+	across := f32((cell % grid.width - goal % grid.width) - (cell / grid.width - goal / grid.width)) * f32(CELL_WIDTH / 2)
+	down := f32((cell % grid.width - goal % grid.width) + (cell / grid.width - goal / grid.width)) * f32(CELL_HEIGHT / 2)
+	return i32(sqrt(across * across + down * down) * 10)
+}
+
+// Whether the straight line between two points of the level is walkable all along.
+line_walkable :: fun(grid: ^Walk_Grid, from_x: f32, from_y: f32, to_x: f32, to_y: f32) -> bool {
+	across := to_x - from_x
+	down := to_y - from_y
+	line_length := sqrt(across * across + down * down)
+	steps := i64(line_length / f32(LINE_STEP)) + 1
+	for k in 0..steps {
+		share := f32(k) / f32(steps)
+		if not walkable(grid, from_x + across * share, from_y + down * share) do return false
+	}
+	return true
+}

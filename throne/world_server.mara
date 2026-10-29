@@ -12,6 +12,7 @@ use mara.time
 use mara.string
 use mara.os
 use world_state
+use walk_grid
 use wire
 use logging
 
@@ -39,9 +40,9 @@ World_Server :: struct {
 // and that level's area (world_start), no clients, not listening. Hosted in
 // a player's game, its joins and leaves are told to the players (their
 // journals); alone, on the console too.
-server_start :: fun(server: ^World_Server, level: []utf8, area: Area, alone: bool = false) {
+server_start :: fun(server: ^World_Server, level: []utf8, area: Area, walk: ^Walk_Grid, alone: bool = false) {
 	server.alone = alone
-	world_start(&server.state, level, area)
+	world_start(&server.state, level, area, walk)
 	for &client in server.clients {
 		client.here = false
 		client.connection = no_connection()
@@ -79,7 +80,7 @@ server_join :: fun(server: ^World_Server, connection: Tcp_Connection) -> i64 {
 		wire_start(&client.from_client)
 		wire_start(&client.to_client)
 		player := &server.state.players[slot]
-		player_clear(player, server.next_id, slot, server.state.area)
+		player_clear(player, server.next_id, slot, &server.state)
 		server.next_id += 1
 		wire_put(&client.to_client, MESSAGE_WELCOME, Welcome_Message{player = player.id, seed = server.state.seed,
 			level = server.state.level, area = server.state.area})
@@ -97,7 +98,7 @@ server_leave :: fun(server: ^World_Server, slot: i64, reason: err) {
 	server_tell_about(server, slot, " left")
 	tcp_close(&client.connection)
 	client.here = false
-	player_clear(&server.state.players[slot], 0, slot, server.state.area)
+	player_clear(&server.state.players[slot], 0, slot, &server.state)
 	server.players_due = true
 }
 
@@ -165,7 +166,10 @@ server_run :: fun(server: ^World_Server) {
 server_take :: fun(server: ^World_Server, slot: i64, message: Wire_Message) {
 	if message.kind == MESSAGE_GO {
 		go, whole := wire_value(message, Go_Message{x = 0, y = 0})
-		if whole do player_go(&server.state.players[slot], go.x, go.y, server.state.area)
+		if whole do player_go(&server.state.players[slot], go.x, go.y, &server.state)
+	elif message.kind == MESSAGE_ATTACK
+		toward, whole := wire_value(message, Go_Message{x = 0, y = 0})
+		if whole do player_strike(&server.state.players[slot], toward.x, toward.y)
 	}
 }
 

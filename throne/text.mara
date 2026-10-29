@@ -1,0 +1,74 @@
+// Text in the game's own fonts (Base.lot's Fonts\ANIM_<name>\000.s8): a
+// sprite of 256 frames, frame k the character k; each frame's box on its
+// canvas (8 x 16 for the chat font) is the letter, its right edge where the
+// next one starts (an empty one, the space: SPACE_ADVANCE).
+module text
+
+use mara.core
+use mara.memory
+use mara.string
+use lot
+use spr8
+use art
+use sprite_layer
+
+FONT_ARCHIVE :: "Base.lot"
+CHAT_FONT :: "fonts/anim_chatfont/000.s8"
+SPACE_ADVANCE :: 4
+LETTER_GAP :: 1
+
+Font :: struct {
+	atlas: Atlas             // the letters in one row, each in a cell
+	advances: [256!]i64      // how far on the next letter starts
+	ready: bool
+}
+
+// A font read from the game's Base.lot and put on the card. (A GL context
+// must be current.)
+load_font :: fun(font: ^Font, path: []utf8) -> err {
+	font.ready = false
+	archive : Lot
+	directory : [1 * MB]byte = void
+	lot_open(&archive, lot_file_path(FONT_ARCHIVE), &directory)?
+	defer lot_close(&archive)
+	file, found := lot_find(&archive, path)
+	if not found do return Art_Error.No_Sprite
+	sprite : [SPRITE_ROOM]byte = void
+	lot_read(&archive, file, &sprite)?
+	spr8_check(sprite)?
+	palette := spr8_palette(sprite)?
+	font.atlas = atlas_shape(sprite, 1)?
+	image : [8 * MB]byte = void
+	atlas_draw(sprite, &palette, &font.atlas, &image)?
+	font.atlas.texture = texture_from_pixels(image, font.atlas.width, font.atlas.height)
+	for k in 0:256 {
+		font.advances[k] = SPACE_ADVANCE
+		if k >= spr8_frame_count(sprite) do continue
+		frame := spr8_frame(sprite, k)?
+		if frame.right > frame.left do font.advances[k] = frame.right + LETTER_GAP
+	}
+	font.ready = true
+}
+
+// How wide text is drawn at scale.
+text_width :: fun(font: ^Font, words: []utf8, scale: f32) -> f32 {
+	width : i64 = 0
+	for c in words do width += font.advances[i64(c) & 255]
+	return f32(width) * scale
+}
+
+// Puts text on the layer, its top left at x, y, scale window pixels to a
+// font's, tinted colour.
+draw_text :: fun(layer: ^Sprite_Layer, font: ^Font, words: []utf8, x: f32, y: f32, scale: f32, colour: [4!]f32) {
+	if not font.ready do return
+	atlas := &font.atlas
+	pen := x
+	for c in words {
+		k := i64(c) & 255
+		u0 := f32(k * atlas.cell_width) / f32(atlas.width)
+		u1 := f32((k + 1) * atlas.cell_width) / f32(atlas.width)
+		layer_image(layer, atlas.texture, pen + f32(atlas.left) * scale, y + f32(atlas.top) * scale, f32(atlas.cell_width) * scale,
+			f32(atlas.cell_height) * scale, u0, 0, u1, 1, colour)
+		pen += f32(font.advances[k]) * scale
+	}
+}

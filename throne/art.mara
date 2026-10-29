@@ -30,7 +30,9 @@ SAMURAI_LOOKS :: 7
 // What a samurai's doing, as its pictures go, and those pictures' folders.
 ACTION_RUN :: 0
 ACTION_STAND :: 1
-ACTION_FOLDERS :: ["anim_run", "anim_neutral"]
+ACTION_ATTACK :: 2
+ACTIONS :: 3
+ACTION_FOLDERS :: ["anim_run", "anim_neutral", "anim_attack"]
 // The directions sprites are drawn in; how fast each action's frames go
 // (frames a second: guesses, to be fitted to the game).
 DIRECTIONS :: 8
@@ -38,7 +40,7 @@ RUN_FRAME_RATE :: 20.0
 STAND_FRAME_RATE :: 10.0
 // Room for reading a sprite and drawing its atlas.
 SPRITE_ROOM :: 2 * MB
-ATLAS_ROOM :: 24 * MB
+ATLAS_ROOM :: 64 * MB
 
 Art_Error :: error {
 	No_Sprite   // no .s8 file in the folder asked for
@@ -64,7 +66,7 @@ Atlas :: struct {
 
 // Every samurai's actions, on the card; ready once all are.
 Samurai_Art :: struct {
-	atlases: [SAMURAI_LOOKS!][2!]Atlas
+	atlases: [SAMURAI_LOOKS!][ACTIONS!]Atlas
 	ready: bool
 }
 
@@ -135,8 +137,11 @@ samurai_folder :: fun(look: i64, action: i64) -> str256 {
 	return folder
 }
 
-// Every samurai's running and standing read from Samurai.lot and put on
-// the card. (A GL context must be current.)
+// Every samurai's running, standing and attacking read from Samurai.lot
+// and put on the card. (A GL context must be current.) Running and
+// standing must be read; an attack that can't be is left out (its samurai
+// stands instead: draw_samurai), and the first reason why is given back
+// with art ready.
 load_samurai_art :: fun(art: ^Samurai_Art) -> err {
 	art.ready = false
 	archive : Lot
@@ -145,26 +150,42 @@ load_samurai_art :: fun(art: ^Samurai_Art) -> err {
 	defer lot_close(&archive)
 	sprite : [SPRITE_ROOM]byte = void
 	image : [ATLAS_ROOM]byte = void
+	left_out : err
 	for look in 0:SAMURAI_LOOKS {
-		for action in 0:2 {
-			atlas := read_atlas(&archive, samurai_folder(look, action), &sprite, &image)?
+		for action in 0:ACTIONS {
+			atlas, atlas_error := read_atlas(&archive, samurai_folder(look, action), &sprite, &image)
+			if atlas_error {
+				if action != ACTION_ATTACK do return atlas_error
+				if not left_out do left_out = atlas_error
+				art.atlases[look][action] = Atlas{0}
+				continue
+			}
 			atlas.texture = texture_from_pixels(image, atlas.width, atlas.height)
 			art.atlases[look][action] = atlas
 		}
 	}
 	art.ready = true
+	if left_out do return left_out
 }
 
 // Puts a samurai on the layer: its look, what it's doing, which way it
 // faces (0 to 7, as DIRECTIONS go), standing at x, y on the window, drawn
 // scale window pixels to a sprite's; seconds is the game's time, for its
-// frames.
+// frames (running and standing loop). An attack plays once: done is how
+// much of it is (0 to 1), its last frame held.
 draw_samurai :: fun(layer: ^Sprite_Layer, art: ^Samurai_Art, look: i64, action: i64, facing: i64, seconds: f64, x: f32, y: f32,
-	scale: f32)
+	scale: f32, done: f32 = 0)
 {
-	atlas := &art.atlases[look % SAMURAI_LOOKS][action]
-	rate := if action == ACTION_RUN do RUN_FRAME_RATE else STAND_FRAME_RATE
+	doing := action
+	atlas := &art.atlases[look % SAMURAI_LOOKS][doing]
+	// (An attack not read: standing instead.)
+	if atlas.texture == 0 {
+		doing = ACTION_STAND
+		atlas = &art.atlases[look % SAMURAI_LOOKS][doing]
+	}
+	rate := if doing == ACTION_RUN do RUN_FRAME_RATE else STAND_FRAME_RATE
 	column := i64(seconds * rate) % atlas.columns
+	if doing == ACTION_ATTACK do column = min(i64(done * f32(atlas.columns)), atlas.columns - 1)
 	row := facing % atlas.rows
 	u0 := f32(column * atlas.cell_width) / f32(atlas.width)
 	v0 := f32(row * atlas.cell_height) / f32(atlas.height)

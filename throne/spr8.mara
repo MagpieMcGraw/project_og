@@ -128,6 +128,9 @@ spr8_draw :: fun(bytes: []byte, k: i64, palette: ^Palette, image: ^[]byte, width
 	frame := spr8_frame(bytes, k)?
 	frame_width := frame.right - frame.left
 	frame_height := frame.bottom - frame.top
+	// (An empty frame — a font's control characters, a palette's one — still
+	// holds a pixel of its own; there's nothing to draw.)
+	if frame_width == 0 or frame_height == 0 do return
 	height := image.len / (width * 4)
 	column : i64 = 0
 	row : i64 = 0

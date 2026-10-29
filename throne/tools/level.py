@@ -116,6 +116,8 @@ if __name__ == '__main__':
     right = max(t[0] + t[2] for t in drawn)
     bottom = max(t[1] + t[3] for t in drawn)
     print('level box', left, top, right, bottom)
+    # (Where the picture starts on the level, for walk.py to lay the grid on it.)
+    open(out + '.box', 'w').write(f'{left} {top}')
     if order == 'y':
         ground = [t for t in drawn if t[6] < things[0][5] + 1] if False else []
         drawn.sort(key=lambda t: t[1] + t[3])

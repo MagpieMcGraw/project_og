@@ -44,6 +44,7 @@ Level_Piece :: struct {
 
 Level_Art :: struct {
 	name: [48]utf8               // the level's (World.ini's name); empty: none
+	music: [64]utf8              // its music, as World.ini names it ("music\castle.mp3")
 	pieces: [LEX_PLACED]Level_Piece
 	textures: [LEVEL_TEXTURES]Level_Texture
 	missing: i64                 // things placed whose pictures weren't found
@@ -55,6 +56,7 @@ Level_Art :: struct {
 load_level_art :: fun(view: ^Level_Art, name: []utf8) -> err {
 	view.ready = false
 	view.name.len = 0
+	view.music.len = 0
 	view.pieces.len = 0
 	view.textures.len = 0
 	view.missing = 0
@@ -65,6 +67,7 @@ load_level_art :: fun(view: ^Level_Art, name: []utf8) -> err {
 	layout : Layout
 	file : [LEVEL_FILE_ROOM]byte = void
 	info := read_level(&world, name, &layout, &file)?
+	view.music = info.music
 	for thing in layout.placed do &view.pieces + Level_Piece{texture = -1, x = f32(thing.x), y = f32(thing.y), speed = thing.speed}
 	bundle_bytes : [BUNDLE_ROOM]byte = void
 	image : [ATLAS_ROOM]byte = void

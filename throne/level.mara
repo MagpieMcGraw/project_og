@@ -135,3 +135,37 @@ read_level :: fun(world: ^Lot, name: []utf8, layout: ^Layout, file: ^[]byte) -> 
 	lex_read(layout, file^)?
 	return info
 }
+
+// A level's shrine, where players start in it: the first of its named
+// spots (<LEX>.stripped.sp: u32 0, u32 count, then each a u8 name length,
+// its name, i32 x, i32 y) whose name ends with SHRINE ("MORISHRINE");
+// false when it has none. file is room to read the spots in.
+level_shrine :: fun(world: ^Lot, info: ^Level_Info, file: ^[]byte) -> f32, f32, bool {
+	path : [256]utf8
+	&path + info.folder
+	&path + info.layout_name
+	&path + ".stripped.sp"
+	spots_file, found := lot_find(world, path)
+	if not found do return 0, 0, false
+	read_error := lot_read(world, spots_file, file)
+	if read_error or file.len < 8 do return 0, 0, false
+	count : u32 = file[4]
+	at : i64 = 8
+	for k in 0:i64(count) {
+		if at >= file.len do break
+		size := i64(file[at])
+		if at + 1 + size + 8 > file.len do break
+		x : i32 = file[at + 1 + size]
+		y : i32 = file[at + 5 + size]
+		ending := "SHRINE"
+		if size >= ending.len {
+			is_shrine := true
+			for c, j in ending {
+				if lower(letter(file^, at + 1 + size - ending.len + j)) != lower(c) do is_shrine = false
+			}
+			if is_shrine do return f32(x), f32(y), true
+		}
+		at += 1 + size + 8
+	}
+	return 0, 0, false
+}

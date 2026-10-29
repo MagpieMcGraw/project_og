@@ -1,0 +1,70 @@
+// The game's music, where og's music (audio's want_music) can play it: in
+// a folder of MP3 files. Throne's tracks are in Stream.lot (stored as they
+// are: MP3, 44.1 kHz stereo); a level names its own in World.ini
+// ("music\castle.mp3"). A track is written once into cache\music\<name>\,
+// the folder its only file: played over and over.
+module music_cache
+
+use mara.core
+use mara.os
+use mara.memory
+use mara.string
+use lot
+use art
+use disk
+
+STREAM_ARCHIVE :: "Stream.lot"
+MUSIC_CACHE :: "cache/music/"
+// The biggest track (KASL2.mp3) is 9.5 MB.
+TRACK_ROOM :: 16 * MB
+
+Music_Cache_Error :: error {
+	No_Track   // Stream.lot has no track of that name
+}
+
+// The folder a track (as World.ini names it: "music\castle.mp3") is
+// played from, written there first if it isn't yet.
+track_folder :: fun(track: []utf8) -> Path, err {
+	// Its name: past the last separator, up to its ".".
+	name_start : i64 = 0
+	name_end := track.len
+	for c, k in track {
+		if c == '\\' or c == '/' do name_start = k + 1
+	}
+	for k in name_start:track.len {
+		if track[k] == '.' do name_end = k
+	}
+	folder : Path
+	&folder + MUSIC_CACHE
+	for k in name_start:name_end do &folder + lower_letter(track[k])
+	&folder + "/"
+	file : Path
+	&file + folder
+	for k in name_start:track.len do &file + lower_letter(track[k])
+	// (Already written: done.)
+	existing, open_error := file_open_read(file)
+	if not open_error {
+		file_close(existing)
+		return folder
+	}
+	make_folder("cache")
+	make_folder("cache/music")
+	make_folder(folder)
+	archive : Lot
+	directory : [64 * KB]byte = void
+	lot_open(&archive, lot_file_path(STREAM_ARCHIVE), &directory)?
+	defer lot_close(&archive)
+	found_at, found := lot_find(&archive, track)
+	if not found do return folder, No_Track
+	bytes : [TRACK_ROOM]byte = void
+	lot_read(&archive, found_at, &bytes)?
+	written := file_open_write(file)?
+	defer file_close(written)
+	rest := bytes[0 : bytes.len]
+	for rest.len > 0 {
+		count := file_write(written, rest)?
+		if count <= 0 do return folder, File_Error.Write_Failed
+		rest = rest[count : rest.len]
+	}
+	return folder
+}

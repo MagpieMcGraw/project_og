@@ -1,0 +1,81 @@
+// LZW unpacking, the variable-width kind: codes 9 bits wide at first and
+// a bit wider each time the table fills its width (up to 12), read lowest
+// bit first; codes under 256 are bytes, the table's new entries number
+// from 256 (no clear or end codes: it ends when the bits do). Each code
+// after the first adds an entry: the last code's bytes and the first of
+// this one's (or of its own, when it's the entry being made). When the
+// table holds 4096 entries it starts over: none past the bytes, 9 bits,
+// the next code a first one. (So Throne of Darkness's walk grids are
+// packed: all 110 unpack to their size exactly.)
+//
+// Every read and write is checked: bad data fails (Bad_Code), it never
+// reads or writes outside.
+module lzw
+
+use mara.core
+use mara.memory
+
+LZW_MOST_WIDTH :: 12
+LZW_ENTRIES :: 1 << LZW_MOST_WIDTH
+
+Lzw_Error :: error {
+	Bad_Code      // a code for an entry not made yet
+	Out_Of_Room   // the unpacked bytes don't fit
+}
+
+// An entry of the table: where its bytes are in the output, how many.
+Lzw_Entry :: struct {
+	at: i64
+	size: i64
+}
+
+// Unpacks the LZW bits of packed from bit start on (lowest bit of a byte
+// first) onto the end of out, up to its cap. Stops when fewer bits are left
+// than a code takes.
+lzw_unpack :: fun(packed: []byte, start: i64, out: ^[]byte) -> err {
+	table : [LZW_ENTRIES]Lzw_Entry = void
+	table.len = 0
+	for k in 0:256 do &table + Lzw_Entry{at = -1, size = 1}
+	width : i64 = 9
+	bit := start
+	total := packed.len * 8
+	previous := Lzw_Entry{at = -1, size = 0}
+	for bit + width <= total {
+		code : i64 = 0
+		for k in 0:width {
+			at := bit + k
+			code |= ((i64(packed[at >> 3]) >> (at & 7)) & 1) << k
+		}
+		bit += width
+		this_at := out.len
+		if code < 256 {
+			if out.len + 1 > out.cap do return Out_Of_Room
+			out + u8(code)
+		elif code < table.len
+			entry := table[code]
+			if out.len + entry.size > out.cap do return Out_Of_Room
+			for k in 0:entry.size do out + out[entry.at + k]
+		elif code == table.len and previous.size > 0
+			// The entry being made: the last code's bytes and their first.
+			if out.len + previous.size + 1 > out.cap do return Out_Of_Room
+			for k in 0:previous.size do out + out[previous.at + k]
+			out + out[previous.at]
+		else
+			return Bad_Code
+		}
+		this_size := out.len - this_at
+		if previous.size > 0 and table.len < table.cap {
+			// The last code's bytes and this one's first: they lie together in out.
+			&table + Lzw_Entry{at = previous.at, size = previous.size + 1}
+		}
+		previous = Lzw_Entry{at = this_at, size = this_size}
+		if table.len >= (1 << width) and width < LZW_MOST_WIDTH {
+			width += 1
+		elif table.len >= LZW_ENTRIES
+			// Full: it starts over.
+			table.len = 256
+			width = 9
+			previous = Lzw_Entry{at = -1, size = 0}
+		}
+	}
+}

@@ -6,13 +6,15 @@
 // server and clients.
 //
 // Places are in the level's pixels (its layout's: level.mara), down the
-// screen positive. For now a player may walk anywhere in the level's area —
-// the box round all it shows — and nothing's in their way.
+// screen positive. Players walk on the level's walk grid (walk_grid.mara):
+// a step onto a blocked cell slides along it, or stops. A level with no
+// grid read is open everywhere in its area (the box round all it shows).
 module world_state
 
 use mara.core
 use mara.math
 use mara.time
+use walk_grid
 
 // Players in one game at most: Throne of Darkness took 8.
 MAX_PLAYERS :: 8
@@ -55,6 +57,7 @@ GAME_PORT :: 27200
 
 // From a client to its server.
 MESSAGE_GO :: 1          // where the player wants to walk to (Go_Message)
+MESSAGE_ATTACK :: 2      // the player strikes toward a spot (Go_Message)
 // From a server to its clients.
 MESSAGE_WELCOME :: 10    // which player the client is, the level (Welcome_Message)
 MESSAGE_PLAYERS :: 11    // every player, where they are (a list of Player_Seens)
@@ -66,6 +69,9 @@ Area :: struct {
 	top: f32
 	right: f32
 	bottom: f32
+	// Where players start: the level's shrine (its named spot), else the middle.
+	start_x: f32
+	start_y: f32
 }
 
 // Where a player wants to walk to, in the level.
@@ -85,13 +91,16 @@ Welcome_Message :: struct {
 }
 
 // A player as every client's told of them: their number, where they are,
-// whether they're walking, which way they face (FACING_*), how they look
+// whether they're walking or striking (and how many strikes they've begun:
+// a new one when it goes up), which way they face (FACING_*), how they look
 // (which samurai).
 Player_Seen :: struct {
 	id: i64
 	x: f32
 	y: f32
 	walking: bool
+	striking: bool
+	strikes: i64
 	facing: i64
 	look: i64
 }
@@ -102,24 +111,37 @@ Note_Message :: struct {
 }
 
 // A player in the world: their number (0: nobody in this slot), where they
-// are, where they're walking to, whether they're walking, which way they
-// face, how they look.
+// are, where they're walking to and their route there (its points; the one
+// they're walking to next: route_at), whether they're walking, how long
+// their strike has still to go (seconds; 0: none) and how many they've
+// begun, which way they face, how they look.
 Player_State :: struct {
 	id: i64
 	x: f32
 	y: f32
 	to_x: f32
 	to_y: f32
+	route: [ROUTE_POINTS]Route_Point
+	route_at: i64
 	walking: bool
+	strike_left: f32
+	strikes: i64
 	facing: i64
 	look: i64
 }
 
-// The world: its level and area, its players in slots (a client's slot is
-// its player's), the steps it's taken, its seed.
+// How long a strike takes (seconds): the player stands in it, and each
+// window plays their attack across it.
+STRIKE_SECONDS :: 0.75
+
+// The world: its level, its area and walk grid (and room to search it for
+// routes), its players in slots (a client's slot is its player's), the
+// steps it's taken, its seed.
 World_State :: struct {
 	level: [48]utf8
 	area: Area
+	walk: Walk_Grid
+	search: Route_Search
 	players: [MAX_PLAYERS!]Player_State
 	ticks: i64
 	seed: u64
@@ -127,33 +149,43 @@ World_State :: struct {
 
 // The area when no level's read: a bare room.
 no_level_area :: fun() -> Area {
-	return Area{left = 0, top = 0, right = f32(NO_LEVEL_WIDTH), bottom = f32(NO_LEVEL_HEIGHT)}
+	return Area{left = 0, top = 0, right = f32(NO_LEVEL_WIDTH), bottom = f32(NO_LEVEL_HEIGHT), start_x = f32(NO_LEVEL_WIDTH) / 2,
+		start_y = f32(NO_LEVEL_HEIGHT) / 2}
 }
 
-// A world starting in a level (empty: none) and its area: nobody in it.
-world_start :: fun(state: ^World_State, level: []utf8, area: Area) {
+// A world starting in a level (empty: none), its area and its walk grid
+// (copied; not ready: walk anywhere): nobody in it.
+world_start :: fun(state: ^World_State, level: []utf8, area: Area, walk: ^Walk_Grid) {
 	state.level.len = 0
 	for c in level {
 		if state.level.len < state.level.cap do &state.level + c
 	}
 	state.area = area
-	for &player, slot in state.players do player_clear(player, 0, slot, area)
+	state.walk = walk^
+	route_search_start(&state.search)
+	for &player, slot in state.players do player_clear(player, 0, slot, state)
 	state.ticks = 0
 	state.seed = time_now()
 }
 
 // A slot's player made afresh: the player numbered id (0: none), standing
-// at their slot's start, round the area's middle, a little apart from the
-// others'.
-player_clear :: fun(player: ^Player_State, id: i64, slot: i64, area: Area) {
+// at their slot's start, round the area's start (its shrine), a little apart
+// from the others' — on the open cell nearest it.
+player_clear :: fun(player: ^Player_State, id: i64, slot: i64, state: ^World_State) {
+	area := state.area
 	player.id = id
-	player.x = (area.left + area.right) / 2 + f32(slot % 4) * f32(START_SPACING) - f32(START_SPACING) * 1.5
-	player.y = (area.top + area.bottom) / 2 + f32(slot / 4) * f32(START_SPACING) - f32(START_SPACING) * 0.5
+	start_x := area.start_x + f32(slot % 4) * f32(START_SPACING) - f32(START_SPACING) * 1.5
+	start_y := area.start_y + f32(slot / 4) * f32(START_SPACING) - f32(START_SPACING) * 0.5
+	player.x, player.y = nearest_open(&state.walk, start_x, start_y)
+	player.route.len = 0
+	player.route_at = 0
 	player.to_x = player.x
 	player.to_y = player.y
 	player.walking = false
 	player.facing = FACING_DOWN
 	player.look = if id > 0 do (id - 1) % LOOKS else 0
+	player.strike_left = 0
+	player.strikes = 0
 }
 
 // Which way someone faces going across and down (screen pixels, down
@@ -165,34 +197,102 @@ facing_toward :: fun(across: f32, down: f32) -> i64 {
 	return if down > 0 do FACING_DOWN_RIGHT else FACING_UP_RIGHT
 }
 
-// A player told to walk to a spot, kept AREA_MARGIN inside the area.
-player_go :: fun(player: ^Player_State, x: f32, y: f32, area: Area) {
+// A player told to strike toward a spot: they stop where they are, turn to
+// it, and stand in the strike STRIKE_SECONDS (a strike begun mid-strike is
+// let go). Nothing is struck yet: there's nothing in the world to strike.
+player_strike :: fun(player: ^Player_State, x: f32, y: f32) {
+	if player.strike_left > 0 do return
+	player.walking = false
+	player.route.len = 0
+	player.route_at = 0
+	player.to_x = player.x
+	player.to_y = player.y
+	across := x - player.x
+	down := y - player.y
+	if abs(across) + abs(down) >= f32(ARRIVED) do player.facing = facing_toward(across, down)
+	player.strike_left = f32(STRIKE_SECONDS)
+	player.strikes += 1
+}
+
+// A player told to walk to a spot, kept AREA_MARGIN inside the area; a
+// blocked spot becomes the open one nearest it. They go by a route round
+// what's in the way (walk_grid's find_route); with none, straight. (Told
+// the same cell again while walking, as a held mouse does, the route's
+// kept.)
+player_go :: fun(player: ^Player_State, x: f32, y: f32, state: ^World_State) {
+	// (Mid-strike, a player finishes it first.)
+	if player.strike_left > 0 do return
+	area := state.area
 	margin := f32(AREA_MARGIN)
-	player.to_x = min(max(x, area.left + margin), area.right - margin)
-	player.to_y = min(max(y, area.top + margin), area.bottom - margin)
+	to_x := min(max(x, area.left + margin), area.right - margin)
+	to_y := min(max(y, area.top + margin), area.bottom - margin)
+	to_x, to_y = nearest_open(&state.walk, to_x, to_y)
+	if player.walking and state.walk.ready {
+		old_gx, old_up := cell_of(&state.walk, player.to_x, player.to_y)
+		new_gx, new_up := cell_of(&state.walk, to_x, to_y)
+		if old_gx == new_gx and old_up == new_up do return
+	}
+	player.to_x = to_x
+	player.to_y = to_y
+	player.route_at = 0
+	if not find_route(&state.walk, &state.search, player.x, player.y, to_x, to_y, &player.route) do player.route.len = 0
 	player.walking = true
 }
 
-// The world one step on: each walking player a step nearer where they're
-// going, stopped once there.
+// The world one step on: each walking player a step nearer the next point
+// of their route (or where they're going, with none), on to the next once
+// there, stopped at the last. A step onto a blocked cell slides along it
+// (across, or down, alone), or the player stops.
 world_step :: fun(state: ^World_State) {
 	step := f32(WALK_SPEED * WORLD_TICK)
 	for &player in state.players {
-		if player.id == 0 or not player.walking do continue
-		across := player.to_x - player.x
-		down := player.to_y - player.y
-		distance := sqrt(across * across + down * down)
-		if distance >= f32(ARRIVED) do player.facing = facing_toward(across, down)
-		if distance <= step or distance < f32(ARRIVED) {
-			player.x = player.to_x
-			player.y = player.to_y
-			player.walking = false
+		if player.id != 0 and player.strike_left > 0 {
+			player.strike_left = max(f32(0), player.strike_left - f32(WORLD_TICK))
 			continue
 		}
-		player.x += across / distance * step
-		player.y += down / distance * step
+		if player.id == 0 or not player.walking do continue
+		aim_x := player.to_x
+		aim_y := player.to_y
+		last := true
+		if player.route_at < player.route.len {
+			aim_x = player.route[player.route_at].x
+			aim_y = player.route[player.route_at].y
+			last = player.route_at == player.route.len - 1
+		}
+		across := aim_x - player.x
+		down := aim_y - player.y
+		distance := sqrt(across * across + down * down)
+		if distance >= f32(ARRIVED) do player.facing = facing_toward(across, down)
+		next_x := aim_x
+		next_y := aim_y
+		arriving := distance <= step or distance < f32(ARRIVED)
+		if not arriving {
+			next_x = player.x + across / distance * step
+			next_y = player.y + down / distance * step
+		}
+		if walkable(&state.walk, next_x, next_y) {
+			player.x = next_x
+			player.y = next_y
+			if arriving {
+				player.route_at += 1
+				if last do player.walking = false
+			}
+		elif walkable(&state.walk, player.x + sign_of(across) * step, player.y)
+			player.x += sign_of(across) * step
+		elif walkable(&state.walk, player.x, player.y + sign_of(down) * step)
+			player.y += sign_of(down) * step
+		else
+			player.walking = false
+		}
 	}
 	state.ticks += 1
+}
+
+// -1, 0 or 1, as a number's sign.
+sign_of :: fun(value: f32) -> f32 {
+	if value > 0 do return 1
+	if value < 0 do return -1
+	return 0
 }
 
 // Every player in the world, as clients are told of them.
@@ -200,7 +300,8 @@ players_seen :: fun(state: ^World_State) -> [MAX_PLAYERS]Player_Seen {
 	seen : [MAX_PLAYERS]Player_Seen
 	for &player in state.players {
 		if player.id == 0 do continue
-		&seen + Player_Seen{id = player.id, x = player.x, y = player.y, walking = player.walking, facing = player.facing, look = player.look}
+		&seen + Player_Seen{id = player.id, x = player.x, y = player.y, walking = player.walking,
+			striking = player.strike_left > 0, strikes = player.strikes, facing = player.facing, look = player.look}
 	}
 	return seen
 }

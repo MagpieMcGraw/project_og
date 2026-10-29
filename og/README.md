@@ -21,6 +21,7 @@ here, and the ways of working the ports share.
 | inflate | deflate (zlib) decoding |
 | png | PNG writing |
 | lzo | LZO1X unpacking, every read and write checked |
+| lzw | LZW unpacking, the variable-width kind (9 to 12 bits, lowest bit first, no clear or end codes, starting over at 4096 entries), every read and write checked |
 | sprite_layer | pictures drawn flat on the window (textured rectangles in pixels, tinted, blended), and textures made from pixels |
 | audio | the sound: a mixer of WAV clips (the game reads their bytes) through SDL3, each voice its pitch, side and kind's volume; MP3 music streamed from a folder, faded between folders |
 | mp3 | MP3 decoding (MPEG-1 Layer III) |
