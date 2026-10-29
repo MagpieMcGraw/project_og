@@ -1,0 +1,14 @@
+*.exe
+*.pdb
+*.ll
+*.o
+*_build/
+profile.txt
+memory.txt
+*.png
+*.log
+compiler/
+cache/
+pictures/
+__pycache__/
+settings.txt

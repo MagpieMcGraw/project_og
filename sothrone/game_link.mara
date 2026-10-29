@@ -1,0 +1,123 @@
+// A player's link to the game's server, the same for the window and the
+// bot. Given an address it connects there. Given none it joins the game
+// hosted on this machine if there is one, else hosts one: the server runs
+// in this program, this player its first client (its queues passed
+// directly), others on this machine let join. So opening the game twice
+// puts two players in one game. (As sooblivion's viewer does: open_link.)
+module game_link
+
+use mara.core
+use mara.os
+use mara.string
+use world_state
+use world_server
+use world_copy
+use wire
+use logging
+
+// A game hosted on this machine is looked for this long (milliseconds)
+// before this one hosts its own; and, another starting to host in the same
+// moment (the port taken), waited for this long to be joined.
+LOCAL_GAME_WAIT :: 300
+LOCAL_GAME_STARTING_WAIT :: 2000
+
+Link :: struct {
+	hosting: bool
+	server: World_Server         // hosting: the game's server
+	connection: Tcp_Connection   // joined: to the server (NO_SOCKET when hosting)
+	to_server: Wire_Queue
+	from_server: Wire_Queue
+	server_lost: bool            // joined, and the server's gone
+	seen: World_Copy             // the world as the server's told it
+}
+
+// Opens the link: to the server at an address (a name or a.b.c.d; :port,
+// else GAME_PORT), or with none, the game on this machine joined or hosted.
+// Fails only when an address is given and can't be reached.
+link_open :: fun(link: ^Link, journal: ^Journal, address: []utf8) -> err {
+	link.connection = no_connection()
+	link.server_lost = false
+	link.hosting = false
+	wire_start(&link.to_server)
+	wire_start(&link.from_server)
+	copy_start(&link.seen)
+	if address.len > 0 {
+		link.connection = wire_connect(address, GAME_PORT)?
+		note(journal, "connected to the game at ")
+		note(journal, address)
+		note_end(journal)
+		return
+	}
+	if join_local(link, journal, LOCAL_GAME_WAIT) do return
+	link.hosting = true
+	server_start(&link.server)
+	_ = server_join(&link.server, no_connection())
+	listen_error := server_listen(&link.server, GAME_PORT, false)
+	if listen_error == Net_Error.Port_Taken {
+		// (Another game began hosting as this one looked: that one's joined.)
+		if join_local(link, journal, LOCAL_GAME_STARTING_WAIT) do return
+	}
+	if listen_error {
+		note(journal, "hosting a game others can't join: ")
+		note_error(journal, listen_error)
+		note_end(journal)
+		return
+	}
+	note(journal, "hosting the game: others on this machine can join, port ")
+	note(journal, i64(GAME_PORT))
+	note_end(journal)
+}
+
+// Joins the game hosted on this machine, if one answers within wait
+// milliseconds: true when it's joined.
+join_local :: fun(link: ^Link, journal: ^Journal, wait: i64) -> bool {
+	local, lookup_error := net_lookup("127.0.0.1", GAME_PORT)
+	if lookup_error do return false
+	connection, connect_error := tcp_connect(local, wait)
+	if connect_error do return false
+	link.connection = connection
+	link.hosting = false
+	note(journal, "joined the game hosted on this machine")
+	note_end(journal)
+	return true
+}
+
+link_close :: fun(link: ^Link) {
+	if link.hosting do server_stop(&link.server)
+	else do tcp_close(&link.connection)
+}
+
+// Where this player's messages to the server go, and where the server's
+// come.
+outgoing :: fun(link: ^Link) -> ^Wire_Queue {
+	if link.hosting do return &link.server.clients[0].from_client
+	return &link.to_server
+}
+incoming :: fun(link: ^Link) -> ^Wire_Queue {
+	if link.hosting do return &link.server.clients[0].to_client
+	return &link.from_server
+}
+
+// Runs the link as far as now: hosting, the server itself; else what's
+// waiting for the server sent and what it's sent taken in. Then what it's
+// told is taken into the copy, its notes written in the journal.
+link_run :: fun(link: ^Link, journal: ^Journal) {
+	if link.hosting {
+		server_run(&link.server)
+	elif not link.server_lost
+		link_error := wire_send(&link.to_server, &link.connection)
+		if not link_error do link_error = wire_receive(&link.from_server, &link.connection)
+		if link_error {
+			note(journal, "lost the server: ")
+			note_error(journal, link_error)
+			note_end(journal)
+			link.server_lost = true
+		}
+	}
+	copy_take(&link.seen, incoming(link))
+	for told in link.seen.notes {
+		note(journal, told.text)
+		note_end(journal)
+	}
+	link.seen.notes.len = 0
+}

@@ -1,0 +1,69 @@
+// A client's copy of the world: what its server's told it (world_server),
+// taken off the wire as it comes (copy_take), and what it tells the server
+// (send_go). It's all a client knows of the world: the window shows it, a
+// bot acts on it.
+module world_copy
+
+use mara.core
+use mara.math
+use mara.string
+use world_state
+use wire
+
+// Notes waiting to be read, at most.
+COPY_NOTES :: 16
+
+World_Copy :: struct {
+	me: i64                                  // our player's number: 0 till the server says
+	seed: u64
+	players: [MAX_PLAYERS]Player_Seen        // every player, as last told
+	players_told: i64                        // how many times they've been told
+	notes: [COPY_NOTES]Note_Message          // the server's notes, not read yet
+}
+
+copy_start :: fun(copy: ^World_Copy) {
+	copy.me = 0
+	copy.seed = 0
+	copy.players.len = 0
+	copy.players_told = 0
+	copy.notes.len = 0
+}
+
+// Takes in what the server's said, all that's whole on the queue.
+copy_take :: fun(copy: ^World_Copy, queue: ^Wire_Queue) {
+	for true {
+		message, has_message := wire_take(queue)
+		if not has_message do break
+		if message.kind == MESSAGE_WELCOME {
+			welcome, whole := wire_value(message, Welcome_Message{player = 0, seed = 0})
+			if not whole do continue
+			copy.me = welcome.player
+			copy.seed = welcome.seed
+		elif message.kind == MESSAGE_PLAYERS
+			count, whole := wire_count(message, size_of(Player_Seen), copy.players.cap)
+			if not whole do continue
+			copy.players.len = 0
+			for k in 0:count {
+				player : Player_Seen = message.body[8 + k * size_of(Player_Seen)]
+				&copy.players + player
+			}
+			copy.players_told += 1
+		elif message.kind == MESSAGE_NOTE
+			told, whole := wire_value(message, Note_Message{text = []})
+			if whole and copy.notes.len < copy.notes.cap do &copy.notes + told
+		}
+	}
+}
+
+// Our own player as last told; false till the server's told of them.
+copy_me :: fun(copy: ^World_Copy) -> Player_Seen, bool {
+	for player in copy.players {
+		if player.id == copy.me and copy.me != 0 do return player, true
+	}
+	return Player_Seen{id = 0, x = 0, y = 0, walking = false, facing = 0, look = 0}, false
+}
+
+// Tells the server where our player wants to walk to.
+send_go :: fun(queue: ^Wire_Queue, x: f32, y: f32) {
+	wire_put(queue, MESSAGE_GO, Go_Message{x = x, y = y})
+}

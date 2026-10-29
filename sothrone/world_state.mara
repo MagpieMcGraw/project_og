@@ -1,0 +1,174 @@
+// The game's world as its server keeps it: the players in it, where each
+// is and where each is walking to, stepped WORLD_TICK at a time. Players
+// say where they want to go (Go_Message); the server walks them there and
+// tells everyone where everyone is (Player_Seen). Its messages are here too:
+// what travels on the wire (wire.mara) between server and clients.
+//
+// For now the world is one room, ROOM_WIDTH by ROOM_HEIGHT pixels (the
+// Mori shrine's size, as its .lex file says, a guess), and the players are
+// all there is in it.
+module world_state
+
+use mara.core
+use mara.math
+use mara.time
+
+// Players in one game at most: Throne of Darkness took 8.
+MAX_PLAYERS :: 8
+// The world steps this often (seconds), its clients told after each step;
+// steps due but not taken by then (a slow frame) are let go past this many.
+WORLD_TICK :: 1.0 / 30.0
+MOST_TICKS_AT_ONCE :: 10
+// How fast a player walks, pixels a second; how close to where they're
+// going counts as there.
+WALK_SPEED :: 180.0
+ARRIVED :: 1.0
+// The room, in pixels.
+ROOM_WIDTH :: 800.0
+ROOM_HEIGHT :: 600.0
+// How players look: one of the seven samurai each (art.mara's SAMURAI),
+// the first player the first.
+LOOKS :: 7
+// The ways a player can face, as the game's sprites are drawn: toward the
+// viewer (down the screen), then turning clockwise as seen on the screen.
+FACING_DOWN :: 0
+FACING_DOWN_LEFT :: 1
+FACING_LEFT :: 2
+FACING_UP_LEFT :: 3
+FACING_UP :: 4
+FACING_UP_RIGHT :: 5
+FACING_RIGHT :: 6
+FACING_DOWN_RIGHT :: 7
+// tan 22.5°: a way across this much steeper or shallower than a diagonal
+// is straight.
+STRAIGHT_SLANT :: 0.41421356
+// The port a game is hosted on, unless told another (not the original
+// game's 63078: both may run on one machine).
+GAME_PORT :: 27200
+
+// From a client to its server.
+MESSAGE_GO :: 1          // where the player wants to walk to (Go_Message)
+// From a server to its clients.
+MESSAGE_WELCOME :: 10    // which player the client is (Welcome_Message)
+MESSAGE_PLAYERS :: 11    // every player, where they are (a list of Player_Seens)
+MESSAGE_NOTE :: 12       // something to tell the player (Note_Message)
+
+// Where a player wants to walk to, in the room.
+Go_Message :: struct {
+	x: f32
+	y: f32
+}
+
+// Which player a client is (their number), and the world's seed (for
+// chance its players roll alike).
+Welcome_Message :: struct {
+	player: i64
+	seed: u64
+}
+
+// A player as every client's told of them: their number, where they are,
+// whether they're walking, which way they face (FACING_*), how they look
+// (which samurai).
+Player_Seen :: struct {
+	id: i64
+	x: f32
+	y: f32
+	walking: bool
+	facing: i64
+	look: i64
+}
+
+// Something the server tells a player: who joined, who left.
+Note_Message :: struct {
+	text: [200]utf8
+}
+
+// A player in the world: their number (0: nobody in this slot), where they
+// are, where they're walking to, whether they're walking, which way they
+// face, how they look.
+Player_State :: struct {
+	id: i64
+	x: f32
+	y: f32
+	to_x: f32
+	to_y: f32
+	walking: bool
+	facing: i64
+	look: i64
+}
+
+// The world: its players in slots (a client's slot is its player's), the
+// steps it's taken, its seed.
+World_State :: struct {
+	players: [MAX_PLAYERS!]Player_State
+	ticks: i64
+	seed: u64
+}
+
+// A world starting: nobody in it.
+world_start :: fun(state: ^World_State) {
+	for &player, slot in state.players do player_clear(player, 0, slot)
+	state.ticks = 0
+	state.seed = time_now()
+}
+
+// A slot's player made afresh: the player numbered id (0: none), standing
+// at their slot's start, a little apart from the others'.
+player_clear :: fun(player: ^Player_State, id: i64, slot: i64) {
+	player.id = id
+	player.x = f32(ROOM_WIDTH / 2) + f32(slot % 4) * 60 - 90
+	player.y = f32(ROOM_HEIGHT / 2) + f32(slot / 4) * 60 - 30
+	player.to_x = player.x
+	player.to_y = player.y
+	player.walking = false
+	player.facing = FACING_DOWN
+	player.look = if id > 0 do (id - 1) % LOOKS else 0
+}
+
+// Which way someone faces going across and down (screen pixels, down
+// positive): the nearest of the eight.
+facing_toward :: fun(across: f32, down: f32) -> i64 {
+	if abs(across) * f32(STRAIGHT_SLANT) >= abs(down) do return if across > 0 do FACING_RIGHT else FACING_LEFT
+	if abs(down) * f32(STRAIGHT_SLANT) >= abs(across) do return if down > 0 do FACING_DOWN else FACING_UP
+	if across < 0 do return if down > 0 do FACING_DOWN_LEFT else FACING_UP_LEFT
+	return if down > 0 do FACING_DOWN_RIGHT else FACING_UP_RIGHT
+}
+
+// A player told to walk to a spot (kept inside the room).
+player_go :: fun(player: ^Player_State, x: f32, y: f32) {
+	player.to_x = min(max(x, 0), f32(ROOM_WIDTH))
+	player.to_y = min(max(y, 0), f32(ROOM_HEIGHT))
+	player.walking = true
+}
+
+// The world one step on: each walking player a step nearer where they're
+// going, stopped once there.
+world_step :: fun(state: ^World_State) {
+	step := f32(WALK_SPEED * WORLD_TICK)
+	for &player in state.players {
+		if player.id == 0 or not player.walking do continue
+		across := player.to_x - player.x
+		down := player.to_y - player.y
+		distance := sqrt(across * across + down * down)
+		if distance >= f32(ARRIVED) do player.facing = facing_toward(across, down)
+		if distance <= step or distance < f32(ARRIVED) {
+			player.x = player.to_x
+			player.y = player.to_y
+			player.walking = false
+			continue
+		}
+		player.x += across / distance * step
+		player.y += down / distance * step
+	}
+	state.ticks += 1
+}
+
+// Every player in the world, as clients are told of them.
+players_seen :: fun(state: ^World_State) -> [MAX_PLAYERS]Player_Seen {
+	seen : [MAX_PLAYERS]Player_Seen
+	for &player in state.players {
+		if player.id == 0 do continue
+		&seen + Player_Seen{id = player.id, x = player.x, y = player.y, walking = player.walking, facing = player.facing, look = player.look}
+	}
+	return seen
+}

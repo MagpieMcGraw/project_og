@@ -1,0 +1,176 @@
+// The game's pictures as the window draws them: for now the seven samurai,
+// each running and standing, read from the game's Samurai.lot.
+//
+// An action's sprite (.s8) holds its frames direction by direction: 8
+// directions — toward the viewer, then turning clockwise as seen on the
+// screen: down, down-left, left, up-left, up, up-right, right, down-right —
+// and the same number of frames in each. Its frames go into one texture, an
+// atlas: a row for each direction, a column for each frame, every cell the
+// box round all the frames. A frame is drawn on a canvas (640 x 480), the
+// samurai standing at its middle (a guess: every samurai's frames are
+// centred across it).
+module art
+
+use mara.core
+use mara.os
+use mara.math
+use mara.memory
+use mara.string
+use lot
+use spr8
+use sprite_layer
+use logging
+
+// Where the game's archives are.
+LOT_FOLDER :: "D:/Games/Disciples 2/Throne of Darkness/LotFiles/"
+// The seven samurai, by their folders in Samurai.lot (a player's look is
+// its number here).
+SAMURAI :: ["Leader", "Swordsman", "Archer", "Berserker", "Ninja", "Wizard", "Brick"]
+SAMURAI_LOOKS :: 7
+// What a samurai's doing, as its pictures go, and those pictures' folders.
+ACTION_RUN :: 0
+ACTION_STAND :: 1
+ACTION_FOLDERS :: ["anim_run", "anim_neutral"]
+// The directions sprites are drawn in; how fast each action's frames go
+// (frames a second: guesses, to be fitted to the game).
+DIRECTIONS :: 8
+RUN_FRAME_RATE :: 20.0
+STAND_FRAME_RATE :: 10.0
+// Room for reading a sprite and drawing its atlas.
+SPRITE_ROOM :: 2 * MB
+ATLAS_ROOM :: 24 * MB
+
+Art_Error :: error {
+	No_Sprite   // no .s8 file in the folder asked for
+	Too_Big     // an atlas bigger than ATLAS_ROOM
+}
+
+// A sprite's frames in one texture: its size, its cells' size, how many
+// across (frames in a direction) and down (directions), where the cells'
+// top left is on the frames' canvas, the canvas's size.
+Atlas :: struct {
+	texture: u32      // on the card (0: not put there)
+	width: i64
+	height: i64
+	cell_width: i64
+	cell_height: i64
+	columns: i64
+	rows: i64
+	left: i64
+	top: i64
+	canvas_width: i64
+	canvas_height: i64
+}
+
+// Every samurai's actions, on the card; ready once all are.
+Samurai_Art :: struct {
+	atlases: [SAMURAI_LOOKS!][2!]Atlas
+	ready: bool
+}
+
+// The path of an archive in the game's folder (a name), or as given (a
+// path with a separator in it).
+lot_file_path :: fun(name: []utf8) -> Path {
+	path : Path
+	has_separator := false
+	for c in name {
+		if c == '/' or c == '\\' do has_separator = true
+	}
+	if not has_separator do &path + LOT_FOLDER
+	&path + name
+	return path
+}
+
+// An atlas's shape for a sprite: its cells the box round all its frames,
+// a row a direction (one row when its frames don't split into DIRECTIONS).
+atlas_shape :: fun(bytes: []byte) -> Atlas, err {
+	bounds := spr8_bounds(bytes)?
+	first := spr8_frame(bytes, 0)?
+	frames := spr8_frame_count(bytes)
+	rows := if frames % DIRECTIONS == 0 do DIRECTIONS else 1
+	atlas := Atlas{texture = 0, width = 0, height = 0, cell_width = bounds[2] - bounds[0], cell_height = bounds[3] - bounds[1],
+		columns = frames / rows, rows = rows, left = bounds[0], top = bounds[1], canvas_width = first.canvas_width,
+		canvas_height = first.canvas_height}
+	atlas.width = atlas.cell_width * atlas.columns
+	atlas.height = atlas.cell_height * atlas.rows
+	return atlas
+}
+
+// Draws a sprite's frames into image (red, green, blue, alpha; what it held
+// replaced) as its atlas lays them out, see-through where nothing's drawn.
+atlas_draw :: fun(bytes: []byte, palette: ^Palette, atlas: ^Atlas, image: ^[]byte) -> err {
+	size := atlas.width * atlas.height * 4
+	if size > image.cap do return Too_Big
+	image.len = size
+	for k in 0:size do image[k] = u8(0)
+	for k in 0:atlas.columns * atlas.rows {
+		frame := spr8_frame(bytes, k)?
+		x := (k % atlas.columns) * atlas.cell_width + frame.left - atlas.left
+		y := (k / atlas.columns) * atlas.cell_height + frame.top - atlas.top
+		spr8_draw(bytes, k, palette, image, atlas.width, x, y)?
+	}
+}
+
+// The first sprite in a folder of an archive, read into sprite and drawn
+// into image as its atlas: the atlas (not on the card yet).
+read_atlas :: fun(archive: ^Lot, folder: []utf8, sprite: ^[]byte, image: ^[]byte) -> Atlas, err {
+	file, found := lot_find_in(archive, folder, ".s8")
+	if not found do return Atlas{0}, No_Sprite
+	lot_read(archive, file, sprite)?
+	spr8_check(sprite^)?
+	palette := spr8_palette(sprite^)?
+	atlas := atlas_shape(sprite^)?
+	atlas_draw(sprite^, &palette, &atlas, image)?
+	return atlas
+}
+
+// A samurai's action's folder in Samurai.lot.
+samurai_folder :: fun(look: i64, action: i64) -> str256 {
+	folder : str256
+	&folder + "characters/"
+	&folder + SAMURAI[look]
+	&folder + "/armor0/weapon0/"
+	&folder + ACTION_FOLDERS[action]
+	return folder
+}
+
+// Every samurai's running and standing read from Samurai.lot and put on
+// the card. (A GL context must be current.)
+load_samurai_art :: fun(art: ^Samurai_Art) -> err {
+	art.ready = false
+	archive : Lot
+	directory : [1 * MB]byte = void
+	lot_open(&archive, lot_file_path("Samurai.lot"), &directory)?
+	defer lot_close(&archive)
+	sprite : [SPRITE_ROOM]byte = void
+	image : [ATLAS_ROOM]byte = void
+	for look in 0:SAMURAI_LOOKS {
+		for action in 0:2 {
+			atlas := read_atlas(&archive, samurai_folder(look, action), &sprite, &image)?
+			atlas.texture = texture_from_pixels(image, atlas.width, atlas.height)
+			art.atlases[look][action] = atlas
+		}
+	}
+	art.ready = true
+}
+
+// Puts a samurai on the layer: its look, what it's doing, which way it
+// faces (0 to 7, as DIRECTIONS go), standing at x, y on the window, drawn
+// scale window pixels to a sprite's; seconds is the game's time, for its
+// frames.
+draw_samurai :: fun(layer: ^Sprite_Layer, art: ^Samurai_Art, look: i64, action: i64, facing: i64, seconds: f64, x: f32, y: f32,
+	scale: f32)
+{
+	atlas := &art.atlases[look % SAMURAI_LOOKS][action]
+	rate := if action == ACTION_RUN do RUN_FRAME_RATE else STAND_FRAME_RATE
+	column := i64(seconds * rate) % atlas.columns
+	row := facing % atlas.rows
+	u0 := f32(column * atlas.cell_width) / f32(atlas.width)
+	v0 := f32(row * atlas.cell_height) / f32(atlas.height)
+	u1 := f32((column + 1) * atlas.cell_width) / f32(atlas.width)
+	v1 := f32((row + 1) * atlas.cell_height) / f32(atlas.height)
+	left := x + f32(atlas.left - atlas.canvas_width / 2) * scale
+	top := y + f32(atlas.top - atlas.canvas_height / 2) * scale
+	layer_image(layer, atlas.texture, left, top, f32(atlas.cell_width) * scale, f32(atlas.cell_height) * scale, u0, v0, u1, v1,
+		[4!]f32{1, 1, 1, 1})
+}

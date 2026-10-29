@@ -1,0 +1,4 @@
+Mara 373ba2b7 (2026-10-29 18:34): A module found in two folders is an error
+commit 373ba2b71e52b707e1ac36333fdf361f5c3fdd3c
+released 2026-10-29 18:37 by release.sh: Mara.exe built -o:speed from a clean tree
+suite with this Mara.exe and stdlib: pass=399  xfail=286  skip=20  mismatches=0
