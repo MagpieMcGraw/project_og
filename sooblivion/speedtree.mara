@@ -1,0 +1,863 @@
+// Trees: the game's trees are SpeedTree 4 files (.spt), which hold how to
+// grow a tree, not its shape: the game grew them with SpeedTree's library
+// as it loaded them. This reads the files and grows trees after them in its
+// own way: like the game's in size, outline and textures, not branch for
+// branch.
+//
+// A .spt is a run of tags, each a number (u32) and a value whose size the
+// tag says (TAG_*: tag_value_size). What's used here:
+//   2000 the bark's texture, 2001 the tree's size, 2005 its seed, 2006 its
+//     scale in percent (the size of everything below is a share of
+//     size x scale / 100);
+//   1016 .. 1017 a branch level (the trunk first, then each level of
+//     branches on the one before; the last level's "branches" are where
+//     the leaves go): 6000 disturbance, 6001 gravity, 6002 flexibility,
+//     6003 flexibility's scale, 6004 length, 6005 radius (a share of the
+//     branch's length), 6006 the radius along the branch, 6007 the angle
+//     from the branch it grows on (curves: Tree_Curve); 6008 and 6009 the
+//     segments around and along it; 6010 and 6011 where along it the next
+//     level's branches start and stop; 6012 how many there are; 6013 and
+//     6014 how often the bark's texture goes round and along;
+//   1007 .. 1008 a leaf picture: 4004 where on it it's held, 4005 its size;
+//     and 10002 each one's rectangle in the tree's leaf texture (its TREE
+//     record's ICON, in textures\trees\leaves\).
+module speedtree
+
+use mara.core
+use mara.math
+use mara.string
+use model
+use logging
+
+MAX_TREE_LEVELS :: 8
+MAX_TREE_LEAVES :: 8
+MAX_CURVE_POINTS :: 8
+
+// How thickly leaves cover a crown: the opaque part of their cards (as
+// much of each as its leaf texture is: Tree_Fit's leaf_fill), this many
+// times the crown's area (seen from the side, an ellipse). The places the
+// branch levels give for leaves are thinned to it; where there are too
+// few, each gets more cards round it, up to LEAF_MOST_PER_PLACE.
+LEAF_COVERAGE :: 1.6
+LEAF_MOST_PER_PLACE :: 4
+
+// Whether a level's curves go along the part of its parent its branches
+// grow from (first_child to last_child), or along the whole parent. (The
+// whole: the white pine's branches are longest where its trunk's first
+// grow, 0.3 along it, where their length's curve is highest.)
+CURVES_ACROSS_SPAN :: false
+
+// A branch's radius, at least and at most, as a share of its length: the
+// files' range from the white pine's hairs (0.05%) to the grey poplar's
+// cones (20%).
+BRANCH_LEAST_RADIUS :: 0.02
+BRANCH_MOST_RADIUS :: 0.05
+
+// How far a grown tree is stretched or squeezed sideways, at most, to be
+// as wide as its billboard (Tree_Fit).
+LEAST_SIDEWAYS :: 0.6
+MOST_SIDEWAYS :: 1.8
+
+// A tree's size in its billboard, in units: its silhouette's (where the
+// picture's alpha is at least a half). A grown tree is fitted to it: as
+// tall, and stretched sideways to be as wide (LEAST_SIDEWAYS to
+// MOST_SIDEWAYS), so it looks like the game's and its billboard takes its
+// place unchanged. Zero: grown as it grows.
+Tree_Fit :: struct {
+	width: f32
+	height: f32
+	leaf_fill: f32   // how much of its leaf texture is opaque (LEAF_ALPHA_TEST); 0: not known
+}
+
+// Leaves are cut out where their texture's alpha is below this. (Their
+// alpha is soft: needles' edges are grey. The mesh program makes up for
+// what the smaller mipmaps lose.)
+LEAF_ALPHA_TEST :: 0.3
+
+// How many vertices a tree's bark or leaves can have (a part's indexes
+// are 16-bit).
+TREE_PART_VERTICES :: 65535
+
+SPEED_TREE_HEADER :: "__IdvSpt_02_"
+
+Speed_Tree_Error :: error {
+	Not_A_Speed_Tree  // it doesn't start with SpeedTree 4's header
+	Unknown_Tag       // a tag whose value's size isn't known
+	Cut_Short         // a value runs past the file's end
+	Bad_Curve         // a curve's text isn't one
+}
+
+// A value along a branch, as SpeedTree keeps one: a curve from x 0 to 1
+// (where along the branch, or along the part of its parent it grows from)
+// whose height 0 to 1 goes from low to high, and up to variance more or
+// less at random.
+Tree_Curve :: struct {
+	low: f32
+	high: f32
+	variance: f32
+	points: [MAX_CURVE_POINTS]Curve_Point
+}
+
+// A point the curve goes through, and its way on from there: a Bezier
+// curve between each two, its control points the points' tangents (a
+// direction and how far along it).
+Curve_Point :: struct {
+	x: f32
+	y: f32
+	tangent: [2!]f32
+	reach: f32
+}
+
+// A level of branches (the first: the trunk).
+Branch_Level :: struct {
+	disturbance: Tree_Curve   // a random wander, its variance in degrees
+	gravity: Tree_Curve       // how much it bends down (the willow's: 2 to 4)
+	flexibility: Tree_Curve
+	flexibility_scale: Tree_Curve
+	length: Tree_Curve        // a share of the tree's size
+	radius: Tree_Curve        // a share of its own length
+	taper: Tree_Curve         // its radius along it, a share of the radius
+	start_angle: Tree_Curve   // degrees from the branch it grows on (the trunk's -90: up)
+	around: i64               // segments round it
+	along: i64                // segments along it
+	first_child: f32          // where along it the next level's branches start, 0 to 1
+	last_child: f32           // and stop
+	frequency: f32            // how many: this, times its length's share of the tree's size
+	repeat_around: f32        // how often the bark's texture goes round it
+	repeat_along: f32         // and along it
+}
+
+// A leaf picture of the tree's leaf texture: its size (a share of the
+// tree's), where on it it's held (0 to 1 across and up), and its corners'
+// places in the texture (right top, left top, left bottom, right bottom;
+// u and v, v up).
+Tree_Leaf :: struct {
+	size: [2!]f32
+	pivot: [2!]f32
+	corners: [8!]f32
+}
+
+// What a SpeedTree file says, as used here (see the top).
+Speed_Tree :: struct {
+	bark: [64]utf8        // its bark texture's name: no folders or extension, lower case
+	size: f32
+	scale: f32            // percent
+	seed: i64
+	levels: [MAX_TREE_LEVELS]Branch_Level
+	leaves: [MAX_TREE_LEAVES]Tree_Leaf
+}
+
+// ---- reading ----------------------------------------------------------------------
+
+// A SpeedTree file's data read.
+read_speed_tree :: fun(data: []byte, tree: ^Speed_Tree) -> err {
+	tree.bark.len = 0
+	tree.size = 0
+	tree.scale = 100
+	tree.seed = 0
+	tree.levels.len = 0
+	tree.leaves.len = 0
+	in_level := false
+	in_leaf := false
+	at : i64 = 0
+	first := true
+	rectangles_seen := false
+	for at < data.len {
+		if at + 4 > data.len do return Cut_Short
+		tag : u32 = data[at]
+		at += 4
+		size := tag_value_size(tag, data, at)?
+		if at + size > data.len do return Cut_Short
+		value := data[at : at + size]
+		at += size
+		if first {
+			if tag != 1000 or text_of(value) != SPEED_TREE_HEADER do return Not_A_Speed_Tree
+			first = false
+			continue
+		}
+		if tag == 2000 {
+			bark_name(text_of(value), &tree.bark)
+		elif tag == 2001
+			tree_size : f32 = value[0]
+			tree.size = tree_size
+		elif tag == 2005
+			seed : i32 = value[0]
+			tree.seed = i64(seed)
+		elif tag == 2006
+			scale : f32 = value[0]
+			tree.scale = scale
+		elif tag == 1016
+			in_level = tree.levels.len < tree.levels.cap
+			if in_level do &tree.levels + Branch_Level{0}
+		elif tag == 1017
+			in_level = false
+		elif tag >= 6000 and tag <= 6017 and in_level
+			read_level_value(&tree.levels[tree.levels.len - 1], tag, value)?
+		elif tag == 1007
+			in_leaf = tree.leaves.len < tree.leaves.cap
+			if in_leaf do &tree.leaves + Tree_Leaf{0}
+		elif tag == 1008
+			in_leaf = false
+		elif tag == 4004 and in_leaf
+			across : f32 = value[0]
+			up : f32 = value[4]
+			tree.leaves[tree.leaves.len - 1].pivot = [across, up]
+		elif tag == 4005 and in_leaf
+			width : f32 = value[0]
+			height : f32 = value[4]
+			tree.leaves[tree.leaves.len - 1].size = [width, height]
+		elif tag == 10002 and not rectangles_seen
+			// A count, then each leaf picture's corners.
+			rectangles_seen = true
+			for k in 0:tree.leaves.len {
+				if 4 + 32 * (k + 1) > value.len do break
+				for c in 0:8 {
+					corner : f32 = value[4 + 32 * k + 4 * c]
+					tree.leaves[k].corners[c] = corner
+				}
+			}
+		}
+	}
+	if first do return Not_A_Speed_Tree
+	// A tree whose leaf texture is one picture (8 of them) gives no
+	// rectangles: each leaf has all of it.
+	for &leaf in tree.leaves {
+		unplaced := true
+		for corner in leaf.corners {
+			if corner != 0 do unplaced = false
+		}
+		if unplaced do leaf.corners = [1, 1, 0, 1, 0, 0, 1, 0]
+	}
+}
+
+// One of a branch level's values.
+read_level_value :: fun(level: ^Branch_Level, tag: u32, value: []byte) -> err {
+	text := text_of(value)
+	if tag == 6000 do read_curve(text, &level.disturbance)?
+	if tag == 6001 do read_curve(text, &level.gravity)?
+	if tag == 6002 do read_curve(text, &level.flexibility)?
+	if tag == 6003 do read_curve(text, &level.flexibility_scale)?
+	if tag == 6004 do read_curve(text, &level.length)?
+	if tag == 6005 do read_curve(text, &level.radius)?
+	if tag == 6006 do read_curve(text, &level.taper)?
+	if tag == 6007 do read_curve(text, &level.start_angle)?
+	if tag < 6008 or tag > 6014 or value.len < 4 do return
+	count : i32 = value[0]
+	number : f32 = value[0]
+	if tag == 6008 do level.around = i64(count)
+	if tag == 6009 do level.along = i64(count)
+	if tag == 6010 do level.first_child = number
+	if tag == 6011 do level.last_child = number
+	if tag == 6012 do level.frequency = number
+	if tag == 6013 do level.repeat_around = number
+	if tag == 6014 do level.repeat_along = number
+}
+
+// How many bytes a tag's value (at `at` in data) takes: by the tag, as the
+// game's 113 trees have them.
+tag_value_size :: fun(tag: u32, data: []byte, at: i64) -> i64, err {
+	// Text: its length (u32), then it.
+	curve := (tag >= 6000 and tag <= 6007) or tag == 6017 or tag == 13005
+	named := tag == 1000 or tag == 2000 or tag == 4003 or tag == 14002 or tag == 20002
+	if curve or named {
+		if at + 4 > data.len do return 0, Cut_Short
+		length_of_text : u32 = data[at]
+		return 4 + i64(length_of_text)
+	}
+	// A count, then that many rectangles of 8 floats.
+	if tag == 10002 or tag == 10003 or tag == 10004 {
+		if at + 4 > data.len do return 0, Cut_Short
+		count : u32 = data[at]
+		return 4 + 32 * i64(count)
+	}
+	// Nothing: a group's start or end.
+	if (tag >= 1001 and tag <= 1005) or (tag >= 1007 and tag <= 1012) or (tag >= 1015 and tag <= 1017) do return 0
+	if tag == 9005 or tag == 9006 do return 0
+	if tag >= 8000 and tag <= 20001 and tag % 1000 <= 1 do return 0
+	// A byte.
+	flag := tag == 2002 or tag == 3003 or tag == 3006 or tag == 3009 or tag == 4000 or tag == 5006 or tag == 6015
+	other_flag := tag == 6016 or tag == 13007 or tag == 15002 or tag == 20003 or tag == 20004 or tag == 22000
+	if flag or other_flag do return 1
+	// Floats: three (a color, a place), or more.
+	if tag == 4001 or (tag >= 4004 and tag <= 4006) or (tag >= 5000 and tag <= 5004) or (tag >= 18002 and tag <= 18004) do return 12
+	if tag == 12002 do return 16
+	if tag == 12003 do return 20
+	if tag == 20005 do return 32
+	if tag == 8003 or tag == 8005 or tag == 8009 do return 52   // a material: four colors and a shine
+	// Four bytes: a number.
+	if tag >= 1006 and tag <= 22000 do return 4
+	return 0, Unknown_Tag
+}
+
+// A value's bytes as text.
+text_of :: fun(value: []byte) -> []utf8 {
+	if value.len < 4 do return value[0:0]
+	return value[4 : value.len]
+}
+
+// The bark texture's name from the path the tree was made with
+// (C:\...\TreeEnglishOakBark.tga): its file name without its extension,
+// lower case.
+bark_name :: fun(path: []utf8, name: ^[64]utf8) {
+	name.len = 0
+	start : i64 = 0
+	end := path.len
+	for c, k in path {
+		if c == '\\' or c == '/' do start = k + 1
+	}
+	for k in start:path.len {
+		if path[k] == '.' do end = k
+	}
+	for k in start:end {
+		if fits(name.len + 1, name.cap) do name + lower(path[k])
+	}
+}
+
+// A curve from its text: "BezierSpline low high variance { count, then
+// each point's x, y, tangent x and y, and reach }".
+read_curve :: fun(text: []utf8, curve: ^Tree_Curve) -> err {
+	at : i64 = 0
+	if next_word(text, &at) != "BezierSpline" do return Bad_Curve
+	curve.low = next_number(text, &at)?
+	curve.high = next_number(text, &at)?
+	curve.variance = next_number(text, &at)?
+	if next_word(text, &at) != "{" do return Bad_Curve
+	count := i64(next_number(text, &at)?)
+	curve.points.len = 0
+	for k in 0:count {
+		x := next_number(text, &at)?
+		y := next_number(text, &at)?
+		tangent_x := next_number(text, &at)?
+		tangent_y := next_number(text, &at)?
+		reach := next_number(text, &at)?
+		if fits(curve.points.len + 1, curve.points.cap) do &curve.points + Curve_Point{x = x, y = y, tangent = [tangent_x, tangent_y], reach = reach}
+	}
+	if curve.points.len == 0 do return Bad_Curve
+}
+
+// The next word of text from at (past spaces, tabs and line ends), at
+// moved past it.
+next_word :: fun(text: []utf8, at: ^i64) -> []utf8 {
+	for at^ < text.len and (text[at^] == ' ' or text[at^] == '\t' or text[at^] == '\n' or text[at^] == '\r') do at^ += 1
+	start := at^
+	for at^ < text.len and not (text[at^] == ' ' or text[at^] == '\t' or text[at^] == '\n' or text[at^] == '\r') do at^ += 1
+	return text[start : at^]
+}
+
+// The next word of text as a number (1.5, -6.24607e-008).
+next_number :: fun(text: []utf8, at: ^i64) -> f32, err {
+	number, is_number := parse_number(next_word(text, at))
+	if not is_number do return 0, Bad_Curve
+	return f32(number)
+}
+
+// ---- curves -------------------------------------------------------------------------
+
+// The curve's height (0 to 1) at x (0 to 1).
+curve_height :: fun(curve: ^Tree_Curve, x: f32) -> f32 {
+	points : []Curve_Point = curve.points
+	if x <= points[0].x do return points[0].y
+	last := points[points.len - 1]
+	if x >= last.x do return last.y
+	for k in 1:points.len {
+		a := points[k - 1]
+		b := points[k]
+		if x > b.x do continue
+		// The Bezier curve from a to b: its x goes up with t, so t is found
+		// by halving, then its height there.
+		x0 := a.x
+		x1 := a.x + a.tangent[0] * a.reach
+		x2 := b.x - b.tangent[0] * b.reach
+		x3 := b.x
+		y0 := a.y
+		y1 := a.y + a.tangent[1] * a.reach
+		y2 := b.y - b.tangent[1] * b.reach
+		y3 := b.y
+		low : f32 = 0
+		high : f32 = 1
+		for halving in 0:24 {
+			t := (low + high) / 2
+			if bezier(x0, x1, x2, x3, t) < x do low = t
+			else do high = t
+		}
+		return bezier(y0, y1, y2, y3, (low + high) / 2)
+	}
+	return last.y
+}
+
+// A cubic Bezier curve's value at t (0 to 1), from its four values.
+bezier :: fun(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
+	u := 1 - t
+	return u * u * u * p0 + 3 * u * u * t * p1 + 3 * u * t * t * p2 + t * t * t * p3
+}
+
+// The curve's value at x: between low and high by its height, with its
+// variance at random.
+curve_value :: fun(curve: ^Tree_Curve, x: f32, dice: ^u64) -> f32 {
+	value := curve.low + (curve.high - curve.low) * curve_height(curve, x)
+	if curve.variance != 0 do value += curve.variance * (2 * roll(dice) - 1)
+	return value
+}
+
+// A number from 0 up to 1, the dice moved on (splitmix64).
+roll :: fun(dice: ^u64) -> f32 {
+	dice^ = dice^ +% 0x9E3779B97F4A7C15
+	mixed := dice^
+	mixed = (mixed ~ (mixed >> 30)) *% 0xBF58476D1CE4E5B9
+	mixed = (mixed ~ (mixed >> 27)) *% 0x94D049BB133111EB
+	mixed = mixed ~ (mixed >> 31)
+	return f32(mixed >> 40) / 16777216
+}
+
+// ---- growing ----------------------------------------------------------------------
+
+// A tree being grown: what it's grown after, the dice, how big a share of
+// its size is, and its bark's and leaves' vertices and indexes so far.
+Growth :: struct {
+	tree: ^Speed_Tree
+	dice: u64
+	leaf_dice: u64            // the leaves' own: they're thinned without the branches changing
+	units: f32                // the tree's size, scaled: what lengths are shares of
+	trunk_way: Vec3           // which way its trunk grows from its foot
+	counting: bool            // the first time: leaves counted (leaf_area, crown_low and high), not made
+	leaf_area: f32
+	leaf_places: i64
+	crown_low: Vec3
+	crown_high: Vec3
+	leaf_share: f32           // the share of leaf places given a card
+	leaf_cards: i64           // how many cards each leaf place given one gets
+	bark_vertices: []Vertex
+	bark_indices: []u16
+	leaf_vertices: []Vertex
+	leaf_indices: []u16
+	branches: i64
+	leaves: i64
+	left_out: i64             // branches or leaves with no room left
+}
+
+// The model of a tree grown from its SpeedTree parameters with a seed (the
+// tree's own, or one of its TREE record's: each grows a different one):
+// its bark, round its trunk and branches (textures\trees\branches\), and
+// its leaves, cards that face the camera (leaf_texture), made in storage.
+// Fitted to its billboard's size (Tree_Fit), where that's given.
+grow_tree :: fun(tree: ^Speed_Tree, seed: i64, leaf_texture: []utf8, fit: Tree_Fit, storage: ^[]byte) -> Model, Growth_Report, err {
+	report := Growth_Report{branches = 0, leaves = 0, left_out = 0, trunk_radius = 0}
+	if tree.levels.len == 0 do return Model{0}, report, Not_A_Speed_Tree
+	growth := Growth{
+		tree = tree,
+		dice = 0, leaf_dice = 0,
+		units = tree.size * tree.scale / 100,
+		trunk_way = Vec3{0, 0, 1},
+		counting = true, leaf_area = 0, leaf_places = 0,
+		crown_low = Vec3{1000000, 1000000, 1000000}, crown_high = Vec3{-1000000, -1000000, -1000000},
+		leaf_share = 1, leaf_cards = 1,
+		bark_vertices = slice([:TREE_PART_VERTICES]Vertex, storage),
+		bark_indices = slice([:TREE_PART_VERTICES * 6]u16, storage),
+		leaf_vertices = slice([:TREE_PART_VERTICES]Vertex, storage),
+		leaf_indices = slice([:TREE_PART_VERTICES * 3 / 2]u16, storage),
+		branches = 0, leaves = 0, left_out = 0}
+
+	// Grown twice: first to count the places for leaves and see the crown,
+	// then again (the same, the dice started again) with as many leaves as
+	// cover it (LEAF_COVERAGE).
+	grow_from_seed(&growth, seed)
+	// Its size as grown: the crown its leaves' places make (as far round
+	// as the average leaf reaches), the top of that or of its trunk.
+	upward : f32 = 1
+	sideways : f32 = 1
+	if growth.leaf_places > 0 {
+		leaf_side := sqrt_f32(growth.leaf_area / f32(growth.leaf_places))
+		crown := growth.crown_high - growth.crown_low
+		crown_width := max(crown.x, crown.y) + leaf_side
+		top := growth.crown_high.z + leaf_side / 2
+		for &vertex in growth.bark_vertices do top = max(top, vertex.position.z)
+		if fit.height > 0 and top > 0 do upward = fit.height / top
+		if fit.width > 0 do sideways = min(max(fit.width / upward / crown_width, LEAST_SIDEWAYS), MOST_SIDEWAYS)
+		fill := if fit.leaf_fill > 0 do fit.leaf_fill else 0.5
+		wanted := LEAF_COVERAGE * PI / 4 * crown_width * sideways * (crown.z + leaf_side) / max(fill, 0.1)
+		growth.leaf_share = min(wanted / growth.leaf_area, 1)
+		if wanted > growth.leaf_area do growth.leaf_cards = min(i64(ceil_f32(wanted / growth.leaf_area)), LEAF_MOST_PER_PLACE)
+	}
+	growth.counting = false
+	growth.bark_vertices.len = 0
+	growth.bark_indices.len = 0
+	growth.branches = 0
+	growth.left_out = 0
+	grow_from_seed(&growth, seed)
+	shade_leaves(&growth)
+	fit_growth(&growth, upward, sideways)
+
+	parts := slice([:2]Model_Part, storage)
+	low := Vec3{1000000, 1000000, 1000000}
+	high := Vec3{-1000000, -1000000, -1000000}
+	for &vertex in growth.bark_vertices do widen(&low, &high, vertex.position, 0)
+	for &vertex in growth.leaf_vertices do widen(&low, &high, vertex.position, max(abs_f32(vertex.tangent[0]), abs_f32(vertex.tangent[1])))
+	bark_texture : [160]utf8
+	&bark_texture + "textures\\trees\\branches\\"
+	&bark_texture + tree.bark
+	&bark_texture + ".dds"
+	if growth.bark_indices.len > 0 do &parts + tree_part(&growth, false, bark_texture)
+	if growth.leaf_indices.len > 0 do &parts + tree_part(&growth, true, leaf_texture)
+	report = Growth_Report{branches = growth.branches, leaves = growth.leaves, left_out = growth.left_out,
+		trunk_radius = trunk_foot_radius(&growth)}
+	return Model{parts = parts, flips = [], particles = [], motions = [], bounds_min = low, bounds_max = high, palette = []}, report
+}
+
+// Grows the tree from its trunk, the dice started from the seed.
+grow_from_seed :: fun(growth: ^Growth, seed: i64) {
+	tree := growth.tree
+	growth.dice = u64(seed) *% 0x2545F4914F6CDD1D +% 1
+	growth.leaf_dice = growth.dice ~ 0x5DEECE66D
+	// The trunk: up, leaning a little (its start angle's variance) to a
+	// side at random.
+	trunk := &tree.levels[0]
+	lean := (curve_value(&trunk.start_angle, 0, &growth.dice) + 90) * PI / 180
+	side := roll(&growth.dice) * 2 * PI
+	lean_axis := Vec3{cos_f32(side), sin_f32(side), 0}
+	trunk_way := turned_about(Vec3{0, 0, 1}, lean_axis, lean)
+	growth.trunk_way = trunk_way
+	trunk_length := curve_value(&trunk.length, 0, &growth.dice) * growth.units
+	trunk_radius := curve_value(&trunk.radius, 0, &growth.dice) * trunk_length
+	grow_branch(growth, 0, Vec3{0, 0, 0}, trunk_way, trunk_length, trunk_radius, 0)
+}
+
+// What growing a tree made: how many branches (the trunk one) and leaves,
+// and how many were left out for want of room; how thick its trunk is at
+// its foot (its radius, from the tree's middle).
+Growth_Report :: struct {
+	branches: i64
+	leaves: i64
+	left_out: i64
+	trunk_radius: f32
+}
+
+// The trunk's radius at its foot, as grown and fitted: its first ring's
+// or its second's, the thinner (a flared foot is let in), each across (x
+// and y) from its middle on average. (The trunk is the first tube grown,
+// its rings the first of its vertices: around + 1 to a ring.)
+trunk_foot_radius :: fun(growth: ^Growth) -> f32 {
+	around := max(growth.tree.levels[0].around, 3)
+	if growth.bark_vertices.len < (around + 1) * 2 do return 0
+	thinnest : f32 = 1000000
+	for ring in 0:2 {
+		first := ring * (around + 1)
+		middle := Vec3{0, 0, 0}
+		for k in first:first + around do middle = middle + growth.bark_vertices[k].position
+		middle = middle * (1 / f32(around))
+		total : f32 = 0
+		for k in first:first + around {
+			at := growth.bark_vertices[k].position - middle
+			total += sqrt_f32(at.x * at.x + at.y * at.y)
+		}
+		thinnest = min(thinnest, total / f32(around))
+	}
+	return thinnest
+}
+
+// Grows a branch of a level from start, its way, length and radius, bent
+// down by gravity as it goes; then the next level's branches on it, or
+// where it's the level before the last, its leaves.
+grow_branch :: fun(growth: ^Growth, level_index: i64, start: Vec3, way: Vec3, branch_length: f32, radius: f32, gravity: f32) {
+	tree := growth.tree
+	level := &tree.levels[level_index]
+	along := max(level.along, 1)
+	around := max(level.around, 3)
+	ring_count := along + 1
+	if growth.bark_vertices.len + ring_count * (around + 1) > growth.bark_vertices.cap {
+		growth.left_out += 1
+		return
+	}
+	growth.branches += 1
+
+	// Its spine: a point at each ring, wandering (its disturbance) and bent
+	// down (its gravity, as far as it reaches out sideways) a little at each.
+	spine : [65]Vec3
+	&spine + start
+	heading := way
+	wander := level.disturbance.variance * PI / 180
+	step := branch_length / f32(along)
+	steps := along
+	if not fits(spine.len + steps, spine.cap) do steps = spine.cap - spine.len
+	for k in 0:steps {
+		if wander != 0 {
+			turning := turned_about(square_to(heading), heading, roll(&growth.dice) * 2 * PI)
+			heading = vec3_normalize(turned_about(heading, turning, (2 * roll(&growth.dice) - 1) * wander / f32(along)))
+		}
+		if gravity != 0 and level_index > 0 {
+			sideways := sqrt_f32(heading.x * heading.x + heading.y * heading.y)
+			bent := Vec3{heading.x, heading.y, heading.z - gravity * sideways / f32(along)}
+			if vec3_length(bent) > 0.001 do heading = vec3_normalize(bent)
+		}
+		&spine + (spine[spine.len - 1] + heading * step)
+	}
+	add_tube(growth, level, spine, radius)
+
+	// The next level's branches, or the leaves.
+	if level_index + 1 >= tree.levels.len do return
+	child_level := &tree.levels[level_index + 1]
+	leaves_next := level_index + 2 == tree.levels.len
+	first := level.first_child
+	last := level.last_child
+	count_share := level.frequency * (branch_length / growth.units) * (last - first)
+	count := i64(count_share + roll(&growth.dice))
+	turn_round := roll(&growth.dice) * 2 * PI
+	for c in 0:count {
+		t := first + (last - first) * (f32(c) + roll(&growth.dice)) / f32(count)
+		// The child level's curves go across the part this one's children
+		// grow from: 0 where they start, 1 where they stop.
+		span : f32 = t
+		if CURVES_ACROSS_SPAN do span = if last > first do (t - first) / (last - first) else 0
+		at, parent_way := spine_at(spine, t)
+		turn_round += 137.5 * PI / 180 + (2 * roll(&growth.dice) - 1) * 0.3
+		out := turned_about(square_to(parent_way), parent_way, turn_round)
+		angle := curve_value(&child_level.start_angle, span, &growth.dice) * PI / 180
+		child_way := vec3_normalize(turned_about(parent_way, vec3_normalize(cross(parent_way, out)), angle))
+		if leaves_next {
+			// A leaf where the leaf level's stem would end.
+			stem := curve_value(&child_level.length, span, &growth.leaf_dice) * growth.units
+			place := at + child_way * stem
+			if growth.counting {
+				count_leaf(growth, place)
+			elif roll(&growth.leaf_dice) <= growth.leaf_share
+				add_leaf(growth, place)
+				// More round it, where the places are too few: up to half a
+				// leaf away.
+				for extra in 1:growth.leaf_cards {
+					reach := sqrt_f32(growth.leaf_area / f32(growth.leaf_places)) * 0.5
+					away := Vec3{2 * roll(&growth.leaf_dice) - 1, 2 * roll(&growth.leaf_dice) - 1, 2 * roll(&growth.leaf_dice) - 1}
+					add_leaf(growth, place + away * reach)
+				}
+			}
+			continue
+		}
+		child_length := curve_value(&child_level.length, span, &growth.dice) * growth.units
+		if child_length <= 0 do continue
+		child_radius := curve_value(&child_level.radius, span, &growth.dice) * child_length
+		// Kept branch-shaped (BRANCH_LEAST_RADIUS to BRANCH_MOST_RADIUS),
+		// and thinner than where it grows from.
+		child_radius = min(max(child_radius, BRANCH_LEAST_RADIUS * child_length), BRANCH_MOST_RADIUS * child_length)
+		child_radius = min(child_radius, 0.85 * radius * curve_height(&level.taper, t))
+		bend := curve_value(&child_level.gravity, span, &growth.dice)
+		grow_branch(growth, level_index + 1, at, child_way, child_length, child_radius, bend)
+	}
+}
+
+// The point and way of a spine at t (0 to 1) along it.
+spine_at :: fun(spine: []Vec3, t: f32) -> Vec3, Vec3 {
+	segments := spine.len - 1
+	place := t * f32(segments)
+	k := min(max(i64(place), 0), segments - 1)
+	share := place - f32(k)
+	a := spine[k]
+	b := spine[k + 1]
+	return a + (b - a) * share, vec3_normalize(b - a)
+}
+
+// The bark round a spine: a ring of vertices at each of its points (its
+// radius there by the level's taper), the rings joined; the texture going
+// round and along it as often as the level says.
+add_tube :: fun(growth: ^Growth, level: ^Branch_Level, spine: []Vec3, radius: f32) {
+	around := max(level.around, 3)
+	along := spine.len - 1
+	first_vertex := growth.bark_vertices.len
+	// A frame carried along the spine (each ring's right is the last one's,
+	// turned no more than the spine does), so the bark doesn't twist.
+	right := square_to(vec3_normalize(spine[1] - spine[0]))
+	for k in 0..along {
+		way := if k < along do vec3_normalize(spine[k + 1] - spine[k]) else vec3_normalize(spine[k] - spine[k - 1])
+		right = right - way * dot(right, way)
+		if vec3_length(right) < 0.0001 do right = square_to(way)
+		right = vec3_normalize(right)
+		up := cross(way, right)
+		ring_radius := radius * curve_height(&level.taper, f32(k) / f32(along))
+		for a in 0..around {
+			angle := f32(a) / f32(around) * 2 * PI
+			outward := right * cos_f32(angle) + up * sin_f32(angle)
+			round_way := up * cos_f32(angle) - right * sin_f32(angle)
+			&growth.bark_vertices + Vertex{
+				position = spine[k] + outward * ring_radius,
+				normal = outward,
+				uv = [f32(a) / f32(around) * level.repeat_around, f32(k) / f32(along) * level.repeat_along],
+				color = [1, 1, 1, 1],
+				tangent = [round_way.x, round_way.y, round_way.z, 1]}
+		}
+	}
+	for k in 0:along {
+		for a in 0:around {
+			here := first_vertex + k * (around + 1) + a
+			above := here + around + 1
+			&growth.bark_indices + u16(here)
+			&growth.bark_indices + u16(here + 1)
+			&growth.bark_indices + u16(above + 1)
+			&growth.bark_indices + u16(here)
+			&growth.bark_indices + u16(above + 1)
+			&growth.bark_indices + u16(above)
+		}
+	}
+}
+
+// A place for a leaf counted: the crown widened to take it in, and the
+// average leaf picture's area added.
+count_leaf :: fun(growth: ^Growth, place: Vec3) {
+	tree := growth.tree
+	if tree.leaves.len == 0 do return
+	area : f32 = 0
+	for &picture in tree.leaves do area += picture.size[0] * picture.size[1]
+	growth.leaf_area += area / f32(tree.leaves.len) * growth.units * growth.units
+	growth.leaf_places += 1
+	widen(&growth.crown_low, &growth.crown_high, place, 0)
+}
+
+// A leaf card at a place: one of the tree's leaf pictures at random, its
+// size and its corners. A card's corners all sit at its place; each keeps
+// how far it's set off across and up from there (its tangent's first two),
+// which the renderer turns to face the camera.
+add_leaf :: fun(growth: ^Growth, place: Vec3) {
+	tree := growth.tree
+	if tree.leaves.len == 0 do return
+	if growth.leaf_vertices.len + 4 > growth.leaf_vertices.cap {
+		growth.left_out += 1
+		return
+	}
+	growth.leaves += 1
+	picture := &tree.leaves[min(i64(roll(&growth.leaf_dice) * f32(tree.leaves.len)), tree.leaves.len - 1)]
+	width := picture.size[0] * growth.units
+	height := picture.size[1] * growth.units
+	// A little darker or lighter, the same all over.
+	shade := 0.8 + 0.2 * roll(&growth.leaf_dice)
+	first_vertex := growth.leaf_vertices.len
+	// The corners as the leaf's rectangle has them: right top, left top,
+	// left bottom, right bottom.
+	across := [4!]f32{1, 0, 0, 1}
+	up := [4!]f32{1, 1, 0, 0}
+	for c in 0:4 {
+		&growth.leaf_vertices + Vertex{
+			position = place,
+			normal = Vec3{0, 0, 1},
+			// (v down in the texture as loaded: the file's is up.)
+			uv = [picture.corners[2 * c], 1 - picture.corners[2 * c + 1]],
+			color = [shade, shade, shade, 1],
+			tangent = [(across[c] - picture.pivot[0]) * width, (up[c] - picture.pivot[1]) * height, 0, 1]}
+	}
+	for k in [0, 1, 2, 0, 2, 3] do &growth.leaf_indices + u16(first_vertex + k)
+}
+
+// Scales a grown tree (Tree_Fit): all of it upward times, and its places
+// across (not its leaf cards) sideways times more, out from its trunk's
+// line (so the trunk leans no more than it grew).
+fit_growth :: fun(growth: ^Growth, upward: f32, sideways: f32) {
+	for &vertex in growth.bark_vertices do vertex.position = fitted(growth.trunk_way, vertex.position, upward, sideways)
+	for &vertex in growth.leaf_vertices {
+		vertex.position = fitted(growth.trunk_way, vertex.position, upward, sideways)
+		vertex.tangent[0] *= upward
+		vertex.tangent[1] *= upward
+	}
+}
+
+// A place of a tree fitted (fit_growth): its way across from the trunk's
+// line at its height stretched sideways times, then all of it upward times.
+fitted :: fun(trunk_way: Vec3, place: Vec3, upward: f32, sideways: f32) -> Vec3 {
+	along := trunk_way * (place.z / max(trunk_way.z, 0.1))
+	across := place - along
+	return (along + Vec3{across.x * sideways, across.y * sideways, across.z}) * upward
+}
+
+// A tree's size in its billboard (Tree_Fit), from the picture's pixels
+// (red, green, blue, alpha; columns by rows, from the top), the picture
+// being width by height units: the columns its silhouette spans, and how
+// far down from the top it starts (its foot is at the bottom).
+billboard_fit :: fun(pixels: []byte, columns: i64, rows: i64, width: f32, height: f32) -> Tree_Fit {
+	none := Tree_Fit{width = 0, height = 0, leaf_fill = 0}
+	left := columns
+	right : i64 = -1
+	top := rows
+	for y in 0:rows {
+		for x in 0:columns {
+			alpha := u8(pixels[4 * (y * columns + x) + 3])
+			if alpha < 128 do continue
+			left = min(left, x)
+			right = max(right, x)
+			top = min(top, y)
+		}
+	}
+	if right < left do return none
+	return Tree_Fit{width = f32(right - left + 1) / f32(columns) * width, height = f32(rows - top) / f32(rows) * height, leaf_fill = 0}
+}
+
+// How much of a leaf texture (its pixels, as billboard_fit's) is opaque
+// enough to be drawn (LEAF_ALPHA_TEST).
+leaf_fill :: fun(pixels: []byte) -> f32 {
+	opaque : i64 = 0
+	count := pixels.len / 4
+	for k in 0:count {
+		alpha := u8(pixels[4 * k + 3])
+		if f32(alpha) / 255 >= LEAF_ALPHA_TEST do opaque += 1
+	}
+	return if count > 0 do f32(opaque) / f32(count) else 0
+}
+
+// The leaves' normals: out from the middle of the crown (and a little up),
+// so its far side is in shade and its top in the sun.
+shade_leaves :: fun(growth: ^Growth) {
+	if growth.leaf_vertices.len == 0 do return
+	middle := Vec3{0, 0, 0}
+	for &vertex in growth.leaf_vertices do middle = middle + vertex.position
+	middle = middle * (1 / f32(growth.leaf_vertices.len))
+	for &vertex in growth.leaf_vertices {
+		out := vertex.position - middle
+		if vec3_length(out) < 0.001 do out = Vec3{0, 0, 1}
+		vertex.normal = vec3_normalize(vec3_normalize(out) + Vec3{0, 0, 0.5})
+	}
+}
+
+// A part of a growing tree's model: its bark (opaque) or its leaves (cut
+// out by their texture's alpha, both sides, cards facing the camera).
+tree_part :: fun(growth: ^Growth, leaves: bool, texture: []utf8) -> Model_Part {
+	part := Model_Part{
+		vertices = if leaves do growth.leaf_vertices else growth.bark_vertices,
+		indices = if leaves do growth.leaf_indices else growth.bark_indices,
+		texture = [],
+		glow_texture = [],
+		clamp_mode = 3,
+		flip = -1,
+		additive = false,
+		billboard_mode = -1,
+		billboard_node = mat4_identity(),
+		alpha_blend = false,
+		depth_write = true,
+		alpha_test = leaves,
+		alpha_threshold = if leaves do LEAF_ALPHA_TEST else 0,
+		two_sided = leaves,
+		diffuse = Vec3{1, 1, 1},
+		emissive = Vec3{0, 0, 0},
+		specular = Vec3{0, 0, 0},
+		glossiness = 10,
+		alpha = 1,
+		vertex_mode = 2,
+		lighting_mode = 1,
+		leaf_cards = leaves,
+		influences = []}
+	add_what_fits(&part.texture, texture)
+	return part
+}
+
+// Widens a box (low to high) to take in a point, and as far round it.
+widen :: fun(low: ^Vec3, high: ^Vec3, point: Vec3, reach: f32) {
+	for axis in 0:3 {
+		low[axis] = min(low[axis], point[axis] - reach)
+		high[axis] = max(high[axis], point[axis] + reach)
+	}
+}
+
+// A way turned about an axis (of length 1) by an angle (radians).
+turned_about :: fun(way: Vec3, axis: Vec3, angle: f32) -> Vec3 {
+	c := cos_f32(angle)
+	s := sin_f32(angle)
+	return way * c + cross(axis, way) * s + axis * (dot(axis, way) * (1 - c))
+}
+
+// Some way square to another (of length 1).
+square_to :: fun(way: Vec3) -> Vec3 {
+	other := if abs_f32(way.x) < 0.9 do Vec3{1, 0, 0} else Vec3{0, 1, 0}
+	return vec3_normalize(cross(way, other))
+}

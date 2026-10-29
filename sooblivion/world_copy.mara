@@ -1,0 +1,191 @@
+// The world as a client knows it: what its server last told it (og's wire),
+// and what the client tells the server. The viewer shows this copy, never
+// the server's own state, so a server elsewhere is no different to it.
+module world_copy
+
+use mara.core
+use mara.math
+use mara.string
+use world
+use world_state
+use scene
+use wire
+use logging
+
+// The references other players' bodies are placed with: a top byte no
+// plugin's form id has, and their number.
+OTHER_PLAYER_KEY :: 0xFE000000
+
+World_Copy :: struct {
+	// The clock and the sky, as the server last told them (Clock_Message).
+	seed: u64
+	hour: f32
+	day: i64
+	seconds: f64
+	hurried: bool
+	climate_id: u32
+	sky_taken: bool
+	sky_source: u32
+	walked_into_sky: bool
+	weather: u32
+	last_weather: u32
+	weather_share: f32
+	// The people in the player's place as they stand, the doors opened or
+	// shut.
+	actors: [WORLD_ACTORS]Reference
+	doors: [WORLD_DOORS]Door_State
+	// The other players, where they are.
+	others: [MAX_PLAYERS]Other_Player
+	// Since the viewer last looked (it clears them): whether the people were
+	// told anew; the server's notes for its journal; what the others said.
+	people_changed: bool
+	notes: [8]Note_Message
+	said: [8]Said_Message
+}
+
+// A copy before the server's told it anything: the world as it starts.
+copy_start :: fun(copy: ^World_Copy) {
+	copy.seed = 1
+	copy.hour = START_HOUR
+	copy.day = 0
+	copy.seconds = 0
+	copy.hurried = false
+	copy.climate_id = 0
+	copy.sky_taken = false
+	copy.sky_source = 0
+	copy.walked_into_sky = false
+	copy.weather = 0
+	copy.last_weather = 0
+	copy.weather_share = 1
+	copy.actors.len = 0
+	copy.doors.len = 0
+	copy.others.len = 0
+	copy.people_changed = false
+	copy.notes.len = 0
+	copy.said.len = 0
+}
+
+// Takes in what the server's told (one the copy doesn't take, or that
+// isn't whole, is let go).
+copy_take :: fun(copy: ^World_Copy, queue: ^Wire_Queue) {
+	for true {
+		message, has_message := wire_take(queue)
+		if not has_message do break
+		if message.kind == MESSAGE_CLOCK {
+			clock, whole := wire_value(message, Clock_Message{seed = 0, hour = 0, day = 0, seconds = 0, hurried = false, climate = 0,
+				sky_taken = false, sky_source = 0, walked_into_sky = false, weather = 0, last_weather = 0, weather_share = 0})
+			if not whole do continue
+			copy.seed = clock.seed
+			copy.hour = clock.hour
+			copy.day = clock.day
+			copy.seconds = clock.seconds
+			copy.hurried = clock.hurried
+			copy.climate_id = clock.climate
+			copy.sky_taken = clock.sky_taken
+			copy.sky_source = clock.sky_source
+			copy.walked_into_sky = clock.walked_into_sky
+			copy.weather = clock.weather
+			copy.last_weather = clock.last_weather
+			copy.weather_share = clock.weather_share
+		elif message.kind == MESSAGE_PEOPLE
+			count, whole := wire_count(message, size_of(Reference), copy.actors.cap)
+			if not whole do continue
+			copy.actors.len = 0
+			for k in 0:count {
+				actor : Reference = message.body[8 + k * size_of(Reference)]
+				&copy.actors + actor
+			}
+			copy.people_changed = true
+		elif message.kind == MESSAGE_DOORS
+			count, whole := wire_count(message, size_of(Door_State), copy.doors.cap)
+			if not whole do continue
+			copy.doors.len = 0
+			for k in 0:count {
+				door : Door_State = message.body[8 + k * size_of(Door_State)]
+				&copy.doors + door
+			}
+		elif message.kind == MESSAGE_PLAYERS
+			count, whole := wire_count(message, size_of(Other_Player), copy.others.cap)
+			if not whole do continue
+			copy.others.len = 0
+			for k in 0:count {
+				other : Other_Player = message.body[8 + k * size_of(Other_Player)]
+				&copy.others + other
+			}
+		elif message.kind == MESSAGE_NOTE
+			told, whole := wire_value(message, Note_Message{text = []})
+			if whole and fits(copy.notes.len + 1, copy.notes.cap) do &copy.notes + told
+		elif message.kind == MESSAGE_SAID
+			said, whole := wire_value(message, Said_Message{player = 0, text = []})
+			if whole and fits(copy.said.len + 1, copy.said.cap) do &copy.said + said
+		}
+	}
+}
+
+// One of the people in the player's place, by their reference; false when
+// they aren't.
+copy_actor :: fun(copy: ^World_Copy, reference: u32) -> Reference, bool {
+	for actor in copy.actors {
+		if actor.form_id == reference do return actor, true
+	}
+	return Reference{0}, false
+}
+
+// Whether a door that opens in place is open (one the server hasn't told
+// of is shut).
+copy_door_open :: fun(copy: ^World_Copy, reference: u32) -> bool {
+	for door in copy.doors {
+		if door.reference == reference do return door.open
+	}
+	return false
+}
+
+// Swings a place's doors that open in place to the server's say: one that
+// isn't at rest as it has it starts swinging; one just placed is put so at
+// once.
+follow_door_states :: fun(place: ^Scene, copy: ^World_Copy) {
+	for &swinging in place.swinging {
+		wanted := copy_door_open(copy, swinging.reference)
+		if swinging.fresh {
+			swinging.fresh = false
+			if wanted != swinging.open do rest_door(place, swinging, wanted)
+			continue
+		}
+		if not swinging.moving and wanted != swinging.open do _ = use_door(place, swinging.reference)
+	}
+}
+
+// Words a player said as they're shown and heard: "player 2: …".
+said_text :: fun(said: Said_Message) -> [256]utf8 {
+	text : [256]utf8
+	&text + "player "
+	&text + int_text(said.player)
+	&text + ": "
+	add_what_fits(&text, said.text)
+	return text
+}
+
+// Tells the server where the player is now, how fast they're going, how
+// many times they've swung (the others see each new one) and whom their
+// blows met.
+send_player :: fun(queue: ^Wire_Queue, told: Player_Message) {
+	wire_put(queue, MESSAGE_PLAYER, told)
+}
+
+// Tells the server the player's come into a place: an interior (cell), or a
+// world's cells round x, y (crossing into others too).
+send_place :: fun(queue: ^Wire_Queue, world_id: u32, cell: u32, x: i64, y: i64, feet: Vec3) {
+	wire_put(queue, MESSAGE_PLACE, Place_Message{world_id = world_id, cell = cell, x = x, y = y, feet = feet})
+}
+
+// Says something to the other players (what fits of it).
+send_say :: fun(queue: ^Wire_Queue, text: []utf8) {
+	said := Note_Message{text = []}
+	add_what_fits(&said.text, text)
+	wire_put(queue, MESSAGE_SAY, said)
+}
+
+// Asks the server to open a shut door that opens in place, or shut an open one.
+send_use_door :: fun(queue: ^Wire_Queue, reference: u32) {
+	wire_put(queue, MESSAGE_USE_DOOR, reference)
+}

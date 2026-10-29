@@ -1,0 +1,938 @@
+// A NIF read into blocks: the types of block Oblivion's files have, what
+// the engine keeps of each, and the reading of a whole file.
+module nif
+
+use mara.core
+use mara.math
+use mara.string
+
+// Every block type in Oblivion's meshes (the base game's, its DLCs' and
+// Shivering Isles'), by the name the file gives it:
+// `Block_Type.from_text(name)`.
+Block_Type :: union {
+	unknown = 0
+
+	// The scene tree.
+	NiNode
+	NiBillboardNode
+	NiCamera
+	NiTriShape
+	NiTriStrips
+	NiParticleSystem
+	NiMeshParticleSystem
+	NiAmbientLight
+	NiDirectionalLight
+
+	// How shapes are drawn.
+	NiAlphaProperty
+	NiDitherProperty
+	NiFogProperty
+	NiMaterialProperty
+	NiSpecularProperty
+	NiStencilProperty
+	NiTexturingProperty
+	NiVertexColorProperty
+	NiWireframeProperty
+	NiZBufferProperty
+	NiSourceTexture
+
+	// Extra data: named values hung on objects.
+	NiBinaryExtraData
+	NiBooleanExtraData
+	NiIntegerExtraData
+	BSXFlags
+	NiStringExtraData
+	NiTextKeyExtraData
+	BSBound
+	BSFurnitureMarker
+	NiStringPalette
+	NiDefaultAVObjectPalette
+
+	// Geometry, skinning and morphing.
+	NiTriShapeData
+	NiTriStripsData
+	NiPSysData
+	NiMeshPSysData
+	NiSkinInstance
+	NiSkinData
+	NiSkinPartition
+	NiMorphData
+
+	// Animation: keys, interpolators, controllers.
+	NiKeyframeData
+	NiTransformData
+	NiFloatData
+	NiPosData
+	NiColorData
+	NiBoolData
+	NiFloatInterpolator
+	NiBoolInterpolator
+	NiBoolTimelineInterpolator
+	NiPoint3Interpolator
+	NiTransformInterpolator
+	NiBSplineTransformInterpolator
+	NiBSplineCompTransformInterpolator
+	NiBSplineData
+	NiBSplineBasisData
+	NiPathInterpolator
+	NiBlendBoolInterpolator
+	NiBlendFloatInterpolator
+	NiBlendPoint3Interpolator
+	NiBlendTransformInterpolator
+	NiTransformController
+	BSKeyframeController
+	NiMultiTargetTransformController
+	NiControllerManager
+	NiControllerSequence
+	NiGeomMorpherController
+	NiVisController
+	NiAlphaController
+	NiMaterialColorController
+	NiFlipController
+	NiTextureTransformController
+	NiBSBoneLODController
+	bhkBlendController
+
+	// Particles.
+	NiPSysUpdateCtlr
+	NiPSysResetOnLoopCtlr
+	NiPSysEmitterCtlr
+	NiPSysModifierActiveCtlr
+	NiPSysEmitterSpeedCtlr
+	NiPSysEmitterDeclinationCtlr
+	NiPSysEmitterInitialRadiusCtlr
+	NiPSysEmitterLifeSpanCtlr
+	NiPSysGravityStrengthCtlr
+	NiPSysEmitterDeclinationVarCtlr
+	NiPSysPositionModifier
+	NiPSysAgeDeathModifier
+	NiPSysBombModifier
+	NiPSysBoundUpdateModifier
+	NiPSysColorModifier
+	NiPSysDragModifier
+	NiPSysGravityModifier
+	NiPSysGrowFadeModifier
+	NiPSysMeshUpdateModifier
+	NiPSysRotationModifier
+	NiPSysSpawnModifier
+	BSParentVelocityModifier
+	BSWindModifier
+	NiPSysColliderManager
+	NiPSysBoxEmitter
+	NiPSysCylinderEmitter
+	NiPSysSphereEmitter
+	BSPSysArrayEmitter
+	NiPSysMeshEmitter
+	NiPSysPlanarCollider
+
+	// Havok collision.
+	bhkCollisionObject
+	bhkSPCollisionObject
+	bhkBlendCollisionObject
+	bhkRigidBody
+	bhkRigidBodyT
+	bhkSimpleShapePhantom
+	bhkSphereShape
+	bhkBoxShape
+	bhkCapsuleShape
+	bhkConvexVerticesShape
+	bhkMultiSphereShape
+	bhkConvexTransformShape
+	bhkTransformShape
+	bhkConvexSweepShape
+	bhkListShape
+	bhkMoppBvTreeShape
+	bhkNiTriStripsShape
+	bhkMeshShape
+	bhkPackedNiTriStripsShape
+	hkPackedNiTriStripsData
+	bhkLimitedHingeConstraint
+	bhkRagdollConstraint
+	bhkHingeConstraint
+	bhkPrismaticConstraint
+	bhkStiffSpringConstraint
+	bhkMalleableConstraint
+}
+
+// A particle emitter: makes particles in a shape about its emitter object
+// (shape EMITTER_*: a box size.x wide along x, size.y along y, size.z
+// along z; a cylinder of radius size.x, size.y long; a sphere of radius
+// size.x), sends each off along the object's z tipped by the declination
+// and turned round z by the planar angle, at a speed, with a color, radius
+// and life span (in seconds). Each variation is how far either way a
+// particle's may be.
+Emitter :: struct {
+	active: bool
+	shape: i64
+	emitter_object: i64
+	size: Vec3
+	speed: f32
+	speed_variation: f32
+	declination: f32
+	declination_variation: f32
+	planar_angle: f32
+	planar_angle_variation: f32
+	color: [4!]f32
+	radius: f32
+	radius_variation: f32
+	life_span: f32
+	life_span_variation: f32
+}
+
+// A group of keys of a value value_size bytes (a float 4, a color 16, a
+// bool 1): their type (KEY_*), how many, and the keys as the file has
+// them — each its time, its value, then what its type adds (key_bytes).
+Keys :: struct {
+	value_size: i64
+	key_type: i64
+	count: i64
+	data: []byte
+
+	// The k-th key's time.
+	time :: fun(keys: Self, k: i64) -> f32 {
+		seconds : f32 = keys.data[k * key_bytes(keys.key_type, keys.value_size)]
+		return seconds
+	}
+
+	// Where the k-th key's value starts in data.
+	value_at :: fun(keys: Self, k: i64) -> i64 {
+		return k * key_bytes(keys.key_type, keys.value_size) + 4
+	}
+}
+
+// A controller of a property's value over time — NiTextureTransformController
+// (a texture's place: its operation, TT_*, of a texturing's slot),
+// NiMaterialColorController (a material's color: its operation, COLOR_*),
+// NiAlphaController (a material's opacity) — by its interpolator, played
+// as a time controller is: its time at a frequency from a phase, between a
+// start and stop; its flags' bit 3 when it's running, bits 1 and 2 past
+// the stop (CYCLE_*).
+Property_Controller :: struct {
+	kind: i64            // VALUE_TEXTURE, VALUE_COLOR or VALUE_ALPHA
+	next: i64
+	flags: u16
+	frequency: f32
+	phase: f32
+	start_time: f32
+	stop_time: f32
+	interpolator: i64
+	slot: u32
+	operation: u32
+}
+
+// What every object in the scene tree has: a name, its place relative to
+// its parent, and the properties it's drawn with.
+Av_Object :: struct {
+	name: []utf8
+	extra_data: Refs
+	controller: i64
+	flags: u16          // bit 0: hidden
+	translation: Vec3
+	rotation: [9!]f32   // row by row: a point turns to rotation times it
+	scale: f32
+	properties: Refs
+	collision: i64
+}
+
+// A spline interpolator's fields (see Block.Spline_Interpolator).
+Spline_Transform :: struct {
+	start_time: f32
+	stop_time: f32
+	spline_data: i64
+	basis_data: i64
+	translation: Vec3
+	rotation: [4!]f32     // a quaternion: w, x, y, z
+	scale: f32
+	handles: [3!]u32      // translation, rotation, scale
+	compressed: bool
+	offsets: [3!]f32      // compressed: a value is offset + half range * point / 32767
+	half_ranges: [3!]f32
+}
+
+// A spline data's control points: as floats, and as compressed i16s.
+Spline_Points :: struct {
+	floats: []byte
+	shorts: []byte
+}
+
+// One of a texturing property's textures.
+Texture_Slot :: struct {
+	used: bool
+	source: i64        // its NiSourceTexture
+	clamp_mode: u32    // 0 clamp both ways … 3 wrap both ways
+	filter_mode: u32
+	uv_set: u32
+}
+
+// The slots of a texturing property, by their numbers in the file.
+SLOT_BASE   :: 0
+SLOT_DARK   :: 1
+SLOT_DETAIL :: 2
+SLOT_GLOSS  :: 3
+SLOT_GLOW   :: 4
+SLOT_BUMP   :: 5
+SLOT_DECAL  :: 6
+SLOT_COUNT  :: 8   // the base to the second decal: the ones kept
+
+// Vertices and what goes with them: NiTriShapeData, NiTriStripsData. The
+// arrays are views of the file, laid out as it lays them out.
+Geometry :: struct {
+	vertex_count: i64
+	vertices: []byte        // a Vec3 for each vertex; empty when there are none
+	normals: []byte         // a Vec3 for each vertex, or empty
+	colors: []byte          // 4 f32s (red, green, blue, alpha) for each vertex, or empty
+	uv_set_count: i64
+	uvs: []byte             // for each set, a pair of f32s for each vertex
+	center: Vec3            // of a sphere around the vertices
+	radius: f32
+	triangle_count: i64
+	triangles: []byte       // NiTriShapeData's: 3 u16 vertex indexes each
+	strip_count: i64
+	strip_lengths: []byte   // NiTriStripsData's: a u16 for each strip
+	strips: []byte          // the strips' u16 vertex indexes, one strip after another
+}
+
+// What the engine keeps of a block. Blocks it has no use for yet are read
+// (to get past them) and kept as Other.
+Block :: union {
+	Other = 0
+	Node {
+		object: Av_Object
+		children: Refs
+		billboard: bool
+		billboard_mode: u16  // a billboard's: 0 faces the camera; 1 (and 5) turns about its up; …
+	}
+	// NiTriShape, NiTriStrips: a mesh in the tree, its geometry in another block.
+	Shape {
+		object: Av_Object
+		data: i64
+		skin: i64
+	}
+	Shape_Data {
+		geometry: Geometry
+	}
+	// NiSkinInstance: the bones a skinned shape follows (nodes of its NIF),
+	// in the order its skin data has them.
+	Skin_Instance {
+		data: i64
+		bones: Refs
+	}
+	// NiSkinData: the skin's transform, and for each bone (bone_count) its
+	// transform from the skin's space into the bone's (as the bind pose
+	// has it) and the vertices it moves, by how much — as the file has
+	// them, in bones (see skin_bone_at).
+	Skin_Data {
+		transform: Mat4
+		bone_count: i64
+		has_weights: bool
+		bones: []byte
+	}
+	Texturing {
+		apply_mode: u32
+		slots: [SLOT_COUNT!]Texture_Slot
+		controller: i64      // its first controller (a flip controller, say), -1 for none
+	}
+	Source_Texture {
+		file_name: []utf8   // a path under textures\, as the file spells it
+	}
+	Material {
+		ambient: Vec3
+		diffuse: Vec3
+		specular: Vec3
+		emissive: Vec3
+		glossiness: f32
+		alpha: f32
+		controller: i64      // its first controller (a color or alpha controller), -1 for none
+	}
+	Alpha {
+		flags: u16       // bit 0 blending, bits 1-4 and 5-8 its factors, bit 9 testing
+		threshold: u8
+	}
+	Stencil {
+		draw_mode: u32   // 3: both sides of each triangle are drawn
+	}
+	Vertex_Color {
+		vertex_mode: u32     // 0 ignore the colors, 1 emissive, 2 ambient and diffuse
+		lighting_mode: u32
+	}
+	Z_Buffer {
+		flags: u16       // bit 0 test, bit 1 write
+		function: u32
+	}
+	Specular {
+		enabled: bool
+	}
+	String_Extra {
+		name: []utf8
+		value: []utf8
+	}
+	// NiBinaryExtraData: bytes with a name. Oblivion's meshes keep their
+	// tangent space so: TANGENT_SPACE.
+	Binary_Extra {
+		name: []utf8
+		data: []byte
+	}
+	Integer_Extra {
+		name: []utf8     // BSXFlags' is "BSX"
+		value: u32
+	}
+
+	// Havok collision: what an object collides as. A collision object
+	// (bhkCollisionObject, and the SP and blend ones) on a node names its
+	// body; the body its shape. Shapes are in Havok's units (HAVOK_SCALE
+	// game units each).
+	Collision_Object {
+		body: i64
+	}
+	// bhkRigidBody, bhkRigidBodyT: its shape, and its layer (what it
+	// collides as: a wall, a trigger, a ragdoll's bone…). A T's shape is
+	// moved and turned by its translation and rotation (a quaternion).
+	Rigid_Body {
+		shape: i64
+		layer: u8
+		moved: bool
+		translation: Vec3
+		rotation: [4!]f32    // x, y, z, w
+	}
+	Sphere_Shape {
+		radius: f32
+	}
+	Box_Shape {
+		half_size: Vec3
+	}
+	Capsule_Shape {
+		first: Vec3          // the ends of its middle line
+		second: Vec3
+		radius: f32
+	}
+	// bhkConvexVerticesShape: a convex hull, by its corners and its faces' planes.
+	Convex_Shape {
+		vertex_count: i64
+		vertices: []byte     // 4 f32s each, the last unused
+		plane_count: i64
+		planes: []byte       // a normal and a distance, 4 f32s each: n·x + d is 0 on the face
+	}
+	// bhkConvexTransformShape, bhkTransformShape: a shape moved and turned.
+	Transform_Shape {
+		shape: i64
+		transform: [16!]f32  // column by column, the translation last
+	}
+	List_Shape {
+		shapes: Refs
+	}
+	// bhkMoppBvTreeShape: its shape, with Havok's tree for finding what in it is hit.
+	Mopp_Shape {
+		shape: i64
+	}
+	// bhkNiTriStripsShape: triangles from NiTriStripsData blocks, scaled.
+	Strips_Shape {
+		scale: Vec3
+		strips: Refs
+		filters: []byte   // each strip's Havok filter, 4 bytes: its layer, flags, group (2)
+	}
+	// bhkPackedNiTriStripsShape: triangles in an hkPackedNiTriStripsData.
+	Packed_Shape {
+		data: i64
+	}
+	Packed_Data {
+		triangle_count: i64
+		triangles: []byte    // 3 u16 vertex indexes, welding (u16), a normal: 20 bytes each
+		vertex_count: i64
+		vertices: []byte     // a Vec3 each
+	}
+
+	// NiFlipController: flips one of a texturing's textures through
+	// sources over time — which shows when, its interpolator's keys say.
+	Flip_Controller {
+		next: i64            // the next controller on the same object
+		frequency: f32
+		phase: f32
+		start_time: f32
+		stop_time: f32
+		interpolator: i64
+		slot: u32            // which of the texturing's textures (SLOT_BASE…)
+		sources: Refs        // NiSourceTextures
+	}
+	// NiFloatInterpolator: a number, as its keys say over time (or its value).
+	Float_Interpolator {
+		value: f32
+		data: i64
+	}
+	// NiPoint3Interpolator: a point or a color, as its keys say over time
+	// (or its value).
+	Point_Interpolator {
+		value: Vec3
+		data: i64
+	}
+	// NiTextureTransformController, NiMaterialColorController, NiAlphaController.
+	Value_Controller {
+		controller: Property_Controller
+	}
+	// NiBoolInterpolator: on or off, as its keys say over time (or its value).
+	Bool_Interpolator {
+		value: bool
+		data: i64
+	}
+	// NiFloatData, NiColorData, NiBoolData, NiPosData.
+	Key_Data {
+		keys: Keys
+	}
+
+	// Particles. NiParticleSystem: particles, each drawn as a square facing
+	// the camera — its data (room for them), whether they're kept in the
+	// world's space (else its own), and the modifiers that make, move, age
+	// and color them.
+	Particle_System {
+		object: Av_Object
+		data: i64
+		world_space: bool
+		modifiers: Refs
+	}
+	// NiPSysData: how many particles a system has room for.
+	Particle_Data {
+		capacity: i64
+	}
+	// NiPSysBoxEmitter, NiPSysCylinderEmitter, NiPSysSphereEmitter.
+	Particle_Emitter {
+		emitter: Emitter
+	}
+	// NiPSysGrowFadeModifier: particles grow from nothing over their first
+	// grow_time seconds and shrink to nothing over their last fade_time.
+	Grow_Fade_Modifier {
+		active: bool
+		grow_time: f32
+		fade_time: f32
+	}
+	// NiPSysColorModifier: particles' colors over their lives, its data's
+	// keys (times from 0, born, to 1, dying).
+	Color_Modifier {
+		active: bool
+		data: i64
+	}
+	// NiPSysRotationModifier: particles turn (on the screen) at a speed (in
+	// radians a second) from an angle, each a variation either way; the
+	// speed's sign at random if asked.
+	Rotation_Modifier {
+		active: bool
+		speed: f32
+		speed_variation: f32
+		angle: f32
+		angle_variation: f32
+		random_sign: bool
+	}
+	// NiPSysGravityModifier: particles pulled along an axis of its gravity
+	// object (force type 0) or toward it (1), by a strength (units a second,
+	// each second).
+	Gravity_Modifier {
+		active: bool
+		gravity_object: i64
+		axis: Vec3
+		decay: f32
+		strength: f32
+		force_type: u32
+		turbulence: f32
+		turbulence_scale: f32
+	}
+	// NiPSysEmitterCtlr: how fast its system's emitter makes particles (its
+	// birth rate interpolator: particles a second) and when it's on (its
+	// active interpolator, -1 for always) — played as a time controller is:
+	// its time at a frequency from a phase, between a start and a stop
+	// time; flags bits 1 and 2 how it goes on past the stop (CYCLE_*).
+	Emitter_Controller {
+		next: i64
+		flags: u16
+		frequency: f32
+		phase: f32
+		start_time: f32
+		stop_time: f32
+		birth_rate: i64
+		active: i64
+	}
+
+	// Animation. NiControllerSequence: one of an object's animations (a
+	// door's Open, its Close): the blocks it moves, each by an
+	// interpolator; its span of time.
+	Sequence {
+		name: []utf8
+		block_count: i64
+		blocks: []byte       // as Oblivion's files have them: CONTROLLED_BLOCK_SIZE bytes each
+		start_time: f32
+		stop_time: f32
+		text_keys: i64       // its text keys (a Text_Keys block), -1 for none
+		cycle: u32           // past its stop: CYCLE_LOOP, CYCLE_REVERSE or CYCLE_CLAMP
+		frequency: f32
+	}
+	// NiTextKeyExtraData: texts at times in an animation ("start", "end",
+	// "Sound: DRSMetalOpen01"…): how many, and the keys as the file has them
+	// (each a time, then its text's length and text: next_text_key).
+	Text_Keys {
+		count: i64
+		keys: []byte
+	}
+	// NiStringPalette: names, each ended by a 0, that sequences point into.
+	String_Palette {
+		text: []byte
+	}
+	// NiTransformInterpolator: an object's pose where its keys say nothing
+	// (beyond UNSET_BEYOND where it gives none either), and its keys.
+	Transform_Interpolator {
+		translation: Vec3
+		rotation: [4!]f32    // a quaternion: w, x, y, z
+		scale: f32
+		data: i64
+	}
+	// NiBSplineTransformInterpolator, NiBSplineCompTransformInterpolator: an
+	// object's movement as cubic B-splines over control points (in its
+	// spline data: floats, or compressed to i16s), from start_time to
+	// stop_time. Its translation, rotation and scale each have their own,
+	// from its handle in the data (SPLINE_NONE: none, its pose here for it).
+	Spline_Interpolator {
+		spline: Spline_Transform
+	}
+	// NiBSplineData: control points, as floats and as compressed i16s.
+	Spline_Data {
+		points: Spline_Points
+	}
+	// NiBSplineBasisData: how many control points each spline has.
+	Spline_Basis {
+		control_points: i64
+	}
+	// NiTransformData, NiKeyframeData: keys over time. Each group: its
+	// type (KEY_*), its count, the keys as the file has them.
+	Transform_Data {
+		rotation_type: i64
+		rotation_count: i64
+		rotations: []byte    // time, w x y z, and what the type adds
+		angles: []byte       // rotations as three angles' tracks (KEY_XYZ): x's, y's, z's, each a group of f32 keys
+		translation_type: i64
+		translation_count: i64
+		translations: []byte // time, x y z, and what the type adds
+	}
+}
+
+// A whole NIF: its header, its blocks, and the blocks at the top of its tree.
+Nif :: struct {
+	header: Nif_Header
+	types: []Block_Type    // for each of the header's type names
+	blocks: []Block        // one for each block, in the file's order
+	roots: Refs
+	trailing_bytes: i64    // bytes after the roots: a few of Oblivion's
+	                       // landscape LOD files have an older version's tail
+}
+
+// Why a NIF couldn't be read, beyond its header.
+Nif_Block_Error :: error {
+	Unknown_Block_Type   // a type this doesn't know: it can't be stepped over
+	Broken_Block         // a block's reading went past the end, or astray
+	Bad_Separator        // the 0 before a block in versions before 10.2 wasn't 0
+}
+
+// Where reading a NIF stopped, when it failed: for finding which block
+// type's reading is wrong.
+Nif_Failure :: struct {
+	block: i64
+	type_name: []utf8
+}
+
+// Reads a whole NIF from data. The tables are carved from storage. When it
+// fails, failure says which block it was reading.
+read_nif :: fun(data: []byte, storage: ^[]byte, failure: ^Nif_Failure) -> Nif, err {
+	reader := nif_reader(data)
+	header := read_header(&reader, storage)?
+
+	types := slice([:header.type_names.len]Block_Type, storage)
+	for name in header.type_names do &types + Block_Type.from_text(name)
+
+	blocks := slice([:header.block_count]Block, storage)
+	for i in 0:header.block_count {
+		failure.block = i
+		type_index := i64(header.block_types[i])
+		if type_index >= types.len do return Nif{0}, Broken_Block
+		failure.type_name = header.type_names[type_index]
+		block_type := types[type_index]
+		if block_type == .unknown do return Nif{0}, Unknown_Block_Type
+
+		// Before 10.2, a 0 comes before each block — except Havok's.
+		if reader.version < VERSION_10_2_0_0 and not starts_with(failure.type_name, "bhk") {
+			if read_u32(&reader) != 0 do return Nif{0}, Bad_Separator
+		}
+		&blocks + read_block(&reader, block_type)
+		if reader.broken or reader.bad_reference do return Nif{0}, Broken_Block
+	}
+	failure.block = header.block_count
+	roots := read_refs(&reader)
+	if reader.broken do return Nif{0}, Broken_Block
+
+	return Nif{header = header, types = types, blocks = blocks, roots = roots,
+		trailing_bytes = reader.data.len - reader.at}
+}
+
+// Reads one block of the type given.
+read_block :: fun(reader: ^Nif_Reader, block_type: Block_Type) -> Block {
+	match block_type {
+	unknown
+		reader.broken = true
+		return .Other
+
+	NiNode
+		return read_node(reader)
+	NiBillboardNode
+		return read_billboard_node(reader)
+	NiCamera
+		return read_camera(reader)
+	NiTriShape
+		return read_shape(reader)
+	NiTriStrips
+		return read_shape(reader)
+	NiParticleSystem
+		return read_particle_system(reader)
+	NiMeshParticleSystem
+		return read_particle_system(reader)
+	NiAmbientLight
+		return read_light(reader)
+	NiDirectionalLight
+		return read_light(reader)
+
+	NiAlphaProperty
+		return read_alpha_property(reader)
+	NiDitherProperty
+		return read_flags_property(reader)
+	NiFogProperty
+		return read_fog_property(reader)
+	NiMaterialProperty
+		return read_material_property(reader)
+	NiSpecularProperty
+		return read_specular_property(reader)
+	NiStencilProperty
+		return read_stencil_property(reader)
+	NiTexturingProperty
+		return read_texturing_property(reader)
+	NiVertexColorProperty
+		return read_vertex_color_property(reader)
+	NiWireframeProperty
+		return read_flags_property(reader)
+	NiZBufferProperty
+		return read_z_buffer_property(reader)
+	NiSourceTexture
+		return read_source_texture(reader)
+
+	NiBinaryExtraData
+		return read_binary_extra(reader)
+	NiBooleanExtraData
+		return read_boolean_extra(reader)
+	NiIntegerExtraData
+		return read_integer_extra(reader)
+	BSXFlags
+		return read_integer_extra(reader)
+	NiStringExtraData
+		return read_string_extra(reader)
+	NiTextKeyExtraData
+		return read_text_key_extra(reader)
+	BSBound
+		return read_bound_extra(reader)
+	BSFurnitureMarker
+		return read_furniture_marker(reader)
+	NiStringPalette
+		return read_string_palette(reader)
+	NiDefaultAVObjectPalette
+		return read_object_palette(reader)
+
+	NiTriShapeData
+		return read_tri_shape_data(reader)
+	NiTriStripsData
+		return read_tri_strips_data(reader)
+	NiPSysData
+		return read_particle_system_data(reader)
+	NiMeshPSysData
+		return read_mesh_particle_system_data(reader)
+	NiSkinInstance
+		return read_skin_instance(reader)
+	NiSkinData
+		return read_skin_data(reader)
+	NiSkinPartition
+		return read_skin_partition(reader)
+	NiMorphData
+		return read_morph_data(reader)
+
+	NiKeyframeData
+		return read_keyframe_data(reader)
+	NiTransformData
+		return read_keyframe_data(reader)
+	NiFloatData
+		return read_key_data(reader, 4)
+	NiPosData
+		return read_key_data(reader, 12)
+	NiColorData
+		return read_key_data(reader, 16)
+	NiBoolData
+		return read_key_data(reader, 1)
+	NiFloatInterpolator
+		return read_value_interpolator(reader, 4)
+	NiBoolInterpolator
+		return read_value_interpolator(reader, 1)
+	NiBoolTimelineInterpolator
+		return read_value_interpolator(reader, 1)
+	NiPoint3Interpolator
+		return read_value_interpolator(reader, 12)
+	NiTransformInterpolator
+		return read_transform_interpolator(reader)
+	NiBSplineTransformInterpolator
+		return read_spline_interpolator(reader, false)
+	NiBSplineCompTransformInterpolator
+		return read_spline_interpolator(reader, true)
+	NiBSplineData
+		return read_spline_data(reader)
+	NiBSplineBasisData
+		return Spline_Basis{control_points = i64(read_u32(reader))}
+	NiPathInterpolator
+		return read_path_interpolator(reader)
+	NiBlendBoolInterpolator
+		return read_blend_value_interpolator(reader, 1)
+	NiBlendFloatInterpolator
+		return read_blend_value_interpolator(reader, 4)
+	NiBlendPoint3Interpolator
+		return read_blend_value_interpolator(reader, 12)
+	NiBlendTransformInterpolator
+		return read_blend_transform_interpolator(reader)
+	NiTransformController
+		return read_transform_controller(reader)
+	BSKeyframeController
+		return read_bs_keyframe_controller(reader)
+	NiMultiTargetTransformController
+		return read_multi_target_controller(reader)
+	NiControllerManager
+		return read_controller_manager(reader)
+	NiControllerSequence
+		return read_controller_sequence(reader)
+	NiGeomMorpherController
+		return read_geom_morpher_controller(reader)
+	NiVisController
+		return read_data_controller(reader)
+	NiAlphaController
+		return read_alpha_controller(reader)
+	NiMaterialColorController
+		return read_material_color_controller(reader)
+	NiFlipController
+		return read_flip_controller(reader)
+	NiTextureTransformController
+		return read_texture_transform_controller(reader)
+	NiBSBoneLODController
+		return read_bone_lod_controller(reader)
+	bhkBlendController
+		return read_blend_controller(reader)
+
+	NiPSysUpdateCtlr
+		return read_plain_controller(reader)
+	NiPSysResetOnLoopCtlr
+		return read_plain_controller(reader)
+	NiPSysEmitterCtlr
+		return read_emitter_controller(reader)
+	NiPSysModifierActiveCtlr
+		return read_modifier_data_controller(reader)
+	NiPSysEmitterSpeedCtlr
+		return read_modifier_data_controller(reader)
+	NiPSysEmitterDeclinationCtlr
+		return read_modifier_data_controller(reader)
+	NiPSysEmitterInitialRadiusCtlr
+		return read_modifier_data_controller(reader)
+	NiPSysEmitterLifeSpanCtlr
+		return read_modifier_data_controller(reader)
+	NiPSysGravityStrengthCtlr
+		return read_modifier_data_controller(reader)
+	NiPSysEmitterDeclinationVarCtlr
+		return read_modifier_data_controller(reader)
+	NiPSysPositionModifier
+		return read_plain_modifier(reader)
+	NiPSysAgeDeathModifier
+		return read_age_death_modifier(reader)
+	NiPSysBombModifier
+		return read_bomb_modifier(reader)
+	NiPSysBoundUpdateModifier
+		return read_bound_update_modifier(reader)
+	NiPSysColorModifier
+		return read_color_modifier(reader)
+	NiPSysDragModifier
+		return read_drag_modifier(reader)
+	NiPSysGravityModifier
+		return read_gravity_modifier(reader)
+	NiPSysGrowFadeModifier
+		return read_grow_fade_modifier(reader)
+	NiPSysMeshUpdateModifier
+		return read_mesh_update_modifier(reader)
+	NiPSysRotationModifier
+		return read_rotation_modifier(reader)
+	NiPSysSpawnModifier
+		return read_spawn_modifier(reader)
+	BSParentVelocityModifier
+		return read_parent_velocity_modifier(reader)
+	BSWindModifier
+		return read_wind_modifier(reader)
+	NiPSysColliderManager
+		return read_collider_manager(reader)
+	NiPSysBoxEmitter
+		return read_box_emitter(reader)
+	NiPSysCylinderEmitter
+		return read_cylinder_emitter(reader)
+	NiPSysSphereEmitter
+		return read_sphere_emitter(reader)
+	BSPSysArrayEmitter
+		return read_array_emitter(reader)
+	NiPSysMeshEmitter
+		return read_mesh_emitter(reader)
+	NiPSysPlanarCollider
+		return read_planar_collider(reader)
+
+	bhkCollisionObject
+		return read_collision_object(reader)
+	bhkSPCollisionObject
+		return read_collision_object(reader)
+	bhkBlendCollisionObject
+		return read_blend_collision_object(reader)
+	bhkRigidBody
+		return read_rigid_body(reader, false)
+	bhkRigidBodyT
+		return read_rigid_body(reader, true)
+	bhkSimpleShapePhantom
+		return read_simple_shape_phantom(reader)
+	bhkSphereShape
+		return read_sphere_shape(reader)
+	bhkBoxShape
+		return read_box_shape(reader)
+	bhkCapsuleShape
+		return read_capsule_shape(reader)
+	bhkConvexVerticesShape
+		return read_convex_vertices_shape(reader)
+	bhkMultiSphereShape
+		return read_multi_sphere_shape(reader)
+	bhkConvexTransformShape
+		return read_transform_shape(reader)
+	bhkTransformShape
+		return read_transform_shape(reader)
+	bhkConvexSweepShape
+		return read_convex_sweep_shape(reader)
+	bhkListShape
+		return read_list_shape(reader)
+	bhkMoppBvTreeShape
+		return read_mopp_shape(reader)
+	bhkNiTriStripsShape
+		return read_tri_strips_shape(reader)
+	bhkMeshShape
+		return read_mesh_shape(reader)
+	bhkPackedNiTriStripsShape
+		return read_packed_tri_strips_shape(reader)
+	hkPackedNiTriStripsData
+		return read_packed_tri_strips_data(reader)
+	bhkLimitedHingeConstraint
+		return read_constraint(reader, LIMITED_HINGE_SIZE)
+	bhkRagdollConstraint
+		return read_constraint(reader, RAGDOLL_SIZE)
+	bhkHingeConstraint
+		return read_constraint(reader, HINGE_SIZE)
+	bhkPrismaticConstraint
+		return read_constraint(reader, PRISMATIC_SIZE)
+	bhkStiffSpringConstraint
+		return read_constraint(reader, STIFF_SPRING_SIZE)
+	bhkMalleableConstraint
+		return read_malleable_constraint(reader)
+	}
+}

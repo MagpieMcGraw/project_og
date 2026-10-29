@@ -1,0 +1,2145 @@
+// What's drawn: the models the shown cells need, each loaded once, the
+// instances of them placed by the cells' references, the lights they
+// give, the land outside.
+//
+// What an instance needs to be drawn is worked out once, when it's placed:
+// its matrix, a sphere around it, the lights that reach it (the lights
+// don't move).
+//
+// Loading is spread over frames: a cell's references whose meshes aren't
+// on the card yet wait in a queue (and land in another), and each frame
+// loads from the queues for a few milliseconds. Arriving somewhere new
+// loads everything at once; walking into the next cell outside doesn't.
+module scene
+
+use mara.core
+use mara.math
+use mara.string
+use mara.memory
+use mara.time
+use bsa
+use nif
+use model
+use render
+use world
+use esm
+use land
+use grass
+use audio
+use collision
+use animation
+use speedtree
+use dds
+use logging
+use indexing
+use game_sound
+
+// Room for the models' collision: points, three a triangle. (Tamriel's
+// meshes have 1.8 million triangles in all; a scene's models, a few hundred
+// thousand.)
+COLLISION_POINTS :: 3145728
+
+// How many cells around the camera's have their trees drawn: as far as
+// the game drew them (uGridDistantTreeRange).
+TREE_RADIUS :: 15
+
+// A door in the scene that leads somewhere.
+Scene_Door :: struct {
+	reference: u32
+	position: Vec3
+}
+
+// The sounds a door makes opening and closing (in the scene's sound kinds,
+// -1 for none).
+Door_Sounds :: struct {
+	reference: u32
+	position: Vec3
+	opening: i64
+	closing: i64
+}
+
+// A reference waiting for its mesh to be put on the card.
+Waiting_Instance :: struct {
+	path: [256]utf8
+	world: Mat4
+	reference: u32
+	door: bool         // a door that doesn't lead anywhere: it may open in place
+	npc: u32           // an NPC's form id: its model put together (npc_model), not read from path
+	tree: u32          // a tree's (TREE) form id: its model grown (tree_model), not read from path
+}
+
+// Doors that open in place: kinds of them loaded, the moving pieces a
+// kind can have, the doors placed at once.
+DOOR_KINDS :: 64
+DOOR_PIECES :: 4
+SWINGING_DOORS :: 512
+
+// A moving piece of a door that opens in place: its model (what's under
+// its node, in the node's space), where its node's parent is in the
+// door's model, and its node's tracks in the door's Open and Close.
+Door_Piece :: struct {
+	model: i64
+	parent: Mat4
+	opening: Track
+	closing: Track
+}
+
+// A kind of door that opens in place (its mesh has Open and Close
+// sequences that move something): its frame's model (what doesn't move;
+// -1 when everything does), its moving pieces, and the spans of time its
+// opening and closing take.
+Door_Kind :: struct {
+	frame: i64
+	pieces: [DOOR_PIECES]Door_Piece
+	open_start: f32
+	open_stop: f32
+	close_start: f32
+	close_stop: f32
+	// The sounds its Open and Close sequences make, at their times.
+	open_cues: [DOOR_CUES]Door_Cue
+	close_cues: [DOOR_CUES]Door_Cue
+}
+
+// The room for the scene's animations' keys.
+TRACK_ROOM :: 16 * MB
+
+// The pieces a model that moves by itself is in, at most.
+MOVING_PIECES :: 8
+
+// A piece of a model that moves by itself: one of its mesh's moving nodes
+// (and what's under it, but other moving nodes) as a model of its own;
+// the nearest moving node above it (a piece of the same kind; -1 for none)
+// and where its parent is from that node (or from the model's root); its
+// track.
+Moving_Piece :: struct {
+	model: i64
+	above: i64
+	from_above: Mat4
+	track: Track
+}
+
+// A kind of model that moves by itself — its mesh's Idle (or SpecialIdle)
+// sequence moves some of its nodes, round and round: the frame's model
+// (what doesn't move), its pieces, and the sequence's span and speed.
+Moving_Kind :: struct {
+	frame: i64
+	pieces: [MOVING_PIECES]Moving_Piece
+	start: f32
+	stop: f32
+	frequency: f32
+}
+
+// The sounds a door's sequence makes, at most.
+DOOR_CUES :: 4
+
+// A sound a door's animation makes (a text key "Sound: <editor id>"): when,
+// in its sequence's time, and which (in the scene's sound kinds).
+Door_Cue :: struct {
+	time: f32
+	sound: i64
+}
+
+// A sound a door makes now: which (in the scene's sound kinds), and where.
+Door_Noise :: struct {
+	sound: i64
+	position: Vec3
+}
+
+// A door placed that opens in place: its reference, its kind, where it's
+// placed, whether it's open; while it moves, which way and how long it's
+// been moving.
+Swinging_Door :: struct {
+	reference: u32
+	kind: i64
+	placement: Mat4
+	open: bool
+	moving: bool
+	opening: bool
+	time: f32
+	fresh: bool      // just placed: put open or shut as the world has it, not swung there
+}
+
+// What loading a model can fail with, beyond reading its file.
+Load_Error :: error {
+	Not_In_Archive     // no file of that path in the archives
+	No_Room_For_Models // the scene's models are all taken
+	No_Parts           // a part of a mesh with nothing to draw
+	No_Skeleton        // an NPC's skeleton (or its idle) couldn't be read
+}
+
+// A model's collision: its points in the scene's collision, three a triangle.
+Collision_Range :: struct {
+	first: i64
+	count: i64
+	// An upright cylinder from the model's middle, walked round (a person,
+	// a tree's trunk): its radius and height; 0 for none.
+	upright: f32
+	upright_height: f32
+}
+
+// The thinnest trunk walked round: thinner, a shrub's, walked through.
+TREE_TRUNK_LEAST :: 4
+
+// A cell waiting for its land to be put on the card.
+Waiting_Land :: struct {
+	cell: u32
+	x: i64
+	y: i64
+}
+
+// The models on the card, and what's drawn with them: instances, lights,
+// doors, lighting, land — an interior cell's, or the exterior cells around
+// the camera. Models stay loaded from cell to cell; land is let go when
+// the camera leaves it behind.
+Scene :: struct {
+	models: [4096]Gpu_Model
+	// What each model collides as (by its index), its points in collision_points.
+	model_collision: [4096]Collision_Range
+	collision_points: [COLLISION_POINTS]Vec3
+	paths: Key_Index             // each mesh's model (+1; 0 when it couldn't be loaded), by the path's hash
+	// What loading couldn't do since the journal last told of it: how many
+	// things failed (each left out), and the first's name and why.
+	failures: i64
+	first_failure: [256]utf8
+	first_failure_reason: err
+	instances: [32768]Instance
+	lights: [4096]Point_Light
+	lights_changed: bool         // since the renderer was last given them (set_scene_lights)
+	flicker_seed: u64            // for the flickering lights' chances
+	doors: [1024]Scene_Door
+	// Sounds: the kinds the cells' references make (each SOUN read once,
+	// found by its form id: its index + 1, 0 for none), the sounds placed
+	// (SOUN references, and the lights and activators that make one), and
+	// each door's opening and closing sounds.
+	sound_kinds: [1024]Sound_Kind
+	sound_kind_index: Key_Index
+	sound_names: Key_Index       // each SOUN's form id (+1), by its editor id's hash (any case)
+	sound_names_read: bool       // whether sound_names has been made
+	// The keys of the animations of the doors and of what moves by itself.
+	track_room: [TRACK_ROOM]byte
+	// The kinds of model that move by themselves, found by their mesh's
+	// path (+1; 0 for a mesh that doesn't).
+	moving_kinds: [256]Moving_Kind
+	moving_index: Key_Index
+	sounds: [1024]Placed_Sound
+	door_sounds: [2048]Door_Sounds
+	lighting: Cell_Lighting
+	world: u32                   // the world shown outside, 0 inside
+	grows_grass: bool            // its land grows grass: not a small world (a city's, a realm)
+	parent_world: u32            // the world it's part of, whose land it shows (0: none, its own)
+	center_x: i64                // the cell the exterior was loaded around
+	center_y: i64
+	grounds: [LAND_SLOTS]Gpu_Land
+	land_heights: [LAND_SLOTS!][1089!]f32   // each land slot's heights, for standing on
+
+	// Doors that open in place: the kinds loaded (by their mesh's path:
+	// the kind's index + 1; 0 for a mesh that isn't one), the doors placed.
+	door_kinds: [DOOR_KINDS]Door_Kind
+	door_kind_index: Key_Index
+	swinging: [SWINGING_DOORS]Swinging_Door
+
+	// What's seen from afar outside: the world's references seen from afar
+	// (but its trees, billboards: tree_cells), each with its far mesh;
+	// drawn past the cells drawn in full. All of a world's at once: Tamriel
+	// has about 840.
+	distant_instances: [4096]Instance
+	distant_world: u32
+	// Distant objects being placed a few cells a frame (place_distant_step):
+	// the next of the plugin's exterior cells' slots (-1: none), since when.
+	distant_next: i64
+	distant_started: u64
+	grass_cells: [LAND_SLOTS]Gpu_Grass   // each land's grass, in its land's slot
+	waters: [WATER_SLOTS]Water_Cell
+	waters_changed: bool         // since the renderer was last given them (upload_waters)
+
+	// Trees: the cells' whose trees are on the card (and which slots they
+	// take), the world and cell they're around, each kind of tree's look
+	// (by its TREE's form id: its index + 1), and the cells waiting.
+	tree_cells: [TREE_CELLS]Gpu_Trees
+	tree_slots_taken: [TREE_CELLS!]bool
+	trees_world: u32
+	trees_x: i64
+	trees_y: i64
+	tree_kinds: Key_Index
+	kinds: [1024]Tree_Kind
+	waiting_trees: [TREE_CELLS]Waiting_Land
+	waiting_trees_next: i64
+	// The slowest thing the last load_waiting loaded, and how long it took
+	// (nanoseconds): said with a slow frame.
+	slowest_load: u64
+	slowest_what: [256]utf8
+
+	// Grass: each kind's look and model (by its GRAS's form id: its index
+	// + 1; 0 for one that can't be drawn), and each land texture's grasses
+	// (by its LTEX's form id: its index + 1).
+	grass_index: Key_Index
+	grass_kinds: [256]Grass_Kind
+	texture_grass_index: Key_Index
+	texture_grasses: [1024]Texture_Grasses
+
+	// What's still to load, in order, and how far along that is.
+	waiting: [16384]Waiting_Instance
+	waiting_next: i64
+	waiting_land: [64]Waiting_Land
+	waiting_land_next: i64
+	// The world whose land is on the card (grounds): the one shown, or —
+	// inside — the one a door out leads to, readied (ready_outside).
+	land_world: u32
+	// The outside readied from inside, so it shows at once when it's gone
+	// out to (0: none being readied): its world; the cells around the one
+	// the door leads to, whose references are still to be read; the models
+	// they need that aren't loaded, still to be (and each one's key, so
+	// none is asked for twice); since when.
+	ready_world: u32
+	ready_cells: [32]Waiting_Land
+	ready_cells_next: i64
+	ready_models: [2048]Waiting_Instance
+	ready_keys: [2048]u64
+	ready_models_next: i64
+	ready_started: u64
+	// Skeletons NPCs are posed on (npc_model), their poses kept.
+	npc_skeletons: [4]Npc_Skeleton
+	// NPCs' models made for the card to move (assemble_npc, rigged): each
+	// one's skeleton, height and palette entries; found by their model + 1
+	// (an index's keys can't be 0), as their place + 1.
+	npc_rigs: [512]Npc_Rig
+	rig_entries: [131072]Palette_Entry
+	model_rigs: Key_Index
+}
+
+// A kind of tree: its look, its billboard's texture slot.
+Tree_Kind :: struct {
+	look: Tree_Look
+	texture: i64
+	fit: Tree_Fit          // its size in its billboard: what it's grown to
+}
+
+// Where the scene's models come from: the game's archives, and the renderer
+// that puts them on the card, with the rooms loading uses. Not drawing (a
+// server's world, a headless command), nothing goes on the card and the
+// renderer's left alone: models are only where they are and what they
+// collide as (undrawn_model), land only its heights; trees' billboards,
+// grass and faces aren't made.
+Loader :: struct {
+	renderer: ^Renderer
+	archives: ^Archives
+	room: ^Load_Room
+	drawing: bool
+}
+
+// A model that isn't drawn (loading not drawing): only a sphere round it,
+// for finding what's near.
+undrawn_model :: fun(center: Vec3, radius: f32) -> Gpu_Model {
+	return Gpu_Model{first_part = 0, part_count = 0, first_particles = 0, particles_count = 0, center = center,
+		radius = radius, rigged = false}
+}
+
+// A sphere round points (a model's collision): its middle, and how far
+// from it the farthest is. A point's 0 wide, round nothing.
+points_sphere :: fun(points: []Vec3) -> Vec3, f32 {
+	if points.len == 0 do return Vec3{0, 0, 0}, 0
+	low := points[0]
+	high := points[0]
+	for point in points {
+		low = Vec3{min_f32(low.x, point.x), min_f32(low.y, point.y), min_f32(low.z, point.z)}
+		high = Vec3{max_f32(high.x, point.x), max_f32(high.y, point.y), max_f32(high.z, point.z)}
+	}
+	middle := (low + high) * 0.5
+	return middle, vec3_length(high - middle)
+}
+
+// The rooms loading uses: for a mesh's file, its blocks, its model, and
+// for reading and decoding textures.
+Load_Room :: struct {
+	file: []byte
+	blocks: []byte
+	model: []byte
+	texture: []byte
+}
+
+// An empty scene, its lighting daylight; its table of paths carved from
+// storage.
+scene_clear :: fun(scene: ^Scene, storage: ^[]byte) {
+	scene.models.len = 0
+	scene.model_collision.len = 0
+	scene.collision_points.len = 0
+	scene.door_kinds.len = 0
+	scene.door_kind_index = key_index(1 << 9, storage)
+	scene.paths = key_index(1 << 13, storage)
+	scene.sound_kinds.len = 0
+	scene.sound_kind_index = key_index(1 << 11, storage)
+	scene.sound_names = key_index(1 << 12, storage)
+	scene.sound_names_read = false
+	scene.track_room.len = 0
+	scene.moving_kinds.len = 0
+	scene.moving_index = key_index(1 << 12, storage)
+	scene.failures = 0
+	scene.grounds.len = 0
+	scene.world = 0
+	scene.grows_grass = true
+	scene.npc_skeletons.len = 0
+	scene.npc_rigs.len = 0
+	scene.rig_entries.len = 0
+	scene.model_rigs = key_index(1 << 10, storage)
+	scene.parent_world = 0
+	scene.tree_kinds = key_index(1 << 11, storage)
+	scene.kinds.len = 0
+	scene.grass_index = key_index(1 << 9, storage)
+	scene.grass_kinds.len = 0
+	scene.texture_grass_index = key_index(1 << 11, storage)
+	scene.texture_grasses.len = 0
+	scene.grass_cells.len = 0
+	scene.distant_instances.len = 0
+	scene.distant_world = 0
+	scene.distant_next = -1
+	drop_trees(scene, NOWHERE)
+	scene.trees_world = 0
+	scene.waiting_trees.len = 0
+	scene.waiting_trees_next = 0
+	scene.land_world = 0
+	scene_clear_cell(scene)
+}
+
+// The scene without its cells: the models kept, nothing waiting.
+scene_clear_cell :: fun(scene: ^Scene) {
+	scene.instances.len = 0
+	scene.lights.len = 0
+	scene.lights_changed = true
+	scene.doors.len = 0
+	scene.sounds.len = 0
+	scene.door_sounds.len = 0
+	scene.waters.len = 0
+	scene.waters_changed = true
+	scene.lighting = DAYLIGHT
+	scene.waiting.len = 0
+	scene.waiting_next = 0
+	scene.waiting_land.len = 0
+	scene.waiting_land_next = 0
+	// (The trees waiting are show_trees's to keep or let go: it keeps those
+	// still near what it shows.)
+	scene.swinging.len = 0
+	stop_readying(scene)
+}
+
+// ---- models ---------------------------------------------------------------------
+
+// The scene's model for a mesh path: loaded the first time it's asked
+// for. -1 when it can't be.
+scene_model :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64 {
+	key := text_hash(path)
+	known, found := index_get(&scene.paths, key)
+	if found do return known - 1
+	model_index, load_error := load_model(scene, loader, path)
+	if load_error {
+		note_failure(scene, path, load_error)
+		model_index = -1
+	}
+	_ = index_put(&scene.paths, key, model_index + 1)
+	return model_index
+}
+
+// ---- sounds ----------------------------------------------------------------------
+
+// The kind of sound a SOUN record makes, read the first time: its index in
+// the scene's sound kinds; -1 when it's none (or there's no more room).
+scene_sound_kind :: fun(scene: ^Scene, plugin: ^Plugin, form_id: u32) -> i64 {
+	known, found := index_get(&scene.sound_kind_index, u64(form_id))
+	if found do return known - 1
+	scratch : [256 * KB]byte
+	index : i64 = -1
+	record, record_error := find_record(plugin, form_id, &scratch)
+	if record_error {
+		note_failure(scene, "a sound's record", record_error)
+	else
+		kind, made := sound_kind_of(record)
+		if made and fits(scene.sound_kinds.len + 1, scene.sound_kinds.cap) {
+			&scene.sound_kinds + kind
+			index = scene.sound_kinds.len - 1
+		}
+	}
+	// (A full table only means it's read again next time.)
+	_ = index_put(&scene.sound_kind_index, u64(form_id), index + 1)
+	return index
+}
+
+// The kind of sound a SOUN record makes, if it has been read: its index in
+// the scene's sound kinds; -1 when it hasn't, or it's none.
+scene_sound_kind_known :: fun(scene: ^Scene, form_id: u32) -> i64 {
+	known, found := index_get(&scene.sound_kind_index, u64(form_id))
+	if not found do return -1
+	return known - 1
+}
+
+// A sound placed where a reference is: the sound of a SOUN record.
+add_placed_sound :: fun(scene: ^Scene, plugin: ^Plugin, sound: u32, reference: Reference) {
+	kind := scene_sound_kind(scene, plugin, sound)
+	if kind < 0 or not fits(scene.sounds.len + 1, scene.sounds.cap) do return
+	&scene.sounds + Placed_Sound{kind = scene.sound_kinds[kind], position = reference.position,
+		key = u64(reference.form_id), next_play = 0, volume = 1}
+}
+
+// The sounds a door makes opening (its SNAM) and closing (ANAM), if any.
+add_door_sounds :: fun(scene: ^Scene, plugin: ^Plugin, base: Record, reference: Reference) {
+	opening, opens_loud := form_field(plugin, base, "SNAM")
+	closing, closes_loud := form_field(plugin, base, "ANAM")
+	if not opens_loud and not closes_loud or not fits(scene.door_sounds.len + 1, scene.door_sounds.cap) do return
+	&scene.door_sounds + Door_Sounds{reference = reference.form_id, position = reference.position,
+		opening = if opens_loud do scene_sound_kind(scene, plugin, opening) else -1,
+		closing = if closes_loud do scene_sound_kind(scene, plugin, closing) else -1}
+}
+
+// The sound a door makes opening or closing (in the scene's sound kinds),
+// and where it is; -1 for none.
+door_sound :: fun(scene: ^Scene, reference: u32, opening: bool) -> i64, Vec3 {
+	for &sounds in scene.door_sounds {
+		if sounds.reference == reference do return if opening do sounds.opening else sounds.closing, sounds.position
+	}
+	return -1, Vec3{0, 0, 0}
+}
+
+// The sounds a door's sequence makes, from its text keys "Sound: <editor
+// id>" (any case), into cues.
+read_door_cues :: fun(scene: ^Scene, plugin: ^Plugin, mesh: ^Nif, sequence: i64, cues: ^[]Door_Cue) {
+	cues.len = 0
+	match mesh.blocks[sequence] {
+	Sequence played
+		if played.text_keys < 0 or played.text_keys >= mesh.blocks.len do return
+		match mesh.blocks[played.text_keys] {
+		Text_Keys text_keys
+			at : i64 = 0
+			for k in 0:text_keys.count {
+				seconds, text, next_at := next_text_key(text_keys.keys, at)
+				at = next_at
+				if text.len < 6 or compare_folded(text[0:6], "sound:") != 0 do continue
+				name := text[6 : text.len]
+				for name.len > 0 and name[0] == ' ' do name = name[1 : name.len]
+				sound := named_sound_kind(scene, plugin, name)
+				if sound >= 0 and fits(cues.len + 1, cues.cap) do cues + Door_Cue{time = seconds, sound = sound}
+			}
+		else
+		}
+	else
+	}
+}
+
+// The kind of sound a SOUN record makes, found by its editor id (any
+// case): its index in the scene's sound kinds; -1 when there's none. The
+// sounds' editor ids are read the first time.
+named_sound_kind :: fun(scene: ^Scene, plugin: ^Plugin, name: []utf8) -> i64 {
+	if not scene.sound_names_read {
+		// Each file's sounds, from its group of them: a later file's copy of
+		// one (an override) found in place of an earlier's.
+		scratch : [64 * KB]byte
+		for &span in plugin.files {
+			at := span.sounds_at
+			for at < span.sounds_end {
+				header := record_header_at(plugin, at)
+				if header.kind != "SOUN" {
+					at += HEADER_SIZE
+					continue
+				}
+				scratch.len = 0
+				record, record_error := record_at(plugin, at, &scratch)
+				at += HEADER_SIZE + i64(header.size)
+				if record_error {
+					note_failure(scene, "a sound's record", record_error)
+					continue
+				}
+				// (A full table only leaves some sounds unfound by name.)
+				_ = index_put(&scene.sound_names, folded_hash(editor_id(record.data)), i64(record.header.form_id) + 1)
+			}
+		}
+		scene.sound_names_read = true
+	}
+	form_id, found := index_get(&scene.sound_names, folded_hash(name))
+	if not found do return -1
+	return scene_sound_kind(scene, plugin, u32(form_id - 1))
+}
+
+// Notes that something couldn't be loaded (and is left out): counted, the
+// first's name and reason kept, for the journal.
+note_failure :: fun(scene: ^Scene, what: []utf8, reason: err) {
+	scene.failures += 1
+	if scene.failures > 1 do return
+	scene.first_failure.len = 0
+	add_what_fits(&scene.first_failure, what)
+	scene.first_failure_reason = reason
+}
+
+// Whether a mesh path's model has been asked for before: its index (-1
+// when it couldn't be loaded), and false when it hasn't.
+known_model :: fun(scene: ^Scene, path: []utf8) -> i64, bool {
+	known, found := index_get(&scene.paths, text_hash(path))
+	return known - 1, found
+}
+
+// Reads a mesh, makes its model and puts it on the card: its index in the
+// scene's models.
+load_model :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64, err {
+	if scene.models.len == scene.models.cap do return -1, No_Room_For_Models
+	room := loader.room
+	mesh_file, found := find_archived(loader.archives, path)
+	if not found do return -1, Not_In_Archive
+	room.file.len = 0
+	data := read_archived(loader.archives, mesh_file, &room.file)?
+
+	room.blocks.len = 0
+	failure := Nif_Failure{block = 0, type_name = room.file[0:0]}
+	mesh := read_nif(data, &room.blocks, &failure)?
+	// A mesh that moves by itself: its frame is the path's model, its
+	// pieces apart.
+	frame, moves := add_moving_kind(scene, loader, &mesh, path)?
+	if moves do return frame
+	gpu := undrawn_model(Vec3{0, 0, 0}, 0)
+	if loader.drawing {
+		room.model.len = 0
+		built := build_model(&mesh, &room.model)?
+		gpu = upload_model(loader.renderer, &built, loader.archives, &room.texture)?
+	}
+	// What it collides as (from its blocks, still in their room); not
+	// drawn, a sphere round that.
+	collision_start := scene.collision_points.len
+	add_collision(&mesh, &scene.collision_points)
+	if not loader.drawing {
+		middle, reach := points_sphere(scene.collision_points[collision_start : scene.collision_points.len])
+		gpu = undrawn_model(middle, reach)
+	}
+	&scene.model_collision + Collision_Range{first = collision_start, count = scene.collision_points.len - collision_start,
+		upright = 0, upright_height = 0}
+	&scene.models + gpu
+	return scene.models.len - 1
+}
+
+// Whether a mesh is an editor's marker, not drawn in the game: the
+// markers' meshes are in meshes\ itself, named marker….
+is_marker :: fun(path: []utf8) -> bool {
+	return starts_with(path, "meshes\\marker")
+}
+
+// Places an instance of a model, when there's room: lit by the scene's
+// lights as they are now (choose_all_lights does them all again).
+add_instance :: fun(scene: ^Scene, model_index: i64, placement: Mat4, reference: u32 = 0) {
+	if not fits(scene.instances.len + 1, scene.instances.cap) do return
+	instance := next(&scene.instances)
+	instance^ = place_instance(scene.models[model_index], model_index, placement, reference)
+	choose_lights(instance, &scene.lights)
+}
+
+// Lets go of the instances of a reference.
+remove_instances :: fun(scene: ^Scene, reference: u32) {
+	kept : i64 = 0
+	for k in 0:scene.instances.len {
+		if scene.instances[k].reference == reference do continue
+		if kept != k do scene.instances[kept] = scene.instances[k]
+		kept += 1
+	}
+	scene.instances.len = kept
+}
+
+// Chooses every instance's lights again: after a cell's lights are all known.
+choose_all_lights :: fun(scene: ^Scene) {
+	for &instance in scene.instances do choose_lights(instance, &scene.lights)
+}
+
+// ---- cells -----------------------------------------------------------------------
+
+// Places a cell's references in the scene, those in area and not in placed
+// (where they're placed already): their instances (or, for meshes not yet
+// loaded, their places in the queue), the lights they give and the doors
+// that lead somewhere.
+add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, placed: Grid_Area) -> err {
+	references : [16384]Reference
+	cell_references(plugin, cell, &references)?
+	scratch : [4 * MB]byte
+	for reference in references {
+		if reference.flags & RECORD_DISABLED != 0 do continue
+		if not area_holds(area, reference.position) or area_holds(placed, reference.position) do continue
+		scratch.len = 0
+		base, base_error := find_record(plugin, reference.base, &scratch)
+		if base_error do continue
+
+		light, gives_light := light_of(base, reference)
+		if gives_light and fits(scene.lights.len + 1, scene.lights.cap) {
+			&scene.lights + light
+			scene.lights_changed = true
+		}
+		// What it sounds like: a sound placed; a light's or activator's own
+		// sound, where it is; a door's, opening and closing.
+		if base.header.kind == "SOUN" do add_placed_sound(scene, plugin, reference.base, reference)
+		if base.header.kind == "LIGH" or base.header.kind == "ACTI" {
+			sound, makes_sound := form_field(plugin, base, "SNAM")
+			if makes_sound do add_placed_sound(scene, plugin, sound, reference)
+		}
+		if base.header.kind == "DOOR" do add_door_sounds(scene, plugin, base, reference)
+		in_place := false
+		if base.header.kind == "DOOR" {
+			// (Its own scratch: base's data may be in scratch.)
+			door_scratch : [64 * KB]byte
+			_, leads := door_destination(plugin, reference.form_id, &door_scratch)?
+			if leads and fits(scene.doors.len + 1, scene.doors.cap) do &scene.doors + Scene_Door{reference = reference.form_id, position = reference.position}
+			in_place = not leads
+		}
+
+		// A tree: grown when it's loaded, drawn so within TREE_NEAR (past it,
+		// its billboard: load_trees).
+		if base.header.kind == "TREE" {
+			if fits(scene.waiting.len + 1, scene.waiting.cap) {
+				waiting := next(&scene.waiting)
+				waiting.reference = reference.form_id
+				waiting.door = false
+				waiting.npc = 0
+				waiting.tree = reference.base
+				waiting.path.len = 0
+				waiting.world = reference_transform(reference)
+			}
+			continue
+		}
+		// An NPC: the world's, shown where it has them (queue_actors).
+		if base.header.kind == "NPC_" do continue
+		path := model_path(base)
+		if path.len == 0 or is_marker(path) do continue
+		// A door that opens in place, of a kind loaded: its pieces.
+		if in_place {
+			kind_index, kind_known := index_get(&scene.door_kind_index, text_hash(path))
+			if kind_known and kind_index > 0 {
+				place_door(scene, kind_index - 1, reference_transform(reference), reference.form_id)
+				continue
+			}
+			if not kind_known and fits(scene.waiting.len + 1, scene.waiting.cap) {
+				waiting := next(&scene.waiting)
+				waiting.reference = reference.form_id
+				waiting.door = true
+				waiting.npc = 0
+				waiting.tree = 0
+				waiting.path.len = 0
+				&waiting.path + path
+				waiting.world = reference_transform(reference)
+				continue
+			}
+		}
+		model_index, known := known_model(scene, path)
+		if known {
+			if model_index >= 0 do place_model(scene, model_index, path, reference_transform(reference), reference.form_id)
+		elif fits(scene.waiting.len + 1, scene.waiting.cap)
+			waiting := next(&scene.waiting)
+			waiting.reference = reference.form_id
+			waiting.door = false
+			waiting.npc = 0
+			waiting.tree = 0
+			waiting.path.len = 0
+			&waiting.path + path
+			waiting.world = reference_transform(reference)
+		}
+	}
+}
+
+// Has the people of the world's place (as they stand now) that aren't here
+// yet, nor waiting, wait to be put together and placed: outside, those in
+// the area shown.
+queue_actors :: fun(scene: ^Scene, actors: []Reference) {
+	area := if scene.world != 0 do shown_area(scene) else EVERYWHERE
+	for actor in actors {
+		if not area_holds(area, actor.position) do continue
+		here := false
+		for &instance in scene.instances {
+			if instance.reference == actor.form_id do here = true
+		}
+		for k in scene.waiting_next:scene.waiting.len {
+			if scene.waiting[k].reference == actor.form_id do here = true
+		}
+		if here or not fits(scene.waiting.len + 1, scene.waiting.cap) do continue
+		waiting := next(&scene.waiting)
+		waiting.reference = actor.form_id
+		waiting.door = false
+		waiting.npc = actor.base
+		waiting.tree = 0
+		waiting.path.len = 0
+		waiting.world = reference_transform(actor)
+	}
+}
+
+// Loads what's waiting until it's all loaded (true) or budget nanoseconds
+// have gone (false) — at least one thing each call. Land first; then what's
+// nearest near (the camera) of the rest, each time.
+load_waiting :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, budget: u64, near: Vec3) -> bool {
+	start := time_now()
+	scene.slowest_load = 0
+	scene.slowest_what.len = 0
+	for scene.waiting_land_next < scene.waiting_land.len {
+		if time_now() - start > budget do return false
+		item := scene.waiting_land[scene.waiting_land_next]
+		scene.waiting_land_next += 1
+		area := shown_area(scene)
+		inside := item.x >= area.low_x and item.x <= area.high_x and item.y >= area.low_y and item.y <= area.high_y
+		if inside {
+			item_start := time_now()
+			load_land(scene, plugin, item.cell, item.x, item.y, loader)
+			note_load_time(scene, "a land cell", item_start)
+		}
+	}
+	for scene.waiting_next < scene.waiting.len {
+		if time_now() - start > budget do return false
+		// The nearest of what's left, next.
+		nearest := scene.waiting_next
+		nearest_distance : f32 = 1000000000000
+		for k in scene.waiting_next:scene.waiting.len {
+			placing := &scene.waiting[k].world
+			away := Vec3{placing[3][0] - near.x, placing[3][1] - near.y, placing[3][2] - near.z}
+			distance := away.x * away.x + away.y * away.y + away.z * away.z
+			if distance < nearest_distance {
+				nearest = k
+				nearest_distance = distance
+			}
+		}
+		if nearest != scene.waiting_next {
+			moved := scene.waiting[nearest]
+			scene.waiting[nearest] = scene.waiting[scene.waiting_next]
+			scene.waiting[scene.waiting_next] = moved
+		}
+		item := &scene.waiting[scene.waiting_next]
+		scene.waiting_next += 1
+		// (Outside, the camera may have moved on since it was queued.)
+		place := Vec3{item.world[3][0], item.world[3][1], item.world[3][2]}
+		if scene.world != 0 and not area_holds(shown_area(scene), place) do continue
+		item_start := time_now()
+		load_waiting_item(scene, plugin, loader, item)
+		if item.npc != 0 {
+			note_load_time(scene, "an NPC", item_start)
+		elif item.tree != 0
+			note_load_time(scene, "a tree", item_start)
+		else
+			note_load_time(scene, item.path, item_start)
+		}
+	}
+	for scene.waiting_trees_next < scene.waiting_trees.len {
+		if time_now() - start > budget do return false
+		item := scene.waiting_trees[scene.waiting_trees_next]
+		scene.waiting_trees_next += 1
+		area := area_around_by(scene.trees_x, scene.trees_y, TREE_RADIUS)
+		inside := item.x >= area.low_x and item.x <= area.high_x and item.y >= area.low_y and item.y <= area.high_y
+		if inside {
+			item_start := time_now()
+			load_trees(scene, plugin, item.cell, item.x, item.y, loader)
+			note_load_time(scene, "a cell's trees", item_start)
+		}
+	}
+	scene.waiting_trees.len = 0
+	scene.waiting_trees_next = 0
+	scene.waiting.len = 0
+	scene.waiting_next = 0
+	scene.waiting_land.len = 0
+	scene.waiting_land_next = 0
+	return true
+}
+
+// Loads a thing that was waiting, and places it: a door, an NPC, a tree
+// or a model.
+load_waiting_item :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, item: ^Waiting_Instance) {
+	if item.door {
+		kind_index := door_kind(scene, plugin, loader, item.path)
+		if kind_index >= 0 {
+			place_door(scene, kind_index, item.world, item.reference)
+			return
+		}
+	}
+	if item.npc != 0 {
+		npc_index := npc_model(scene, plugin, loader, item.npc)
+		if npc_index >= 0 do add_instance(scene, npc_index, item.world, item.reference)
+		return
+	}
+	if item.tree != 0 {
+		tree_index := tree_model(scene, plugin, loader, item.tree, item.reference)
+		before := scene.instances.len
+		if tree_index >= 0 do add_instance(scene, tree_index, item.world, item.reference)
+		if scene.instances.len > before do scene.instances[before].reach = TREE_NEAR
+		return
+	}
+	model_index := scene_model(scene, loader, item.path)
+	if model_index >= 0 do place_model(scene, model_index, item.path, item.world, item.reference)
+}
+
+// Keeps what was loaded since start if it's the slowest of this load_waiting.
+note_load_time :: fun(scene: ^Scene, what: []utf8, start: u64) {
+	took := time_now() - start
+	if took <= scene.slowest_load do return
+	scene.slowest_load = took
+	scene.slowest_what.len = 0
+	&scene.slowest_what + what[0 : min(what.len, scene.slowest_what.cap)]
+}
+
+// ---- trees ------------------------------------------------------------------------
+
+// The kind of tree a base record is: its index in the scene's kinds, its
+// billboard loaded the first time; -1 when it isn't a tree.
+tree_kind :: fun(scene: ^Scene, plugin: ^Plugin, base: u32, loader: Loader) -> i64 {
+	header_at, found := index_get(&plugin.records, u64(base))
+	if not found do return -1
+	header := record_header_at(plugin, header_at)
+	if header.kind != "TREE" do return -1
+	known, seen := index_get(&scene.tree_kinds, u64(base))
+	if seen do return known - 1
+	kind_index : i64 = -1
+	scratch : [64 * KB]byte
+	record, record_error := record_at(plugin, header_at, &scratch)
+	if record_error do note_failure(scene, "a tree's record", record_error)
+	if not record_error and fits(scene.kinds.len + 1, scene.kinds.cap) {
+		look, is_tree := tree_look(record)
+		if is_tree {
+			// (The picture fills its texture: clamped, its edges don't pick up
+			// the far side.) Not drawing, it's only there to fit the tree to.
+			texture : i64 = 0
+			if loader.drawing do texture = texture_for(loader.renderer, loader.archives, look.billboard, &loader.room.texture, CLAMP_BOTH)
+			_, has_billboard := find_archived(loader.archives, look.billboard)
+			if texture != 0 or (not loader.drawing and has_billboard) {
+				fit, fit_error := read_billboard_fit(loader, &look)
+				if fit_error do note_failure(scene, look.billboard, fit_error)
+				&scene.kinds + Tree_Kind{look = look, texture = texture, fit = fit}
+				kind_index = scene.kinds.len - 1
+			}
+		}
+	}
+	_ = index_put(&scene.tree_kinds, u64(base), kind_index + 1)
+	return kind_index
+}
+
+// A tree's size in its billboard and how opaque its leaves are (Tree_Fit:
+// grown trees are fitted to it), from the pictures' smallest mipmaps at
+// least 64 wide.
+read_billboard_fit :: fun(loader: Loader, look: ^Tree_Look) -> Tree_Fit, err {
+	columns, rows := small_picture(loader, look.billboard)?
+	fit := billboard_fit(loader.room.model, columns, rows, look.width, look.height)
+	small_picture(loader, look.leaves)?
+	fit.leaf_fill = leaf_fill(loader.room.model)
+	return fit
+}
+
+// A texture's smallest mipmap at least 64 wide, decoded into the room's
+// model room (red, green, blue, alpha, rows from the top): how many columns
+// and rows.
+small_picture :: fun(loader: Loader, path: []utf8) -> i64, i64, err {
+	found, in_archives := find_archived(loader.archives, path)
+	if not in_archives do return 0, 0, Not_In_Archive
+	loader.room.file.len = 0
+	data := read_archived(loader.archives, found, &loader.room.file)?
+	texture := read_texture(data)?
+	mip : i64 = 0
+	for mip + 1 < texture.mips.len and texture.mips[mip + 1].width >= 64 do mip += 1
+	loader.room.model.len = 0
+	decode_rgba(texture, mip, &loader.room.model)?
+	return texture.mips[mip].width, texture.mips[mip].height
+}
+
+// Puts a cell's trees on the card, unless they're there: in a free slot,
+// even when it has none (so it's known to be done).
+load_trees :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64, loader: Loader) {
+	if not loader.drawing do return
+	for &placed in scene.tree_cells {
+		if placed.x == x and placed.y == y do return
+	}
+	slot : i64 = -1
+	for k in 0:TREE_CELLS {
+		if not scene.tree_slots_taken[k] {
+			slot = k
+			break
+		}
+	}
+	if slot < 0 or scene.tree_cells.len == scene.tree_cells.cap do return
+	references : [16384]Reference
+	references_error := cell_references(plugin, cell, &references)
+	if references_error do note_failure(scene, "a cell's references, for its trees", references_error)
+	trees : [TREES_PER_CELL]Placed_Tree
+	for reference in references {
+		if not fits(trees.len + 1, trees.cap) do break
+		if reference.flags & RECORD_DISABLED != 0 do continue
+		kind_index := tree_kind(scene, plugin, reference.base, loader)
+		if kind_index < 0 do continue
+		kind := &scene.kinds[kind_index]
+		// A little brighter or darker, the same each time.
+		shade := f32((reference.form_id *% 2654435761) >> 24) / 255
+		&trees + Placed_Tree{position = reference.position, width = kind.look.width * reference.scale,
+			height = kind.look.height * reference.scale, brightness = 0.88 + 0.2 * shade, texture = kind.texture}
+	}
+	scene.tree_slots_taken[slot] = true
+	&scene.tree_cells + upload_trees(loader.renderer, &trees, x, y, slot)
+}
+
+// A key in the scene's paths for a tree's model: a bit, its kind's form
+// id and the seed's index (a text's hash is unlikely to be one).
+TREE_MODEL_KEY :: 0x4000000000000000
+
+// A tree's model, grown (speedtree.mara) with one of its kind's seeds: the
+// one its reference's form id picks. Grown the first time it's asked for,
+// then kept; -1 when it can't be.
+tree_model :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, base: u32, reference: u32) -> i64 {
+	kind_index := tree_kind(scene, plugin, base, loader)
+	if kind_index < 0 do return -1
+	kind := &scene.kinds[kind_index]
+	look := &kind.look
+	seed_index : i64 = 0
+	if look.seeds.len > 0 do seed_index = i64(reference % u32(look.seeds.len))
+	key := TREE_MODEL_KEY | (u64(base) << 8) | u64(seed_index)
+	known, found := index_get(&scene.paths, key)
+	if found do return known - 1
+	model_index, grow_error := grow_tree_model(scene, loader, kind, seed_index)
+	if grow_error {
+		note_failure(scene, look.model, grow_error)
+		model_index = -1
+	}
+	_ = index_put(&scene.paths, key, model_index + 1)
+	return model_index
+}
+
+// Grows a tree after its kind's SpeedTree file, with its seed_index-th seed
+// (the file's own where the record names none), fitted to its billboard,
+// and puts it on the card: its model's index.
+grow_tree_model :: fun(scene: ^Scene, loader: Loader, kind: ^Tree_Kind, seed_index: i64) -> i64, err {
+	look := &kind.look
+	if scene.models.len == scene.models.cap do return -1, No_Room_For_Models
+	found, in_archives := find_archived(loader.archives, look.model)
+	if not in_archives do return -1, Not_In_Archive
+	loader.room.file.len = 0
+	data := read_archived(loader.archives, found, &loader.room.file)?
+	tree : Speed_Tree
+	read_speed_tree(data, &tree)?
+	seed := if look.seeds.len > 0 do look.seeds[seed_index] else tree.seed
+	loader.room.model.len = 0
+	grown, report := grow_tree(&tree, seed, look.leaves, kind.fit, &loader.room.model)?
+	gpu : Gpu_Model
+	if loader.drawing {
+		gpu = upload_model(loader.renderer, &grown, loader.archives, &loader.room.texture)?
+	else
+		middle := (grown.bounds_min + grown.bounds_max) * 0.5
+		gpu = undrawn_model(middle, vec3_length(grown.bounds_max - middle))
+	}
+	// Its trunk walked round (a shrub's walked through).
+	trunk := if report.trunk_radius >= TREE_TRUNK_LEAST do report.trunk_radius else 0
+	&scene.model_collision + Collision_Range{first = scene.collision_points.len, count = 0, upright = trunk,
+		upright_height = grown.bounds_max.z}
+	&scene.models + gpu
+	return scene.models.len - 1
+}
+
+// Lets go of the trees of the cells outside an area.
+drop_trees :: fun(scene: ^Scene, area: Grid_Area) {
+	kept : i64 = 0
+	for k in 0:scene.tree_cells.len {
+		cell := &scene.tree_cells[k]
+		inside := cell.x >= area.low_x and cell.x <= area.high_x and cell.y >= area.low_y and cell.y <= area.high_y
+		if inside {
+			if kept != k do scene.tree_cells[kept] = scene.tree_cells[k]
+			kept += 1
+		else
+			scene.tree_slots_taken[cell.slot] = false
+		}
+	}
+	scene.tree_cells.len = kept
+	if kept == 0 {
+		for k in 0:TREE_CELLS do scene.tree_slots_taken[k] = false
+	}
+}
+
+// Shows the trees of a world's cells around the one at x, y: those it
+// had already that are still near kept, the new ones' cells waiting to be
+// loaded, the nearest first.
+show_trees :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, x: i64, y: i64) {
+	area := area_around_by(x, y, TREE_RADIUS)
+	placed := NOWHERE
+	same_world := scene.trees_world == world_id
+	if same_world {
+		placed = area_around_by(scene.trees_x, scene.trees_y, TREE_RADIUS)
+		drop_trees(scene, area)
+	else
+		drop_trees(scene, NOWHERE)
+	}
+	scene.trees_world = world_id
+	scene.trees_x = x
+	scene.trees_y = y
+	// What still waits and is still near waits on; the new cells after it.
+	kept : i64 = 0
+	for k in scene.waiting_trees_next:scene.waiting_trees.len {
+		item := scene.waiting_trees[k]
+		inside := item.x >= area.low_x and item.x <= area.high_x and item.y >= area.low_y and item.y <= area.high_y
+		if inside and same_world {
+			scene.waiting_trees[kept] = item
+			kept += 1
+		}
+	}
+	scene.waiting_trees.len = kept
+	scene.waiting_trees_next = 0
+	for ring in 0..TREE_RADIUS {
+		for cell_y in y - ring..y + ring {
+			for cell_x in x - ring..x + ring {
+				on_ring := cell_x == x - ring or cell_x == x + ring or cell_y == y - ring or cell_y == y + ring
+				if not on_ring do continue
+				already := cell_x >= placed.low_x and cell_x <= placed.high_x and cell_y >= placed.low_y and cell_y <= placed.high_y
+				if already do continue
+				cell := exterior_cell(plugin, world_id, cell_x, cell_y)
+				if cell == 0 or not fits(scene.waiting_trees.len + 1, scene.waiting_trees.cap) do continue
+				&scene.waiting_trees + Waiting_Land{cell = cell, x = cell_x, y = cell_y}
+			}
+		}
+	}
+}
+
+// Whether anything is waiting to be loaded.
+anything_waiting :: fun(scene: ^Scene) -> bool {
+	return scene.waiting_next < scene.waiting.len or scene.waiting_land_next < scene.waiting_land.len or
+		scene.waiting_trees_next < scene.waiting_trees.len
+}
+
+// Where one arrives in the scene's cell through one of its doors: the
+// other side of a door here says where. False when no door here leads
+// anywhere that leads back.
+scene_entrance :: fun(scene: ^Scene, plugin: ^Plugin) -> Door_Destination, bool {
+	scratch : [4 * MB]byte
+	for door in scene.doors {
+		scratch.len = 0
+		// (A door whose record can't be read is passed over, as one that leads nowhere.)
+		there, leads, there_error := door_destination(plugin, door.reference, &scratch)
+		if there_error or not leads do continue
+		back, leads_back, back_error := door_destination(plugin, there.door, &scratch)
+		if not back_error and leads_back and back.door == door.reference do return back, true
+	}
+	return Door_Destination{door = 0, position = Vec3{0, 0, 0}, rotation = Vec3{0, 0, 0}}, false
+}
+
+// Shows an interior cell: its references and its lighting, in place of
+// what the scene showed, all loaded.
+show_interior :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, loader: Loader) -> err {
+	drop_land(scene, EVERYWHERE, true)
+	scene.land_world = 0
+	scene_clear_cell(scene)
+	scene.world = 0
+	scratch : [1 * MB]byte
+	scene.lighting = cell_lighting(plugin, cell, &scratch)?
+	// What it holds: placed, or waiting to be loaded (a little each frame,
+	// the nearest first: load_waiting).
+	add_cell(scene, plugin, cell, EVERYWHERE, NOWHERE)?
+	choose_all_lights(scene)
+
+	// Water inside (sewers, caves): a plane under all that's there.
+	height, has_water := cell_water(plugin, cell, &scratch)?
+	if has_water and scene.instances.len + scene.waiting.len > 0 {
+		low := Vec3{1000000, 1000000, 0}
+		high := Vec3{-1000000, -1000000, 0}
+		for instance in scene.instances do widen_box(&low, &high, instance.center)
+		for &item in scene.waiting do widen_box(&low, &high, Vec3{item.world[3][0], item.world[3][1], 0})
+		water := next(&scene.waters)
+		water.low_x = low.x - 4096
+		water.low_y = low.y - 4096
+		water.high_x = high.x + 4096
+		water.high_y = high.y + 4096
+		water.height = height
+		for k in 0:WATER_VERTICES do water.depths[k] = 1000   // (deep: there's no land under it to know)
+		scene.waters_changed = true
+	}
+}
+
+// Widens a box (low to high, across) to take in a place.
+widen_box :: fun(low: ^Vec3, high: ^Vec3, place: Vec3) {
+	if place.x < low.x do low.x = place.x
+	if place.y < low.y do low.y = place.y
+	if place.x > high.x do high.x = place.x
+	if place.y > high.y do high.y = place.y
+}
+
+// ---- outside ------------------------------------------------------------------------
+
+// Lets go of the land outside an area (all of it, when everything): its
+// slots free for other land.
+drop_land :: fun(scene: ^Scene, area: Grid_Area, everything: bool) {
+	k : i64 = 0
+	for k < scene.grounds.len {
+		ground := scene.grounds[k]
+		inside := ground.x >= area.low_x and ground.x <= area.high_x and ground.y >= area.low_y and ground.y <= area.high_y
+		if everything or not inside {
+			scene.grounds[k] = scene.grounds[scene.grounds.len - 1]
+			scene.grounds.len -= 1
+		else
+			k += 1
+		}
+	}
+	// The grass goes with its land.
+	k = 0
+	for k < scene.grass_cells.len {
+		cell := &scene.grass_cells[k]
+		inside := cell.x >= area.low_x and cell.x <= area.high_x and cell.y >= area.low_y and cell.y <= area.high_y
+		if everything or not inside {
+			scene.grass_cells[k] = scene.grass_cells[scene.grass_cells.len - 1]
+			scene.grass_cells.len -= 1
+		else
+			k += 1
+		}
+	}
+}
+
+// Whether the land of the cell at x, y is on the card.
+land_loaded :: fun(scene: ^Scene, x: i64, y: i64) -> bool {
+	for ground in scene.grounds {
+		if ground.x == x and ground.y == y do return true
+	}
+	return false
+}
+
+// A land slot no land is in, -1 when all are taken.
+free_land_slot :: fun(scene: ^Scene) -> i64 {
+	for slot in 0:LAND_SLOTS {
+		taken := false
+		for ground in scene.grounds {
+			if ground.slot == slot do taken = true
+		}
+		if not taken do return slot
+	}
+	return -1
+}
+
+// Puts a cell's land on the card, unless it's there or the cell has none.
+load_land :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64, loader: Loader) {
+	if land_loaded(scene, x, y) do return
+	slot := free_land_slot(scene)
+	if slot < 0 do return
+	land_at, found := shown_land(plugin, scene.land_world, scene.parent_world, x, y)
+	if not found do return
+	room := loader.room
+	room.file.len = 0
+	record, record_error := record_at(plugin, land_at, &room.file)
+	if record_error {
+		note_failure(scene, "a cell's land", record_error)
+		return
+	}
+	cell_land : Land
+	read_land(plugin, record, &cell_land)
+	mesh : Land_Mesh
+	build_land_mesh(plugin, &cell_land, x, y, &mesh)
+	scene.land_heights[slot] = cell_land.heights
+	if not loader.drawing {
+		&scene.grounds + Gpu_Land{x = x, y = y, slot = slot, center = mesh.center, radius = mesh.radius}
+		return
+	}
+	&scene.grounds + upload_land(loader.renderer, &mesh, x, y, slot, loader.archives, &room.texture)
+	load_grass(scene, plugin, cell, x, y, &cell_land, slot, loader)
+}
+
+// ---- lights that change ------------------------------------------------------------
+
+// How far a flickering light wavers off its place, at most (the game's
+// fFlickerMovement), and its pace: steps a second, and how far each takes
+// the brightness (as OpenMW has it, after the original games).
+FLICKER_MOVEMENT :: 8
+FLICKER_STEPS :: 15
+QUICK_STEP :: 0.1
+SLOW_STEP :: 0.05
+
+// Moves the lights that change on by a frame: each's brightness toward
+// its target, a new one when it's there — by chance for a flicker, the
+// other end for a pulse — and a flickering one's waver with it. True when
+// any changed (the renderer's to be given them).
+change_lights :: fun(scene: ^Scene, seconds: f32) -> bool {
+	steps := seconds * FLICKER_STEPS
+	changed := false
+	for &light in scene.lights {
+		if light.kind == .steady do continue
+		changed = true
+		quick := light.kind == .flicker or light.kind == .pulse
+		pace : f32 = if quick do QUICK_STEP else SLOW_STEP
+		if light.brightness >= light.target do light.brightness = max_f32(light.target, light.brightness - steps * pace)
+		else do light.brightness = min_f32(light.target, light.brightness + steps * pace)
+		flickers := light.kind == .flicker or light.kind == .flicker_slow
+		if abs_f32(light.brightness - light.target) < pace * 0.5 {
+			if flickers {
+				light.target = 0.25 + next_chance(&scene.flicker_seed) * 0.75
+				light.drift_target = Vec3{next_chance(&scene.flicker_seed) * 2 - 1, next_chance(&scene.flicker_seed) * 2 - 1,
+					next_chance(&scene.flicker_seed) * 2 - 1} * FLICKER_MOVEMENT
+			else
+				light.target = if light.target <= 0.5 do 1 else 0.25
+			}
+		}
+		if flickers do light.drift = light.drift + (light.drift_target - light.drift) * min_f32(1, steps * pace)
+	}
+	return changed
+}
+
+// A number from 0 to 1, the seed moved on.
+next_chance :: fun(seed: ^u64) -> f32 {
+	seed^ = seed^ *% 6364136223846793005 +% 1442695040888963407
+	return f32(seed^ >> 40) / 16777216
+}
+
+// ---- doors that open in place -------------------------------------------------------
+
+// The kind of door a mesh is, if it opens in place: its index in the
+// scene's door kinds, loaded the first time; -1 when it doesn't.
+door_kind :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, path: []utf8) -> i64 {
+	key := text_hash(path)
+	known, found := index_get(&scene.door_kind_index, key)
+	if found do return known - 1
+	kind_index, load_error := load_door_kind(scene, plugin, loader, path)
+	if load_error {
+		note_failure(scene, path, load_error)
+		kind_index = -1
+	}
+	_ = index_put(&scene.door_kind_index, key, kind_index + 1)
+	return kind_index
+}
+
+// Reads a door's mesh: if its Open and Close sequences move nodes, its
+// frame and those nodes' pieces are each put on the card as a model (with
+// its collision), and the tracks kept. -1 when they move nothing (no
+// error: a door that doesn't open in place).
+load_door_kind :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, path: []utf8) -> i64, err {
+	if scene.door_kinds.len == scene.door_kinds.cap do return -1
+	room := loader.room
+	mesh_file, found := find_archived(loader.archives, path)
+	if not found do return -1, Not_In_Archive
+	room.file.len = 0
+	data := read_archived(loader.archives, mesh_file, &room.file)?
+	room.blocks.len = 0
+	failure := Nif_Failure{block = 0, type_name = room.file[0:0]}
+	mesh := read_nif(data, &room.blocks, &failure)?
+	open := find_sequence(&mesh, "Open")
+	close := find_sequence(&mesh, "Close")
+	if open < 0 or close < 0 do return -1
+	opening : [DOOR_PIECES]Track
+	closing : [DOOR_PIECES]Track
+	read_tracks(&mesh, open, &opening, &scene.track_room, false)
+	read_tracks(&mesh, close, &closing, &scene.track_room, false)
+	// The nodes they move, each found, its rest taken.
+	moving : [DOOR_PIECES]i64
+	for &track in opening {
+		node := find_node(&mesh, track.node_name)
+		if node < 0 do return -1
+		match mesh.blocks[node] {
+		Node moved
+			track.rest = local_transform(moved.object)
+		else
+		}
+		&moving + node
+	}
+	if moving.len == 0 do return -1
+	for &track in closing {
+		node := find_node(&mesh, track.node_name)
+		if node < 0 do continue
+		match mesh.blocks[node] {
+		Node moved
+			track.rest = local_transform(moved.object)
+		else
+		}
+	}
+
+	kind := next(&scene.door_kinds)
+	kind.open_start, kind.open_stop = sequence_span(&mesh, open)
+	kind.close_start, kind.close_stop = sequence_span(&mesh, close)
+	read_door_cues(scene, plugin, &mesh, open, &kind.open_cues)
+	read_door_cues(scene, plugin, &mesh, close, &kind.close_cues)
+	// (The frame may be nothing: a door that moves all of itself.)
+	frame, frame_error := add_part_model(scene, loader, &mesh, -1, moving)
+	kind.frame = if frame_error do -1 else frame
+	kind.pieces.len = 0
+	for k in 0:moving.len {
+		// (A moving node under another is its own piece, not part of that one's.)
+		others : [DOOR_PIECES]i64
+		for other in moving {
+			if other != moving[k] do &others + other
+		}
+		piece := next(&kind.pieces)
+		piece_model, piece_error := add_part_model(scene, loader, &mesh, moving[k], others)
+		if piece_error {
+			scene.door_kinds.len -= 1
+			return -1, piece_error
+		}
+		piece.model = piece_model
+		piece.parent, _ = parent_transform(&mesh, moving[k])
+		piece.opening = opening[k]
+		// Its Close track: the one for its node; else its Open one, run back.
+		piece.closing = opening[k]
+		for &track in closing {
+			if track.node_name == opening[k].node_name do piece.closing = track^
+		}
+	}
+	return scene.door_kinds.len - 1
+}
+
+// ---- what moves by itself ------------------------------------------------------------
+
+// For a mesh whose Idle (or SpecialIdle) sequence moves some of its nodes:
+// its moving kind — the frame and each moving node put on the card as a
+// model, the tracks kept — and the frame's index in the scene's models,
+// true. False for a mesh that doesn't move so (or when there's no room).
+add_moving_kind :: fun(scene: ^Scene, loader: Loader, mesh: ^Nif, path: []utf8) -> i64, bool, err {
+	idle := find_sequence(mesh, "Idle")
+	if idle < 0 do idle = find_sequence(mesh, "SpecialIdle")
+	if idle < 0 or not fits(scene.moving_kinds.len + 1, scene.moving_kinds.cap) do return -1, false
+	tracks : [MOVING_PIECES]Track
+	read_tracks(mesh, idle, &tracks, &scene.track_room, false)
+	// The nodes they move, each found, its rest taken.
+	kept : [MOVING_PIECES]Track
+	moving : [MOVING_PIECES]i64
+	for &track in tracks {
+		node := find_node(mesh, track.node_name)
+		if node < 0 do continue
+		match mesh.blocks[node] {
+		Node moved
+			track.rest = local_transform(moved.object)
+			&kept + track^
+			&moving + node
+		else
+		}
+	}
+	if moving.len == 0 do return -1, false
+
+	kind := next(&scene.moving_kinds)
+	kind.start, kind.stop = sequence_span(mesh, idle)
+	kind.frequency = 1
+	match mesh.blocks[idle] {
+	Sequence sequence
+		if sequence.frequency > 0 do kind.frequency = sequence.frequency
+	else
+	}
+	frame, frame_error := add_part_model(scene, loader, mesh, -1, moving)
+	if frame_error {
+		scene.moving_kinds.len -= 1
+		return -1, false, frame_error
+	}
+	kind.frame = frame
+	kind.pieces.len = 0
+	for k in 0:moving.len {
+		// (A moving node under another is its own piece, not part of that one's.)
+		others : [MOVING_PIECES]i64
+		for other in moving {
+			if other != moving[k] do &others + other
+		}
+		piece_model, piece_error := add_part_model(scene, loader, mesh, moving[k], others)
+		if piece_error {
+			scene.moving_kinds.len -= 1
+			return -1, false, piece_error
+		}
+		piece := next(&kind.pieces)
+		piece.model = piece_model
+		piece.track = kept[k]
+		parent, _ := parent_transform(mesh, moving[k])
+		piece.above = moving_above(mesh, moving[k], moving)
+		piece.from_above = parent
+		if piece.above >= 0 {
+			above_place, _ := object_place(mesh, moving[piece.above])
+			piece.from_above = mat4_mul(mat4_inverse(above_place), parent)
+		}
+	}
+	_ = index_put(&scene.moving_index, text_hash(path), scene.moving_kinds.len)
+	return frame, true
+}
+
+// The nearest of the moving nodes above a node: its index among them; -1
+// for none.
+moving_above :: fun(mesh: ^Nif, node: i64, moving: []i64) -> i64 {
+	at := node_parent(mesh, node)
+	for at >= 0 {
+		for other, k in moving {
+			if other == at do return k
+		}
+		at = node_parent(mesh, at)
+	}
+	return -1
+}
+
+// The node a block is a child of; -1 for none.
+node_parent :: fun(mesh: ^Nif, child: i64) -> i64 {
+	for &block, index in mesh.blocks {
+		match block^ {
+		Node node
+			for k in 0:node.children.count {
+				if node.children.at(k) == child do return index
+			}
+		else
+		}
+	}
+	return -1
+}
+
+// Places a model where a reference is: one that moves by itself, its frame
+// and its pieces; another, itself.
+place_model :: fun(scene: ^Scene, model_index: i64, path: []utf8, placement: Mat4, reference: u32) {
+	kind, found := index_get(&scene.moving_index, text_hash(path))
+	if found and kind > 0 {
+		place_moving(scene, kind - 1, placement, reference)
+		return
+	}
+	add_instance(scene, model_index, placement, reference)
+}
+
+// Places a model that moves by itself: its frame, and its pieces where the
+// start of its sequence has them, each told its kind, piece and placement.
+place_moving :: fun(scene: ^Scene, kind_index: i64, placement: Mat4, reference: u32) {
+	kind := &scene.moving_kinds[kind_index]
+	add_instance(scene, kind.frame, placement, reference)
+	for p in 0:kind.pieces.len {
+		if not fits(scene.instances.len + 1, scene.instances.cap) do return
+		add_instance(scene, kind.pieces[p].model, moving_piece_world(kind, p, placement, kind.start), reference)
+		instance := &scene.instances[scene.instances.len - 1]
+		instance.moving_kind = i32(kind_index)
+		instance.moving_piece = i32(p)
+		instance.placement = placement
+	}
+}
+
+// Where a piece of a model that moves by itself is, its object placed at
+// placement, at a moment (seconds) of its sequence.
+moving_piece_world :: fun(kind: ^Moving_Kind, piece_index: i64, placement: Mat4, moment: f32) -> Mat4 {
+	return mat4_mul(placement, piece_in_model(kind, piece_index, moment))
+}
+
+// A piece's place in its model at a moment: the moving pieces above it
+// posed too, each by its own track.
+piece_in_model :: fun(kind: ^Moving_Kind, piece_index: i64, moment: f32) -> Mat4 {
+	piece := &kind.pieces[piece_index]
+	own := mat4_mul(piece.from_above, track_pose(&piece.track, moment))
+	if piece.above < 0 do return own
+	return mat4_mul(piece_in_model(kind, piece.above, moment), own)
+}
+
+// Moves the pieces of what moves by itself to where their sequences have
+// them at a time (seconds), round and round; each object its own way into
+// its loop, so two alike don't move in step.
+move_pieces :: fun(scene: ^Scene, seconds: f32) {
+	for &instance in scene.instances {
+		if instance.moving_kind < 0 do continue
+		kind := &scene.moving_kinds[i64(instance.moving_kind)]
+		moment := kind.start
+		span := kind.stop - kind.start
+		if span > 0 {
+			played := seconds * kind.frequency + f32(instance.reference % 101) * 0.61
+			moment = kind.start + played - floor_f32(played / span) * span
+		}
+		posed := moving_piece_world(kind, i64(instance.moving_piece), instance.placement, moment)
+		// (Moved, its lights kept.)
+		moved := place_instance(scene.models[instance.model], instance.model, posed, instance.reference)
+		instance.world = moved.world
+		instance.center = moved.center
+		instance.radius = moved.radius
+	}
+}
+
+// Puts part of a mesh on the card as a model, with its collision: what's
+// under a node, in its space (node -1: all but what's under the nodes left
+// out). Its index in the scene's models. A part with nothing to draw is a
+// model of no parts.
+add_part_model :: fun(scene: ^Scene, loader: Loader, mesh: ^Nif, node: i64, left_out: []i64) -> i64, err {
+	if scene.models.len == scene.models.cap do return -1, No_Room_For_Models
+	room := loader.room
+	gpu := undrawn_model(Vec3{0, 0, 0}, 0)
+	if loader.drawing {
+		room.model.len = 0
+		built := build_model_part(mesh, node, left_out, &room.model)?
+		gpu = upload_model(loader.renderer, &built, loader.archives, &room.texture)?
+	}
+	collision_start := scene.collision_points.len
+	add_collision_part(mesh, node, left_out, &scene.collision_points)
+	if not loader.drawing {
+		middle, reach := points_sphere(scene.collision_points[collision_start : scene.collision_points.len])
+		gpu = undrawn_model(middle, reach)
+	}
+	&scene.model_collision + Collision_Range{first = collision_start, count = scene.collision_points.len - collision_start,
+		upright = 0, upright_height = 0}
+	&scene.models + gpu
+	return scene.models.len - 1
+}
+
+// Where a door's piece is with its node posed by a track at a moment (seconds).
+piece_world :: fun(placement: Mat4, piece: ^Door_Piece, track: ^Track, moment: f32) -> Mat4 {
+	return mat4_mul(placement, mat4_mul(piece.parent, track_pose(track, moment)))
+}
+
+// Places a door that opens in place, closed: its frame and its pieces
+// (each where its Close leaves it), all of them its reference's.
+place_door :: fun(scene: ^Scene, kind_index: i64, placement: Mat4, reference: u32) {
+	kind := &scene.door_kinds[kind_index]
+	if kind.frame >= 0 do add_instance(scene, kind.frame, placement, reference)
+	for &piece in kind.pieces do add_instance(scene, piece.model, piece_world(placement, piece, &piece.closing, kind.close_stop), reference)
+	door := Swinging_Door{reference = reference, kind = kind_index, placement = placement, open = false, moving = false, opening = false,
+		time = 0, fresh = true}
+	for &placed in scene.swinging {
+		if placed.reference == reference {
+			placed^ = door
+			return
+		}
+	}
+	if fits(scene.swinging.len + 1, scene.swinging.cap) do &scene.swinging + door
+}
+
+// Opens or closes a door that opens in place, if a reference is one (and
+// it isn't moving already): true when it is.
+use_door :: fun(scene: ^Scene, reference: u32) -> bool {
+	for &door in scene.swinging {
+		if door.reference != reference do continue
+		if not door.moving {
+			door.opening = not door.open
+			door.moving = true
+			door.time = 0
+		}
+		return true
+	}
+	return false
+}
+
+// Puts a door that opens in place at rest, open or shut: its pieces posed
+// so, no sound made.
+rest_door :: fun(scene: ^Scene, door: ^Swinging_Door, open: bool) {
+	kind := &scene.door_kinds[door.kind]
+	door.open = open
+	door.opening = open
+	door.moving = false
+	door.time = 0
+	at := if open do kind.open_stop else kind.close_stop
+	for &piece in kind.pieces {
+		track := if open do &piece.opening else &piece.closing
+		posed := piece_world(door.placement, piece, track, at)
+		for &instance in scene.instances {
+			if instance.reference != door.reference or instance.model != piece.model do continue
+			moved := place_instance(scene.models[instance.model], instance.model, posed, instance.reference)
+			instance.world = moved.world
+			instance.center = moved.center
+			instance.radius = moved.radius
+		}
+	}
+}
+
+// Whether a reference is a door that opens in place.
+swings :: fun(scene: ^Scene, reference: u32) -> bool {
+	for &door in scene.swinging {
+		if door.reference == reference do return true
+	}
+	return false
+}
+
+// Moves the doors that are opening or closing on by a frame: their
+// pieces' instances posed as their tracks say, until they're done. The
+// sounds they make in this frame go into noises: their sequence's cues as
+// it passes them; for a sequence with none, the door's own — opening as it
+// starts, closing as it shuts.
+swing_doors :: fun(scene: ^Scene, seconds: f32, noises: ^[]Door_Noise) {
+	for &door in scene.swinging {
+		if not door.moving do continue
+		kind := &scene.door_kinds[door.kind]
+		before := door.time
+		door.time += seconds
+		start := if door.opening do kind.open_start else kind.close_start
+		stop := if door.opening do kind.open_stop else kind.close_stop
+		at := start + door.time
+		shut := false
+		if at >= stop {
+			at = stop
+			door.moving = false
+			door.open = door.opening
+			shut = not door.opening
+		}
+		place := Vec3{door.placement[3][0], door.placement[3][1], door.placement[3][2]}
+		cues := if door.opening do kind.open_cues else kind.close_cues
+		if cues.len > 0 {
+			for cue in cues {
+				due := cue.time <= at and (before == 0 or cue.time > start + before)
+				if due and fits(noises.len + 1, noises.cap) do noises + Door_Noise{sound = cue.sound, position = place}
+			}
+		elif (door.opening and before == 0) or shut
+			sound, _ := door_sound(scene, door.reference, door.opening)
+			if sound >= 0 and fits(noises.len + 1, noises.cap) do noises + Door_Noise{sound = sound, position = place}
+		}
+		for &piece in kind.pieces {
+			track := if door.opening do &piece.opening else &piece.closing
+			posed := piece_world(door.placement, piece, track, at)
+			for &instance in scene.instances {
+				if instance.reference != door.reference or instance.model != piece.model do continue
+				// (Moved, its lights kept.)
+				moved := place_instance(scene.models[instance.model], instance.model, posed, instance.reference)
+				instance.world = moved.world
+				instance.center = moved.center
+				instance.radius = moved.radius
+			}
+		}
+	}
+}
+
+// ---- seen from afar ---------------------------------------------------------------
+
+// Starts placing a world's references seen from afar, in place of the
+// last world's, a few cells a frame (place_distant_step): each with its far
+// mesh (its mesh's name with _far: a few hundred triangles), or its mesh
+// where there's none. Trees are left to their billboards.
+begin_distant_objects :: fun(scene: ^Scene, world_id: u32) {
+	scene.distant_instances.len = 0
+	scene.distant_world = world_id
+	scene.distant_next = 0
+	scene.distant_started = time_now()
+}
+
+// Places the distant objects of the world's next exterior cells till
+// budget nanoseconds have gone (a cell at least): true when they're all
+// placed, or none are being.
+place_distant_step :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, budget: u64) -> bool {
+	if scene.distant_next < 0 do return true
+	start := time_now()
+	world_id := scene.distant_world
+	references : [1024]Reference
+	scratch : [64 * KB]byte
+	for scene.distant_next < plugin.exterior_cells.keys.len {
+		if time_now() - start > budget do return false
+		key := plugin.exterior_cells.keys[scene.distant_next]
+		scene.distant_next += 1
+		if key == 0 or u32(key >> 32) != world_id do continue
+		cell := exterior_cell(plugin, world_id, i64(i16(u16((key >> 16) & 0xFFFF))), i64(i16(u16(key & 0xFFFF))))
+		references.len = 0
+		cell_distant_references(plugin, cell, &references)
+		for reference in references {
+			if reference.flags & RECORD_DISABLED != 0 do continue
+			if not fits(scene.distant_instances.len + 1, scene.distant_instances.cap) {
+				scene.distant_next = -1
+				return true
+			}
+			scratch.len = 0
+			base, base_error := find_record(plugin, reference.base, &scratch)
+			if base_error or base.header.kind == "TREE" do continue
+			path := model_path(base)
+			if path.len < 4 or is_marker(path) do continue
+			far : [256]utf8
+			&far + path[0 : path.len - 4]
+			&far + "_far.nif"
+			_, has_far := find_archived(loader.archives, far)
+			model_index := scene_model(scene, loader, if has_far do far else path)
+			if model_index < 0 do continue
+			&scene.distant_instances + place_instance(scene.models[model_index], model_index, reference_transform(reference), reference.form_id)
+		}
+	}
+	scene.distant_next = -1
+	return true
+}
+
+// ---- grass ----------------------------------------------------------------------
+
+// Places a cell's grass over its land and puts it on the card, in the
+// land's slot.
+load_grass :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64, cell_land: ^Land, slot: i64, loader: Loader) {
+	if not scene.grows_grass or not fits(scene.grass_cells.len + 1, scene.grass_cells.cap) do return
+	// The grasses of each texture in the land.
+	textures : [40]Texture_Grasses
+	for &quadrant in cell_land.quadrants {
+		add_texture_grasses(scene, plugin, quadrant.base, &textures, loader)
+		for &layer in quadrant.layers do add_texture_grasses(scene, plugin, layer.texture, &textures, loader)
+	}
+	scratch : [64 * KB]byte
+	water_height, has_water, water_error := cell_water(plugin, cell, &scratch)
+	if water_error do note_failure(scene, "a cell's water, for its grass", water_error)
+	if not has_water do water_height = -1000000
+	blades : [GRASS_PER_CELL]Placed_Grass
+	place_grass(cell_land, x, y, water_height, textures, &scene.grass_kinds, &blades)
+	&scene.grass_cells + upload_grass(loader.renderer, &scene.models, &blades, x, y, slot)
+}
+
+// Adds a land texture's grasses to textures, unless they're there.
+add_texture_grasses :: fun(scene: ^Scene, plugin: ^Plugin, texture: u32, textures: ^[]Texture_Grasses, loader: Loader) {
+	if texture == 0 or not fits(textures.len + 1, textures.cap) do return
+	for &entry in textures {
+		if entry.texture == texture do return
+	}
+	textures + texture_grasses_of(scene, plugin, texture, loader)
+}
+
+// A land texture's grasses (its first GRASSES_PER_TEXTURE GNAMs): the
+// scene's kinds, read and their models loaded the first time.
+texture_grasses_of :: fun(scene: ^Scene, plugin: ^Plugin, texture: u32, loader: Loader) -> Texture_Grasses {
+	known, seen := index_get(&scene.texture_grass_index, u64(texture))
+	if seen do return scene.texture_grasses[known - 1]
+	grasses := Texture_Grasses{texture = texture, kinds = [-1, -1]}
+	scratch : [64 * KB]byte
+	record, record_error := find_record(plugin, texture, &scratch)
+	if record_error do note_failure(scene, "a land texture's record", record_error)
+	if not record_error {
+		count : i64 = 0
+		fields := Fields{data = record.data, at = 0, broken = false}
+		for field in next_field(&fields) {
+			if field.kind != "GNAM" or field.data.len < 4 or count == GRASSES_PER_TEXTURE do continue
+			grass_id : u32 = field.data[0]
+			grasses.kinds[count] = grass_kind(scene, plugin, record_form(plugin, record, grass_id), loader)
+			count += 1
+		}
+	}
+	if fits(scene.texture_grasses.len + 1, scene.texture_grasses.cap) {
+		&scene.texture_grasses + grasses
+		_ = index_put(&scene.texture_grass_index, u64(texture), scene.texture_grasses.len)
+	}
+	return grasses
+}
+
+// A grass's kind in the scene: its look read and its model loaded the
+// first time; -1 when it can't be drawn.
+grass_kind :: fun(scene: ^Scene, plugin: ^Plugin, grass_id: u32, loader: Loader) -> i64 {
+	known, seen := index_get(&scene.grass_index, u64(grass_id))
+	if seen do return known - 1
+	kind_index : i64 = -1
+	scratch : [64 * KB]byte
+	record, record_error := find_record(plugin, grass_id, &scratch)
+	if record_error do note_failure(scene, "a grass's record", record_error)
+	if not record_error and fits(scene.grass_kinds.len + 1, scene.grass_kinds.cap) {
+		look, readable := read_grass_look(record)
+		if readable {
+			grass_model := scene_model(scene, loader, look.model)
+			if grass_model >= 0 {
+				&scene.grass_kinds + Grass_Kind{look = look, model = grass_model}
+				kind_index = scene.grass_kinds.len - 1
+			}
+		}
+	}
+	_ = index_put(&scene.grass_index, u64(grass_id), kind_index + 1)
+	return kind_index
+}
+
+// The lighting outside, until weather is read: daylight, and fog hiding
+// where the loaded cells end.
+exterior_lighting :: fun() -> Cell_Lighting {
+	lighting := DAYLIGHT
+	lighting.fog_near = CELL_SIZE * EXTERIOR_RADIUS * 0.5
+	lighting.fog_far = CELL_SIZE * (EXTERIOR_RADIUS + 0.5)
+	return lighting
+}
+
+// The area of cells shown outside: around the cell it was loaded around.
+shown_area :: fun(scene: ^Scene) -> Grid_Area {
+	return area_around(scene.center_x, scene.center_y)
+}
+
+// Shows a world's cells around the one at x, y: their land and references,
+// and the world's persistent references among them. What's on the card
+// already shows at once; the rest waits to be loaded, the nearest cells'
+// first.
+//
+// Moving within the world shown, only what's changed is: what's left the
+// area is let go, and only the cells come into it are read and placed.
+show_exterior :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, x: i64, y: i64) -> err {
+	area := area_around(x, y)
+	placed := NOWHERE   // what's placed already, and stays
+	if scene.world == world_id {
+		placed = shown_area(scene)
+		drop_outside(scene, area)
+	else
+		// (Land readied for this world from inside stays, where it's in the
+		// area: ready_outside.)
+		drop_land(scene, area, scene.land_world != world_id)
+		scene_clear_cell(scene)
+		scene.lighting = exterior_lighting()
+		take_world_land(scene, plugin, world_id)
+	}
+	scene.world = world_id
+	scene.center_x = x
+	scene.center_y = y
+
+	// Ring by ring outward from the middle: the nearest wait first.
+	for ring in 0..EXTERIOR_RADIUS {
+		for cell_y in y - ring..y + ring {
+			for cell_x in x - ring..x + ring {
+				on_ring := cell_x == x - ring or cell_x == x + ring or cell_y == y - ring or cell_y == y + ring
+				if not on_ring do continue
+				already := cell_x >= placed.low_x and cell_x <= placed.high_x and cell_y >= placed.low_y and cell_y <= placed.high_y
+				if already do continue
+				cell := exterior_cell(plugin, world_id, cell_x, cell_y)
+				if cell == 0 do continue
+				if not land_loaded(scene, cell_x, cell_y) and fits(scene.waiting_land.len + 1, scene.waiting_land.cap) {
+					&scene.waiting_land + Waiting_Land{cell = cell, x = cell_x, y = cell_y}
+				}
+				add_cell_water(scene, plugin, cell, cell_x, cell_y)
+				add_cell(scene, plugin, cell, EVERYWHERE, NOWHERE)?
+			}
+		}
+	}
+	show_trees(scene, plugin, world_id, x, y)
+	persistent := persistent_cell(plugin, world_id)
+	if persistent != 0 do add_cell(scene, plugin, persistent, area, placed)?
+	choose_all_lights(scene)
+	scene.lights_changed = true
+}
+
+// Takes a world's land as the land to load (land_world). A world that's
+// part of another shows its land (see shown_land). A small world's land
+// grows no grass: a guess (see ASSETS.md), but with the cities put back in
+// Tamriel (Open Cities), grass is known to come up through their streets
+// from the same land.
+take_world_land :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32) {
+	scene.land_world = world_id
+	scratch : [1 * MB]byte
+	parent, parent_error := world_parent(plugin, world_id, &scratch)
+	if parent_error do note_failure(scene, "a world's record, for its land", parent_error)
+	scene.parent_world = parent
+	small, small_error := small_world(plugin, world_id, &scratch)
+	if small_error do note_failure(scene, "a world's record, for its grass", small_error)
+	scene.grows_grass = not small
+}
+
+// ---- readied from inside ------------------------------------------------------------
+
+// Readies the outside a door leads to while inside, so it shows at once
+// when it's gone out to (show_exterior): a world's land around the cell at
+// x, y loaded as it would be shown (waiting, as show_exterior has it wait),
+// then the models its cells' references need, then its trees (ready_step).
+// Inside, none of it is drawn.
+ready_outside :: fun(scene: ^Scene, plugin: ^Plugin, world_id: u32, x: i64, y: i64) {
+	drop_land(scene, area_around(x, y), scene.land_world != world_id)
+	take_world_land(scene, plugin, world_id)
+	scene.center_x = x
+	scene.center_y = y
+	scene.waiting_land.len = 0
+	scene.waiting_land_next = 0
+	stop_readying(scene)
+	scene.ready_world = world_id
+	scene.ready_started = time_now()
+	for ring in 0..EXTERIOR_RADIUS {
+		for cell_y in y - ring..y + ring {
+			for cell_x in x - ring..x + ring {
+				on_ring := cell_x == x - ring or cell_x == x + ring or cell_y == y - ring or cell_y == y + ring
+				if not on_ring do continue
+				cell := exterior_cell(plugin, world_id, cell_x, cell_y)
+				if cell == 0 do continue
+				if not land_loaded(scene, cell_x, cell_y) and fits(scene.waiting_land.len + 1, scene.waiting_land.cap) {
+					&scene.waiting_land + Waiting_Land{cell = cell, x = cell_x, y = cell_y}
+				}
+				if fits(scene.ready_cells.len + 1, scene.ready_cells.cap) do &scene.ready_cells + Waiting_Land{cell = cell, x = cell_x, y = cell_y}
+			}
+		}
+	}
+	// The world's persistent references too, those in the area.
+	persistent := persistent_cell(plugin, world_id)
+	if persistent != 0 and fits(scene.ready_cells.len + 1, scene.ready_cells.cap) {
+		&scene.ready_cells + Waiting_Land{cell = persistent, x = x, y = y}
+	}
+}
+
+// Stops readying the outside: what's readied stays loaded.
+stop_readying :: fun(scene: ^Scene) {
+	scene.ready_world = 0
+	scene.ready_cells.len = 0
+	scene.ready_cells_next = 0
+	scene.ready_models.len = 0
+	scene.ready_keys.len = 0
+	scene.ready_models_next = 0
+}
+
+// Whether the outside is being readied (ready_outside), and isn't all yet.
+readying :: fun(scene: ^Scene) -> bool {
+	return scene.ready_world != 0
+}
+
+// Readies a little more of the outside (ready_outside) till budget
+// nanoseconds have gone (a cell's references read or a model loaded, at
+// least): the cells' references read for the models they need, the models
+// loaded, then the trees left waiting to be. True when that's done (the
+// readying stops), false when there's more.
+ready_step :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, budget: u64) -> bool {
+	if scene.ready_world == 0 do return true
+	start := time_now()
+	for scene.ready_cells_next < scene.ready_cells.len {
+		if time_now() - start > budget do return false
+		cell := scene.ready_cells[scene.ready_cells_next].cell
+		scene.ready_cells_next += 1
+		queue_ready_models(scene, plugin, cell)
+	}
+	for scene.ready_models_next < scene.ready_models.len {
+		if time_now() - start > budget do return false
+		item := &scene.ready_models[scene.ready_models_next]
+		scene.ready_models_next += 1
+		item_start := time_now()
+		ready_model(scene, plugin, loader, item)
+		if item.npc != 0 {
+			note_load_time(scene, "an NPC, readied", item_start)
+		elif item.tree != 0
+			note_load_time(scene, "a tree, readied", item_start)
+		else
+			note_load_time(scene, item.path, item_start)
+		}
+	}
+	show_trees(scene, plugin, scene.ready_world, scene.center_x, scene.center_y)
+	scene.ready_world = 0
+	return true
+}
+
+// Queues the models a cell's references in the area need that aren't
+// loaded or queued (the persistent cell has the whole world's references):
+// the models of things, NPCs, trees and doors that open in place, as
+// add_cell has them.
+queue_ready_models :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32) {
+	references : [16384]Reference
+	references_error := cell_references(plugin, cell, &references)
+	if references_error {
+		note_failure(scene, "a cell's references, to ready them", references_error)
+		return
+	}
+	area := shown_area(scene)
+	scratch : [64 * KB]byte
+	door_scratch : [64 * KB]byte
+	for reference in references {
+		if reference.flags & RECORD_DISABLED != 0 or not area_holds(area, reference.position) do continue
+		scratch.len = 0
+		base, base_error := find_record(plugin, reference.base, &scratch)
+		if base_error do continue
+		key : u64 = 0
+		door := false
+		npc : u32 = 0
+		tree : u32 = 0
+		path := model_path(base)
+		if base.header.kind == "TREE" {
+			// (Not checked for: its model is the one of its seed the
+			// reference picks, known once its kind is read.)
+			tree = reference.base
+		elif base.header.kind == "NPC_"
+			npc = reference.base
+			key = u64(npc) | NPC_MODEL_KEY
+			_, known := index_get(&scene.paths, key)
+			if known do continue
+		else
+			if path.len == 0 or is_marker(path) do continue
+			key = text_hash(path)
+			// A door that opens in place, of a kind not read: its kind.
+			if base.header.kind == "DOOR" {
+				door_scratch.len = 0
+				_, leads, door_error := door_destination(plugin, reference.form_id, &door_scratch)
+				_, kind_known := index_get(&scene.door_kind_index, key)
+				door = not door_error and not leads and not kind_known
+			}
+			if not door {
+				_, known := known_model(scene, path)
+				if known do continue
+			}
+		}
+		queued := false
+		if key != 0 {
+			for queued_key in scene.ready_keys {
+				if queued_key == key do queued = true
+			}
+		}
+		if queued or not fits(scene.ready_models.len + 1, scene.ready_models.cap) do continue
+		item := next(&scene.ready_models)
+		item.path.len = 0
+		&item.path + path
+		item.world = reference_transform(reference)
+		item.reference = reference.form_id
+		item.door = door
+		item.npc = npc
+		item.tree = tree
+		&scene.ready_keys + key
+	}
+}
+
+// Loads the model a readied reference needs (as load_waiting_item would),
+// placing nothing.
+ready_model :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, item: ^Waiting_Instance) {
+	if item.door {
+		if door_kind(scene, plugin, loader, item.path) >= 0 do return
+	}
+	if item.npc != 0 {
+		_ = npc_model(scene, plugin, loader, item.npc)
+		return
+	}
+	if item.tree != 0 {
+		_ = tree_model(scene, plugin, loader, item.tree, item.reference)
+		return
+	}
+	_ = scene_model(scene, loader, item.path)
+}
+
+// Lets go of what's placed outside an area: instances, lights and doors by
+// where they are, and land. The instances' lights are chosen again after,
+// as the lights' places in the list move.
+drop_outside :: fun(scene: ^Scene, area: Grid_Area) {
+	kept : i64 = 0
+	for k in 0:scene.instances.len {
+		placement := scene.instances[k].world
+		if area_holds(area, Vec3{placement[3][0], placement[3][1], placement[3][2]}) {
+			scene.instances[kept] = scene.instances[k]
+			kept += 1
+		}
+	}
+	scene.instances.len = kept
+
+	kept = 0
+	for k in 0:scene.lights.len {
+		if area_holds(area, scene.lights[k].position) {
+			scene.lights[kept] = scene.lights[k]
+			kept += 1
+		}
+	}
+	scene.lights.len = kept
+
+	kept = 0
+	for k in 0:scene.doors.len {
+		if area_holds(area, scene.doors[k].position) {
+			scene.doors[kept] = scene.doors[k]
+			kept += 1
+		}
+	}
+	scene.doors.len = kept
+
+	kept = 0
+	for k in 0:scene.sounds.len {
+		if area_holds(area, scene.sounds[k].position) {
+			scene.sounds[kept] = scene.sounds[k]
+			kept += 1
+		}
+	}
+	scene.sounds.len = kept
+
+	kept = 0
+	for k in 0:scene.door_sounds.len {
+		if area_holds(area, scene.door_sounds[k].position) {
+			scene.door_sounds[kept] = scene.door_sounds[k]
+			kept += 1
+		}
+	}
+	scene.door_sounds.len = kept
+
+	kept = 0
+	for k in 0:scene.waters.len {
+		water := &scene.waters[k]
+		middle := Vec3{(water.low_x + water.high_x) / 2, (water.low_y + water.high_y) / 2, 0}
+		if area_holds(area, middle) {
+			if kept != k do scene.waters[kept] = scene.waters[k]
+			kept += 1
+		}
+	}
+	if kept != scene.waters.len do scene.waters_changed = true
+	scene.waters.len = kept
+
+	drop_land(scene, area, false)
+	// What still waits is let go as it comes up, if it's left the area.
+}
+
+// Adds an exterior cell's water, if it has any and any of it is above the
+// land: over the cell, its depth at each of the land's points.
+add_cell_water :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, x: i64, y: i64) {
+	scratch : [256 * KB]byte
+	height, has_water, water_error := cell_water(plugin, cell, &scratch)
+	if water_error do note_failure(scene, "a cell's water", water_error)
+	if not has_water or not fits(scene.waters.len + 1, scene.waters.cap) do return
+	// Deep where there's no land under it to know.
+	depths : [WATER_VERTICES!]f32
+	for k in 0:WATER_VERTICES do depths[k] = 1000
+	land_at, has_land := shown_land(plugin, scene.world, scene.parent_world, x, y)
+	if has_land {
+		scratch.len = 0
+		record, record_error := record_at(plugin, land_at, &scratch)
+		if record_error {
+			note_failure(scene, "a cell's land, under its water", record_error)
+			return
+		}
+		cell_land : Land
+		read_land(plugin, record, &cell_land)
+		// All of the land above the water: none to draw.
+		under := false
+		for k in 0:WATER_VERTICES {
+			depths[k] = height - cell_land.heights[k]
+			if depths[k] > 0 do under = true
+		}
+		if not under do return
+	}
+	water := next(&scene.waters)
+	water.low_x = f32(x * CELL_SIZE)
+	water.low_y = f32(y * CELL_SIZE)
+	water.high_x = f32((x + 1) * CELL_SIZE)
+	water.high_y = f32((y + 1) * CELL_SIZE)
+	water.height = height
+	water.depths = depths
+	scene.waters_changed = true
+}

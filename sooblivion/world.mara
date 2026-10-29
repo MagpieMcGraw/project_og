@@ -1,0 +1,962 @@
+// The game's world as a plugin describes it: records found by their form
+// ids, cells found by their editor ids, and the objects placed in them.
+//
+// Cells hold references (REFR): a base object (a STAT, DOOR, LIGH…, whose
+// record names its mesh) placed somewhere, turned and scaled. A cell's
+// references are in the group right after its record.
+module world
+
+use mara.core
+use mara.math
+use mara.string
+use mara.memory
+use esm
+use logging
+use indexing
+
+// What finding things in the world can fail with.
+World_Error :: error {
+	No_Such_Cell
+	No_Such_Record
+	Broken_Group     // a record in a cell's group runs past the group's end
+	Missing_Master   // a plugin's master isn't among the plugins loaded
+	Not_A_Plugin     // a plugin file that doesn't start with its TES4 record
+}
+
+// ---- finding records ---------------------------------------------------------
+
+// The key of an exterior cell: its world, and its place on the world's
+// grid (cells 4096 units square, 0 0 the one north-east of the origin).
+grid_key :: fun(world: u32, x: i64, y: i64) -> u64 {
+	return (u64(world) << 32) | (u64(x & 0xFFFF) << 16) | u64(y & 0xFFFF)
+}
+
+// ---- the plugins, indexed ----------------------------------------------------
+
+// Plugin files loaded at most.
+MAX_PLUGIN_FILES :: 16
+
+// One plugin file in the plugins' data: its name; where its bytes are;
+// its place in the load order (the top byte of its own records' form ids,
+// as the game numbers them), and each of its masters' (a form id in the
+// file names its plugin by its top byte: one of its masters, in their
+// order, or past them the file itself); its top group of interior cells.
+Plugin_Span :: struct {
+	name: [64]utf8
+	start: i64
+	end: i64
+	own_index: u32
+	masters: [16!]u32
+	master_count: i64
+	interior_cells_at: i64
+	interior_cells_end: i64
+	sounds_at: i64           // its group of sounds (SOUN): where its records start and end
+	sounds_end: i64
+}
+
+// The game's plugins read into memory, one file after another (the master
+// first, in the load order), with where their records and cells are. A
+// record a later file has too (an override) is found as that file has it;
+// form ids are the game's, their top bytes places in the load order.
+Plugin :: struct {
+	file_bytes: [MAX_PLUGIN_FILES][]byte   // each file's bytes (mapped: file_map), as files has them
+	files: [MAX_PLUGIN_FILES]Plugin_Span
+	records: Key_Index           // each record's place, by its form id
+	cell_children: Key_Index     // each file's group of a cell's references, by cell_group_key
+	exterior_cells: Key_Index    // each exterior cell's form id, by grid_key
+	cell_worlds: Key_Index       // each exterior cell's world, by the cell's form id
+	persistent_cells: Key_Index  // each world's cell for its persistent references, by the world
+}
+
+// The key of a file's group of a cell's references: each file that places
+// something in the cell has one.
+cell_group_key :: fun(file: i64, cell: u32) -> u64 {
+	return (u64(file) << 32) | u64(cell)
+}
+
+// The plugins' indexes' rooms: for every record, for cells, for worlds.
+RECORD_SLOTS :: 1 << 22
+CELL_SLOTS :: 1 << 17
+WORLD_SLOTS :: 1 << 10
+
+// Indexes the plugins' data (plugin.file_bytes and each file's name, span and
+// place in the load order set): each file's masters read from its TES4
+// record, then one walk over each file. The indexes are carved from storage.
+index_plugin :: fun(plugin: ^Plugin, storage: ^[]byte) -> err {
+	plugin.records = key_index(RECORD_SLOTS, storage)
+	plugin.cell_children = key_index(CELL_SLOTS, storage)
+	plugin.exterior_cells = key_index(CELL_SLOTS, storage)
+	plugin.cell_worlds = key_index(CELL_SLOTS, storage)
+	plugin.persistent_cells = key_index(WORLD_SLOTS, storage)
+	for file in 0:plugin.files.len {
+		read_masters(plugin, file)?
+		index_file(plugin, file)?
+	}
+}
+
+// Reads a plugin file's masters (its TES4 record's MAST fields) as places
+// in the load order.
+read_masters :: fun(plugin: ^Plugin, file: i64) -> err {
+	span := &plugin.files[file]
+	span.master_count = 0
+	span.interior_cells_at = 0
+	span.interior_cells_end = 0
+	span.sounds_at = 0
+	span.sounds_end = 0
+	data := plugin.file_bytes[file]
+	if data.len < HEADER_SIZE do return Not_A_Plugin
+	header : Record_Header = data[0]
+	if header.kind != "TES4" or HEADER_SIZE + i64(header.size) > data.len do return Not_A_Plugin
+	body := data[HEADER_SIZE : HEADER_SIZE + i64(header.size)]
+	fields := Fields{data = body, at = 0, broken = false}
+	for field in next_field(&fields) {
+		if field.kind != "MAST" do continue
+		if span.master_count == 16 do return Missing_Master
+		name := field_text(field.data)
+		found := false
+		for &other in plugin.files {
+			if compare_folded(other.name, name) == 0 {
+				span.masters[span.master_count] = other.own_index
+				found = true
+			}
+		}
+		if not found do return Missing_Master
+		span.master_count += 1
+	}
+}
+
+// One walk over a plugin file's groups and records, into the indexes.
+index_file :: fun(plugin: ^Plugin, file: i64) -> err {
+	span := &plugin.files[file]
+	// (Its own bytes, from its start: a place in them is at - base.)
+	data := plugin.file_bytes[file]
+	base := span.start
+	// The world whose group the walk is in, where that group ends, and
+	// whether its blocks of cells have begun: the cell before them is the
+	// world's persistent one.
+	world : u32 = 0
+	world_end : i64 = 0
+	in_blocks := false
+	at := span.start
+	for at < span.end {
+		if at + HEADER_SIZE > span.end do return Truncated
+		if world != 0 and at >= world_end do world = 0
+		header : Record_Header = data[at - base]
+		if header.kind == "GRUP" {
+			group_header : Group_Header = data[at - base]
+			if group_header.group_type == GROUP_CELL_CHILDREN {
+				index_put(&plugin.cell_children, cell_group_key(file, global_form(plugin, file, group_header.label)), at)?
+			}
+			if group_header.group_type == GROUP_WORLD_CHILDREN {
+				world = global_form(plugin, file, group_header.label)
+				world_end = at + i64(group_header.size)
+				in_blocks = false
+			}
+			if group_header.group_type == GROUP_EXTERIOR_BLOCK do in_blocks = true
+			if group_header.group_type == GROUP_TOP {
+				label : [4!]utf8 = data[at - base + 8]
+				if label == "CELL" {
+					span.interior_cells_at = at + HEADER_SIZE
+					span.interior_cells_end = at + i64(group_header.size)
+				}
+				if label == "SOUN" {
+					span.sounds_at = at + HEADER_SIZE
+					span.sounds_end = at + i64(group_header.size)
+				}
+			}
+			at += HEADER_SIZE
+			continue
+		}
+		next_at := at + HEADER_SIZE + i64(header.size)
+		form_id := global_form(plugin, file, header.form_id)
+		if form_id != 0 do index_put(&plugin.records, u64(form_id), at)?
+		if world != 0 and header.kind == "CELL" {
+			index_put(&plugin.cell_worlds, u64(form_id), i64(world))?
+			body := data[at - base + HEADER_SIZE : next_at - base]
+			grid, has_grid := find_field(body, "XCLC")
+			if not in_blocks {
+				index_put(&plugin.persistent_cells, u64(world), i64(form_id))?
+			elif has_grid and grid.len >= 8
+				x : i32 = grid[0]
+				y : i32 = grid[4]
+				index_put(&plugin.exterior_cells, grid_key(world, i64(x), i64(y)), i64(form_id))?
+			}
+		}
+		at = next_at
+	}
+}
+
+// A form id as a plugin file names it, as the game numbers it: its top
+// byte the place in the load order of the plugin it names (one of the
+// file's masters, or the file itself). 0 stays 0.
+global_form :: fun(plugin: ^Plugin, file: i64, raw: u32) -> u32 {
+	if raw == 0 do return 0
+	span := &plugin.files[file]
+	which := i64(raw >> 24)
+	place := if which < span.master_count do span.masters[which] else span.own_index
+	return (place << 24) | (raw & 0xFFFFFF)
+}
+
+// The plugin file a place in the plugins' data is in.
+file_at :: fun(plugin: ^Plugin, at: i64) -> i64 {
+	for &span, k in plugin.files {
+		if at >= span.start and at < span.end do return k
+	}
+	return 0
+}
+
+// A record: its header (its form id the game's), its data (unpacked into
+// scratch when packed), and the plugin file it's from: form ids read from
+// its data are made the game's with record_form.
+Record :: struct {
+	header: Record_Header
+	data: []byte
+	file: i64
+}
+
+// A form id read from a record's data, as the game numbers it.
+record_form :: fun(plugin: ^Plugin, record: Record, raw: u32) -> u32 {
+	return global_form(plugin, record.file, raw)
+}
+
+// The plugins' bytes at a place (the files' spans laid end to end), size
+// of them: a view of the file they're in.
+plugin_bytes :: fun(plugin: ^Plugin, at: i64, size: i64) -> []byte {
+	file := file_at(plugin, at)
+	from := at - plugin.files[file].start
+	return plugin.file_bytes[file][from : from + size]
+}
+
+// The header of the record at a place in the plugins.
+record_header_at :: fun(plugin: ^Plugin, at: i64) -> Record_Header {
+	header : Record_Header = plugin_bytes(plugin, at, HEADER_SIZE)[0]
+	return header
+}
+
+// The header of the group at a place in the plugins.
+group_header_at :: fun(plugin: ^Plugin, at: i64) -> Group_Header {
+	header : Group_Header = plugin_bytes(plugin, at, HEADER_SIZE)[0]
+	return header
+}
+
+// The record at a place in the plugins.
+record_at :: fun(plugin: ^Plugin, at: i64, scratch: ^[]byte) -> Record, err {
+	file := file_at(plugin, at)
+	bytes := plugin.file_bytes[file]
+	from := at - plugin.files[file].start
+	header : Record_Header = bytes[from]
+	body := bytes[from + HEADER_SIZE : from + HEADER_SIZE + i64(header.size)]
+	data := record_data(header, body, scratch)?
+	header.form_id = global_form(plugin, file, header.form_id)
+	return Record{header = header, data = data, file = file}
+}
+
+// The record with a form id, as the last plugin to have it has it.
+find_record :: fun(plugin: ^Plugin, form_id: u32, scratch: ^[]byte) -> Record, err {
+	at, found := index_get(&plugin.records, u64(form_id))
+	if not found do return Record{header = Record_Header{0}, data = [], file = 0}, No_Such_Record
+	return record_at(plugin, at, scratch)
+}
+
+// A record's first field of a kind, and false when it has none.
+find_field :: fun(data: []byte, kind: []utf8) -> []byte, bool {
+	fields := Fields{data = data, at = 0, broken = false}
+	for field in next_field(&fields) {
+		if field.kind == kind do return field.data, true
+	}
+	return data[0:0], false
+}
+
+// A field's text: up to its 0 (the plugins end their text with one).
+field_text :: fun(field: []byte) -> []utf8 {
+	text : []utf8 = field
+	for c, i in text {
+		if c == utf8(0) do return text[0 : i]
+	}
+	return text
+}
+
+// A record's editor id (EDID), or empty.
+editor_id :: fun(data: []byte) -> []utf8 {
+	field, found := find_field(data, "EDID")
+	if not found do return field_text(data[0:0])
+	return field_text(field)
+}
+
+// A record's name for people (FULL), else its editor id.
+record_name :: fun(plugin: ^Plugin, form_id: u32) -> str256 {
+	scratch : [1 * MB]byte
+	name : str256
+	record, record_error := find_record(plugin, form_id, &scratch)
+	if record_error do return name
+	full_name, has_name := find_field(record.data, "FULL")
+	if has_name do &name + field_text(full_name)
+	else do &name + editor_id(record.data)
+	return name
+}
+
+// A reference's name, as the game shows it: its base's (FULL); empty for
+// one without.
+reference_name :: fun(plugin: ^Plugin, reference_id: u32) -> str256 {
+	name : str256
+	if reference_id == 0 do return name
+	scratch : [64 * KB]byte
+	reference, reference_error := find_record(plugin, reference_id, &scratch)
+	if reference_error do return name
+	base, has_base := find_field(reference.data, "NAME")
+	if not has_base or base.len < 4 do return name
+	raw : u32 = base[0]
+	base_scratch : [256 * KB]byte
+	record, record_error := find_record(plugin, record_form(plugin, reference, raw), &base_scratch)
+	if record_error do return name
+	full_name, has_name := find_field(record.data, "FULL")
+	if has_name do add_what_fits(&name, field_text(full_name))
+	return name
+}
+
+// A record's editor id, as text kept by value.
+editor_id_of :: fun(plugin: ^Plugin, form_id: u32) -> str256 {
+	scratch : [1 * MB]byte
+	name : str256
+	record, record_error := find_record(plugin, form_id, &scratch)
+	if not record_error do &name + editor_id(record.data)
+	return name
+}
+
+// ---- cells and what's in them ------------------------------------------------
+
+// The interior cell whose editor id is name (any letter case): its form id.
+find_interior_cell :: fun(plugin: ^Plugin, name: []utf8, scratch: ^[]byte) -> u32, err {
+	for &span in plugin.files {
+		at := span.interior_cells_at
+		for at < span.interior_cells_end {
+			header := record_header_at(plugin, at)
+			if header.kind == "GRUP" {
+				at += HEADER_SIZE
+				continue
+			}
+			if header.kind == "CELL" {
+				record := record_at(plugin, at, scratch)?
+				if compare_folded(editor_id(record.data), name) == 0 do return record.header.form_id
+			}
+			at += HEADER_SIZE + i64(header.size)
+		}
+	}
+	return 0, No_Such_Cell
+}
+
+// An object placed in a cell: what it is, where, turned how, how big.
+Reference :: struct {
+	form_id: u32
+	base: u32          // the record of what's placed: a STAT, DOOR, LIGH…
+	position: Vec3
+	rotation: Vec3     // radians about x, y and z, each clockwise; turned about z first, x last
+	scale: f32
+	flags: u32         // RECORD_*: disabled, persistent…
+}
+
+// The references in a cell (REFR records, and the NPCs placed, ACHR), into
+// references: from each plugin file's group for the cell, each reference
+// as the last file to have it has it (a later one may move it to another
+// cell, or delete it).
+cell_references :: fun(plugin: ^Plugin, cell: u32, references: ^[]Reference) -> err {
+	for file in 0:plugin.files.len {
+		group_at, found := index_get(&plugin.cell_children, cell_group_key(file, cell))
+		if not found do continue
+		group_header := group_header_at(plugin, group_at)
+		end := group_at + i64(group_header.size)
+		at := group_at + HEADER_SIZE
+		for at < end {
+			header := record_header_at(plugin, at)
+			if header.kind == "GRUP" {
+				at += HEADER_SIZE   // the persistent, temporary and distant groups: into them
+				continue
+			}
+			next_at := at + HEADER_SIZE + i64(header.size)
+			if next_at > end do return Broken_Group
+			placed := header.kind == "REFR" or header.kind == "ACHR"
+			if placed and fits(references.len + 1, references.cap) and winning_copy(plugin, file, header, at) {
+				body := plugin_bytes(plugin, at + HEADER_SIZE, i64(header.size))
+				references + read_reference(plugin, file, header, body)
+			}
+			at = next_at
+		}
+	}
+}
+
+// Whether a record at a place in a plugin file is the one that counts: no
+// later file has it, and it isn't deleted.
+winning_copy :: fun(plugin: ^Plugin, file: i64, header: Record_Header, at: i64) -> bool {
+	if header.flags & RECORD_DELETED != 0 do return false
+	winner, found := index_get(&plugin.records, u64(global_form(plugin, file, header.form_id)))
+	return found and winner == at
+}
+
+// The references of a cell that are seen from afar (its visible-distant
+// groups: the game draws them past the cells loaded), into references.
+cell_distant_references :: fun(plugin: ^Plugin, cell: u32, references: ^[]Reference) {
+	for file in 0:plugin.files.len {
+		group_at, found := index_get(&plugin.cell_children, cell_group_key(file, cell))
+		if not found do continue
+		group_header := group_header_at(plugin, group_at)
+		end := group_at + i64(group_header.size)
+		at := group_at + HEADER_SIZE
+		for at < end {
+			// The cell's groups: only the visible-distant one is read.
+			inner := group_header_at(plugin, at)
+			if inner.kind != "GRUP" do break
+			inner_end := at + i64(inner.size)
+			if inner.group_type == GROUP_CELL_VISIBLE_DISTANT {
+				place := at + HEADER_SIZE
+				for place < inner_end {
+					header := record_header_at(plugin, place)
+					next_place := place + HEADER_SIZE + i64(header.size)
+					if header.kind == "REFR" and fits(references.len + 1, references.cap) and winning_copy(plugin, file, header, place) {
+						references + read_reference(plugin, file, header, plugin_bytes(plugin, place + HEADER_SIZE, i64(header.size)))
+					}
+					place = next_place
+				}
+			}
+			at = inner_end
+		}
+	}
+}
+
+// A REFR record's fields (from a plugin file): NAME the base, DATA where
+// and how turned, XSCL its scale.
+read_reference :: fun(plugin: ^Plugin, file: i64, header: Record_Header, data: []byte) -> Reference {
+	reference := Reference{
+		form_id = global_form(plugin, file, header.form_id),
+		base = 0,
+		position = Vec3{0, 0, 0},
+		rotation = Vec3{0, 0, 0},
+		scale = 1,
+		flags = header.flags}
+	fields := Fields{data = data, at = 0, broken = false}
+	for field in next_field(&fields) {
+		kind := field.kind
+		if kind == "NAME" and field.data.len >= 4 {
+			base : u32 = field.data[0]
+			reference.base = global_form(plugin, file, base)
+		elif kind == "DATA" and field.data.len >= 24
+			reference.position = field.data[0]
+			reference.rotation = field.data[12]
+		elif kind == "XSCL" and field.data.len >= 4
+			reference.scale = field.data[0]
+		}
+	}
+	return reference
+}
+
+// The mesh a base object's record names (MODL), as an archive path:
+// meshes\…, lower case. Empty when it names none.
+model_path :: fun(record: Record) -> [256]utf8 {
+	path : [256]utf8
+	field, found := find_field(record.data, "MODL")
+	if not found do return path
+	name := field_text(field)
+	if name.len == 0 do return path
+	&path + "meshes\\"
+	for c in name {
+		if not fits(path.len + 1, path.cap) do break
+		if c == '/' do &path + '\\'
+		else do &path + lower(c)
+	}
+	return path
+}
+
+// A reference's place in the world as a matrix: scaled, turned (about z
+// first, then y, then x, each clockwise, as OpenMW does it), moved.
+reference_transform :: fun(reference: Reference) -> Mat4 {
+	turn_x := clockwise(reference.rotation.x, 0)
+	turn_y := clockwise(reference.rotation.y, 1)
+	turn_z := clockwise(reference.rotation.z, 2)
+	turned := mat4_mul(turn_x, mat4_mul(turn_y, turn_z))
+	scaled := mat4_mul(turned, mat4_scale(Vec3{reference.scale, reference.scale, reference.scale}))
+	return mat4_mul(mat4_translate(reference.position), scaled)
+}
+
+// A turn by angle clockwise about an axis (0 x, 1 y, 2 z), looking down
+// the axis toward the origin.
+clockwise :: fun(angle: f32, axis: i64) -> Mat4 {
+	c := cos_f32(angle)
+	s := sin_f32(angle)
+	m := mat4_identity()
+	// The other two axes, in order: (y, z) for x, (z, x) for y, (x, y) for z.
+	a := (axis + 1) % 3
+	b := (axis + 2) % 3
+	m[a][a] = c
+	m[a][b] = -s
+	m[b][a] = s
+	m[b][b] = c
+	return m
+}
+
+// ---- a cell's light, the lights in it, and its doors ---------------------------
+
+// An interior cell's light (its XCLL): an ambient color, a directional
+// light, and fog. Colors 0 to 1.
+Cell_Lighting :: struct {
+	ambient: Vec3
+	directional: Vec3
+	direction: Vec3     // where the directional light comes from
+	fog_color: Vec3
+	fog_near: f32
+	fog_far: f32
+}
+
+// The lighting an exterior cell or a cell without XCLL is drawn with,
+// until weather is read: daylight.
+DAYLIGHT :: Cell_Lighting{
+	ambient = Vec3{0.4, 0.42, 0.45},
+	directional = Vec3{0.75, 0.72, 0.65},
+	direction = Vec3{0.3, -0.4, 0.85},
+	fog_color = Vec3{0.45, 0.6, 0.8},
+	fog_near = 0,
+	fog_far = 0}
+
+// A color as a cell or light record stores it: red, green, blue bytes.
+byte_color :: fun(data: []byte, at: i64) -> Vec3 {
+	red : u8 = data[at]
+	green : u8 = data[at + 1]
+	blue : u8 = data[at + 2]
+	return Vec3{f32(red) / 255, f32(green) / 255, f32(blue) / 255}
+}
+
+// A cell's lighting: its XCLL, or daylight when it has none.
+cell_lighting :: fun(plugin: ^Plugin, cell: u32, scratch: ^[]byte) -> Cell_Lighting, err {
+	record := find_record(plugin, cell, scratch)?
+	field, found := find_field(record.data, "XCLL")
+	if not found or field.len < 36 do return DAYLIGHT
+	fog_near : f32 = field[12]
+	fog_far : f32 = field[16]
+	// The directional light's angles, in degrees: around z, and up from level.
+	around : i32 = field[20]
+	up : i32 = field[24]
+	around_radians := f32(around) * 0.0174533
+	up_radians := f32(up) * 0.0174533
+	return Cell_Lighting{
+		ambient = byte_color(field, 0),
+		directional = byte_color(field, 4),
+		direction = Vec3{sin_f32(around_radians) * cos_f32(up_radians), cos_f32(around_radians) * cos_f32(up_radians), sin_f32(up_radians)},
+		fog_color = byte_color(field, 8),
+		fog_near = fog_near,
+		fog_far = fog_far}
+}
+
+// A light's flags (LIGH's DATA).
+LIGHT_NEGATIVE       :: 0x4    // takes light away
+LIGHT_FLICKER        :: 0x8
+LIGHT_OFF_BY_DEFAULT :: 0x20
+LIGHT_FLICKER_SLOW   :: 0x40
+LIGHT_PULSE          :: 0x80
+LIGHT_PULSE_SLOW     :: 0x100
+
+// How a light's brightness changes: not at all, flickering (quickly or
+// slowly: toward new levels by chance), pulsing (between full and a
+// quarter).
+Light_Kind :: union {
+	steady = 0
+	flicker
+	flicker_slow
+	pulse
+	pulse_slow
+}
+
+// A light placed in a cell: where, how far it reaches, its color; how it
+// changes, and as it does, how bright it is now, toward what, and how far
+// it's moved off its place (a flickering one wavers).
+Point_Light :: struct {
+	position: Vec3
+	radius: f32
+	color: Vec3
+	kind: Light_Kind
+	brightness: f32
+	target: f32
+	drift: Vec3
+	drift_target: Vec3
+}
+
+// The light a LIGH base object gives, placed by a reference; false when
+// it gives none (off, negative, or no data).
+light_of :: fun(base: Record, reference: Reference) -> Point_Light, bool {
+	none := Point_Light{position = reference.position, radius = 0, color = Vec3{0, 0, 0}, kind = .steady,
+		brightness = 1, target = 1, drift = Vec3{0, 0, 0}, drift_target = Vec3{0, 0, 0}}
+	if base.header.kind != "LIGH" do return none, false
+	field, found := find_field(base.data, "DATA")
+	if not found or field.len < 16 do return none, false
+	radius : u32 = field[4]
+	flags : u32 = field[12]
+	if flags & (LIGHT_NEGATIVE | LIGHT_OFF_BY_DEFAULT) != 0 or radius == 0 do return none, false
+	kind := Light_Kind.steady
+	if flags & LIGHT_FLICKER != 0 do kind = .flicker
+	elif flags & LIGHT_FLICKER_SLOW != 0 do kind = .flicker_slow
+	elif flags & LIGHT_PULSE != 0 do kind = .pulse
+	elif flags & LIGHT_PULSE_SLOW != 0 do kind = .pulse_slow
+	// A changing light starts partway (as OpenMW has it): each its own way.
+	start : f32 = if kind == .steady do 1 else 0.675
+	return Point_Light{position = reference.position, radius = f32(radius) * reference.scale, color = byte_color(field, 8),
+		kind = kind, brightness = start, target = start, drift = Vec3{0, 0, 0}, drift_target = Vec3{0, 0, 0}}, true
+}
+
+// ---- sounds -------------------------------------------------------------------
+
+// A sound base object (SOUN): its file's path in the archives (sound\…;
+// a folder's: one of its files is picked each time it plays); where it's
+// heard — full within min_distance, fading out by max_distance (game
+// units); its pitch shifted by a share up or down; its flags (SOUND_*);
+// how many decibels quieter it always plays; and the hours of the day it
+// plays between (start and stop the same: always).
+Sound_Kind :: struct {
+	path: [160]utf8
+	folder: bool
+	min_distance: f32
+	max_distance: f32
+	pitch_shift: f32
+	flags: u32
+	attenuation: f32
+	start_hour: f32
+	stop_hour: f32
+}
+
+SOUND_RANDOM_PITCH        :: 0x1    // its pitch shifted at random each time
+SOUND_PLAY_AT_RANDOM      :: 0x2    // played now and then, not on and on
+SOUND_ENVIRONMENT_IGNORED :: 0x4
+SOUND_RANDOM_LOCATION     :: 0x8    // from somewhere about where it's placed
+SOUND_LOOP                :: 0x10
+SOUND_MENU                :: 0x20
+SOUND_2D                  :: 0x40   // from nowhere in particular: as loud anywhere
+SOUND_360_LFE             :: 0x80   // heard all round
+
+// The sound a SOUN record makes; false when it's not one, or names no file.
+sound_kind_of :: fun(base: Record) -> Sound_Kind, bool {
+	kind := Sound_Kind{path = [], folder = false, min_distance = 0, max_distance = 0, pitch_shift = 0, flags = 0,
+		attenuation = 0, start_hour = 0, stop_hour = 0}
+	if base.header.kind != "SOUN" do return kind, false
+	name_field, named := find_field(base.data, "FNAM")
+	if not named do return kind, false
+	name := field_text(name_field)
+	if name.len == 0 do return kind, false
+	&kind.path + "sound\\"
+	for c in name {
+		if not fits(kind.path.len + 1, kind.path.cap) do break
+		if c == '/' do &kind.path + '\\'
+		else do &kind.path + lower(c)
+	}
+	kind.folder = not ends_with(kind.path, ".wav")
+	data, has_data := find_field(base.data, "SNDX")
+	if not has_data do data, has_data = find_field(base.data, "SNDD")
+	if has_data and data.len >= 8 {
+		near : u8 = data[0]
+		far : u8 = data[1]
+		shift : i8 = data[2]
+		flags : u16 = data[4]
+		kind.min_distance = f32(near) * 5
+		kind.max_distance = f32(far) * 100
+		kind.pitch_shift = f32(shift) / 100
+		kind.flags = u32(flags)
+		if data.len >= 12 {
+			attenuation : u16 = data[8]
+			stop : u8 = data[10]
+			start : u8 = data[11]
+			kind.attenuation = f32(attenuation) / 100
+			kind.start_hour = f32(start) * 24 / 256
+			kind.stop_hour = f32(stop) * 24 / 256
+		}
+	}
+	return kind, true
+}
+
+// The world a world is part of (WNAM: a city's is Tamriel), 0 for none.
+world_parent :: fun(plugin: ^Plugin, world_id: u32, scratch: ^[]byte) -> u32, err {
+	record := find_record(plugin, world_id, scratch)?
+	parent, _ := form_field(plugin, record, "WNAM")
+	return parent
+}
+
+// Whether a world is a small one (its DATA's flag 0x01): a walled city's
+// own, an Imperial City district, an Oblivion realm.
+small_world :: fun(plugin: ^Plugin, world_id: u32, scratch: ^[]byte) -> bool, err {
+	record := find_record(plugin, world_id, scratch)?
+	flags, found := find_field(record.data, "DATA")
+	return found and flags.len > 0 and (u8(flags[0]) & 0x01) != 0
+}
+
+// The kind of music a place wants (0 exploring, 1 public, 2 dungeon): a
+// cell's own (XCMT; 0 or none is the default); outside, for a cell with the
+// default (or no cell), its world's (SNAM), then its regions' (RDMD, among
+// their sounds); else exploring.
+place_music :: fun(plugin: ^Plugin, cell: u32, world_id: u32, scratch: ^[]byte) -> i64, err {
+	regions : [16]u32
+	if cell != 0 {
+		cell_record := find_record(plugin, cell, scratch)?
+		own, has_own := find_field(cell_record.data, "XCMT")
+		if has_own and own.len > 0 and own[0] != 0 do return i64(own[0])
+		region_ids, has_regions := find_field(cell_record.data, "XCLR")
+		if has_regions {
+			count := region_ids.len / 4
+			if not fits(regions.len + count, regions.cap) do count = regions.cap - regions.len
+			for k in 0:count {
+				region : u32 = region_ids[k * 4]
+				&regions + record_form(plugin, cell_record, region)
+			}
+		}
+	}
+	if world_id == 0 do return 0
+	world_record := find_record(plugin, world_id, scratch)?
+	// (A world's SNAM is its music type, a number, not a form id.)
+	world_music, has_world_music := find_field(world_record.data, "SNAM")
+	if has_world_music and world_music.len >= 4 {
+		music : u32 = world_music[0]
+		if music != 0 do return i64(music)
+	}
+	for region in regions {
+		region_scratch : [65536]byte
+		record := find_record(plugin, region, &region_scratch)?
+		field, found := find_field(record.data, "RDMD")
+		if found and field.len >= 4 {
+			music : u32 = field[0]
+			if music != 0 do return i64(music)
+		}
+	}
+	return 0
+}
+
+// A form id field of a record (SNAM, ANAM…), as the game numbers it, and
+// false when it has none.
+form_field :: fun(plugin: ^Plugin, record: Record, kind: []utf8) -> u32, bool {
+	field, found := find_field(record.data, kind)
+	if not found or field.len < 4 do return 0, false
+	form_id : u32 = field[0]
+	return record_form(plugin, record, form_id), true
+}
+
+// Where a door leads (a reference's XTEL): the door at the other end, and
+// where and facing which way one arrives.
+Door_Destination :: struct {
+	door: u32
+	position: Vec3
+	rotation: Vec3
+}
+
+// A reference's destination, and false when it leads nowhere.
+door_destination :: fun(plugin: ^Plugin, reference: u32, scratch: ^[]byte) -> Door_Destination, bool, err {
+	none := Door_Destination{door = 0, position = Vec3{0, 0, 0}, rotation = Vec3{0, 0, 0}}
+	record := find_record(plugin, reference, scratch)?
+	field, found := find_field(record.data, "XTEL")
+	if not found or field.len < 28 do return none, false
+	door : u32 = field[0]
+	position : Vec3 = field[4]
+	rotation : Vec3 = field[16]
+	return Door_Destination{door = record_form(plugin, record, door), position = position, rotation = rotation}, true
+}
+
+// The cell a reference is in: the one whose group of references (in any
+// plugin file) holds its record. 0 when none does.
+cell_of_reference :: fun(plugin: ^Plugin, reference: u32) -> u32 {
+	at, found := index_get(&plugin.records, u64(reference))
+	if not found do return 0
+	cells := &plugin.cell_children
+	for key, slot in cells.keys {
+		if key == 0 do continue
+		group_at := i64(cells.values[slot])
+		group_header := group_header_at(plugin, group_at)
+		if at > group_at and at < group_at + i64(group_header.size) do return u32(key & 0xFFFFFFFF)
+	}
+	return 0
+}
+
+// ---- areas of the grid --------------------------------------------------------
+
+// How many cells around the player's are loaded outside: 2 is 5 by 5.
+EXTERIOR_RADIUS :: 2
+
+// A part of the world the grid's cells x and y go from low to high in.
+Grid_Area :: struct {
+	everywhere: bool   // no limit: an interior cell's
+	low_x: i64
+	low_y: i64
+	high_x: i64
+	high_y: i64
+}
+
+EVERYWHERE :: Grid_Area{everywhere = true, low_x = 0, low_y = 0, high_x = 0, high_y = 0}
+NOWHERE :: Grid_Area{everywhere = false, low_x = 1, low_y = 1, high_x = 0, high_y = 0}
+
+// Whether a place is in an area.
+area_holds :: fun(area: Grid_Area, position: Vec3) -> bool {
+	if area.everywhere do return true
+	x, y := grid_of(position)
+	return x >= area.low_x and x <= area.high_x and y >= area.low_y and y <= area.high_y
+}
+
+// The cells within radius of the one at x, y.
+area_around_by :: fun(x: i64, y: i64, radius: i64) -> Grid_Area {
+	return Grid_Area{everywhere = false, low_x = x - radius, low_y = y - radius, high_x = x + radius, high_y = y + radius}
+}
+
+// The area of cells loaded around a cell.
+area_around :: fun(x: i64, y: i64) -> Grid_Area {
+	return Grid_Area{everywhere = false,
+		low_x = x - EXTERIOR_RADIUS, low_y = y - EXTERIOR_RADIUS,
+		high_x = x + EXTERIOR_RADIUS, high_y = y + EXTERIOR_RADIUS}
+}
+
+// ---- exterior cells ------------------------------------------------------------
+
+// The size of an exterior cell, in units.
+CELL_SIZE :: 4096
+
+// The world an exterior cell is in, 0 for an interior one.
+cell_world :: fun(plugin: ^Plugin, cell: u32) -> u32 {
+	world, found := index_get(&plugin.cell_worlds, u64(cell))
+	if not found do return 0
+	return u32(world)
+}
+
+// The exterior cell at a place on a world's grid, 0 when there's none.
+exterior_cell :: fun(plugin: ^Plugin, world: u32, x: i64, y: i64) -> u32 {
+	cell, found := index_get(&plugin.exterior_cells, grid_key(world, x, y))
+	if not found do return 0
+	return u32(cell)
+}
+
+// The world's cell holding its persistent references (doors, quest
+// things…), 0 when it has none.
+persistent_cell :: fun(plugin: ^Plugin, world: u32) -> u32 {
+	cell, found := index_get(&plugin.persistent_cells, u64(world))
+	if not found do return 0
+	return u32(cell)
+}
+
+// The place on the grid a point in the world is in.
+grid_of :: fun(position: Vec3) -> i64, i64 {
+	return i64(floor_f32(position.x / CELL_SIZE)), i64(floor_f32(position.y / CELL_SIZE))
+}
+
+// The world whose editor id is name (any letter case): its form id.
+find_world :: fun(plugin: ^Plugin, name: []utf8, scratch: ^[]byte) -> u32 {
+	for key, slot in plugin.persistent_cells.keys {
+		if key == 0 do continue
+		record, record_error := find_record(plugin, u32(key), scratch)
+		if record_error do continue
+		if compare_folded(editor_id(record.data), name) == 0 do return u32(key)
+	}
+	return 0
+}
+
+// A cell's flags (its DATA), for what this reads of them.
+CELL_HAS_WATER :: 0x2
+
+// Whether a cell has water, and its height: its XCLW, else (outside) the
+// sea's, 0.
+cell_water :: fun(plugin: ^Plugin, cell: u32, scratch: ^[]byte) -> f32, bool, err {
+	record := find_record(plugin, cell, scratch)?
+	flags_field, has_flags := find_field(record.data, "DATA")
+	if not has_flags or flags_field.len < 1 do return 0, false
+	flags : u8 = flags_field[0]
+	if flags & CELL_HAS_WATER == 0 do return 0, false
+	height_field, has_height := find_field(record.data, "XCLW")
+	if has_height and height_field.len >= 4 {
+		height : f32 = height_field[0]
+		return height, true
+	}
+	return 0, true
+}
+
+// A kind of water (WATR): how it shines and reflects, how its ripples
+// drift, its colors.
+Water_Type :: struct {
+	sun_power: f32        // how tight the sun's glint is: the specular's power
+	reflectivity: f32     // how much of the reflection is the sky's, not reflection_color
+	fresnel: f32          // how much it reflects seen straight down
+	scroll: [2!]f32       // the ripples' drift, in their texture's widths a second
+	shallow: Vec3         // its color seen straight down, and seen at a slant
+	deep: Vec3
+	reflection: Vec3
+}
+
+// Water as the default WATR has it, for a world that names none.
+DEFAULT_WATER :: Water_Type{sun_power = 15, reflectivity = 0.9, fresnel = 0.15, scroll = [0.03, 0.03],
+	shallow = Vec3{0.008, 0.082, 0.118}, deep = Vec3{0.125, 0.18, 0.208}, reflection = Vec3{0.122, 0.267, 0.294}}
+
+// A world's water (its NAM2's WATR). Its DATA: wind velocity and
+// direction, wave amplitude and frequency, sun power, reflectivity,
+// fresnel, scroll speeds, fog near and far (floats), then its shallow,
+// deep and reflection colors (bytes).
+world_water :: fun(plugin: ^Plugin, world_id: u32, scratch: ^[]byte) -> Water_Type, err {
+	water := DEFAULT_WATER
+	record := find_record(plugin, world_id, scratch)?
+	water_field, has_water := find_field(record.data, "NAM2")
+	if not has_water or water_field.len < 4 do return water
+	water_id : u32 = water_field[0]
+	water_record := find_record(plugin, record_form(plugin, record, water_id), scratch)?
+	data, has_data := find_field(water_record.data, "DATA")
+	if not has_data or data.len < 56 do return water
+	water.sun_power = data[16]
+	water.reflectivity = data[20]
+	water.fresnel = data[24]
+	// The scroll speeds: per frame at the game's 30 a second, it seems.
+	scroll_x : f32 = data[28]
+	scroll_y : f32 = data[32]
+	water.scroll = [scroll_x * 30, scroll_y * 30]
+	water.shallow = byte_color(data, 44)
+	water.deep = byte_color(data, 48)
+	water.reflection = byte_color(data, 52)
+	return water
+}
+
+// How a tree (TREE) is drawn. Near, grown from its SpeedTree file
+// (speedtree.mara: the file holds how to grow the tree, not its shape) with
+// its leaves' texture (ICON, in textures\trees\leaves\) and one of its seeds
+// (SNAM: each grows another tree); afar, as its billboard, the picture of it
+// the editor made (textures\trees\billboards\ and its SpeedTree file's
+// name), this wide and tall (BNAM) at a scale of 1.
+Tree_Look :: struct {
+	model: [160]utf8      // its SpeedTree file's archive path: trees\…
+	leaves: [160]utf8
+	seeds: [8]i64
+	billboard: [160]utf8
+	width: f32
+	height: f32
+}
+
+// A TREE record's look; false for other records, or a tree without a size.
+tree_look :: fun(base: Record) -> Tree_Look, bool {
+	look := Tree_Look{model = [], leaves = [], seeds = [], billboard = [], width = 0, height = 0}
+	if base.header.kind != "TREE" do return look, false
+	model, has_model := find_field(base.data, "MODL")
+	size, has_size := find_field(base.data, "BNAM")
+	if not has_model or not has_size or size.len < 8 do return look, false
+	look.width = size[0]
+	look.height = size[4]
+	// The file's name without its folders or its extension.
+	name := field_text(model)
+	start : i64 = 0
+	end := name.len
+	for c, k in name {
+		if c == '\\' or c == '/' do start = k + 1
+	}
+	for k in start:name.len {
+		if name[k] == '.' do end = k
+	}
+	&look.billboard + "textures\\trees\\billboards\\"
+	for k in start:end do &look.billboard + lower(name[k])
+	&look.billboard + ".dds"
+	&look.model + "trees\\"
+	for k in start:name.len do &look.model + lower(name[k])
+	leaves, has_leaves := find_field(base.data, "ICON")
+	if has_leaves {
+		&look.leaves + "textures\\trees\\leaves\\"
+		for c in field_text(leaves) do &look.leaves + lower(c)
+	}
+	seeds, has_seeds := find_field(base.data, "SNAM")
+	if has_seeds {
+		for k in 0:seeds.len / 4 {
+			if not fits(look.seeds.len + 1, look.seeds.cap) do break
+			seed : u32 = seeds[4 * k]
+			&look.seeds + i64(seed)
+		}
+	}
+	return look, true
+}

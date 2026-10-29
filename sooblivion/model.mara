@@ -1,0 +1,1592 @@
+// A NIF turned into what the renderer draws: parts, each a list of
+// triangles in the model's own space with the texture and settings it's
+// drawn with.
+//
+// The NIF's tree is walked from its roots, each object's place combined
+// with its parent's, and the properties on a node passed down to the
+// shapes under it (a shape's own replace them).
+module model
+
+use mara.core
+use mara.math
+use mara.string
+use nif
+use animation
+use logging
+
+// One vertex as the renderer draws it: 48 bytes.
+Vertex :: struct {
+	position: Vec3
+	normal: Vec3
+	uv: [2!]f32
+	color: [4!]f32   // red, green, blue, alpha: the mesh's vertex colors, else white
+	tangent: [4!]f32 // where the texture's x (u) runs, across the normal; its last: 1 when
+	                 // y (v) runs along the normal × it, -1 when the other way (mirrored)
+}
+
+// A part of a model: one shape's triangles, and how they're drawn.
+Model_Part :: struct {
+	vertices: []Vertex
+	indices: []u16          // three for each triangle
+	texture: [160]utf8      // the base texture's path in the archives: textures\…
+	glow_texture: [160]utf8 // the glow map's, or empty
+	clamp_mode: u32         // how the base texture's edges go: 0 clamped both ways, 1 clamped across
+	                        // and repeating up, 2 repeating across and clamped up, 3 repeating both
+	flip: i64               // its texture's flipbook (in the model's flips), -1 for none
+	additive: bool          // blended by adding its light to what's behind (fire)
+	billboard_mode: i64     // under a billboard node: its mode (Node's billboard_mode); -1 for none
+	billboard_node: Mat4    // that node's place in the model
+	alpha_blend: bool       // blended with what's behind it
+	depth_write: bool       // writes the depth buffer (blended too, unless its z-buffer property says not)
+	alpha_test: bool        // pixels whose alpha is below the threshold are left out
+	alpha_threshold: f32    // 0 to 1
+	two_sided: bool
+	diffuse: Vec3
+	emissive: Vec3
+	specular: Vec3          // the color its shine is (black: none); how much shines, its normal map's alpha says
+	glossiness: f32         // how tight the shine is (the power its highlights are raised to)
+	alpha: f32
+	vertex_mode: u32        // what its vertex colors stand for: 0 nothing, 1 its own light, 2 its color
+	lighting_mode: u32      // 0 lit by its own light only, 1 by the scene's lights too
+	leaf_cards: bool        // a tree's leaves: each four vertices a card at their place, turned to face
+	                        // the camera, each corner set off across and up by its tangent's first two
+	influences: []Skin_Influence  // rigged (Build_Options): one for each vertex, its vertices as they are
+	                              // before the card moves them; else none
+}
+
+// What moves a vertex of a rigged part (Build_Options): up to four entries
+// of its model's palette, and how much each (out of 65535, all four adding
+// up to that).
+Skin_Influence :: struct {
+	entries: [4!]u16
+	weights: [4!]u16
+}
+
+// An entry of a rigged model's palette: a bone (its place in the pose the
+// model was rigged to; -1 for none) and where a part is from it. Its matrix
+// at a time is the bone's place then times offset (offset alone, without
+// a bone).
+Palette_Entry :: struct {
+	bone: i64
+	offset: Mat4
+}
+
+// The most entries a rigged model's palette has.
+MODEL_PALETTE :: 1024
+
+// A whole model: its parts, its particle systems, and a box around them.
+Model :: struct {
+	parts: []Model_Part
+	flips: []Model_Flip    // the parts' flipbooks (Model_Part.flip), and the particles'
+	particles: []Model_Particles
+	motions: []Model_Motion
+	bounds_min: Vec3
+	bounds_max: Vec3
+	palette: []Palette_Entry   // a rigged model's (Build_Options): what its parts' influences pick from
+}
+
+// The keys a part's changing value holds, at most.
+MOTION_KEYS :: 64
+
+// What of a part changes over time: its texture moved across (u) or up
+// (v), its glow (its material's emissive color), its opacity.
+MOTION_TEXTURE_U :: 0
+MOTION_TEXTURE_V :: 1
+MOTION_GLOW      :: 2
+MOTION_ALPHA     :: 3
+
+// One of a part's values changing over time, as a controller says: which
+// part and what (MOTION_*); its keys (each a time and a value — a color's
+// three, else the first), or with none its value; played as its controller
+// (or the Idle sequence driving it) has it — its time at a frequency from
+// a phase, kept between a start and stop by its cycle (CYCLE_*).
+Model_Motion :: struct {
+	part: i64
+	what: i64
+	start_time: f32
+	stop_time: f32
+	frequency: f32
+	phase: f32
+	cycle: i64
+	key_times: [MOTION_KEYS]f32
+	key_values: [MOTION_KEYS]Vec3
+	value: Vec3
+}
+
+// The keys of a particle system's changing values, at most.
+PARTICLE_KEYS :: 16
+
+// A particle system of a model, ready to be played: its emitter (its
+// emitter object's place in the model) and room; how fast it makes
+// particles and when, as its emitter controller says — the controller's
+// time is the scene's at a frequency from a phase, kept between a start and
+// stop time by its cycle (CYCLE_*); how its particles grow, fade, change
+// color, turn and are pulled; and how they're drawn, as a part is (its
+// look's texture, flipbook, blending and material; no vertices).
+Model_Particles :: struct {
+	emitter: Emitter
+	emitter_place: Mat4
+	capacity: i64
+	// Particles a second: its keys' (by the controller's time), or with
+	// none its value. On: its keys' (as many times as values), or always.
+	birth_rate: f32
+	birth_times: [PARTICLE_KEYS]f32
+	birth_rates: [PARTICLE_KEYS]f32
+	active_times: [PARTICLE_KEYS]f32
+	active_values: [PARTICLE_KEYS]bool
+	frequency: f32
+	phase: f32
+	start_time: f32
+	stop_time: f32
+	cycle: i64
+	grow_time: f32                     // seconds; 0 for none
+	fade_time: f32
+	color_times: [PARTICLE_KEYS]f32    // 0 (born) to 1 (dying); none: the emitter's color all along
+	colors: [PARTICLE_KEYS][4!]f32
+	rotation_speed: f32                // radians a second
+	rotation_speed_variation: f32
+	rotation_angle: f32
+	rotation_angle_variation: f32
+	random_sign: bool
+	gravity: Vec3                      // the pull, in the model's space (units a second, each second)
+	pulled_in: bool                    // toward gravity_center, at the pull's strength
+	gravity_center: Vec3
+	look: Model_Part
+}
+
+// The frames a flipbook holds, and the keys saying which shows when, at most.
+FLIP_FRAMES :: 128   // (the longest in the game's meshes has 81)
+FLIP_KEYS :: 32
+
+// A part's texture flipped through frames (a flame's, say): the frames'
+// archive paths; its span of time, played at a frequency from a phase;
+// and its keys — at each time, which frame (as a number) — or, with none,
+// the frames in turn across the span. Made from one flip controller (a
+// block of the NIF): the parts it flips share it.
+Model_Flip :: struct {
+	controller: i64
+	frames: [FLIP_FRAMES][160]utf8
+	start_time: f32
+	stop_time: f32
+	frequency: f32
+	phase: f32
+	key_times: [FLIP_KEYS]f32
+	key_values: [FLIP_KEYS]f32
+}
+
+// What makes a model fail.
+Model_Error :: error {
+	Too_Many_Parts   // more shapes than the parts' room
+}
+
+// The properties in effect at a place in the tree: block indexes, -1 for none.
+Inherited :: struct {
+	texturing: i64
+	material: i64
+	alpha: i64
+	stencil: i64
+	z_buffer: i64
+	vertex_color: i64
+	billboard_mode: i64    // the nearest billboard node above: its mode, -1 for none
+	billboard_node: Mat4   // and its place in the model
+}
+
+// An object's place relative to its parent, as a matrix: translate, turn, scale.
+local_transform :: fun(object: Av_Object) -> Mat4 {
+	m := mat4_identity()
+	for column in 0:3 {
+		for row in 0:3 {
+			m[column][row] = object.rotation[row * 3 + column] * object.scale
+		}
+	}
+	m.w.x = object.translation.x
+	m.w.y = object.translation.y
+	m.w.z = object.translation.z
+	return m
+}
+
+// The properties in effect for an object: its parent's, with its own put over them.
+inherit :: fun(mesh: ^Nif, parent: Inherited, properties: Refs) -> Inherited {
+	result := parent
+	for k in 0:properties.count {
+		index := properties.at(k)
+		if index < 0 do continue
+		match mesh.blocks[index] {
+		Texturing
+			result.texturing = index
+		Material
+			result.material = index
+		Alpha
+			result.alpha = index
+		Stencil
+			result.stencil = index
+		Z_Buffer
+			result.z_buffer = index
+		Vertex_Color
+			result.vertex_color = index
+		else
+		}
+	}
+	return result
+}
+
+// Makes a model of a NIF: its parts' vertices and indexes, and the parts
+// themselves, carved from storage.
+build_model :: fun(mesh: ^Nif, storage: ^[]byte) -> Model, err {
+	return build_model_with(mesh, -1, [], plain_build(), storage)
+}
+
+// How a model of a NIF is made (build_model_with). Its skinned shapes are
+// moved with their bones as pose has them (no pose: as the file has them);
+// the rest are placed by root. Its first shape's vertices are moved first,
+// each as far as moves says, where there's a move for each (a face's shape:
+// facegen.mara). Rigged, its vertices are kept as they are and the card
+// moves them, each part's by the entries of the model's palette its
+// influences pick: a skinned shape's by its bones (in pose, by name, its
+// skin's transforms), any other wholly by hang_bone (in pose; -1: none),
+// from where hang_offset says.
+Build_Options :: struct {
+	pose: []Pose_Bone
+	root: Mat4
+	moves: []Vec3
+	rigged: bool
+	hang_bone: i64
+	hang_offset: Mat4
+}
+
+// A model made as the file has it.
+plain_build :: fun() -> Build_Options {
+	return Build_Options{pose = [], root = mat4_identity(), moves = [], rigged = false, hang_bone = -1, hang_offset = mat4_identity()}
+}
+
+// Makes a model of part of a NIF: the objects under a node, in the node's
+// own space (as if it were the model's origin, unturned); or, for node -1,
+// the whole tree but for what's under the nodes left out.
+build_model_part :: fun(mesh: ^Nif, node: i64, left_out: []i64, storage: ^[]byte) -> Model, err {
+	return build_model_with(mesh, node, left_out, plain_build(), storage)
+}
+
+// Makes a model of a NIF posed: its skinned shapes moved with their bones
+// as the pose has them (into the skeleton's space); the rest placed by
+// root (where they hang: a bone's place).
+build_posed_model :: fun(mesh: ^Nif, pose: []Pose_Bone, root: Mat4, storage: ^[]byte) -> Model, err {
+	how := plain_build()
+	how.pose = pose
+	how.root = root
+	return build_model_with(mesh, -1, [], how, storage)
+}
+
+// Makes a model of a NIF posed (see build_posed_model), its first shape's
+// vertices moved before anything else is done with them: each as far as
+// moves says (a face's shape: facegen.mara), where there's a move for each.
+build_shaped_model :: fun(mesh: ^Nif, pose: []Pose_Bone, root: Mat4, moves: []Vec3, storage: ^[]byte, left_out: []i64 = []) -> Model, err {
+	how := plain_build()
+	how.pose = pose
+	how.root = root
+	how.moves = moves
+	return build_model_with(mesh, -1, left_out, how, storage)
+}
+
+// Makes a model of a NIF rigged to a pose (Build_Options): for the card to
+// move with the pose's bones. Its first shape's vertices moved first (see
+// build_shaped_model); an unskinned shape moved by hang_bone from
+// hang_offset. What's under the nodes left out isn't in it.
+build_rigged_model :: fun(mesh: ^Nif, pose: []Pose_Bone, moves: []Vec3, hang_bone: i64, hang_offset: Mat4, storage: ^[]byte,
+	left_out: []i64 = []) -> Model, err
+{
+	how := plain_build()
+	how.pose = pose
+	how.moves = moves
+	how.rigged = true
+	how.hang_bone = hang_bone
+	how.hang_offset = hang_offset
+	return build_model_with(mesh, -1, left_out, how, storage)
+}
+
+// Makes a model of a NIF, or part of one (see build_model_part), as how
+// says (Build_Options).
+build_model_with :: fun(mesh: ^Nif, node: i64, left_out: []i64, how: Build_Options, storage: ^[]byte) -> Model, err {
+	options := how
+	root := how.root
+	// One part for each shape at most.
+	shape_count : i64 = 0
+	for block in mesh.blocks {
+		match block {
+		Shape
+			shape_count += 1
+		else
+		}
+	}
+	// And a flipbook for each flip controller at most, a particle system
+	// for each one. Each part's motions are its texturing's and its
+	// material's (add_motions): as many as the most any texturing and any
+	// material has, for each part, at most.
+	flip_count : i64 = 0
+	system_count : i64 = 0
+	most_texturing_values : i64 = 0
+	most_material_values : i64 = 0
+	for block in mesh.blocks {
+		match block {
+		Flip_Controller
+			flip_count += 1
+		Particle_System
+			system_count += 1
+		Texturing texturing
+			most_texturing_values = max(most_texturing_values, value_controllers(mesh, texturing.controller))
+		Material material
+			most_material_values = max(most_material_values, value_controllers(mesh, material.controller))
+		else
+		}
+	}
+	motion_count := shape_count * (most_texturing_values + most_material_values)
+	model := Model{
+		parts = slice([:shape_count]Model_Part, storage),
+		flips = slice([:flip_count]Model_Flip, storage),
+		particles = slice([:system_count]Model_Particles, storage),
+		motions = slice([:motion_count]Model_Motion, storage),
+		bounds_min = Vec3{1000000, 1000000, 1000000},
+		bounds_max = Vec3{-1000000, -1000000, -1000000},
+		palette = slice([:if how.rigged do MODEL_PALETTE else 0]Palette_Entry, storage)}
+	none := Inherited{texturing = -1, material = -1, alpha = -1, stencil = -1, z_buffer = -1, vertex_color = -1, billboard_mode = -1, billboard_node = mat4_identity()}
+	if node >= 0 {
+		match mesh.blocks[node] {
+		Node part_node
+			properties := inherit(mesh, none, part_node.object.properties)
+			for k in 0:part_node.children.count {
+				child := part_node.children.at(k)
+				if child >= 0 do add_object(mesh, child, root, properties, &model, storage, left_out, &options)?
+			}
+		else
+		}
+		return model
+	}
+	for k in 0:mesh.roots.count {
+		root_object := mesh.roots.at(k)
+		if root_object >= 0 do add_object(mesh, root_object, root, none, &model, storage, left_out, &options)?
+	}
+	return model
+}
+
+// Adds an object of the tree to the model: a node's children, or a shape;
+// nothing under the nodes left out. Skinned shapes posed by pose.
+add_object :: fun(mesh: ^Nif, index: i64, parent: Mat4, inherited: Inherited, model: ^Model, storage: ^[]byte, left_out: []i64,
+	how: ^Build_Options) -> err
+{
+	for out in left_out {
+		if out == index do return
+	}
+	match mesh.blocks[index] {
+	Node node
+		if node.object.flags & 1 != 0 do return   // hidden
+		if node.object.name == "EditorMarker" do return
+		transform := mat4_mul(parent, local_transform(node.object))
+		properties := inherit(mesh, inherited, node.object.properties)
+		if node.billboard {
+			properties.billboard_mode = i64(node.billboard_mode)
+			properties.billboard_node = transform
+		}
+		for k in 0:node.children.count {
+			child := node.children.at(k)
+			if child >= 0 do add_object(mesh, child, transform, properties, model, storage, left_out, how)?
+		}
+	Shape shape
+		if shape.object.flags & 1 != 0 do return
+		if shape.data < 0 do return
+		transform := mat4_mul(parent, local_transform(shape.object))
+		properties := inherit(mesh, inherited, shape.object.properties)
+		match mesh.blocks[shape.data] {
+		Shape_Data data
+			add_shape(mesh, data.geometry, shape.object.extra_data, transform, properties, model, storage, shape.skin, how)?
+		else
+		}
+	Particle_System system
+		if system.object.flags & 1 != 0 do return
+		properties := inherit(mesh, inherited, system.object.properties)
+		add_particles(mesh, system.modifiers, system.data, system.object.controller, mat4_mul(parent, local_transform(system.object)), properties, model)
+	else
+	}
+}
+
+// Adds a shape's geometry to the model as a part: skinned (skin its skin
+// instance) and posed, if the pose has bones; its vertices moved first, if
+// it's the model's first part and there's a move for each; or rigged
+// (Build_Options).
+add_shape :: fun(mesh: ^Nif, geometry: Geometry, extra_data: Refs, transform: Mat4, properties: Inherited, model: ^Model,
+	storage: ^[]byte, skin: i64, how: ^Build_Options) -> err
+{
+	count := geometry.vertex_count
+	if count == 0 or geometry.vertices.len == 0 do return
+	if model.parts.len == model.parts.cap do return Too_Many_Parts
+	skinned := skin >= 0 and how.pose.len > 0
+	own_moves := how.moves[0:0]
+	if model.parts.len == 0 and how.moves.len >= count do own_moves = how.moves
+	// (A rigged skinned shape's vertices stay as the file has them: its
+	// bones place it.)
+	place := if how.rigged and skinned do mat4_identity() else transform
+
+	// The vertices, into the model's space. Normals turn with the shape;
+	// its scale is taken out of them by normalizing.
+	vertices := slice([:count]Vertex, storage)
+	for i in 0:count {
+		local_position : Vec3 = geometry.vertices[i * 12]
+		if own_moves.len > 0 do local_position = local_position + own_moves[i]
+		position := mat4_mul_vec4(place, Vec4{local_position.x, local_position.y, local_position.z, 1})
+		vertex := Vertex{
+			position = Vec3{position.x, position.y, position.z},
+			normal = Vec3{0, 0, 1},
+			uv = [0, 0],
+			color = [1, 1, 1, 1],
+			tangent = [1, 0, 0, 1]}
+		if geometry.normals.len != 0 {
+			local_normal : Vec3 = geometry.normals[i * 12]
+			turned := mat4_mul_vec4(place, Vec4{local_normal.x, local_normal.y, local_normal.z, 0})
+			vertex.normal = vec3_normalize(Vec3{turned.x, turned.y, turned.z})
+		}
+		if geometry.uv_set_count > 0 do vertex.uv = geometry.uvs[i * 8]
+		if geometry.colors.len != 0 do vertex.color = geometry.colors[i * 16]
+		&vertices + vertex
+		if not skinned and not how.rigged do grow_bounds(model, vertex.position)
+	}
+	influences := slice([:0]Skin_Influence, storage)
+	if how.rigged {
+		influences = slice([:count]Skin_Influence, storage)
+		if skinned do rig_skin(mesh, skin, how, vertices, model, &influences, storage)
+		else do rig_hang(how, vertices, model, &influences)
+	elif skinned
+		skin_vertices(mesh, skin, geometry, how.pose, own_moves, &vertices, storage)
+		for &vertex in vertices do grow_bounds(model, vertex.position)
+	}
+
+	// The triangles: as they are, or made from the strips.
+	indices := slice([:geometry.triangle_count * 3]u16, storage)
+	if geometry.triangles.len != 0 {
+		for k in 0:geometry.triangle_count * 3 {
+			index : u16 = geometry.triangles[k * 2]
+			&indices + index
+		}
+	else
+		strip_start : i64 = 0
+		for s in 0:geometry.strip_count {
+			strip_length : u16 = geometry.strip_lengths[s * 2]
+			add_strip(geometry.strips[strip_start * 2 : (strip_start + i64(strip_length)) * 2], &indices)
+			strip_start += i64(strip_length)
+		}
+	}
+
+	add_tangents(mesh, extra_data, place, &vertices, indices)
+
+	part := next(&model.parts)
+	part^ = part_look(mesh, properties, model)
+	part.vertices = vertices
+	part.indices = indices
+	part.influences = influences
+	add_motions(mesh, properties, model, model.parts.len - 1)
+
+	// The material's color, where the mesh has neither colors of its own
+	// (they take its place, as Oblivion's meshes mean them to) nor a
+	// texture, and its opacity, into the vertices' colors: a black backing
+	// behind a sewer's gate stays black. A textured mesh without colors is
+	// white: the game's shaders for them take the material's opacity and
+	// glow but no color of it. (797 textured parts have a material that
+	// isn't white and no colors: a silver battleaxe's blade, black by its
+	// material; a bridge's railing whose white colors the exporter dropped,
+	// gray 0.588 by its material, lying on a copy that kept them.)
+	no_colors := geometry.colors.len == 0 and part.texture.len == 0
+	white := part.diffuse.x == 1 and part.diffuse.y == 1 and part.diffuse.z == 1
+	if (no_colors and not white) or part.alpha != 1 {
+		for &vertex in part.vertices {
+			if no_colors {
+				vertex.color[0] *= part.diffuse.x
+				vertex.color[1] *= part.diffuse.y
+				vertex.color[2] *= part.diffuse.z
+			}
+			vertex.color[3] *= part.alpha
+		}
+	}
+}
+
+// ---- poses and skins --------------------------------------------------------------
+
+// A bone of a posed skeleton: its name, its place in the skeleton's space
+// (the model's), and its place as the skeleton rests (no track moving it).
+Pose_Bone :: struct {
+	name: [64]utf8
+	place: Mat4
+	rest: Mat4
+}
+
+// Where something hung from a bone goes (a hat, hair, eyes): its own
+// coordinates are the model's axes moved to the bone as the skeleton rests,
+// so it goes with the bone's place now, the bone's turn at rest undone.
+// False when the pose hasn't the bone.
+hang_place :: fun(pose: []Pose_Bone, name: []utf8) -> Mat4, bool {
+	for bone in pose {
+		if compare_folded(bone.name, name) != 0 do continue
+		resting_turn := bone.rest
+		resting_turn.w.x = 0
+		resting_turn.w.y = 0
+		resting_turn.w.z = 0
+		return mat4_mul(bone.place, mat4_inverse(resting_turn)), true
+	}
+	return mat4_identity(), false
+}
+
+// A bone's place in a pose (its name in any letter case), and false when
+// the pose hasn't it.
+pose_place :: fun(pose: []Pose_Bone, name: []utf8) -> Mat4, bool {
+	for bone in pose {
+		if compare_folded(bone.name, name) == 0 do return bone.place, true
+	}
+	return mat4_identity(), false
+}
+
+// The pose a NIF's nodes are in: each node's place in the model, those
+// tracks move by their tracks at a time (no tracks: as the file has them).
+// Into pose.
+pose_nodes :: fun(mesh: ^Nif, tracks: ^[]Track, time: f32, pose: ^[]Pose_Bone) {
+	pose.len = 0
+	for k in 0:mesh.roots.count {
+		root_object := mesh.roots.at(k)
+		if root_object >= 0 do pose_node(mesh, root_object, mat4_identity(), mat4_identity(), tracks, time, pose)
+	}
+}
+
+pose_node :: fun(mesh: ^Nif, index: i64, parent: Mat4, parent_rest: Mat4, tracks: ^[]Track, time: f32, pose: ^[]Pose_Bone) {
+	match mesh.blocks[index] {
+	Node node
+		local := local_transform(node.object)
+		rest := mat4_mul(parent_rest, local)
+		for k in 0:tracks.len {
+			if compare_folded(tracks[k].node_name, node.object.name) == 0 {
+				// (What its keys don't say, as the node is.)
+				tracks[k].rest = local
+				local = track_pose(&tracks[k], time)
+				break
+			}
+		}
+		place := mat4_mul(parent, local)
+		if fits(pose.len + 1, pose.cap) {
+			bone := next(pose)
+			bone.name.len = 0
+			&bone.name + node.object.name[0 : min(node.object.name.len, 64)]
+			bone.place = place
+			bone.rest = rest
+		}
+		for k in 0:node.children.count {
+			child := node.children.at(k)
+			if child >= 0 do pose_node(mesh, child, place, rest, tracks, time, pose)
+		}
+	else
+	}
+}
+
+// A skeleton's bones made to be posed quickly (pose_rig): each after its
+// parent, its parent's index (-1 for none), its place in its parent at
+// rest, and the track that moves it (-1 for none). In pose_nodes' order, so
+// a pose's bone k is the rig's.
+Rig_Bone :: struct {
+	parent: i64
+	local: Mat4
+	track: i64
+}
+
+// A NIF's nodes as a rig, into rig (each track's rest set as pose_nodes
+// sets it).
+rig_nodes :: fun(mesh: ^Nif, tracks: ^[]Track, rig: ^[]Rig_Bone) {
+	rig.len = 0
+	for k in 0:mesh.roots.count {
+		root_object := mesh.roots.at(k)
+		if root_object >= 0 do rig_node(mesh, root_object, -1, tracks, rig)
+	}
+}
+
+rig_node :: fun(mesh: ^Nif, index: i64, parent: i64, tracks: ^[]Track, rig: ^[]Rig_Bone) {
+	match mesh.blocks[index] {
+	Node node
+		if not fits(rig.len + 1, rig.cap) do return
+		local := local_transform(node.object)
+		track : i64 = -1
+		for k in 0:tracks.len {
+			if compare_folded(tracks[k].node_name, node.object.name) == 0 {
+				tracks[k].rest = local
+				track = k
+				break
+			}
+		}
+		own := rig.len
+		rig + Rig_Bone{parent = parent, local = local, track = track}
+		for k in 0:node.children.count {
+			child := node.children.at(k)
+			if child >= 0 do rig_node(mesh, child, own, tracks, rig)
+		}
+	else
+	}
+}
+
+// A rig's bones' places at a time, each its parent's place times its own
+// in its parent (its track's there, if it has one): into places.
+pose_rig :: fun(rig: []Rig_Bone, tracks: ^[]Track, time: f32, places: ^[]Mat4) {
+	places.len = 0
+	for bone in rig {
+		local := bone.local
+		if bone.track >= 0 do local = track_pose(&tracks[bone.track], time)
+		place := if bone.parent >= 0 do mat4_mul(places[bone.parent], local) else local
+		places + place
+	}
+}
+
+// Two rigs of one skeleton (bone for bone, as rig_nodes makes them) posed
+// at their times, each bone's place in its parent mixed: the second's by
+// share (0 to 1), the first's by the rest. Into places.
+blend_rigs :: fun(first: []Rig_Bone, first_tracks: ^[]Track, first_time: f32, second: []Rig_Bone, second_tracks: ^[]Track,
+	second_time: f32, share: f32, places: ^[]Mat4)
+{
+	places.len = 0
+	for k in 0:min(first.len, second.len) {
+		from := first[k].local
+		if first[k].track >= 0 do from = track_pose(&first_tracks[first[k].track], first_time)
+		to := second[k].local
+		if second[k].track >= 0 do to = track_pose(&second_tracks[second[k].track], second_time)
+		local := mix_transforms(from, to, share)
+		parent := second[k].parent
+		place := if parent >= 0 do mat4_mul(places[parent], local) else local
+		places + place
+	}
+}
+
+// A share of the way from one transform to another: where each is, and
+// their axes, mixed; the axes made square again (x first, y square to it,
+// z from the two) and as long as their mixed scale.
+mix_transforms :: fun(from: Mat4, to: Mat4, share: f32) -> Mat4 {
+	mixed := mat4_identity()
+	axes : [3!]Vec3
+	for column in 0:3 {
+		a := Vec3{from[column][0], from[column][1], from[column][2]}
+		b := Vec3{to[column][0], to[column][1], to[column][2]}
+		axes[column] = a + (b - a) * share
+	}
+	from_scale := vec3_length(Vec3{from[0][0], from[0][1], from[0][2]})
+	to_scale := vec3_length(Vec3{to[0][0], to[0][1], to[0][2]})
+	scale := from_scale + (to_scale - from_scale) * share
+	x := vec3_normalize(axes[0])
+	y := vec3_normalize(axes[1] - x * dot(x, axes[1]))
+	z := cross(x, y)
+	for axis in 0:3 {
+		mixed[0][axis] = x[axis] * scale
+		mixed[1][axis] = y[axis] * scale
+		mixed[2][axis] = z[axis] * scale
+		mixed[3][axis] = from[3][axis] + (to[3][axis] - from[3][axis]) * share
+	}
+	return mixed
+}
+
+// A node's name; empty for a block that isn't a node.
+node_name :: fun(mesh: ^Nif, index: i64) -> []utf8 {
+	match mesh.blocks[index] {
+	Node node
+		return node.object.name
+	else
+	}
+	return mesh.header.type_names[0][0:0]
+}
+
+// Moves a skinned shape's vertices (and normals) to where its bones are in
+// the pose: each the sum of where each of its bones takes it, by its
+// weight. What its bones don't move all the way (a bone the pose hasn't)
+// stays that much where it was. Room for the sums carved from storage.
+// A rigged skinned shape's influences (Build_Options): an entry of the
+// model's palette for each bone of its skin the pose has (by name, the
+// skin's transform for it); each vertex's four heaviest, their weights
+// made to add up to 65535. Vertices no bone moves stay where the file has
+// them (an entry without a bone). Posed, they widen the model's bounds.
+rig_skin :: fun(mesh: ^Nif, skin: i64, how: ^Build_Options, vertices: []Vertex, model: ^Model, influences: ^[]Skin_Influence,
+	storage: ^[]byte)
+{
+	count := vertices.len
+	// Each vertex's heaviest four so far: entries, then weights.
+	heaviest := slice([:count][8!]f32, storage)
+	for k in 0:count do &heaviest + [-1, -1, -1, -1, 0, 0, 0, 0]
+	data_index : i64 = -1
+	bones := Refs{count = 0, data = []}
+	match mesh.blocks[skin] {
+	Skin_Instance instance
+		data_index = instance.data
+		bones = instance.bones
+	else
+	}
+	if data_index >= 0 {
+		match mesh.blocks[data_index] {
+		Skin_Data data
+			at : i64 = 0
+			for b in 0:data.bone_count {
+				bone := skin_bone_at(data.bones, at, data.has_weights)
+				at = bone.next_at
+				if not data.has_weights or b >= bones.count or not fits(model.palette.len + 1, model.palette.cap) do continue
+				node := bones.at(b)
+				if node < 0 do continue
+				bone_index := pose_index(how.pose, node_name(mesh, node))
+				if bone_index < 0 do continue
+				entry := f32(model.palette.len)
+				&model.palette + Palette_Entry{bone = bone_index, offset = bone.transform}
+				for w in 0:bone.weights.len / 6 {
+					index : u16 = bone.weights[w * 6]
+					weight : f32 = bone.weights[w * 6 + 2]
+					v := i64(index)
+					if v >= count or weight <= 0 do continue
+					// Into the four, in place of the lightest, if heavier.
+					lightest := 0
+					for k in 1:4 {
+						if heaviest[v][4 + k] < heaviest[v][4 + lightest] do lightest = k
+					}
+					if weight > heaviest[v][4 + lightest] {
+						heaviest[v][lightest] = entry
+						heaviest[v][4 + lightest] = weight
+					}
+				}
+			}
+		else
+		}
+	}
+	// (An entry without a bone, for vertices nothing moves.)
+	unmoved : i64 = -1
+	for v in 0:count {
+		total := heaviest[v][4] + heaviest[v][5] + heaviest[v][6] + heaviest[v][7]
+		influence := Skin_Influence{entries = [0, 0, 0, 0], weights = [0, 0, 0, 0]}
+		if total <= 0 {
+			if unmoved < 0 and fits(model.palette.len + 1, model.palette.cap) {
+				unmoved = model.palette.len
+				&model.palette + Palette_Entry{bone = -1, offset = mat4_identity()}
+			}
+			influence.entries[0] = u16(max(unmoved, 0))
+			influence.weights[0] = 65535
+		else
+			given : i64 = 0
+			for k in 0:4 {
+				if heaviest[v][k] < 0 do continue
+				influence.entries[k] = u16(heaviest[v][k])
+				share := i64(heaviest[v][4 + k] / total * 65535 + 0.5)
+				influence.weights[k] = u16(min(share, 65535 - given))
+				given += i64(influence.weights[k])
+			}
+		}
+		influences + influence
+		grow_bounds(model, rigged_place(how, model, influence, vertices[v].position))
+	}
+}
+
+// A rigged unskinned shape's influences (Build_Options): one new entry of
+// the model's palette, the hanging bone from hang_offset, moves every
+// vertex. Posed, they widen the model's bounds.
+rig_hang :: fun(how: ^Build_Options, vertices: []Vertex, model: ^Model, influences: ^[]Skin_Influence) {
+	if not fits(model.palette.len + 1, model.palette.cap) do return
+	entry := model.palette.len
+	&model.palette + Palette_Entry{bone = how.hang_bone, offset = how.hang_offset}
+	for vertex in vertices {
+		influence := Skin_Influence{entries = [u16(entry), 0, 0, 0], weights = [65535, 0, 0, 0]}
+		influences + influence
+		grow_bounds(model, rigged_place(how, model, influence, vertex.position))
+	}
+}
+
+// Where a rigged vertex is in the pose it was rigged to.
+rigged_place :: fun(how: ^Build_Options, model: ^Model, influence: Skin_Influence, position: Vec3) -> Vec3 {
+	placed := Vec3{0, 0, 0}
+	for k in 0:4 {
+		if influence.weights[k] == 0 do continue
+		entry := model.palette[i64(influence.entries[k])]
+		moving := entry.offset
+		if entry.bone >= 0 do moving = mat4_mul(how.pose[entry.bone].place, entry.offset)
+		moved := mat4_mul_vec4(moving, Vec4{position.x, position.y, position.z, 1})
+		placed = placed + Vec3{moved.x, moved.y, moved.z} * (f32(influence.weights[k]) / 65535)
+	}
+	return placed
+}
+
+// A bone's place in a pose (its name in any letter case); -1 when it hasn't it.
+pose_index :: fun(pose: []Pose_Bone, name: []utf8) -> i64 {
+	for bone, k in pose {
+		if compare_folded(bone.name, name) == 0 do return k
+	}
+	return -1
+}
+
+skin_vertices :: fun(mesh: ^Nif, skin: i64, geometry: Geometry, pose: []Pose_Bone, moves: []Vec3, vertices: ^[]Vertex, storage: ^[]byte) {
+	data_index : i64 = -1
+	bones := Refs{count = 0, data = geometry.vertices[0:0]}
+	match mesh.blocks[skin] {
+	Skin_Instance instance
+		data_index = instance.data
+		bones = instance.bones
+	else
+	}
+	if data_index < 0 do return
+	match mesh.blocks[data_index] {
+	Skin_Data data
+		if not data.has_weights do return
+		count := vertices.len
+		moved := slice([:count]Vec3, storage)
+		turned := slice([:count]Vec3, storage)
+		totals := slice([:count]f32, storage)
+		for k in 0:count {
+			&moved + Vec3{0, 0, 0}
+			&turned + Vec3{0, 0, 0}
+			&totals + f32(0)
+		}
+		at : i64 = 0
+		for b in 0:data.bone_count {
+			bone := skin_bone_at(data.bones, at, true)
+			at = bone.next_at
+			if b >= bones.count do continue
+			node := bones.at(b)
+			if node < 0 do continue
+			place, found := pose_place(pose, node_name(mesh, node))
+			if not found do continue
+			moving := mat4_mul(place, bone.transform)
+			for w in 0:bone.weights.len / 6 {
+				index : u16 = bone.weights[w * 6]
+				weight : f32 = bone.weights[w * 6 + 2]
+				v := i64(index)
+				if v >= count do continue
+				raw : Vec3 = geometry.vertices[v * 12]
+				if moves.len > 0 do raw = raw + moves[v]
+				position := mat4_mul_vec4(moving, Vec4{raw.x, raw.y, raw.z, 1})
+				moved[v] = moved[v] + Vec3{position.x, position.y, position.z} * weight
+				if geometry.normals.len != 0 {
+					raw_normal : Vec3 = geometry.normals[v * 12]
+					normal := mat4_mul_vec4(moving, Vec4{raw_normal.x, raw_normal.y, raw_normal.z, 0})
+					turned[v] = turned[v] + Vec3{normal.x, normal.y, normal.z} * weight
+				}
+				totals[v] += weight
+			}
+		}
+		for k in 0:count {
+			rest := max(0, 1 - totals[k])
+			vertices[k].position = moved[k] + vertices[k].position * rest
+			if geometry.normals.len != 0 do vertices[k].normal = vec3_normalize(turned[k] + vertices[k].normal * rest)
+		}
+	else
+	}
+}
+
+// A part's values that change over time: its texturing's controllers that
+// move its base texture, its material's that change its glow or opacity.
+add_motions :: fun(mesh: ^Nif, properties: Inherited, model: ^Model, part: i64) {
+	if properties.texturing >= 0 {
+		match mesh.blocks[properties.texturing] {
+		Texturing texturing
+			add_controller_motions(mesh, texturing.controller, model, part)
+		else
+		}
+	}
+	if properties.material >= 0 {
+		match mesh.blocks[properties.material] {
+		Material material
+			add_controller_motions(mesh, material.controller, model, part)
+		else
+		}
+	}
+}
+
+// How many value controllers a chain of controllers (from the first) has,
+// as add_controller_motions goes down it.
+value_controllers :: fun(mesh: ^Nif, first: i64) -> i64 {
+	count : i64 = 0
+	at := first
+	for at >= 0 and at < mesh.blocks.len {
+		match mesh.blocks[at] {
+		Value_Controller value
+			count += 1
+			at = value.controller.next
+		Flip_Controller flip
+			at = flip.next
+		else
+			return count
+		}
+	}
+	return count
+}
+
+// The motions of a chain of controllers (from the first): each value
+// controller's that a part's look can follow.
+add_controller_motions :: fun(mesh: ^Nif, first: i64, model: ^Model, part: i64) {
+	at := first
+	for at >= 0 and at < mesh.blocks.len {
+		match mesh.blocks[at] {
+		Value_Controller value
+			made := value.controller
+			what : i64 = -1
+			if made.kind == VALUE_TEXTURE and made.slot == SLOT_BASE {
+				if made.operation == TT_TRANSLATE_U do what = MOTION_TEXTURE_U
+				if made.operation == TT_TRANSLATE_V do what = MOTION_TEXTURE_V
+			}
+			if made.kind == VALUE_COLOR and made.operation == COLOR_EMISSIVE do what = MOTION_GLOW
+			if made.kind == VALUE_ALPHA do what = MOTION_ALPHA
+			if what >= 0 and fits(model.motions.len + 1, model.motions.cap) do add_motion(mesh, at, made, what, model, part)
+			at = made.next
+		Flip_Controller flip
+			at = flip.next
+		else
+			return
+		}
+	}
+}
+
+// A controller's motion of a part: its own interpolator and timing, or
+// where it has no interpolator, the one an Idle (or SpecialIdle) sequence
+// drives it with, and the sequence's timing. None when neither has one.
+add_motion :: fun(mesh: ^Nif, controller_index: i64, controller: Property_Controller, what: i64, model: ^Model, part: i64) {
+	interpolator := controller.interpolator
+	start_time := controller.start_time
+	stop_time := controller.stop_time
+	frequency := controller.frequency
+	phase := controller.phase
+	cycle := i64(controller.flags >> 1) & 3
+	if interpolator < 0 {
+		for name in ["Idle", "SpecialIdle"] {
+			sequence_index := find_sequence_named(mesh, name)
+			if sequence_index < 0 do continue
+			match mesh.blocks[sequence_index] {
+			Sequence sequence
+				for k in 0:sequence.block_count {
+					if sequence.blocks.len < (k + 1) * CONTROLLED_BLOCK_SIZE do break
+					driven : i32 = sequence.blocks[k * CONTROLLED_BLOCK_SIZE + 4]
+					if i64(driven) != controller_index do continue
+					driver : i32 = sequence.blocks[k * CONTROLLED_BLOCK_SIZE]
+					interpolator = i64(driver)
+					start_time = sequence.start_time
+					stop_time = sequence.stop_time
+					frequency = sequence.frequency
+					phase = 0
+					cycle = i64(sequence.cycle)
+				}
+			else
+			}
+			if interpolator >= 0 do break
+		}
+	}
+	if interpolator < 0 or interpolator >= mesh.blocks.len do return
+	motion := next(&model.motions)
+	motion.part = part
+	motion.what = what
+	motion.start_time = start_time
+	motion.stop_time = stop_time
+	motion.frequency = frequency
+	motion.phase = phase
+	motion.cycle = cycle
+	motion.key_times.len = 0
+	motion.key_values.len = 0
+	motion.value = Vec3{0, 0, 0}
+	data : i64 = -1
+	match mesh.blocks[interpolator] {
+	Float_Interpolator float_interpolator
+		motion.value = Vec3{float_interpolator.value, 0, 0}
+		data = float_interpolator.data
+	Point_Interpolator point_interpolator
+		motion.value = point_interpolator.value
+		data = point_interpolator.data
+	else
+	}
+	if data < 0 or data >= mesh.blocks.len do return
+	match mesh.blocks[data] {
+	Key_Data key_data
+		keys := key_data.keys
+		for k in 0:keys.count {
+			if not fits(motion.key_times.len + 1, motion.key_times.cap) do break
+			value := Vec3{0, 0, 0}
+			if keys.value_size == 12 {
+				point : Vec3 = keys.data[keys.value_at(k)]
+				value = point
+			elif keys.value_size == 4
+				number : f32 = keys.data[keys.value_at(k)]
+				value = Vec3{number, 0, 0}
+			}
+			&motion.key_times + keys.time(k)
+			&motion.key_values + value
+		}
+	else
+	}
+	// (One that never changes is the part's look as it is: none.)
+	if motion.key_times.len < 2 do model.motions.len -= 1
+}
+
+// A motion's value at a time of the scene's (seconds): its controller's
+// time played at its frequency from its phase, kept between its start and
+// stop by its cycle; between its keys there, in a line.
+motion_value :: fun(motion: ^Model_Motion, seconds: f32) -> Vec3 {
+	at := seconds * motion.frequency + motion.phase
+	span := motion.stop_time - motion.start_time
+	if span <= 0 {
+		at = motion.start_time
+	elif motion.cycle == CYCLE_CLAMP
+		at = max(motion.start_time, min(motion.stop_time, at))
+	else
+		laps := floor_f32((at - motion.start_time) / span)
+		inside := at - motion.start_time - laps * span
+		if motion.cycle == CYCLE_REVERSE and i64(laps) % 2 != 0 do inside = span - inside
+		at = motion.start_time + inside
+	}
+	keys := motion.key_times.len
+	if keys == 0 do return motion.value
+	if at <= motion.key_times[0] do return motion.key_values[0]
+	for k in 1:keys {
+		if at < motion.key_times[k] {
+			before := motion.key_times[k - 1]
+			share := (at - before) / (motion.key_times[k] - before)
+			return motion.key_values[k - 1] + (motion.key_values[k] - motion.key_values[k - 1]) * share
+		}
+	}
+	return motion.key_values[keys - 1]
+}
+
+// A sequence by its name (any case): its block's index; -1 for none.
+find_sequence_named :: fun(mesh: ^Nif, name: []utf8) -> i64 {
+	for &block, index in mesh.blocks {
+		match block^ {
+		Sequence sequence
+			if compare_folded(sequence.name, name) == 0 do return index
+		else
+		}
+	}
+	return -1
+}
+
+// The vertices' tangents (where the texture's x and y run on them, for
+// normal maps): as the shape's file keeps them (TANGENT_SPACE: y's for each
+// vertex, then x's), turned into the model's space; else worked out from
+// the triangles' texture coordinates.
+add_tangents :: fun(mesh: ^Nif, extra_data: Refs, transform: Mat4, vertices: ^[]Vertex, indices: []u16) {
+	count := vertices.len
+	for k in 0:extra_data.count {
+		extra := extra_data.at(k)
+		if extra < 0 or extra >= mesh.blocks.len do continue
+		match mesh.blocks[extra] {
+		Binary_Extra binary
+			if binary.name != TANGENT_SPACE or binary.data.len < count * 24 do continue
+			for i in 0:count {
+				along_v : Vec3 = binary.data[i * 12]
+				along_u : Vec3 = binary.data[count * 12 + i * 12]
+				turned_u := mat4_mul_vec4(transform, Vec4{along_u.x, along_u.y, along_u.z, 0})
+				turned_v := mat4_mul_vec4(transform, Vec4{along_v.x, along_v.y, along_v.z, 0})
+				set_tangent(&vertices[i], Vec3{turned_u.x, turned_u.y, turned_u.z}, Vec3{turned_v.x, turned_v.y, turned_v.z})
+			}
+			return
+		else
+		}
+	}
+
+	// Worked out: each triangle's directions of x and y, weighed by its size,
+	// summed at its corners.
+	along_us : [65536]Vec3
+	along_vs : [65536]Vec3
+	for i in 0:count {
+		&along_us + Vec3{0, 0, 0}
+		&along_vs + Vec3{0, 0, 0}
+	}
+	for t in 0:indices.len / 3 {
+		a := i64(indices[t * 3])
+		b := i64(indices[t * 3 + 1])
+		c := i64(indices[t * 3 + 2])
+		edge_one := vertices[b].position - vertices[a].position
+		edge_two := vertices[c].position - vertices[a].position
+		du_one := vertices[b].uv[0] - vertices[a].uv[0]
+		dv_one := vertices[b].uv[1] - vertices[a].uv[1]
+		du_two := vertices[c].uv[0] - vertices[a].uv[0]
+		dv_two := vertices[c].uv[1] - vertices[a].uv[1]
+		area := du_one * dv_two - du_two * dv_one
+		if abs(area) < 0.0000001 do continue
+		along_u := (edge_one * dv_two - edge_two * dv_one) * (1 / area)
+		along_v := (edge_two * du_one - edge_one * du_two) * (1 / area)
+		for corner in [a, b, c] {
+			along_us[corner] = along_us[corner] + along_u
+			along_vs[corner] = along_vs[corner] + along_v
+		}
+	}
+	for i in 0:count do set_tangent(&vertices[i], along_us[i], along_vs[i])
+}
+
+// A vertex's tangent from where the texture's x and y run on it: x's
+// direction across the normal, and which way y runs from there.
+set_tangent :: fun(vertex: ^Vertex, along_u: Vec3, along_v: Vec3) {
+	normal := vertex.normal
+	across := along_u - normal * dot(normal, along_u)
+	if vec3_length(across) < 0.000001 {
+		// No x here: any way across the normal will do.
+		across = cross(normal, if abs(normal.z) < 0.9 do Vec3{0, 0, 1} else Vec3{1, 0, 0})
+	}
+	across = vec3_normalize(across)
+	handedness : f32 = 1
+	if dot(cross(normal, across), along_v) < 0 do handedness = -1
+	vertex.tangent = [across.x, across.y, across.z, handedness]
+}
+
+// Adds a strip's triangles: each vertex after the first two makes one with
+// the two before it, every other one turned around so all face one way.
+// Triangles with a vertex twice (used to join strips) are left out.
+add_strip :: fun(strip: []byte, indices: ^[]u16) {
+	count := strip.len / 2
+	for k in 2:count {
+		a : u16 = strip[(k - 2) * 2]
+		b : u16 = strip[(k - 1) * 2]
+		c : u16 = strip[k * 2]
+		if a == b or b == c or a == c do continue
+		if not fits(indices.len + 3, indices.cap) do return
+		if k % 2 == 0 {
+			indices + a
+			indices + b
+			indices + c
+		else
+			indices + a
+			indices + c
+			indices + b
+		}
+	}
+}
+
+// How a part with the properties in effect is drawn (no vertices yet):
+// as its properties say, as Gamebryo has it where they say nothing.
+part_look :: fun(mesh: ^Nif, properties: Inherited, model: ^Model) -> Model_Part {
+	part := Model_Part{
+		vertices = [],
+		indices = [],
+		texture = [],
+		glow_texture = [],
+		clamp_mode = 3,
+		flip = -1,
+		additive = false,
+		billboard_mode = properties.billboard_mode,
+		billboard_node = properties.billboard_node,
+		alpha_blend = false,
+		depth_write = true,
+		alpha_test = false,
+		alpha_threshold = 0,
+		two_sided = false,
+		diffuse = Vec3{1, 1, 1},
+		emissive = Vec3{0, 0, 0},
+		specular = Vec3{0, 0, 0},
+		glossiness = 10,
+		alpha = 1,
+		vertex_mode = 2,
+		lighting_mode = 1,
+		leaf_cards = false,
+		influences = []}
+	apply_properties(mesh, properties, &part, model)
+	return part
+}
+
+// Sets how a part is drawn from the properties in effect for it.
+apply_properties :: fun(mesh: ^Nif, properties: Inherited, part: ^Model_Part, model: ^Model) {
+	if properties.texturing >= 0 {
+		match mesh.blocks[properties.texturing] {
+		Texturing texturing
+			texture_path(mesh, texturing.slots[SLOT_BASE], &part.texture)
+			part.flip = add_flip(mesh, texturing.controller, model)
+			if texturing.slots[SLOT_BASE].used do part.clamp_mode = texturing.slots[SLOT_BASE].clamp_mode
+			texture_path(mesh, texturing.slots[SLOT_GLOW], &part.glow_texture)
+		else
+		}
+	}
+	if properties.material >= 0 {
+		match mesh.blocks[properties.material] {
+		Material material
+			part.diffuse = material.diffuse
+			part.emissive = material.emissive
+			part.specular = material.specular
+			part.glossiness = material.glossiness
+			part.alpha = material.alpha
+		else
+		}
+	}
+	if properties.alpha >= 0 {
+		match mesh.blocks[properties.alpha] {
+		Alpha alpha
+			part.alpha_blend = alpha.flags & 1 != 0
+			// Its blending's factor for what's behind (bits 5 to 8): 0 is one, adding.
+			part.additive = part.alpha_blend and (alpha.flags >> 5) & 15 == 0
+			part.alpha_test = alpha.flags & 0x200 != 0
+			part.alpha_threshold = f32(alpha.threshold) / 255
+		else
+		}
+	}
+	if properties.stencil >= 0 {
+		match mesh.blocks[properties.stencil] {
+		Stencil stencil
+			part.two_sided = stencil.draw_mode == 3
+		else
+		}
+	}
+	if properties.z_buffer >= 0 {
+		match mesh.blocks[properties.z_buffer] {
+		Z_Buffer z_buffer
+			part.depth_write = z_buffer.flags & 2 != 0
+		else
+		}
+	}
+	if properties.vertex_color >= 0 {
+		match mesh.blocks[properties.vertex_color] {
+		Vertex_Color vertex_color
+			part.vertex_mode = vertex_color.vertex_mode
+			part.lighting_mode = vertex_color.lighting_mode
+		else
+		}
+	}
+}
+
+// Adds a particle system to the model (placed in it at system_place), as
+// its emitter and other modifiers, its data and its emitter controller (in
+// its controllers, from the first) say; none without an emitter. Its
+// emitter's reach goes into the model's bounds.
+add_particles :: fun(mesh: ^Nif, modifiers: Refs, data_block: i64, first_controller: i64, system_place: Mat4,
+	properties: Inherited, model: ^Model)
+{
+	if not fits(model.particles.len + 1, model.particles.cap) do return
+	for k in 0:modifiers.count {
+		at := modifiers.at(k)
+		if at < 0 or at >= mesh.blocks.len do continue
+		match mesh.blocks[at] {
+		Particle_Emitter made
+			add_system(mesh, made.emitter, modifiers, data_block, first_controller, system_place, properties, model)
+			return
+		else
+		}
+	}
+}
+
+// Adds a particle system with its (first) emitter: add_particles'.
+add_system :: fun(mesh: ^Nif, emitter: Emitter, modifiers: Refs, data_block: i64, first_controller: i64, system_place: Mat4,
+	properties: Inherited, model: ^Model)
+{
+	entry := next(&model.particles)
+	entry.emitter = emitter
+	entry.emitter_place = system_place
+	if emitter.emitter_object >= 0 {
+		place, found := object_place(mesh, emitter.emitter_object)
+		if found do entry.emitter_place = place
+	}
+	entry.capacity = 0
+	if data_block >= 0 and data_block < mesh.blocks.len {
+		match mesh.blocks[data_block] {
+		Particle_Data data
+			entry.capacity = data.capacity
+		else
+		}
+	}
+	entry.look = part_look(mesh, properties, model)
+
+	// Its modifiers.
+	entry.grow_time = 0
+	entry.fade_time = 0
+	entry.color_times.len = 0
+	entry.colors.len = 0
+	entry.rotation_speed = 0
+	entry.rotation_speed_variation = 0
+	entry.rotation_angle = 0
+	entry.rotation_angle_variation = 0
+	entry.random_sign = false
+	entry.gravity = Vec3{0, 0, 0}
+	entry.pulled_in = false
+	entry.gravity_center = Vec3{0, 0, 0}
+	for k in 0:modifiers.count {
+		at := modifiers.at(k)
+		if at < 0 or at >= mesh.blocks.len do continue
+		match mesh.blocks[at] {
+		Grow_Fade_Modifier grow_fade
+			if grow_fade.active {
+				entry.grow_time = grow_fade.grow_time
+				entry.fade_time = grow_fade.fade_time
+			}
+		Color_Modifier color
+			if color.active do add_color_keys(mesh, color.data, entry)
+		Rotation_Modifier rotation
+			if rotation.active {
+				entry.rotation_speed = rotation.speed
+				entry.rotation_speed_variation = rotation.speed_variation
+				entry.rotation_angle = rotation.angle
+				entry.rotation_angle_variation = rotation.angle_variation
+				entry.random_sign = rotation.random_sign
+			}
+		Gravity_Modifier gravity
+			if gravity.active {
+				place := system_place
+				if gravity.gravity_object >= 0 {
+					object, found := object_place(mesh, gravity.gravity_object)
+					if found do place = object
+				}
+				turned := mat4_mul_vec4(place, Vec4{gravity.axis.x, gravity.axis.y, gravity.axis.z, 0})
+				axis := Vec3{turned.x, turned.y, turned.z}
+				if vec3_length(axis) > 0 do axis = vec3_normalize(axis)
+				entry.gravity = axis * gravity.strength
+				entry.pulled_in = gravity.force_type == 1
+				entry.gravity_center = Vec3{place[3][0], place[3][1], place[3][2]}
+			}
+		else
+		}
+	}
+
+	// How fast and when: its emitter controller's, among the system's
+	// controllers; without one, as fast as keeps it full.
+	entry.birth_rate = 0
+	if emitter.life_span > 0 do entry.birth_rate = f32(entry.capacity) / emitter.life_span
+	entry.birth_times.len = 0
+	entry.birth_rates.len = 0
+	entry.active_times.len = 0
+	entry.active_values.len = 0
+	entry.frequency = 1
+	entry.phase = 0
+	entry.start_time = 0
+	entry.stop_time = 0
+	entry.cycle = CYCLE_LOOP
+	at := first_controller
+	for at >= 0 and at < mesh.blocks.len {
+		match mesh.blocks[at] {
+		Emitter_Controller controller
+			entry.frequency = controller.frequency
+			entry.phase = controller.phase
+			entry.start_time = controller.start_time
+			entry.stop_time = controller.stop_time
+			entry.cycle = i64(controller.flags >> 1) & 3
+			add_birth_rate(mesh, controller.birth_rate, entry)
+			add_active_keys(mesh, controller.active, entry)
+			break
+		Flip_Controller flip
+			at = flip.next
+		else
+			break
+		}
+	}
+
+	// What it reaches: the emitter's shape, and as far as a particle goes
+	// in its life.
+	life := emitter.life_span + abs(emitter.life_span_variation)
+	speed := abs(emitter.speed) + abs(emitter.speed_variation)
+	reach := speed * life + 0.5 * vec3_length(entry.gravity) * life * life + abs(emitter.radius) + abs(emitter.radius_variation)
+	scale := vec3_length(Vec3{entry.emitter_place[0][0], entry.emitter_place[0][1], entry.emitter_place[0][2]})
+	extent := max(emitter.size.x, max(emitter.size.y, emitter.size.z)) * scale + reach
+	center := Vec3{entry.emitter_place[3][0], entry.emitter_place[3][1], entry.emitter_place[3][2]}
+	grow_bounds(model, center - Vec3{extent, extent, extent})
+	grow_bounds(model, center + Vec3{extent, extent, extent})
+}
+
+// An object's place in the model, from the roots down; false when it isn't
+// in the tree (or isn't a node or a shape).
+object_place :: fun(mesh: ^Nif, index: i64) -> Mat4, bool {
+	parent, found := parent_transform(mesh, index)
+	if not found do return mat4_identity(), false
+	match mesh.blocks[index] {
+	Node node
+		return mat4_mul(parent, local_transform(node.object)), true
+	Shape shape
+		return mat4_mul(parent, local_transform(shape.object)), true
+	Particle_System system
+		return mat4_mul(parent, local_transform(system.object)), true
+	else
+	}
+	return mat4_identity(), false
+}
+
+// A color modifier's keys (colors over a particle's life), into its system.
+add_color_keys :: fun(mesh: ^Nif, data: i64, entry: ^Model_Particles) {
+	if data < 0 or data >= mesh.blocks.len do return
+	match mesh.blocks[data] {
+	Key_Data key_data
+		keys := key_data.keys
+		if keys.value_size != 16 do return
+		for k in 0:keys.count {
+			if not fits(entry.color_times.len + 1, entry.color_times.cap) do return
+			at := keys.value_at(k)
+			color : [4!]f32 = [keys.data[at], keys.data[at + 4], keys.data[at + 8], keys.data[at + 12]]
+			&entry.color_times + keys.time(k)
+			&entry.colors + color
+		}
+	else
+	}
+}
+
+// An emitter controller's birth rate (particles a second: its value, or its
+// keys), into its system.
+add_birth_rate :: fun(mesh: ^Nif, interpolator: i64, entry: ^Model_Particles) {
+	if interpolator < 0 or interpolator >= mesh.blocks.len do return
+	match mesh.blocks[interpolator] {
+	Float_Interpolator float_interpolator
+		entry.birth_rate = float_interpolator.value
+		if float_interpolator.data < 0 or float_interpolator.data >= mesh.blocks.len do return
+		match mesh.blocks[float_interpolator.data] {
+		Key_Data key_data
+			keys := key_data.keys
+			if keys.value_size != 4 do return
+			for k in 0:keys.count {
+				if not fits(entry.birth_times.len + 1, entry.birth_times.cap) do return
+				rate : f32 = keys.data[keys.value_at(k)]
+				&entry.birth_times + keys.time(k)
+				&entry.birth_rates + rate
+			}
+		else
+		}
+	else
+	}
+}
+
+// An emitter controller's on and off (its keys), into its system; with
+// none (or a value of on), always on.
+add_active_keys :: fun(mesh: ^Nif, interpolator: i64, entry: ^Model_Particles) {
+	if interpolator < 0 or interpolator >= mesh.blocks.len do return
+	match mesh.blocks[interpolator] {
+	Bool_Interpolator bool_interpolator
+		if bool_interpolator.data < 0 or bool_interpolator.data >= mesh.blocks.len {
+			if not bool_interpolator.value {
+				&entry.active_times + 0
+				&entry.active_values + false
+			}
+			return
+		}
+		match mesh.blocks[bool_interpolator.data] {
+		Key_Data key_data
+			keys := key_data.keys
+			if keys.value_size != 1 do return
+			for k in 0:keys.count {
+				if not fits(entry.active_times.len + 1, entry.active_times.cap) do return
+				on : u8 = keys.data[keys.value_at(k)]
+				&entry.active_times + keys.time(k)
+				&entry.active_values + (on != 0)
+			}
+		else
+		}
+	else
+	}
+}
+
+// The flipbook of a texturing's base texture, if its controllers flip it
+// (through one frame at least): its index in the model's flips; -1 for
+// none. (Followed down the chain of flip controllers only: the first on a
+// texturing, in Oblivion's meshes.) Made once for each controller: another
+// part with the same one gets the same flipbook.
+add_flip :: fun(mesh: ^Nif, controller: i64, model: ^Model) -> i64 {
+	at := controller
+	for at >= 0 and at < mesh.blocks.len {
+		match mesh.blocks[at] {
+		Flip_Controller flip
+			if flip.slot != SLOT_BASE {
+				at = flip.next
+				continue
+			}
+			if flip.sources.count == 0 do return -1
+			for &made, made_index in model.flips {
+				if made.controller == at do return made_index
+			}
+			if not fits(model.flips.len + 1, model.flips.cap) do return -1
+			entry := next(&model.flips)
+			entry.controller = at
+			entry.frames.len = 0
+			frame_count := flip.sources.count
+			if not fits(frame_count, entry.frames.cap) do frame_count = entry.frames.cap
+			for k in 0:frame_count {
+				frame := next(&entry.frames)
+				texture_path(mesh, Texture_Slot{used = true, source = flip.sources.at(k), clamp_mode = 0, filter_mode = 0, uv_set = 0}, frame)
+			}
+			entry.start_time = flip.start_time
+			entry.stop_time = flip.stop_time
+			entry.frequency = flip.frequency
+			entry.phase = flip.phase
+			entry.key_times.len = 0
+			entry.key_values.len = 0
+			add_flip_keys(mesh, flip.interpolator, entry)
+			return model.flips.len - 1
+		else
+			return -1
+		}
+	}
+	return -1
+}
+
+// A flip's interpolator's keys (which frame at which time), into its flipbook.
+add_flip_keys :: fun(mesh: ^Nif, interpolator: i64, entry: ^Model_Flip) {
+	if interpolator < 0 or interpolator >= mesh.blocks.len do return
+	match mesh.blocks[interpolator] {
+	Float_Interpolator float_interpolator
+		if float_interpolator.data < 0 or float_interpolator.data >= mesh.blocks.len do return
+		match mesh.blocks[float_interpolator.data] {
+		Key_Data data
+			keys := data.keys
+			if keys.value_size != 4 do return
+			for k in 0:keys.count {
+				if not fits(entry.key_times.len + 1, entry.key_times.cap) do return
+				value : f32 = keys.data[keys.value_at(k)]
+				&entry.key_times + keys.time(k)
+				&entry.key_values + value
+			}
+		else
+		}
+	else
+	}
+}
+
+// The archive path of a slot's texture, into path: lower case, '\' between
+// its parts, under textures\ (the files write it with or without that).
+texture_path :: fun(mesh: ^Nif, slot: Texture_Slot, path: ^[160]utf8) {
+	path.len = 0
+	if not slot.used or slot.source < 0 do return
+	match mesh.blocks[slot.source] {
+	Source_Texture source
+		name := source.file_name
+		clean : [160]utf8
+		for c in name {
+			if not fits(clean.len + 1, clean.cap) do break
+			if c == '/' do &clean + '\\'
+			else do &clean + lower(c)
+		}
+		start : i64 = 0
+		if starts_with(clean, "data\\") do start = 5
+		if not starts_with(clean[start : clean.len], "textures\\") do path + "textures\\"
+		path + clean[start : clean.len]
+	else
+	}
+}
+
+// Widens the model's box to hold a point.
+grow_bounds :: fun(model: ^Model, point: Vec3) {
+	for axis in 0:3 {
+		if point[axis] < model.bounds_min[axis] do model.bounds_min[axis] = point[axis]
+		if point[axis] > model.bounds_max[axis] do model.bounds_max[axis] = point[axis]
+	}
+}
+
+// A node of a NIF by its name: its block's index, -1 when there's none.
+find_node :: fun(mesh: ^Nif, name: []utf8) -> i64 {
+	for &block, index in mesh.blocks {
+		match block^ {
+		Node node
+			if node.object.name == name do return index
+		else
+		}
+	}
+	return -1
+}
+
+// Where a node's parent is in the model (its place, from the roots down),
+// unmoved; false when the node isn't in the tree.
+parent_transform :: fun(mesh: ^Nif, node: i64) -> Mat4, bool {
+	for k in 0:mesh.roots.count {
+		root := mesh.roots.at(k)
+		if root < 0 do continue
+		found, place := find_parent_transform(mesh, root, node, mat4_identity())
+		if found do return place, true
+	}
+	return mat4_identity(), false
+}
+
+// Below an object (placed under parent): whether the node is, and its
+// parent's place.
+find_parent_transform :: fun(mesh: ^Nif, index: i64, node: i64, parent: Mat4) -> bool, Mat4 {
+	if index == node do return true, parent
+	match mesh.blocks[index] {
+	Node branch
+		transform := mat4_mul(parent, local_transform(branch.object))
+		for k in 0:branch.children.count {
+			child := branch.children.at(k)
+			if child < 0 do continue
+			found, place := find_parent_transform(mesh, child, node, transform)
+			if found do return true, place
+		}
+	else
+	}
+	return false, parent
+}

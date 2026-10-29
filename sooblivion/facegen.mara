@@ -1,0 +1,188 @@
+// FaceGen: how the game gives each person a face of their own. A race's
+// head, and each part that sits on it (eyes, ears, mouth, teeth, tongue,
+// hair, helmets), has an .egm beside its .nif: ways its vertices can move,
+// its morphs, 50 that keep the face symmetric and 30 that don't. An NPC says
+// how far along each to go (its FGGS and FGGA, around -2 to 2), and its
+// face is the part's own shape moved that far along each. The skin's
+// colors move the same way: the head's .egt and the NPC's FGTS make its
+// face map, which the game's skin shaders (SKIN2000.pso) add to the race's
+// texture, twice over: the skin is base + 2 x (map - 128). The game ships
+// most NPCs' maps made (textures\faces\<plugin>\<form id>_<part>.dds);
+// they're made here for the rest. (The shaders also take an age map,
+// times 4: not yet.)
+//
+// An .egm: "FREGM002", how many vertices (the part's own, in its order,
+// then more that only its .tri's expressions move), how many symmetric and
+// asymmetric morphs (u32s), padding to 64 bytes; then each morph: its scale
+// (f32), and for each vertex how far it moves, x, y and z (i16s), times the
+// scale.
+module facegen
+
+use mara.core
+use mara.math
+use logging
+
+FACE_SYMMETRIC :: 50
+FACE_ASYMMETRIC :: 30
+FACE_TEXTURE :: 50
+
+Facegen_Error :: error {
+	Not_A_Morph_File   // it doesn't start as an .egm does
+	Cut_Short          // it ends before its morphs do
+}
+
+// How far an NPC's face goes along each morph (its FGGS, FGGA, FGTS).
+Face_Values :: struct {
+	symmetric: [FACE_SYMMETRIC!]f32
+	asymmetric: [FACE_ASYMMETRIC!]f32
+	texture: [FACE_TEXTURE!]f32
+}
+
+// An .egm read (see the top): its counts, and the file.
+Shape_Morphs :: struct {
+	vertex_count: i64
+	symmetric: i64
+	asymmetric: i64
+	data: []byte
+}
+
+// An .egm file's data read.
+read_shape_morphs :: fun(data: []byte) -> Shape_Morphs, err {
+	none := Shape_Morphs{vertex_count = 0, symmetric = 0, asymmetric = 0, data = data}
+	if data.len < 64 or data[0:8] != "FREGM002" do return none, Not_A_Morph_File
+	vertex_count : u32 = data[8]
+	symmetric : u32 = data[12]
+	asymmetric : u32 = data[16]
+	morphs := Shape_Morphs{vertex_count = i64(vertex_count), symmetric = i64(symmetric), asymmetric = i64(asymmetric), data = data}
+	if 64 + (morphs.symmetric + morphs.asymmetric) * morph_size(&morphs) > data.len do return none, Cut_Short
+	return morphs
+}
+
+// How many bytes a morph takes: its scale, and a move for each vertex.
+morph_size :: fun(morphs: ^Shape_Morphs) -> i64 {
+	return 4 + morphs.vertex_count * 6
+}
+
+// How far each vertex moves for a face, into moves (len set: as many as
+// the morphs have vertices, or as moves holds).
+face_moves :: fun(morphs: ^Shape_Morphs, face: ^Face_Values, moves: ^[]Vec3) {
+	moves.len = 0
+	count := morphs.vertex_count
+	if not fits(moves.len + count, moves.cap) do count = moves.cap
+	for k in 0:count do moves + Vec3{0, 0, 0}
+	for m in 0:morphs.symmetric + morphs.asymmetric {
+		value : f32 = 0
+		if m < morphs.symmetric and m < FACE_SYMMETRIC do value = face.symmetric[m]
+		if m >= morphs.symmetric and m - morphs.symmetric < FACE_ASYMMETRIC do value = face.asymmetric[m - morphs.symmetric]
+		if value == 0 do continue
+		at := 64 + m * morph_size(morphs)
+		scale : f32 = morphs.data[at]
+		amount := value * scale
+		for v in 0:count {
+			x : i16 = morphs.data[at + 4 + v * 6]
+			y : i16 = morphs.data[at + 6 + v * 6]
+			z : i16 = morphs.data[at + 8 + v * 6]
+			moves[v] = moves[v] + Vec3{f32(x), f32(y), f32(z)} * amount
+		}
+	}
+}
+
+// ---- the skin's colors ------------------------------------------------------------
+
+// An .egt read: "FREGT003", rows and columns, how many symmetric and
+// asymmetric morphs (u32s), padding to 64 bytes; then each morph: its scale
+// (f32), and a red, a green and a blue plane, rows by columns, of how far
+// each texel's color moves (i8s), times the scale. Its rows go up from the
+// bottom.
+Texture_Morphs :: struct {
+	rows: i64
+	columns: i64
+	symmetric: i64
+	data: []byte
+}
+
+// An .egt file's data read.
+read_texture_morphs :: fun(data: []byte) -> Texture_Morphs, err {
+	none := Texture_Morphs{rows = 0, columns = 0, symmetric = 0, data = data}
+	if data.len < 64 or data[0:8] != "FREGT003" do return none, Not_A_Morph_File
+	rows : u32 = data[8]
+	columns : u32 = data[12]
+	symmetric : u32 = data[16]
+	morphs := Texture_Morphs{rows = i64(rows), columns = i64(columns), symmetric = i64(symmetric), data = data}
+	if 64 + morphs.symmetric * (4 + 3 * morphs.rows * morphs.columns) > data.len do return none, Cut_Short
+	return morphs
+}
+
+// A face's map: how far its texture values move the skin's colors, 128
+// for none (as the game's made maps have it), into out (red, green, blue,
+// alpha, rows from the top, the morphs' columns by rows; its len set).
+face_map :: fun(morphs: ^Texture_Morphs, face: ^Face_Values, out: ^[]byte) {
+	plane := morphs.rows * morphs.columns
+	out.len = 0
+	if plane * 4 > out.cap or plane > MOST_SKIN_TEXELS do return
+	moves : [3 * MOST_SKIN_TEXELS]f32
+	for k in 0:3 * plane do &moves + f32(0)
+	for m in 0:min(morphs.symmetric, FACE_TEXTURE) {
+		value := face.texture[m]
+		if abs_f32(value) < 0.001 do continue
+		at := 64 + m * (4 + 3 * plane)
+		scale : f32 = morphs.data[at]
+		amount := value * scale
+		for k in 0:3 * plane {
+			step : i8 = morphs.data[at + 4 + k]
+			moves[k] += f32(step) * amount
+		}
+	}
+	for row in 0:morphs.rows {
+		// (The morphs' rows go up from the bottom.)
+		morph_row := morphs.rows - 1 - row
+		for column in 0:morphs.columns {
+			texel := morph_row * morphs.columns + column
+			for channel in 0:3 do out + u8(min(max(128 + moves[channel * plane + texel], 0), 255))
+			out + u8(255)
+		}
+	}
+}
+
+// A face's skin: the base texture (base_width by base_height) taken to its
+// map's size (map_width by map_height) and moved by it, as the game's skin
+// shaders do: base + 2 x (map - 128). Into out (its len set); the pixels
+// all red, green, blue, alpha, rows from the top. The base's alpha stays.
+skin_from_map :: fun(base: []byte, base_width: i64, base_height: i64, map: []byte, map_width: i64, map_height: i64, out: ^[]byte) {
+	out.len = 0
+	if not fits(out.len + map_width * map_height * 4, out.cap) or map.len < map_width * map_height * 4 do return
+	for row in 0:map_height {
+		for column in 0:map_width {
+			color := base_color(base, base_width, base_height, (f32(column) + 0.5) / f32(map_width), (f32(row) + 0.5) / f32(map_height))
+			at := 4 * (row * map_width + column)
+			for channel in 0:3 {
+				moved := color[channel] + 2 * (f32(u8(map[at + channel])) - 128)
+				out + u8(min(max(moved, 0), 255))
+			}
+			out + u8(color[3])
+		}
+	}
+}
+
+// The most texels a face's skin can have (an .egt's are 256 by 256).
+MOST_SKIN_TEXELS :: 65536
+
+// A texture's color at u, v (0 to 1 across and down), between its four
+// nearest texels: red, green, blue, alpha, 0 to 255.
+base_color :: fun(pixels: []byte, width: i64, height: i64, u: f32, v: f32) -> [4!]f32 {
+	x := u * f32(width) - 0.5
+	y := v * f32(height) - 0.5
+	x0 := min(max(i64(floor_f32(x)), 0), width - 1)
+	y0 := min(max(i64(floor_f32(y)), 0), height - 1)
+	x1 := min(x0 + 1, width - 1)
+	y1 := min(y0 + 1, height - 1)
+	across := min(max(x - f32(x0), 0), 1)
+	down := min(max(y - f32(y0), 0), 1)
+	color : [4!]f32
+	for channel in 0:4 {
+		top := f32(u8(pixels[4 * (y0 * width + x0) + channel])) * (1 - across) + f32(u8(pixels[4 * (y0 * width + x1) + channel])) * across
+		bottom := f32(u8(pixels[4 * (y1 * width + x0) + channel])) * (1 - across) + f32(u8(pixels[4 * (y1 * width + x1) + channel])) * across
+		color[channel] = top * (1 - down) + bottom * down
+	}
+	return color
+}

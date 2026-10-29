@@ -1,0 +1,2544 @@
+// The viewer: the game's window showing a mesh, an interior cell, or a
+// world's land and what's on it; a camera flown around; doors that lead
+// to other cells.
+//
+// W, A, S, D fly, Left Shift faster; the right mouse button turns mouse
+// look on and off; E goes through the door nearest the camera; V turns
+// vsync on and off; B switches between drawing bindless and binding
+// textures (where the card can do both); T, held, hurries the day along;
+// Escape quits. The window's title says where, how many
+// frames a second, and whether vsync is on; sooblivion.log, in the folder
+// it's run from, keeps what happened.
+module sooblivion
+
+use mara.core
+use mara.math
+use mara.memory
+use mara.sdl
+use mara.time
+use bsa
+use file_cache
+use nif
+use model
+use world
+use world_state
+use world_server
+use world_copy
+use wire
+use land
+use scene
+use sky
+use distant
+use walking
+use logging
+use mara.string
+use sdl_platform
+use audio
+use particles
+use mara.os
+use png
+use game_settings
+use indexing
+use random
+use game_sound
+use sprite_layer
+gl :: use mara.open_gl
+render :: use render
+
+// How fast a walker goes, walking and running (Shift), units a second.
+WALK_SPEED :: 220
+RUN_SPEED :: 500
+// The longest frame a walker moves through at once, in seconds: a frame
+// that took longer (loading) doesn't throw it through a wall.
+LONGEST_STEP :: 0.05
+// How quickly the eyes catch up with the feet over steps: the share of
+// the way a second (as a rate; a frame takes its part).
+EYES_CATCH_UP :: 12
+
+// How high above the floor the camera is when arriving: a person's eyes,
+// in Oblivion's units.
+EYE_HEIGHT :: 120
+// How near a door must be to use it: how far the eyes reach.
+DOOR_REACH :: 300
+// How far behind a wall's collision a door may be set and still be used:
+// some walls' collision runs straight across a load door's doorway (the
+// castles' tower walls, 19 units in front of their doors), the doorway and
+// the door in its recess drawn behind it.
+DOOR_RECESS :: 48
+// Without vsync, frames are kept to this many a second at most: the game
+// has to feel good at 60.
+MOST_FRAMES_A_SECOND :: 60
+// How long a frame may spend loading, in nanoseconds (with the drawing,
+// inside a refresh at 60 a second); while the distant land is loading, the
+// share of it that goes to that first (the horizon's seen from everywhere).
+LOAD_BUDGET :: 10000000
+DISTANT_LAND_SHARE :: 3000000
+// A frame longer than this (in nanoseconds) missed a refresh at 60 a
+// second (the next one is 33 ms on), and goes in the journal with where its
+// time went. (With vsync, frames come 15 to 18 ms apart as the system
+// shows them: that's not slow.)
+SLOW_FRAME :: 25000000
+// How often the journal gets a summary of the frames since the last.
+SUMMARY_EVERY :: 10000000000
+// Where the viewer's journal goes, in the folder it's run from; taking a
+// picture, where it goes instead (the game's log left as it is).
+LOG_PATH :: "sooblivion.log"
+PICTURE_LOG_PATH :: "picture.log"
+
+// A picture taken in place of showing the window (`sooblivion picture`):
+// the window kept hidden, no sound. Once what's waiting has loaded, and
+// PICTURE_SETTLE frames more (textures, weather), the frame drawn is
+// written to path as a PNG and the viewer quits; after
+// PICTURE_MOST_FRAMES, whatever's loaded by then. Placed, the camera
+// starts at position, turned by yaw and pitch (radians). The first-person
+// arms are held in one animation (HELD_*; -1: as they'd play) at a time
+// in it (seconds), past its hit striking once. Out, once it's settled it
+// goes through the door out (the one whose outside was readied, else the
+// nearest), and the picture's of the other side, once that's settled.
+// Walking (walk_for), it's on foot, going forward that many seconds first
+// (else it flies, where it's put).
+Picture :: struct {
+	path: [260]utf8      // empty: no picture, the window shown
+	placed: bool
+	position: Vec3
+	yaw: f32
+	pitch: f32
+	held: i64
+	held_at: f32
+	menu: i64            // a menu open in it (MENU_*); 0 for none
+	menu_page: i64       // the menu's page (1 to 5); 0 for its first
+	timed_frames: i64    // frames drawn and timed once it's settled, before it's taken; 0 for none
+	out: bool            // through the door out once it's settled, the picture taken there
+	walk_for: f32        // seconds walked forward first, on foot; 0: flying
+	click: bool          // the left button clicked at click_x, click_y (window pixels) once it's settled
+	click_x: f32
+	click_y: f32
+}
+PICTURE_SETTLE :: 3
+PICTURE_MOST_FRAMES :: 6000
+
+// No picture: the window shown, as usual.
+no_picture :: fun() -> Picture {
+	return Picture{path = [], placed = false, position = Vec3{0, 0, 0}, yaw = 0, pitch = 0, held = -1, held_at = 0, menu = 0, menu_page = 0,
+		timed_frames = 0, out = false, walk_for = 0, click = false, click_x = 0, click_y = 0}
+}
+// The room the sounds' clips are loaded into.
+SOUND_ROOM :: 64 * MB
+
+// Region sounds are tried this often (seconds), at each spot round the
+// player (SOUND_SPOT units square: the 3 by 3 round theirs); thunder's
+// chance each second, by the weather's (0 to 1); a lightning flash fades
+// this fast.
+REGION_SOUND_TRY :: 2
+SOUND_SPOT :: 1024
+// What thunder's chance is rolled for (chance_at), apart from the regions' sounds.
+THUNDER_KEY :: 0x7400000000000000
+THUNDER_CHANCE :: 0.25
+LIGHTNING_FADE :: 4
+// Walked into another region's sky, its weather's blended in over this
+// long (seconds).
+REGION_BLEND :: 4
+
+// Weather sounds' keys: high bits no reference's form id has; the last
+// weather's apart from the coming one's.
+WEATHER_SOUND_KEY :: 0x7000000000000000
+LAST_WEATHER_BIT :: 0x0100000000000000
+
+// The moons' sizes on the sky (across, as a share of the way to the
+// horizon); the days the stars take to turn round.
+MASSER_SIZE :: 0.3
+SECUNDA_SIZE :: 0.12
+STARS_TURN_DAYS :: 2
+
+// What the viewer commands share: the game's plugins in their order and its
+// archives, the window, drawing, what's drawn, the keyboard and mouse, and
+// the journal.
+Viewer :: struct {
+	load_order: Load_Order
+	archives: Archives
+	platform: Platform
+	renderer: render.Renderer
+	shown: Scene
+	room: Load_Room
+	camera: render.Camera
+	speed: f32          // how fast the camera flies, in units a second
+	input: Input
+	journal: Journal
+	place: str256       // what's shown, for the window's title
+	chosen_door: i64    // the door view_frame stopped for
+	// E pressed at what isn't a door that leads somewhere or opens: the
+	// reference (0: nothing within reach), for the journal (explore tells it).
+	missed: bool
+	missed_target: u32
+	walking: bool       // on foot (F), not flying
+	walker: Walker
+	eyes: f32           // how high the walker's eyes are: smoothed over steps
+
+	// The world's server, and this player's link to it: run here (hosting:
+	// this player its first client, their queues passed it directly), or
+	// elsewhere, over a connection (server_address, set before viewer_open:
+	// empty to host); whether it's been lost. The world as this player's
+	// client knows it — what the server's told it: all that's shown is from
+	// this copy, all the player does is told the server (og's wire).
+	hosting: bool
+	server: World_Server
+	server_address: [64]utf8
+	connection: Tcp_Connection
+	to_server: Wire_Queue
+	from_server: Wire_Queue
+	server_lost: bool
+	seen: World_Copy
+	// The interior the player's in (0 outside); where their feet were when
+	// last told the server (for how fast they're going), how many times
+	// they've swung, how many of their blows met someone and whom the last
+	// did; the other players shown here.
+	inside_cell: u32
+	reported_feet: Vec3
+	swings: i64
+	strikes: i64
+	struck: u32
+	others: [MAX_PLAYERS]Other_Shown
+	// The sky as shown: the climate the server says the sky's under, read
+	// (its sun, moons, night sky); the records of the weathers (the one
+	// coming in, the last one going out: take_weather reads them), what's
+	// seen and heard by chance — the regions' sounds, thunder — rolled alike
+	// by every player (chance_at), the moons' phase on the card (-1: none
+	// yet).
+	climate: Climate
+	weather: Weather
+	last_weather: Weather
+	moon_phase: i64
+	// Whose sky's shown (its source, as the server says) and whether one is
+	// yet; how far the weather coming in is shown in (0 to 1: the server's,
+	// or, blending into another region's sky, the viewer's own); whether
+	// it's blending, and whether, blended, it's held till the server's sky
+	// comes to what it shows (show_weather).
+	sky_source: u32
+	sky_shown: bool
+	weather_share: f32
+	blending: bool
+	weather_held: bool
+	// The weather's sounds: its rain's and wind's loops (heard everywhere,
+	// as loud as the weather has come in), and the last weather's, going;
+	// the sounds the regions here make now and then (birds, insects), and
+	// the slot of the world's time they were last tried in (REGION_SOUND_TRY
+	// seconds each); the second thunder was last tried in, and a lightning
+	// flash's brightness now, fading.
+	weather_sounds: [8]Placed_Sound
+	last_weather_sounds: [8]Placed_Sound
+	region_sounds: [REGION_SOUNDS]Region_Sound
+	region_slot: i64
+	thunder_second: i64
+	lightning: f32
+	sky_world: u32      // the world they're of, 0 for none yet (or an interior's own)
+	sky_inside: bool    // in an interior that behaves like an exterior: lit by the sky
+	look: Sky_Look
+	water: Water_Type   // the world's water, as its WATR has it
+
+	// Frames: when the one now drawn began; without vsync, when the next
+	// may begin; how many were drawn in the second counted so far.
+	frame_start: u64
+	next_frame: u64
+	frames_counted: i64
+	counting_since: u64
+	frames_a_second: i64
+
+	// Loading after walking into another cell: when it began, over how many frames.
+	loading_since: u64
+	loading_frames: i64
+	// Inside: whether the outside a door leads to has begun to be readied
+	// (ready_exit), once what's inside is loaded; that door (its index in
+	// the scene's doors, -1 for none).
+	exit_readied: bool
+	exit_door: i64
+
+	// Where the last frame's time went, in nanoseconds, and what it drew:
+	// for the journal when it was slow, and the title.
+	drawing_time: u64    // the CPU's: what draw_frame took
+	card_time: u64       // the card's: waiting for it to finish drawing
+	waiting_time: u64    // showing it: the swap, and vsync's wait for the refresh
+	swap_time: u64       // of that, the swap call itself
+	loading_time: u64
+	crossing_time: u64
+	drawn: Frame_Stats
+	told_framebuffer: bool   // the journal has said the frame's framebuffer couldn't be made
+
+	// The sound: what plays it (its files are in the archives), and how loud
+	// the player has it.
+	audio: Mixer
+	volumes: Volumes
+	told_tracks: i64    // the music's tracks the journal has been told of
+
+	// Since the last summary: frames, refreshes missed, the longest, and
+	// the CPU's and card's time in all, in nanoseconds.
+	last_shown: u64     // when the last frame was shown
+	summary_since: u64
+	summary_frames: i64
+	summary_missed: i64
+	summary_longest: u64
+	summary_drawing: u64
+	summary_card: u64
+	gl_errors_seen: [16]u32
+	// The picture to take (set before viewer_open), and the frames drawn
+	// toward it: in all, and since loading caught up.
+	picture: Picture
+	picture_frames: i64
+	picture_settled: i64
+	picture_walked: f32   // seconds a picture's walk has gone (Picture.walk_for)
+	// A picture's timed frames: since when, the processor's drawing and the
+	// HUD's (and the open menu's) share of it, added up.
+	timing_since: u64
+	timed_drawing: u64
+	timed_hud: u64
+	hud_time: u64        // this frame's HUD and menu, put on the 2D layer
+	// The player's arms and what they hold, drawn with the camera.
+	held: First_Person
+	// The HUD, and what it names: the reference the reticle is on (0 for none).
+	hud: Hud
+	// The game's menus read (the HUD's among them); which one is open
+	// (MENU_*; 0 for none), the stats and map menus' roots (-1 till read),
+	// the player's arrow on the map (-1 till made), whether the mouse looked
+	// round before a menu took it.
+	book: Menu_Book
+	menu_open: i64
+	stats_menu: i64
+	map_menu: i64
+	map_arrow: i64
+	looking_before_menu: bool
+	// The menus round play (system_menus.mara): their roots (-1 till
+	// read); the menu Options was opened from; what the player's chosen
+	// (CHOSE_*); the tiles the mouse is over (their mouseover set); the
+	// volume slider being dragged (-1 for none); when the main menu opened
+	// (its logo fades in); whether the menus' book is open.
+	main_menu: i64
+	pause_menu: i64
+	options_menu: i64
+	audio_menu: i64
+	options_from: i64
+	menu_choice: i64
+	hovered: [16]i64
+	dragged_slider: i64
+	main_menu_since: u64
+	book_ready: bool
+	// The player's stats, and the map of the world shown (map_world's).
+	player_stats: Player_Stats
+	world_map: World_Map
+	map_world: u32
+	start_date: Game_Date   // the day the game starts on (the map menu's date counts from it)
+	targeted: u32
+}
+
+// What happened in a frame that the command has to answer.
+View_Event :: union {
+	nothing = 0
+	quit
+	door        // E was pressed near a door: viewer.chosen_door
+	crossed     // outside, the camera went into another cell
+}
+
+// Opens the archives (their directories into directory_storage), the
+// window (with vsync) and the journal, and sets up drawing, into viewer;
+// the scene's tables are carved from table_storage.
+viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^[]byte) -> err {
+	taking_picture := viewer.picture.path.len > 0
+	viewer.journal = journal_open(if taking_picture do PICTURE_LOG_PATH else LOG_PATH)
+	if not taking_picture do full_log_start()   // (lists found full: see og's logging)
+	read_load_order(&viewer.load_order)?
+	open_game_archives(&viewer.load_order, &viewer.archives, directory_storage)?
+	note(&viewer.journal, "plugins (")
+	note(&viewer.journal, viewer.load_order.listed_in)
+	note(&viewer.journal, "):")
+	for &plugin in viewer.load_order.plugins {
+		note(&viewer.journal, " ")
+		note(&viewer.journal, plugin.name)
+	}
+	if viewer.load_order.missing.len > 0 do note(&viewer.journal, "; not in the data folder:")
+	for &plugin in viewer.load_order.missing {
+		note(&viewer.journal, " ")
+		note(&viewer.journal, plugin.name)
+	}
+	note(&viewer.journal, "; ")
+	note(&viewer.journal, viewer.archives.list.len)
+	note(&viewer.journal, " archives")
+	note_end(&viewer.journal)
+	// The cache of their files unpacked (the files unpacked before, read
+	// again without unpacking).
+	cache := &viewer.archives.cache
+	cache_open(cache, directory_storage)
+	if cache.usable {
+		note(&viewer.journal, "the cache: ")
+		note(&viewer.journal, cache.places.len)
+		note(&viewer.journal, " files unpacked before, ")
+		note(&viewer.journal, cache.data_size / MB)
+		note(&viewer.journal, " MB")
+	else
+		note(&viewer.journal, "no cache (another run may have it): ")
+		note_error(&viewer.journal, cache.failure)
+	}
+	note_end(&viewer.journal)
+	viewer.platform = platform_open("sooblivion", 1280, 720, taking_picture)?
+	audio_init(&viewer.audio, SOUND_ROOM, table_storage)
+	// The volumes as the player last set them (none set yet: every sound as
+	// loud as it's made).
+	settings, settings_error := read_settings()
+	viewer.volumes = settings.volumes
+	set_volumes(&viewer.audio, viewer.volumes)
+	if settings_error and settings_error != File_Error.Open_Failed {
+		note(&viewer.journal, "couldn't read the settings: the defaults instead; ")
+		note_error(&viewer.journal, settings_error)
+		note_end(&viewer.journal)
+	}
+	viewer.told_tracks = 0
+	if taking_picture {
+		note(&viewer.journal, "no sound: taking a picture")
+		note_end(&viewer.journal)
+	else
+		audio_error := audio_open(&viewer.audio)
+		if audio_error {
+			note(&viewer.journal, "no sound: ")
+			note_error(&viewer.journal, audio_error)
+			note_end(&viewer.journal)
+		}
+	}
+	// (A picture's frames are drawn as fast as they can be.)
+	set_vsync(&viewer.platform, not taking_picture)
+	viewer.picture_frames = 0
+	viewer.picture_settled = 0
+	viewer.picture_walked = 0
+	viewer.held.ready = false
+	viewer.held.instances.len = 0
+	viewer.hud.ready = false
+	viewer.targeted = 0
+	viewer.menu_open = 0
+	viewer.stats_menu = -1
+	viewer.map_menu = -1
+	viewer.map_arrow = -1
+	viewer.looking_before_menu = false
+	viewer.main_menu = -1
+	viewer.pause_menu = -1
+	viewer.options_menu = -1
+	viewer.audio_menu = -1
+	viewer.options_from = MENU_PAUSE
+	viewer.menu_choice = CHOSE_NOTHING
+	viewer.hovered.len = 0
+	viewer.dragged_slider = -1
+	viewer.main_menu_since = 0
+	viewer.book_ready = false
+	viewer.world_map.picture.len = 0
+	viewer.map_world = 0
+	renderer_init(&viewer.renderer, table_storage)?
+	note(&viewer.journal, if viewer.renderer.bindless_available do "the card draws bindless" else "the card can't draw bindless: textures are bound")
+	note(&viewer.journal, "; anisotropy ")
+	note(&viewer.journal, i64(viewer.renderer.anisotropy))
+	note_end(&viewer.journal)
+	scene_clear(&viewer.shown, table_storage)
+	viewer.camera = render.Camera(){position = Vec3{0, 0, 0}, yaw = 0, pitch = 0}
+	viewer.speed = 400
+	viewer.place.len = 0
+	viewer.chosen_door = -1
+	viewer.exit_readied = false
+	viewer.exit_door = -1
+	viewer.missed = false
+	viewer.missed_target = 0
+	// On foot (taking a picture, only if it walks).
+	viewer.walking = if taking_picture do viewer.picture.walk_for > 0 else true
+	viewer.walker = Walker{position = Vec3{0, 0, 0}, rising = 0, on_ground = false}
+	viewer.eyes = 0
+	viewer.sky_world = 0
+	viewer.sky_inside = false
+	// (No link to a server yet: open_link, once the player's to be somewhere.)
+	viewer.hosting = false
+	viewer.server_lost = false
+	viewer.connection = no_connection()
+	wire_start(&viewer.to_server)
+	wire_start(&viewer.from_server)
+	copy_start(&viewer.seen)
+	viewer.inside_cell = 0
+	viewer.reported_feet = Vec3{0, 0, 0}
+	viewer.swings = 0
+	viewer.strikes = 0
+	viewer.struck = 0
+	viewer.others.len = 0
+	viewer.climate = default_climate()
+	viewer.weather = default_weather()
+	viewer.last_weather = default_weather()
+	viewer.moon_phase = -1
+	viewer.sky_source = 0
+	viewer.sky_shown = false
+	viewer.weather_share = 1
+	viewer.blending = false
+	viewer.weather_held = false
+	viewer.weather_sounds.len = 0
+	viewer.last_weather_sounds.len = 0
+	viewer.region_sounds.len = 0
+	viewer.region_slot = -1
+	viewer.thunder_second = -1
+	viewer.lightning = 0
+	viewer.look = Sky_Look{state = Sky_State{0}, cloud_lower = 0, cloud_upper = 0, cloud_lower_last = 0, cloud_upper_last = 0,
+		weather_share = 1, sun = 0, precipitation = [], last_precipitation = [],
+		stars = 0, nebula = 0, stars_turn = 0, masser = 0, secunda = 0, masser_direction = Vec3{0, 0, -1},
+		secunda_direction = Vec3{0, 0, -1}, masser_size = 0, secunda_size = 0, sun_glare = 0, sun_glare_strength = 0,
+		cloud_lower_offset = 0, cloud_upper_offset = 0, outside = false, sky = false, time = 0, water = DEFAULT_WATER, wind = 0}
+	viewer.water = DEFAULT_WATER
+	viewer.frame_start = time_now()
+	viewer.next_frame = viewer.frame_start
+	viewer.frames_counted = 0
+	viewer.counting_since = viewer.frame_start
+	viewer.frames_a_second = 0
+	viewer.loading_since = 0
+	viewer.loading_frames = 0
+	viewer.drawing_time = 0
+	viewer.card_time = 0
+	viewer.waiting_time = 0
+	viewer.swap_time = 0
+	viewer.last_shown = time_now()
+	viewer.loading_time = 0
+	viewer.crossing_time = 0
+	start_summary(viewer)
+	viewer.drawn = Frame_Stats{instances = 0, visible = 0, drawn_parts = 0, draw_calls = 0, land_cells = 0}
+	viewer.told_framebuffer = false
+	viewer.gl_errors_seen.len = 0
+}
+
+viewer_close :: fun(viewer: ^Viewer) {
+	tcp_close(&viewer.connection)
+	if viewer.hosting do tcp_listen_stop(&viewer.server.listener)
+	audio_close(&viewer.audio)
+	platform_close(&viewer.platform)
+	note_cache(viewer)
+	close_archives(&viewer.archives)
+	journal_close(&viewer.journal)
+}
+
+// Notes what the cache did this run: files read from it and added to it,
+// and why it stopped being added to, or read, if it did.
+note_cache :: fun(viewer: ^Viewer) {
+	cache := &viewer.archives.cache
+	journal := &viewer.journal
+	note(journal, "the cache: ")
+	note(journal, cache.read_count)
+	note(journal, " files read from it (")
+	note(journal, cache.read_bytes / MB)
+	note(journal, " MB), ")
+	note(journal, cache.added_count)
+	note(journal, " added (")
+	note(journal, cache.added_bytes / MB)
+	note(journal, " MB)")
+	if cache.failure {
+		note(journal, "; it failed: ")
+		note_error(journal, cache.failure)
+	}
+	note_end(journal)
+}
+
+// The rooms loading uses, as views of storages the caller keeps: each up
+// to its cap ( would stop at its len, 0 here).
+load_room :: fun(file_room: ^[]byte, block_room: ^[]byte, model_room: ^[]byte, texture_room: ^[]byte) -> Load_Room {
+	return Load_Room{
+		file = file_room[0 : file_room.cap],
+		blocks = block_room[0 : block_room.cap],
+		model = model_room[0 : model_room.cap],
+		texture = texture_room[0 : texture_room.cap]}
+}
+
+// Where the viewer's scene loads models from.
+viewer_loader :: fun(viewer: ^Viewer) -> Loader {
+	return Loader{renderer = &viewer.renderer, archives = &viewer.archives, room = &viewer.room, drawing = true}
+}
+
+// Shows what's shown, how many frames a second, whether vsync is on, and
+// what the last frame drew in the window's title: "Inn of Ill Omen — 60
+// fps, vsync on — 140 of 210 in view, 52 draw calls".
+update_title :: fun(viewer: ^Viewer) {
+	title : str256
+	&title + viewer.place
+	&title + " — "
+	&title + int_text(viewer.frames_a_second)
+	&title + " fps, vsync "
+	&title + (if viewer.platform.vsync do "on" else "off")
+	&title + (if viewer.renderer.use_bindless do ", bindless" else ", bound textures")
+	&title + (if viewer.walking do ", walking" else ", flying")
+	&title + " — "
+	&title + clock_text(viewer.seen.hour)
+	&title + " — "
+	&title + int_text(viewer.drawn.visible)
+	&title + " of "
+	&title + int_text(viewer.drawn.instances)
+	&title + " in view, "
+	&title + int_text(viewer.drawn.draw_calls)
+	&title + " draw calls"
+	_ = SetWindowTitle(viewer.platform.window, title)   // (the list: a 0 follows the title in its room)
+}
+
+// Names what's shown, in the title.
+set_place :: fun(viewer: ^Viewer, place: []utf8) {
+	viewer.place.len = 0
+	&viewer.place + place
+	update_title(viewer)
+}
+
+// One frame: reads the keyboard and mouse, moves the camera, draws the
+// scene from it. Tells what happened that the command has to answer.
+view_frame :: fun(viewer: ^Viewer) -> View_Event {
+	platform := &viewer.platform
+	camera := &viewer.camera
+	shown := &viewer.shown
+	input := &viewer.input
+
+	read_input(platform, input)
+	if input.quit do return .quit
+	// A picture's click, once it's settled.
+	if viewer.picture.click and viewer.picture_settled == 1 {
+		input.mouse_x = viewer.picture.click_x
+		input.mouse_y = viewer.picture.click_y
+		input.mouse_pressed[1] = true
+	}
+	// The menus: F1 the character's, F4 the map (its key again, or Escape,
+	// closes it); Escape with none open, the pause menu (its Quit quits).
+	// While one is open the mouse is its, and nothing else of the keyboard
+	// or mouse reaches the game.
+	if input.pressed[F1] do toggle_menu(viewer, MENU_STATS)
+	if input.pressed[F4] do toggle_menu(viewer, MENU_MAP)
+	if input.pressed[Escape] {
+		if viewer.menu_open == 0 do open_system_menu(viewer, MENU_PAUSE)
+		else do menu_back(viewer)
+	}
+	if viewer.menu_open != 0 {
+		if viewer.menu_open >= MENU_MAIN do system_menu_input(viewer)
+		elif input.mouse_pressed[1] do click_menu(viewer, input.mouse_x, input.mouse_y)
+		if viewer.menu_choice == CHOSE_QUIT do return .quit
+		for &down in input.held do down^ = false
+		for &down in input.pressed do down^ = false
+		for k in 0:6 {
+			input.mouse_pressed[k] = false
+			input.mouse_held[k] = false
+		}
+		input.mouse_moved_x = 0
+		input.mouse_moved_y = 0
+	}
+	if input.mouse_pressed[3] do set_mouse_look(platform, not platform.mouse_look)
+	if input.pressed[V] {
+		set_vsync(platform, not platform.vsync)
+		viewer.next_frame = time_now()
+		note(&viewer.journal, "vsync ")
+		note(&viewer.journal, if platform.vsync do "on" else "off")
+		note_end(&viewer.journal)
+		update_title(viewer)
+	}
+	if input.pressed[B] and viewer.renderer.bindless_available {
+		viewer.renderer.use_bindless = not viewer.renderer.use_bindless
+		note(&viewer.journal, if viewer.renderer.use_bindless do "drawing bindless" else "drawing with bound textures")
+		note_end(&viewer.journal)
+		update_title(viewer)
+	}
+	// What the reticle is on: E uses it — a door that leads somewhere is
+	// gone through, one that opens in place opens or closes.
+	targeted := targeted_reference(shown, camera^)
+	leading := leading_door(shown, targeted)
+	usable := leading >= 0 or (targeted != 0 and swings(shown, targeted))
+	// What the HUD names: a person the reticle's on within reach (they've no
+	// collision for targeted_reference to meet), else what it is on; and
+	// what using it would do.
+	person, _ := strike(shown, camera^, DOOR_REACH)
+	viewer.targeted = if person != 0 do person else targeted
+	viewer.hud.activate = 0
+	if usable do viewer.hud.activate = ICON_DOOR
+	if person != 0 do viewer.hud.activate = ICON_TALK
+	if input.pressed[E] and usable {
+		if leading >= 0 {
+			// Its opening sound, heard on after going through, where the door
+			// was. (A door that opens in place sounds as it swings.)
+			sound, place := door_sound(shown, targeted, true)
+			if sound >= 0 do play_once(&viewer.audio, &viewer.archives, &shown.sound_kinds[sound], place, listener_of(camera^))
+			viewer.chosen_door = leading
+			return .door
+		}
+		// (Asked of the server: the door swings when it says, follow_door_states.)
+		send_use_door(outgoing(viewer), targeted)
+	}
+	if input.pressed[E] and not usable {
+		viewer.missed = true
+		viewer.missed_target = targeted
+	}
+
+	seconds, now := time_since(viewer.frame_start)
+	// A picture's walk: forward till its seconds have gone.
+	if viewer.picture_walked < viewer.picture.walk_for {
+		input.held[W] = true
+		viewer.picture_walked += f32(seconds)
+	}
+	viewer.frame_start = now
+
+	if platform.mouse_look {
+		camera.yaw += input.mouse_moved_x * 0.003
+		camera.pitch -= input.mouse_moved_y * 0.003
+		if camera.pitch > 1.5 do camera.pitch = 1.5
+		if camera.pitch < -1.5 do camera.pitch = -1.5
+	}
+	if input.pressed[F] do set_walking(viewer, not viewer.walking)
+	if viewer.walking {
+		// Across the ground, the way the camera faces; the camera at the eyes.
+		ahead := Vec3{sin_f32(camera.yaw), cos_f32(camera.yaw), 0}
+		side := Vec3{cos_f32(camera.yaw), -sin_f32(camera.yaw), 0}
+		going := Vec3{0, 0, 0}
+		if input.held[W] do going = going + ahead
+		if input.held[S] do going = going - ahead
+		if input.held[D] do going = going + side
+		if input.held[A] do going = going - side
+		if vec3_length(going) > 0 do going = vec3_normalize(going) * (if input.held[LShift] do RUN_SPEED else WALK_SPEED)
+		step_seconds := min_f32(f32(seconds), LONGEST_STEP)
+		walk(&viewer.walker, shown, going, input.pressed[Space], step_seconds)
+		// The feet climb a step in a frame; the eyes follow over a few, so
+		// stairs are a slope to them. Falling and jumping, they keep up.
+		feet := viewer.walker.position
+		eyes_wanted := feet.z + EYE_HEIGHT
+		if viewer.walker.on_ground and abs_f32(eyes_wanted - viewer.eyes) < STEP_HEIGHT * 2 {
+			viewer.eyes += (eyes_wanted - viewer.eyes) * min_f32(1, step_seconds * EYES_CATCH_UP)
+		else
+			viewer.eyes = eyes_wanted
+		}
+		camera.position = Vec3{feet.x, feet.y, viewer.eyes}
+	else
+		forward, right, up := camera_axes(camera^)
+		step := f32(seconds) * viewer.speed
+		if input.held[LShift] do step *= 4
+		if input.held[W] do camera.position = camera.position + forward * step
+		if input.held[S] do camera.position = camera.position - forward * step
+		if input.held[D] do camera.position = camera.position + right * step
+		if input.held[A] do camera.position = camera.position - right * step
+	}
+
+	report_player(viewer, input.held[T], f32(seconds))
+	show_time(viewer, f32(seconds))
+	noises : [16]Door_Noise
+	follow_door_states(shown, &viewer.seen)
+	swing_doors(shown, f32(seconds), &noises)
+	move_pieces(shown, viewer.look.time)
+	// The people posed, the player's arms too: a left click swings.
+	step_first_person(viewer, input.mouse_pressed[1])
+	viewer.renderer.palette.len = 0
+	follow_actors(viewer)
+	movers : [MAX_PLAYERS]Npc_Mover
+	follow_others(viewer, f32(seconds), &movers)
+	pose_npcs(shown, &viewer.renderer, viewer.look.time, movers)
+	pose_first_person(viewer)
+	upload_palette(&viewer.renderer)
+	for &noise in noises do play_once(&viewer.audio, &viewer.archives, &shown.sound_kinds[noise.sound], noise.position, listener_of(camera^))
+	if change_lights(shown, f32(seconds)) do shown.lights_changed = true
+	drawing_start := time_now()
+	if shown.waters_changed {
+		upload_waters(&viewer.renderer, &shown.waters)
+		shown.waters_changed = false
+	}
+	if shown.lights_changed {
+		set_scene_lights(&viewer.renderer, &shown.lights)
+		shown.lights_changed = false
+	}
+	hud_start := time_now()
+	layer_begin(&viewer.renderer.ui)
+	draw_hud(&viewer.hud, &viewer.book, &viewer.renderer, &viewer.archives, platform.width, platform.height, camera.yaw,
+		viewer.menu_open == 0)
+	draw_open_menu(viewer, platform.width, platform.height)
+	viewer.hud_time = time_now() - hud_start
+	// Inside, the land, trees and grass are the outside's, readied for going
+	// out (ready_exit): not drawn.
+	grounds := shown.grounds[0 : shown.grounds.len]
+	tree_cells := shown.tree_cells[0 : shown.tree_cells.len]
+	grass_cells := shown.grass_cells[0 : shown.grass_cells.len]
+	if shown.world == 0 {
+		grounds.len = 0
+		tree_cells.len = 0
+		grass_cells.len = 0
+	}
+	drawn, framebuffer_error := draw_frame(&viewer.renderer, &shown.models, &shown.instances, &shown.distant_instances, &grounds,
+		&shown.waters, &tree_cells, &grass_cells, &viewer.held.instances, &viewer.look, shown.lighting, camera^,
+		platform.width, platform.height)
+	viewer.drawn = drawn
+	if framebuffer_error and not viewer.told_framebuffer {
+		// Said once: the frames are drawn into the window from here, as well
+		// as they can be.
+		note(&viewer.journal, "the frame's framebuffer couldn't be made, so effects are cut off where they meet walls: ")
+		note_error(&viewer.journal, framebuffer_error)
+		note_end(&viewer.journal)
+		viewer.told_framebuffer = true
+	}
+	if viewer.picture.path.len > 0 {
+		viewer.picture_frames += 1
+		walked := viewer.picture_walked >= viewer.picture.walk_for
+		viewer.picture_settled = if still_loading(viewer) or not walked do 0 else viewer.picture_settled + 1
+		// Out: through the door out, once (it's settled again there).
+		if viewer.picture.out and viewer.picture_settled > PICTURE_SETTLE and shown.doors.len > 0 {
+			viewer.picture.out = false
+			viewer.picture_settled = 0
+			nearest : f32 = 0
+			for way_out, k in shown.doors {
+				away := way_out.position - camera.position
+				distance := away.x * away.x + away.y * away.y + away.z * away.z
+				if k == 0 or distance < nearest {
+					viewer.chosen_door = k
+					nearest = distance
+				}
+			}
+			if viewer.exit_door >= 0 do viewer.chosen_door = viewer.exit_door
+			note(&viewer.journal, "the picture goes through the door out")
+			note_end(&viewer.journal)
+			return .door
+		}
+		// Timed frames: from the one after it settles (the drawing added up is
+		// the frame before's, measured after this point).
+		if viewer.picture_settled == PICTURE_SETTLE + 1 {
+			viewer.timing_since = time_now()
+			viewer.timed_drawing = 0
+			viewer.timed_hud = 0
+		elif viewer.picture_settled > PICTURE_SETTLE + 1
+			viewer.timed_drawing += viewer.drawing_time
+			viewer.timed_hud += viewer.hud_time
+		}
+		if viewer.picture_settled > PICTURE_SETTLE + viewer.picture.timed_frames or viewer.picture_frames > PICTURE_MOST_FRAMES {
+			if viewer.picture.timed_frames > 0 do note_timing(viewer)
+			take_picture(viewer)
+			return .quit
+		}
+	}
+	if not viewer.hud.ready do draw_reticle(platform.width, platform.height, usable)
+	heard_at := f64(time_now()) / 1000000000
+	listener := listener_of(camera^)
+	hear_start(&viewer.audio)
+	hour := viewer.seen.hour
+	hear_sounds(&viewer.audio, &viewer.archives, &shown.sounds, listener, hour, heard_at)
+	if viewer.look.outside {
+		for &sound in viewer.weather_sounds do sound.volume = viewer.weather_share
+		for &sound in viewer.last_weather_sounds do sound.volume = 1 - viewer.weather_share
+		hear_sounds(&viewer.audio, &viewer.archives, &viewer.weather_sounds, listener, hour, heard_at)
+		hear_sounds(&viewer.audio, &viewer.archives, &viewer.last_weather_sounds, listener, hour, heard_at)
+		outdoor_sounds(viewer, listener, heard_at)
+	}
+	hear_finish(&viewer.audio)
+	mix_ahead(&viewer.audio)
+	music := &viewer.audio.music
+	if music.tracks_started != viewer.told_tracks {
+		viewer.told_tracks = music.tracks_started
+		note(&viewer.journal, "music: ")
+		note(&viewer.journal, music.track)
+		note_end(&viewer.journal)
+	}
+	card_start := time_now()
+	viewer.drawing_time = card_start - drawing_start
+	wait_for_card()
+	waiting_start := time_now()
+	viewer.card_time = waiting_start - card_start
+	viewer.swap_time = present(platform)
+	shown_at := time_now()
+	viewer.waiting_time = shown_at - waiting_start
+	// The time since the last frame was shown: what's seen. (Loading and
+	// placing after a frame count toward the next.)
+	add_to_summary(viewer, shown_at - viewer.last_shown)
+	viewer.last_shown = shown_at
+	viewer.loading_time = 0
+	viewer.crossing_time = 0
+	note_gl_errors(viewer)
+	if not platform.vsync and viewer.picture.path.len == 0 do wait_for_next_frame(viewer)
+	count_frame(viewer)
+
+	if shown.world != 0 {
+		x, y := grid_of(camera.position)
+		if x != shown.center_x or y != shown.center_y do return .crossed
+	}
+	return .nothing
+}
+
+// Writes the frame just drawn to the picture's path, as a PNG, every
+// pixel opaque; the journal says where it went, or why it couldn't.
+take_picture :: fun(viewer: ^Viewer) {
+	journal := &viewer.journal
+	bound, width, height := bind_frame_for_reading(&viewer.renderer)
+	if not bound {
+		note(journal, "no picture: the frame wasn't drawn into a framebuffer")
+		note_end(journal)
+		return
+	}
+	pixels : [64 * MB]byte
+	read_pixels(width, height, &pixels)
+	if pixels.len == 0 {
+		note(journal, "no picture: no room for its pixels")
+		note_end(journal)
+		return
+	}
+	// The rows from the top down, as a PNG has them.
+	upright : [64 * MB]byte
+	upright.len = pixels.len
+	row := width * 4
+	for y in 0:height {
+		from := (height - 1 - y) * row
+		for k in 0:row do upright[y * row + k] = pixels[from + k]
+		for x in 0:width do upright[y * row + x * 4 + 3] = u8(255)
+	}
+	png_storage : [64 * MB]byte
+	row_storage : [64 * MB]byte
+	encode_png(upright, width, height, &png_storage, &row_storage)
+	write_error := write_entire_file(viewer.picture.path, png_storage)
+	if write_error {
+		note(journal, "couldn't write the picture to ")
+		note(journal, viewer.picture.path)
+		note(journal, ": ")
+		note_error(journal, write_error)
+		note_end(journal)
+		return
+	}
+	note(journal, "picture: ")
+	note(journal, width)
+	note(journal, " by ")
+	note(journal, height)
+	note(journal, ", after ")
+	note(journal, viewer.picture_frames)
+	note(journal, " frames, into ")
+	note(journal, viewer.picture.path)
+	note(journal, "; the camera at ")
+	note(journal, i64(viewer.camera.position.x))
+	note(journal, " ")
+	note(journal, i64(viewer.camera.position.y))
+	note(journal, " ")
+	note(journal, i64(viewer.camera.position.z))
+	note(journal, ", turned ")
+	note(journal, i64(viewer.camera.yaw * 180 / PI))
+	note(journal, " degrees")
+	note_end(journal)
+}
+
+// Makes the player's first-person model (make_first_person); the journal
+// says why, when it can't be.
+take_first_person :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	journal := &viewer.journal
+	started := time_now()
+	held_error := make_first_person(viewer, plugin)
+	if held_error {
+		note(journal, "no first-person arms: ")
+		note_error(journal, held_error)
+		note_end(journal)
+	}
+	held_at := time_now()
+	// The HUD too, with the weapon's icon.
+	scratch : [32 * MB]byte = void
+	scratch.len = 0
+	hud_error := open_book(viewer)
+	book_at := time_now()
+	if not hud_error do hud_error = load_hud(&viewer.hud, &viewer.book, &viewer.archives, viewer.held.weapon_icon, &scratch)
+	hud_at := time_now()
+	note(journal, "first-person arms made in ")
+	note_milliseconds(journal, held_at - started)
+	note(journal, " ms; the menus' fonts and strings read in ")
+	note_milliseconds(journal, book_at - held_at)
+	note(journal, " ms; the HUD's menus in ")
+	note_milliseconds(journal, hud_at - book_at)
+	note(journal, " ms")
+	note_end(journal)
+	viewer.start_date = read_start_date(plugin)
+	stats_error := read_player_stats(plugin, &viewer.player_stats)
+	if stats_error {
+		note(&viewer.journal, "the player's stats couldn't be read: ")
+		note_error(&viewer.journal, stats_error)
+		note_end(&viewer.journal)
+	}
+	// A picture of a menu: it's open from the start.
+	if viewer.picture.menu != 0 {
+		toggle_menu(viewer, viewer.picture.menu)
+		page := f32(viewer.picture.menu_page)
+		if page > 0 and viewer.picture.menu == MENU_STATS do _ = book_set(&viewer.book, "StatsMenu", "user0", page)
+		if page > 0 and viewer.picture.menu == MENU_MAP do _ = book_set(&viewer.book, "map_background", "user0", page)
+	}
+	if hud_error {
+		note(&viewer.journal, "no HUD: ")
+		note_error(&viewer.journal, hud_error)
+		note_end(&viewer.journal)
+	}
+}
+
+// Plays a sound of the player's (a SOUN record's form id) where they are.
+play_player_sound :: fun(viewer: ^Viewer, plugin: ^Plugin, sound: u32) {
+	shown := &viewer.shown
+	kind := scene_sound_kind(shown, plugin, sound)
+	if kind < 0 do return
+	play_once(&viewer.audio, &viewer.archives, &shown.sound_kinds[kind], viewer.camera.position, listener_of(viewer.camera))
+}
+
+// Tells the journal what a blow met: whom (their name), something else, or
+// nothing.
+note_blow :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	journal := &viewer.journal
+	struck := viewer.held.struck_reference
+	if struck == 0 {
+		note(journal, if viewer.held.struck_thing do "struck something" else "swung at no one")
+		note_end(journal)
+		return
+	}
+	name := reference_name(plugin, struck)
+	note(journal, "struck ")
+	note(journal, if name.len > 0 do name[0 : name.len] else "someone")
+	note_end(journal)
+}
+
+// Tells the journal how long a picture's timed frames took: each, and of
+// that the processor's drawing and the HUD's.
+note_timing :: fun(viewer: ^Viewer) {
+	journal := &viewer.journal
+	frames := max(viewer.picture.timed_frames, 1)
+	note(journal, "timed ")
+	note(journal, frames)
+	note(journal, " frames: ")
+	note_milliseconds(journal, (time_now() - viewer.timing_since) / u64(frames))
+	note(journal, " ms each; drawing ")
+	note_milliseconds(journal, viewer.timed_drawing / u64(frames))
+	note(journal, " ms, of it the HUD ")
+	note_milliseconds(journal, viewer.timed_hud / u64(frames))
+	note(journal, " ms")
+	note_end(journal)
+}
+
+// The camera where a picture says it starts.
+place_camera :: fun(viewer: ^Viewer, picture: Picture) {
+	viewer.camera.position = picture.position
+	viewer.camera.yaw = picture.yaw
+	viewer.camera.pitch = picture.pitch
+}
+
+// Without vsync: waits for the next frame's time. Frames are due on a
+// schedule, a 60th of a second apart, so a wait that runs late is made up
+// by the next one's being shorter. Most of the wait sleeps; the last
+// millisecond spins, as sleeping can overrun by about that much. A frame
+// that ran past its time starts the schedule again from now.
+wait_for_next_frame :: fun(viewer: ^Viewer) {
+	period : u64 = 1000000000 / MOST_FRAMES_A_SECOND
+	viewer.next_frame += period
+	now := time_now()
+	if viewer.next_frame <= now {
+		viewer.next_frame = now
+		return
+	}
+	spin : u64 = 1000000
+	if viewer.next_frame - now > spin do delay_ns(viewer.next_frame - now - spin)
+	for time_now() < viewer.next_frame {}
+}
+
+// Starts counting frames for the next summary.
+start_summary :: fun(viewer: ^Viewer) {
+	viewer.summary_since = time_now()
+	viewer.summary_frames = 0
+	viewer.summary_missed = 0
+	viewer.summary_longest = 0
+	viewer.summary_drawing = 0
+	viewer.summary_card = 0
+}
+
+// Counts the frame just past, which took frame_length nanoseconds from its
+// start to the next's: noted when it missed a refresh; every
+// SUMMARY_EVERY, a summary.
+add_to_summary :: fun(viewer: ^Viewer, frame_length: u64) {
+	viewer.summary_frames += 1
+	viewer.summary_drawing += viewer.drawing_time
+	viewer.summary_card += viewer.card_time
+	if frame_length > viewer.summary_longest do viewer.summary_longest = frame_length
+	if frame_length > SLOW_FRAME {
+		viewer.summary_missed += 1
+		note_slow_frame(viewer, frame_length)
+	}
+	if time_now() - viewer.summary_since < SUMMARY_EVERY do return
+
+	journal := &viewer.journal
+	frames := viewer.summary_frames
+	note(journal, "frames: ")
+	note(journal, frames)
+	note(journal, " in ")
+	note(journal, i64((time_now() - viewer.summary_since) / 1000000000))
+	note(journal, " s, ")
+	note(journal, viewer.summary_missed)
+	note(journal, " missed a refresh, the longest ")
+	note(journal, i64(viewer.summary_longest / 1000000))
+	note(journal, " ms; each took the CPU ")
+	note_milliseconds(journal, viewer.summary_drawing / u64(frames))
+	note(journal, " ms and the card ")
+	note_milliseconds(journal, viewer.summary_card / u64(frames))
+	note(journal, " ms, of 16.7")
+	note_end(journal)
+	start_summary(viewer)
+}
+
+// Notes nanoseconds as milliseconds to a hundredth: "2.41".
+note_milliseconds :: fun(journal: ^Journal, nanoseconds: u64) {
+	hundredths := i64(nanoseconds / 10000)
+	note(journal, hundredths / 100)
+	note(journal, ".")
+	if hundredths % 100 < 10 do note(journal, "0")
+	note(journal, hundredths % 100)
+}
+
+// Notes a frame that missed a refresh, and where its time went: drawing
+// (the CPU's), the card's, waiting to show it (the swap and vsync),
+// loading, and placing a cell walked into.
+note_slow_frame :: fun(viewer: ^Viewer, frame_length: u64) {
+	journal := &viewer.journal
+	drawn := viewer.drawn
+	note(journal, "missed a refresh: ")
+	note(journal, i64(frame_length / 1000000))
+	note(journal, " ms (drawing ")
+	note(journal, i64(viewer.drawing_time / 1000000))
+	note(journal, ", the card ")
+	note(journal, i64(viewer.card_time / 1000000))
+	note(journal, ", showing ")
+	note(journal, i64(viewer.waiting_time / 1000000))
+	note(journal, " (the swap ")
+	note(journal, i64(viewer.swap_time / 1000000))
+	note(journal, ")")
+	note(journal, ", loading ")
+	note(journal, i64(viewer.loading_time / 1000000))
+	note(journal, ", placing ")
+	note(journal, i64(viewer.crossing_time / 1000000))
+	note(journal, "); ")
+	note(journal, drawn.visible)
+	note(journal, " of ")
+	note(journal, drawn.instances)
+	note(journal, " in view, ")
+	note(journal, drawn.drawn_parts)
+	note(journal, " parts, ")
+	note(journal, drawn.draw_calls)
+	note(journal, " draw calls, ")
+	note(journal, drawn.land_cells)
+	note(journal, " land cells")
+	if viewer.loading_time > 0 and viewer.shown.slowest_load > 0 {
+		note(journal, "; the slowest loaded: ")
+		note(journal, viewer.shown.slowest_what)
+		note(journal, ", ")
+		note(journal, i64(viewer.shown.slowest_load / 1000000))
+		note(journal, " ms")
+	}
+	note_end(journal)
+}
+
+// Notes what OpenGL says went wrong, if anything: each kind of error the
+// first time only, so a frame's mistake isn't noted sixty times a second.
+note_gl_errors :: fun(viewer: ^Viewer) {
+	for true {
+		code := gl.GetError()
+		if code == 0 do return
+		if code in viewer.gl_errors_seen do continue
+		if viewer.gl_errors_seen.len < viewer.gl_errors_seen.cap do &viewer.gl_errors_seen + code
+		note(&viewer.journal, "OpenGL error ")
+		note(&viewer.journal, i64(code))
+		note(&viewer.journal, " (1280 bad enum, 1281 bad value, 1282 bad operation, 1285 out of memory)")
+		note_end(&viewer.journal)
+	}
+}
+
+// Whether the world shown has its distant land on the card.
+has_distant_land :: fun(viewer: ^Viewer) -> bool {
+	renderer := &viewer.renderer
+	return renderer.distant_pieces.len > 0 and renderer.distant_world == viewer.shown.world
+}
+
+// Walks (on foot, from where the camera's eyes are) or flies.
+set_walking :: fun(viewer: ^Viewer, on: bool) {
+	viewer.walking = on
+	place_walker(viewer)
+	note(&viewer.journal, if on do "walking" else "flying")
+	note_end(&viewer.journal)
+	update_title(viewer)
+}
+
+// Puts the walker's feet under the camera, standing still.
+place_walker :: fun(viewer: ^Viewer) {
+	viewer.walker = Walker{position = viewer.camera.position - Vec3{0, 0, EYE_HEIGHT}, rising = 0, on_ground = false}
+	viewer.eyes = viewer.camera.position.z
+}
+
+// Tells the server where the player is: their place and feet, which way
+// they face, how fast they've gone across since last told (over seconds);
+// and whether they hurry time (T held).
+report_player :: fun(viewer: ^Viewer, hurried: bool, seconds: f32) {
+	feet := player_feet(viewer)
+	across := Vec3{feet.x - viewer.reported_feet.x, feet.y - viewer.reported_feet.y, 0}
+	speed := if seconds > 0 do vec3_length(across) / seconds else 0
+	viewer.reported_feet = feet
+	send_player(outgoing(viewer), Player_Message{world_id = viewer.shown.world, feet = feet, yaw = viewer.camera.yaw, speed = speed,
+		hurried = hurried, swings = viewer.swings, strikes = viewer.strikes, struck = viewer.struck})
+}
+
+// Another player shown here, as a body: their number and their body's
+// reference (OTHER_PLAYER_KEY and the number); where the server last said
+// they are (feet, facing, how fast they're going), and where they're shown
+// — eased there over a few frames — and how far they've walked (their
+// steps go by it).
+Other_Shown :: struct {
+	id: i64
+	reference: u32
+	told: Other_Player
+	feet: Vec3
+	yaw: f32
+	way: f32
+	swings: i64     // the swings of theirs seen
+	swing: f32      // how far into one they are (seconds); below 0 for none
+}
+
+// Another player's swing is shown for this long at most (seconds: its
+// animation's own span, if shorter).
+SWING_SHOWN :: 2
+
+// Shows the other players the server's told of that are here (in the same
+// world, or the same interior), each as a body (the player's own record's,
+// put together: npc_model); the bodies of those gone, or not here, let go.
+place_others :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	shown := &viewer.shown
+	// Those gone, or not here: let go.
+	kept : i64 = 0
+	for k in 0:viewer.others.len {
+		other := viewer.others[k]
+		told, still := seen_other(&viewer.seen, other.id)
+		if still and other_here(viewer, told) {
+			viewer.others[kept] = other
+			viewer.others[kept].told = told
+			kept += 1
+		else
+			remove_instances(shown, other.reference)
+		}
+	}
+	viewer.others.len = kept
+	// Those come, or come here: shown where they are.
+	for told in viewer.seen.others {
+		if not other_here(viewer, told) do continue
+		known := false
+		for &other in viewer.others {
+			if other.id == told.id do known = true
+		}
+		if known or not fits(viewer.others.len + 1, viewer.others.cap) do continue
+		&viewer.others + Other_Shown{id = told.id, reference = OTHER_PLAYER_KEY | u32(told.id & 0xFFFFFF), told = told,
+			feet = told.feet, yaw = told.yaw, way = 0, swings = told.swings, swing = -1}
+	}
+	// A swing of theirs begun: shown from its start, its swish heard there
+	// (the player's own weapon's).
+	for &other in viewer.others {
+		if other.told.swings == other.swings do continue
+		other.swings = other.told.swings
+		other.swing = 0
+		kind := scene_sound_kind(shown, plugin, viewer.held.swish_sound)
+		if kind >= 0 do play_once(&viewer.audio, &viewer.archives, &shown.sound_kinds[kind], other.feet, listener_of(viewer.camera))
+	}
+	// Each one's body: there, or put together and placed.
+	for &other in viewer.others {
+		placed := false
+		for &instance in shown.instances {
+			if instance.reference == other.reference do placed = true
+		}
+		if placed do continue
+		body := npc_model(shown, plugin, viewer_loader(viewer), PLAYER_NPC)
+		if body >= 0 do add_instance(shown, body, other_placement(other), other.reference)
+	}
+}
+
+// The server's word on another player, by their number; false when it's
+// told of none.
+seen_other :: fun(seen: ^World_Copy, id: i64) -> Other_Player, bool {
+	for told in seen.others {
+		if told.id == id do return told, true
+	}
+	return Other_Player{id = 0, world = 0, cell = 0, feet = Vec3{0, 0, 0}, yaw = 0, speed = 0, swings = 0, strikes = 0, struck = 0}, false
+}
+
+// Whether another player's here: in this world, or in this interior.
+other_here :: fun(viewer: ^Viewer, told: Other_Player) -> bool {
+	if told.world != viewer.shown.world do return false
+	return told.world != 0 or told.cell == viewer.inside_cell
+}
+
+// Where another player's body is placed: at their feet, turned their way.
+other_placement :: fun(other: ^Other_Shown) -> Mat4 {
+	return reference_transform(Reference{form_id = other.reference, base = PLAYER_NPC, position = other.feet,
+		rotation = Vec3{0, 0, other.yaw}, scale = 1, flags = 0})
+}
+
+// Moves the other players' bodies a frame on (seconds): eased toward where
+// the server last said they are (put there at once from far off), turned
+// their way, their steps counted; into movers, for posing them walking.
+follow_others :: fun(viewer: ^Viewer, seconds: f32, movers: ^[]Npc_Mover) {
+	shown := &viewer.shown
+	for &other in viewer.others {
+		before := other.feet
+		away := other.told.feet - other.feet
+		if vec3_length(away) > 500 do other.feet = other.told.feet
+		else do other.feet = other.feet + away * min_f32(1, seconds * 12)
+		turn := other.told.yaw - other.yaw
+		for turn > PI do turn -= 2 * PI
+		for turn < -PI do turn += 2 * PI
+		other.yaw += turn * min_f32(1, seconds * 12)
+		step := Vec3{other.feet.x - before.x, other.feet.y - before.y, 0}
+		other.way += vec3_length(step)
+		if other.swing >= 0 do other.swing += seconds
+		if other.swing > SWING_SHOWN do other.swing = -1
+		for &instance in shown.instances {
+			if instance.reference != other.reference do continue
+			moved := place_instance(shown.models[instance.model], instance.model, other_placement(other), instance.reference)
+			instance.world = moved.world
+			instance.center = moved.center
+			instance.radius = moved.radius
+		}
+		if fits(movers.len + 1, movers.cap) do movers + Npc_Mover{reference = other.reference, speed = other.told.speed, way = other.way,
+			swing = other.swing}
+	}
+}
+
+// Where the player's feet are: the walker's, or flying, below the camera.
+player_feet :: fun(viewer: ^Viewer) -> Vec3 {
+	return if viewer.walking do viewer.walker.position else viewer.camera.position - Vec3{0, 0, EYE_HEIGHT}
+}
+
+// Keeps the people shown where the server has them, as they stand. (They
+// stand still, for now: this is what moves them when they walk.)
+follow_actors :: fun(viewer: ^Viewer) {
+	shown := &viewer.shown
+	for &instance in shown.instances {
+		if instance.reference == 0 do continue
+		_, is_person := index_get(&shown.model_rigs, u64(instance.model + 1))
+		if not is_person do continue
+		actor, found := copy_actor(&viewer.seen, instance.reference)
+		if not found do continue
+		moved := place_instance(shown.models[instance.model], instance.model, reference_transform(actor), instance.reference)
+		instance.world = moved.world
+		instance.center = moved.center
+		instance.radius = moved.radius
+	}
+}
+
+// Tells the server the player's come into a place: an interior (cell), or
+// a world's cells round x, y; their feet there. (Its people come when it
+// says who they are: run_host.)
+take_place :: fun(viewer: ^Viewer, world_id: u32, cell: u32, x: i64, y: i64, feet: Vec3) {
+	send_place(outgoing(viewer), world_id, cell, x, y, feet)
+}
+
+// A game hosted on this machine is looked for this long (milliseconds)
+// before this one hosts its own; and, another starting to host in the same
+// moment (the port taken), waited for this long to be joined.
+LOCAL_GAME_WAIT :: 300
+LOCAL_GAME_STARTING_WAIT :: 2000
+
+// Opens this player's link to the world's server: connecting to it at the
+// address set (a name or a.b.c.d; :port, else DEFAULT_PORT). With none set,
+// joining a game hosted on this machine, if join_local_game and one's
+// there (opening the game twice puts two players in one world); else
+// hosting it — the server started, this player its first client, others
+// on this machine let join (host_listen; not taking a picture).
+open_link :: fun(viewer: ^Viewer, join_local_game: bool) -> err {
+	viewer.connection = no_connection()
+	viewer.server_lost = false
+	wire_start(&viewer.to_server)
+	wire_start(&viewer.from_server)
+	viewer.hosting = false
+	if viewer.server_address.len > 0 {
+		viewer.connection = wire_connect(viewer.server_address, DEFAULT_PORT)?
+		note(&viewer.journal, "connected to the server at ")
+		note(&viewer.journal, viewer.server_address)
+		note_end(&viewer.journal)
+		return
+	}
+	taking_picture := viewer.picture.path.len > 0
+	if join_local_game and not taking_picture and join_local(viewer, LOCAL_GAME_WAIT) do return
+	viewer.hosting = true
+	server_start(&viewer.server)
+	_ = server_join(&viewer.server, no_connection())
+	if taking_picture do return
+	listen_error := host_listen(viewer)
+	if listen_error == Net_Error.Port_Taken and join_local_game {
+		// (Another game began hosting as this one looked: that one's joined.)
+		if join_local(viewer, LOCAL_GAME_STARTING_WAIT) do return
+		viewer.hosting = true
+	}
+}
+
+// Joins the game hosted on this machine, if one answers within wait
+// milliseconds: true when it's joined.
+join_local :: fun(viewer: ^Viewer, wait: i64) -> bool {
+	local, lookup_error := net_lookup("127.0.0.1", DEFAULT_PORT)
+	if lookup_error do return false
+	connection, connect_error := tcp_connect(local, wait)
+	if connect_error do return false
+	viewer.connection = connection
+	viewer.hosting = false
+	note(&viewer.journal, "joined the game hosted on this machine")
+	note_end(&viewer.journal)
+	return true
+}
+
+// Has the world hosted take others joining (a bot, another window), on
+// this machine only (DEFAULT_PORT). When it can't — another game's hosting
+// there — it plays on alone, says so, and gives back why.
+host_listen :: fun(viewer: ^Viewer) -> err {
+	listener, listen_error := tcp_listen(net_local(DEFAULT_PORT))
+	if listen_error {
+		note(&viewer.journal, "others can't join this game: ")
+		note_error(&viewer.journal, listen_error)
+		note_end(&viewer.journal)
+		return listen_error
+	}
+	viewer.server.listener = listener
+	note(&viewer.journal, "others on this machine can join: port ")
+	note(&viewer.journal, DEFAULT_PORT)
+	note_end(&viewer.journal)
+}
+
+// Where this player's messages to the server go, and where its come.
+outgoing :: fun(viewer: ^Viewer) -> ^Wire_Queue {
+	if viewer.hosting do return &viewer.server.clients[0].from_client
+	return &viewer.to_server
+}
+incoming :: fun(viewer: ^Viewer) -> ^Wire_Queue {
+	if viewer.hosting do return &viewer.server.clients[0].to_client
+	return &viewer.from_server
+}
+
+// Runs this player's link to the world's server as far as now: hosting,
+// the server itself (server_run); else what's waiting for the server sent
+// and what it's sent taken in. Then what it's told is shown: its notes in
+// the journal, the sky's climate and weather, the place's people (those
+// not shown yet waiting to be).
+run_link :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	if viewer.hosting {
+		server_run(&viewer.server, plugin)
+	elif not viewer.server_lost
+		link_error := wire_send(&viewer.to_server, &viewer.connection)
+		if not link_error do link_error = wire_receive(&viewer.from_server, &viewer.connection)
+		if link_error {
+			note(&viewer.journal, "lost the server: ")
+			note_error(&viewer.journal, link_error)
+			note_end(&viewer.journal)
+			viewer.server_lost = true
+		}
+	}
+	seen := &viewer.seen
+	copy_take(seen, incoming(viewer))
+	// The server's notes, and what the others said: in the journal, and on
+	// the screen a while.
+	for told in seen.notes {
+		note(&viewer.journal, told.text)
+		note_end(&viewer.journal)
+		hud_notice(&viewer.hud, told.text)
+	}
+	seen.notes.len = 0
+	for said in seen.said {
+		words := said_text(said)
+		note(&viewer.journal, words)
+		note_end(&viewer.journal)
+		hud_say(&viewer.hud, words)
+	}
+	seen.said.len = 0
+	if seen.climate_id != viewer.climate.form_id do show_climate(viewer, plugin)
+	show_weather(viewer, plugin)
+	if seen.people_changed {
+		seen.people_changed = false
+		queue_actors(&viewer.shown, seen.actors)
+	}
+	place_others(viewer, plugin)
+}
+
+// Shows the world's time by a frame's seconds: outside, the sky at its
+// hour — its colors, the clouds' drift (faster hurried), the light
+// everything's drawn with — as its weather has come in.
+show_time :: fun(viewer: ^Viewer, seconds: f32) {
+	seen := &viewer.seen
+	scale : f32 = if seen.hurried do HURRIED_TIME_SCALE else TIME_SCALE
+	look := &viewer.look
+	look.time += seconds
+	// Blending into another region's sky (show_weather), in the viewer's own time.
+	if viewer.blending {
+		viewer.weather_share = min(1, viewer.weather_share + seconds / REGION_BLEND)
+		if viewer.weather_share >= 1 {
+			viewer.blending = false
+			viewer.weather_held = true
+		}
+	}
+	shown := &viewer.shown
+	look.outside = shown.world != 0
+	look.sky = look.outside or viewer.sky_inside
+	if not look.sky {
+		// Inside, what water there is reflects the cell's fog and ambient.
+		lighting := shown.lighting
+		look.state = Sky_State{upper = lighting.ambient, lower = lighting.fog_color, horizon = lighting.fog_color,
+			cloud_lower_color = lighting.ambient, cloud_upper_color = lighting.ambient, sun_color = Vec3{0, 0, 0},
+			stars_color = Vec3{0, 0, 0}, sun_direction = Vec3{0, 0, 1}, daylight = 0, lighting = lighting}
+		look.water = lit_water(viewer.water, lighting.ambient * 2)
+		return
+	}
+	// Without distant land, the fog ends where the loaded cells do.
+	most_fog : f32 = CELL_SIZE * (EXTERIOR_RADIUS + 0.5)
+	if has_distant_land(viewer) do most_fog = 1000000
+	look.weather_share = viewer.weather_share
+	look.state = changing_sky_at(&viewer.climate, &viewer.last_weather, &viewer.weather, viewer.weather_share, seen.hour, most_fog)
+	look.wind = mix_number(viewer.last_weather.wind_speed, viewer.weather.wind_speed, viewer.weather_share)
+	look.cloud_lower_offset += seconds * scale / TIME_SCALE * viewer.weather.cloud_speed_lower
+	look.cloud_upper_offset += seconds * scale / TIME_SCALE * viewer.weather.cloud_speed_upper
+	// A lightning flash, in its color, fading.
+	if viewer.lightning > 0 {
+		flash := viewer.weather.lightning_color * viewer.lightning
+		look.state.upper = look.state.upper + flash * 0.6
+		look.state.lower = look.state.lower + flash * 0.4
+		look.state.horizon = look.state.horizon + flash * 0.5
+		look.state.cloud_lower_color = look.state.cloud_lower_color + flash * 0.7
+		look.state.cloud_upper_color = look.state.cloud_upper_color + flash * 0.7
+		look.state.lighting.ambient = look.state.lighting.ambient + flash * 0.35
+		viewer.lightning = max(0, viewer.lightning - seconds * LIGHTNING_FADE)
+	}
+	shown.lighting = look.state.lighting
+	look.water = lit_water(viewer.water, look.state.lighting.ambient + look.state.lighting.directional * 0.6)
+	move_night_sky(viewer)
+}
+
+// Outside, what's heard now and then, the same for every player: rolled
+// from the world's seed, its time and where (chance_at), not each player's
+// own. The regions' sounds: in each REGION_SOUND_TRY seconds of the world's
+// time, at each spot round the player (the 3 by 3 SOUND_SPOT squares round
+// theirs), each sound by its chance, a ninth at a spot (in the weathers
+// it's for, within its hours), somewhere in it. Thunder: tried each second
+// of the world's, as often as the weather has it once it's mostly come in,
+// with a lightning flash.
+outdoor_sounds :: fun(viewer: ^Viewer, listener: Listener, now: f64) {
+	shown := &viewer.shown
+	seen := &viewer.seen
+	slot := i64(seen.seconds / REGION_SOUND_TRY)
+	if slot != viewer.region_slot {
+		viewer.region_slot = slot
+		spot_x := i64(floor_f32(listener.position.x / SOUND_SPOT))
+		spot_y := i64(floor_f32(listener.position.y / SOUND_SPOT))
+		for y in spot_y - 1..spot_y + 1 {
+			for x in spot_x - 1..spot_x + 1 {
+				for &region_sound in viewer.region_sounds {
+					if viewer.weather.classification & region_sound.weathers == 0 do continue
+					sound := u64(region_sound.sound) << 2
+					if chance_at(seen.seed, slot, x, y, sound) >= region_sound.chance / 9 do continue
+					// (Its kind was read when the regions were: in the scene's kinds.)
+					kind_index := scene_sound_kind_known(shown, region_sound.sound)
+					if kind_index < 0 do continue
+					kind := &shown.sound_kinds[kind_index]
+					if not plays_at_hour(kind, seen.hour) do continue
+					place := Vec3{(f32(x) + chance_at(seen.seed, slot, x, y, sound + 1)) * SOUND_SPOT,
+						(f32(y) + chance_at(seen.seed, slot, x, y, sound + 2)) * SOUND_SPOT,
+						listener.position.z + chance_at(seen.seed, slot, x, y, sound + 3) * 400}
+					play_once(&viewer.audio, &viewer.archives, kind, place, listener)
+				}
+			}
+		}
+	}
+	second := i64(seen.seconds)
+	if viewer.weather.thunder > 0 and viewer.weather_share > 0.5 and second != viewer.thunder_second {
+		viewer.thunder_second = second
+		if chance_at(seen.seed, second, 0, 0, THUNDER_KEY) < viewer.weather.thunder * THUNDER_CHANCE {
+			viewer.lightning = 1
+			for sound in viewer.weather.sounds {
+				if sound.role != WEATHER_SOUND_THUNDER do continue
+				kind_index := scene_sound_kind_known(shown, sound.sound)
+				if kind_index < 0 do continue
+				thunder := shown.sound_kinds[kind_index]
+				thunder.flags |= SOUND_2D
+				play_once(&viewer.audio, &viewer.archives, &thunder, listener.position, listener)
+				break
+			}
+		}
+	}
+}
+
+// The weather sounds a weather makes all along: its rain's and wind's,
+// heard everywhere (whatever their own flags say). Into sounds; their
+// kinds read into the scene's.
+weather_sound_list :: fun(viewer: ^Viewer, plugin: ^Plugin, weather: ^Weather, sounds: ^[]Placed_Sound, list_bit: u64) {
+	sounds.len = 0
+	for sound in weather.sounds {
+		if sound.role != WEATHER_SOUND_PRECIPITATION and sound.role != WEATHER_SOUND_WIND do continue
+		kind_index := scene_sound_kind(&viewer.shown, plugin, sound.sound)
+		if kind_index < 0 or not fits(sounds.len + 1, sounds.cap) do continue
+		kind := viewer.shown.sound_kinds[kind_index]
+		kind.flags |= SOUND_2D
+		// (Keys apart from the references': a weather's own.)
+		sounds + Placed_Sound{kind = kind, position = Vec3{0, 0, 0}, key = WEATHER_SOUND_KEY | list_bit | u64(sound.sound),
+			next_play = 0, volume = 0}
+	}
+	// Its thunder's kinds, read now so the thunder needs no reading.
+	for sound in weather.sounds {
+		if sound.role == WEATHER_SOUND_THUNDER do _ = scene_sound_kind(&viewer.shown, plugin, sound.sound)
+	}
+}
+
+// The moons' phases, in turn, by their pictures' names.
+MOON_PHASES :: ["full", "three_wan", "half_wan", "one_wan", "new", "one_wax", "half_wax", "three_wax"]
+
+// The night sky at the hour: the stars turned with it; the moons across
+// it, from dusk to the next morning (Secunda a little ahead and faster),
+// each in its phase by the days gone (a phase lasting the climate's days);
+// the sun's glare, as much as the weather and the sun's height have it.
+move_night_sky :: fun(viewer: ^Viewer) {
+	look := &viewer.look
+	climate := &viewer.climate
+	days := f32(viewer.seen.day) + viewer.seen.hour / 24
+	look.stars_turn = days * 6.2831853 / STARS_TURN_DAYS
+	dusk := climate.sunset_begin
+	since_dusk := viewer.seen.hour - dusk
+	if since_dusk < 0 do since_dusk += 24
+	night_hours := climate.sunrise_end + 24 - dusk
+	along := since_dusk / night_hours * 3.14159265
+	look.masser_direction = vec3_normalize(Vec3{cos_f32(along), 0.45, sin_f32(along)})
+	ahead := along * 1.15 + 0.35
+	look.secunda_direction = vec3_normalize(Vec3{cos_f32(ahead), 0.2, sin_f32(ahead)})
+	look.masser_size = if climate.masser do MASSER_SIZE else 0
+	look.secunda_size = if climate.secunda do SECUNDA_SIZE else 0
+	phase := i64(days / max(climate.phase_days, 1)) % 8
+	if phase != viewer.moon_phase {
+		viewer.moon_phase = phase
+		room := &viewer.room
+		for moon in ["masser", "secunda"] {
+			path : [160]utf8
+			&path + "textures\\sky\\"
+			&path + moon
+			&path + "_"
+			&path + MOON_PHASES[phase]
+			&path + ".dds"
+			slot := texture_for(&viewer.renderer, &viewer.archives, path, &room.texture, CLAMP_BOTH)
+			if moon == "masser" do look.masser = slot
+			else do look.secunda = slot
+		}
+	}
+	glare := mix_number(viewer.last_weather.sun_glare, viewer.weather.sun_glare, viewer.weather_share)
+	look.sun_glare_strength = glare * look.state.daylight * min(1, max(0, look.state.sun_direction.z * 4))
+}
+
+// The night sky's textures: its stars' and nebula's (the climate's night
+// sky mesh's first two parts'), and the sun's glare's.
+night_sky_textures :: fun(viewer: ^Viewer) -> err {
+	look := &viewer.look
+	room := &viewer.room
+	climate := &viewer.climate
+	look.sun_glare = texture_for(&viewer.renderer, &viewer.archives, climate.sun_glare_texture, &room.texture, CLAMP_BOTH)
+	look.stars = 0
+	look.nebula = 0
+	viewer.moon_phase = -1
+	if climate.stars.len == 0 do return
+	stars_file, found := find_archived(&viewer.archives, climate.stars)
+	if not found do return Not_In_Archive
+	room.file.len = 0
+	data := read_archived(&viewer.archives, stars_file, &room.file)?
+	room.blocks.len = 0
+	failure := Nif_Failure{block = 0, type_name = room.file[0:0]}
+	mesh := read_nif(data, &room.blocks, &failure)?
+	room.model.len = 0
+	built := build_model(&mesh, &room.model)?
+	if built.parts.len > 0 do look.stars = texture_for(&viewer.renderer, &viewer.archives, built.parts[0].texture, &room.texture)
+	if built.parts.len > 1 do look.nebula = texture_for(&viewer.renderer, &viewer.archives, built.parts[1].texture, &room.texture)
+}
+
+// Water whose colors are lit by a light: dim at night, its own by day.
+lit_water :: fun(water: Water_Type, light: Vec3) -> Water_Type {
+	lit := water
+	lit.shallow = Vec3{water.shallow.x * light.x, water.shallow.y * light.y, water.shallow.z * light.z}
+	lit.deep = Vec3{water.deep.x * light.x, water.deep.y * light.y, water.deep.z * light.z}
+	lit.reflection = Vec3{water.reflection.x * light.x, water.reflection.y * light.y, water.reflection.z * light.z}
+	return lit
+}
+
+// A number between two, by a share (0: the first, 1: the second).
+mix_number :: fun(from: f32, to: f32, share: f32) -> f32 {
+	return from + (to - from) * share
+}
+
+// Takes a world's water when the viewer goes out into a world it wasn't in
+// (its sky's climate is the server's: show_climate).
+take_sky :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32) {
+	viewer.sky_inside = false
+	if viewer.sky_world == world_id do return
+	viewer.sky_world = world_id
+	scratch : [4 * MB]byte
+	water, water_error := world_water(plugin, world_id, &scratch)
+	viewer.water = if water_error do DEFAULT_WATER else water
+	if water_error {
+		note(&viewer.journal, "couldn't read the world's water: the default instead; ")
+		note_error(&viewer.journal, water_error)
+		note_end(&viewer.journal)
+	}
+}
+
+// In an interior that behaves like an exterior (the Temple of the One, the
+// Arena, Oblivion's towers), the sky lights it and shows through it (the
+// climate it's under the server's: its own, or the one outside's).
+// Elsewhere inside, none.
+take_cell_sky :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
+	scratch : [4 * MB]byte
+	behaves, _, sky_error := cell_sky(plugin, cell, &scratch)
+	if sky_error {
+		note(&viewer.journal, "couldn't tell whether the cell is lit by the sky: ")
+		note_error(&viewer.journal, sky_error)
+		note_end(&viewer.journal)
+		behaves = false
+	}
+	viewer.sky_inside = behaves
+}
+
+// Shows the climate the server says the sky's under, when it isn't the one
+// shown: its record read (the default's for none), its sun and night sky
+// on the card, the sounds of the regions where the player is.
+show_climate :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	climate_id := viewer.seen.climate_id
+	climate := default_climate()
+	if climate_id != 0 {
+		scratch : [256 * KB]byte
+		read, read_error := read_climate(plugin, climate_id, &scratch)
+		if read_error {
+			note(&viewer.journal, "couldn't read the climate: the default instead; ")
+			note_error(&viewer.journal, read_error)
+			note_end(&viewer.journal)
+		else
+			climate = read
+		}
+	}
+	climate.form_id = climate_id   // (shown, as it can be)
+	viewer.climate = climate
+	look := &viewer.look
+	look.sun = texture_for(&viewer.renderer, &viewer.archives, viewer.climate.sun_texture, &viewer.room.texture)
+	night_error := night_sky_textures(viewer)
+	if night_error {
+		note(&viewer.journal, "couldn't read the night sky: ")
+		note_error(&viewer.journal, night_error)
+		note_end(&viewer.journal)
+	}
+	journal := &viewer.journal
+	climate_shown := &viewer.climate
+	note(journal, "the sky: sunrise ")
+	note(journal, i64(climate_shown.sunrise_begin))
+	note(journal, " to ")
+	note(journal, i64(climate_shown.sunrise_end))
+	note(journal, ", sunset ")
+	note(journal, i64(climate_shown.sunset_begin))
+	note(journal, " to ")
+	note(journal, i64(climate_shown.sunset_end))
+	note_end(journal)
+	take_region_sounds(viewer, plugin)
+}
+
+// The sounds the regions where the player is make now and then (birds,
+// insects), their kinds read.
+take_region_sounds :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	scratch : [256 * KB]byte
+	x, y := grid_of(player_feet(viewer))
+	sounds_error := cell_region_sounds(plugin, viewer.shown.world, x, y, &viewer.region_sounds, &scratch)
+	if sounds_error {
+		note(&viewer.journal, "couldn't read the regions' sounds here: ")
+		note_error(&viewer.journal, sounds_error)
+		note_end(&viewer.journal)
+		viewer.region_sounds.len = 0
+	}
+	for &region_sound in viewer.region_sounds do _ = scene_sound_kind(&viewer.shown, plugin, region_sound.sound)
+}
+
+// Shows the weather under the sky the server says the player's under, as
+// the server has it come in (take_weather reading one that isn't shown).
+// Walked into another region's sky, the weather coming in there is blended
+// in over REGION_BLEND seconds (blend_weather; show_time moves it on), then
+// held till the server's sky comes to it: settled on it, or another coming
+// in over it (settled on another, that's blended in too). Through a door,
+// or the first sky, the server's weathers are shown at once.
+show_weather :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	seen := &viewer.seen
+	if not seen.sky_taken do return
+	if not viewer.sky_shown or seen.sky_source != viewer.sky_source {
+		walked := viewer.sky_shown and seen.walked_into_sky
+		viewer.sky_shown = true
+		viewer.sky_source = seen.sky_source
+		viewer.weather_held = false
+		viewer.blending = false
+		note(&viewer.journal, if walked do "walked under " else "under ")
+		note(&viewer.journal, editor_id_of(plugin, seen.sky_source))
+		note(&viewer.journal, "'s sky")
+		note_end(&viewer.journal)
+		if walked do blend_weather(viewer, plugin, seen.weather)
+		else do take_server_weathers(viewer, plugin)
+		return
+	}
+	if viewer.blending do return
+	if viewer.weather_held {
+		settled := seen.weather_share >= 1
+		if settled and seen.weather != viewer.weather.form_id {
+			viewer.weather_held = false
+			blend_weather(viewer, plugin, seen.weather)
+			return
+		}
+		if not settled and seen.last_weather != viewer.weather.form_id do return
+		viewer.weather_held = false
+	}
+	if seen.weather != viewer.weather.form_id {
+		if seen.last_weather == viewer.weather.form_id do take_weather(viewer, plugin, seen.weather, .coming_goes)
+		else do take_server_weathers(viewer, plugin)
+	elif seen.last_weather != viewer.last_weather.form_id and seen.weather_share < 1
+		take_server_weathers(viewer, plugin)
+	}
+	viewer.weather_share = seen.weather_share
+}
+
+// Shows the server's weathers as they are: the one going out (unless the
+// one coming in is all the way in) and the one coming in, as far in as the
+// server has it.
+take_server_weathers :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	seen := &viewer.seen
+	if seen.weather_share >= 1 or seen.weather == seen.last_weather {
+		take_weather(viewer, plugin, seen.weather, .at_once)
+	else
+		take_weather(viewer, plugin, seen.last_weather, .at_once)
+		take_weather(viewer, plugin, seen.weather, .coming_goes)
+	}
+	viewer.weather_share = seen.weather_share
+}
+
+// Starts blending what's shown into a weather (by form id), over
+// REGION_BLEND seconds (show_time moves it on): on from where it's got to,
+// if it's the one coming in shown; back in, if it's the one going out;
+// else over the weather mostly shown (the other let go).
+blend_weather :: fun(viewer: ^Viewer, plugin: ^Plugin, chosen: u32) {
+	viewer.blending = true
+	if chosen == viewer.weather.form_id do return
+	if chosen == viewer.last_weather.form_id {
+		share := viewer.weather_share
+		take_weather(viewer, plugin, chosen, .coming_goes)
+		viewer.weather_share = 1 - share
+		return
+	}
+	going : Weather_Going = if viewer.weather_share >= 0.5 do .coming_goes else .going_stays
+	take_weather(viewer, plugin, chosen, going)
+	viewer.weather_share = 0
+}
+
+// How a weather comes in, shown (take_weather): over the one coming in
+// shown, that one going out; over the one going out shown, it going on
+// going (the one coming in let go); or at once, nothing going out.
+Weather_Going :: union {
+	at_once = 0
+	coming_goes
+	going_stays
+}
+
+// Shows a weather (by form id) coming in, as going has it: its record
+// read, its clouds and rain or snow on the card, its sounds.
+take_weather :: fun(viewer: ^Viewer, plugin: ^Plugin, chosen: u32, going: Weather_Going) {
+	scratch : [256 * KB]byte
+	weather, weather_error := read_weather(plugin, chosen, &scratch)
+	if weather_error {
+		note(&viewer.journal, "couldn't read a weather: ")
+		note_error(&viewer.journal, weather_error)
+		note_end(&viewer.journal)
+		weather = default_weather()
+		weather.form_id = chosen   // (shown, as it can be)
+	}
+	look := &viewer.look
+	room := &viewer.room
+	if going == .coming_goes {
+		viewer.last_weather = viewer.weather
+		look.cloud_lower_last = look.cloud_lower
+		look.cloud_upper_last = look.cloud_upper
+		look.last_precipitation = look.precipitation
+		viewer.last_weather_sounds = viewer.weather_sounds
+		for &sound in viewer.last_weather_sounds do sound.key |= LAST_WEATHER_BIT
+	}
+	weather_sound_list(viewer, plugin, &weather, &viewer.weather_sounds, 0)
+	rain_error := precipitation_of(viewer, &weather, &look.precipitation)
+	if rain_error {
+		note(&viewer.journal, "couldn't read a weather's rain or snow: ")
+		note_error(&viewer.journal, rain_error)
+		note_end(&viewer.journal)
+		look.precipitation.len = 0
+	}
+	viewer.weather = weather
+	look.cloud_lower = texture_for(&viewer.renderer, &viewer.archives, weather.cloud_lower, &room.texture)
+	look.cloud_upper = texture_for(&viewer.renderer, &viewer.archives, weather.cloud_upper, &room.texture)
+	if going == .at_once {
+		viewer.last_weather = weather
+		viewer.last_weather_sounds.len = 0
+		look.last_precipitation.len = 0
+		look.cloud_lower_last = look.cloud_lower
+		look.cloud_upper_last = look.cloud_upper
+	}
+	note(&viewer.journal, "the weather: ")
+	note(&viewer.journal, editor_id_of(plugin, chosen))
+	note(&viewer.journal, if going == .at_once do "" else ", coming in")
+	note_end(&viewer.journal)
+}
+
+// A weather's rain or snow: its precipitation mesh's particle systems that
+// fall (sent downward), each as drops falling through a box round the
+// camera — as many as fall at once, at the system's speed, from its
+// emitter's height, as far as they fall in their life. Into layers.
+precipitation_of :: fun(viewer: ^Viewer, weather: ^Weather, layers: ^[]Precipitation_Layer) -> err {
+	layers.len = 0
+	if weather.precipitation.len == 0 do return
+	room := &viewer.room
+	rain_file, found := find_archived(&viewer.archives, weather.precipitation)
+	if not found do return Not_In_Archive
+	room.file.len = 0
+	data := read_archived(&viewer.archives, rain_file, &room.file)?
+	room.blocks.len = 0
+	failure := Nif_Failure{block = 0, type_name = room.file[0:0]}
+	mesh := read_nif(data, &room.blocks, &failure)?
+	room.model.len = 0
+	built := build_model(&mesh, &room.model)?
+	for &system in built.particles {
+		if not fits(layers.len + 1, layers.cap) do break
+		emitter := system.emitter
+		// (Only what falls: not the splashes and mist sent up.)
+		if emitter.declination < 2 or emitter.speed <= 0 or emitter.life_span <= 0 do continue
+		layer := next(layers)
+		layer.count = min(i64(fastest_birth_rate(system) * emitter.life_span), MAX_DROPS)
+		layer.width = max(emitter.size.x, emitter.size.y)
+		layer.top = system.emitter_place[3][2]
+		layer.speed = emitter.speed
+		layer.speed_variation = emitter.speed_variation
+		layer.fall = emitter.speed * emitter.life_span
+		layer.size = max(emitter.radius, 1)
+		layer.streak = emitter.speed > 400
+		layer.light = system.look.emissive
+		layer.texture = texture_for(&viewer.renderer, &viewer.archives, system.look.texture, &room.texture, system.look.clamp_mode)
+	}
+}
+
+// Where the camera hears from: its place, and its right.
+listener_of :: fun(camera: render.Camera) -> Listener {
+	_, right, _ := camera_axes(camera)
+	return Listener{position = camera.position, right = right}
+}
+
+// Tells the journal what loading couldn't do since it last did: what the
+// scene left out, the textures drawn white and the sounds not played, how
+// many, and the first's name and why.
+note_failures :: fun(viewer: ^Viewer) {
+	shown := &viewer.shown
+	renderer := &viewer.renderer
+	journal := &viewer.journal
+	if shown.failures > 0 {
+		note(journal, "  couldn't load ")
+		note(journal, shown.failures)
+		note(journal, ", left out; the first: ")
+		note(journal, shown.first_failure)
+		note(journal, ", ")
+		note_error(journal, shown.first_failure_reason)
+		note_end(journal)
+		shown.failures = 0
+	}
+	if renderer.texture_failures > 0 {
+		note(journal, "  couldn't load ")
+		note(journal, renderer.texture_failures)
+		note(journal, " textures, drawn white; the first: ")
+		note(journal, renderer.first_texture_failure)
+		note(journal, ", ")
+		note_error(journal, renderer.first_texture_reason)
+		note_end(journal)
+		renderer.texture_failures = 0
+	}
+	sound := &viewer.audio
+	if sound.failures > 0 {
+		note(journal, "  couldn't play ")
+		note(journal, sound.failures)
+		note(journal, " sounds; the first: ")
+		note(journal, sound.first_failure)
+		note(journal, ", ")
+		note_error(journal, sound.first_failure_reason)
+		note_end(journal)
+		sound.failures = 0
+	}
+}
+
+// Counts a frame drawn; each second, the count goes in the title.
+count_frame :: fun(viewer: ^Viewer) {
+	viewer.frames_counted += 1
+	now := time_now()
+	if now - viewer.counting_since >= 1000000000 {
+		viewer.frames_a_second = viewer.frames_counted
+		viewer.frames_counted = 0
+		viewer.counting_since = now
+		update_title(viewer)
+	}
+}
+
+// Whether anything is still to load: what's waiting near the camera, the
+// outside to be readied or being readied, the distant land, or what's seen
+// from afar.
+still_loading :: fun(viewer: ^Viewer) -> bool {
+	shown := &viewer.shown
+	return anything_waiting(shown) or (shown.world == 0 and not viewer.exit_readied) or readying(shown) or
+		viewer.renderer.distant_next >= 0 or shown.distant_next >= 0
+}
+
+// Loads some of what's still to load, a frame's budget of it: a share of
+// it the distant land, then what's waiting near the camera (the nearest of
+// it first), then — inside, once that's all loaded — the outside a door
+// leads to (ready_exit), then what's seen from afar. Notes how long each
+// took once it's done.
+load_some :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	if not still_loading(viewer) do return
+	shown := &viewer.shown
+	renderer := &viewer.renderer
+	journal := &viewer.journal
+	loader := viewer_loader(viewer)
+	loading_start := time_now()
+	if renderer.distant_next >= 0 {
+		if load_distant_land_step(renderer, loader, DISTANT_LAND_SHARE) {
+			note(journal, "  distant land: ")
+			note(journal, renderer.distant_made)
+			note(journal, " pieces, ")
+			note(journal, renderer.distant_vertices_used)
+			note(journal, " vertices, loaded in ")
+			note(journal, i64((time_now() - renderer.distant_started) / 1000000))
+			note(journal, " ms")
+			if renderer.distant_failure {
+				note(journal, " (some pieces couldn't be read: ")
+				note_error(journal, renderer.distant_failure)
+				note(journal, ")")
+			}
+			note_end(journal)
+		}
+	}
+	spent := time_now() - loading_start
+	if spent < LOAD_BUDGET and anything_waiting(shown) {
+		viewer.loading_frames += 1
+		if load_waiting(shown, plugin, loader, LOAD_BUDGET - spent, viewer.camera.position) {
+			note(journal, "  caught up in ")
+			note(journal, i64((time_now() - viewer.loading_since) / 1000000))
+			note(journal, " ms over ")
+			note(journal, viewer.loading_frames)
+			note(journal, " frames: ")
+			note(journal, shown.models.len)
+			note(journal, " models loaded")
+			note_end(journal)
+			note_failures(viewer)
+		}
+	}
+	if shown.world == 0 and not viewer.exit_readied and not anything_waiting(shown) {
+		viewer.exit_readied = true
+		ready_exit(viewer, plugin)
+	}
+	spent = time_now() - loading_start
+	if spent < LOAD_BUDGET and readying(shown) {
+		if ready_step(shown, plugin, loader, LOAD_BUDGET - spent) {
+			note(journal, "  the outside readied in ")
+			note(journal, i64((time_now() - shown.ready_started) / 1000000))
+			note(journal, " ms: ")
+			note(journal, shown.grounds.len)
+			note(journal, " land cells, ")
+			note(journal, shown.models.len)
+			note(journal, " models loaded in all")
+			note_end(journal)
+		}
+	}
+	spent = time_now() - loading_start
+	if spent < LOAD_BUDGET and shown.distant_next >= 0 {
+		if place_distant_step(shown, plugin, loader, LOAD_BUDGET - spent) {
+			note(journal, "  seen from afar: ")
+			note(journal, shown.distant_instances.len)
+			note(journal, " references placed in ")
+			note(journal, i64((time_now() - shown.distant_started) / 1000000))
+			note(journal, " ms")
+			note_end(journal)
+		}
+	}
+	viewer.loading_time = time_now() - loading_start
+}
+
+// What the reticle is on, within reach: the first thing the eyes meet
+// (a wall between hides what's behind it), its reference; 0 for none.
+targeted_reference :: fun(shown: ^Scene, camera: render.Camera) -> u32 {
+	forward, _, _ := camera_axes(camera)
+	picked, distance, hit := pick(shown, camera.position, forward, DOOR_REACH)
+	if hit and is_door(shown, shown.instances[picked].reference) do return shown.instances[picked].reference
+	// A door set into a recess behind what the line meets first: a wall
+	// whose collision closes over the doorway, as the drawn wall doesn't.
+	if hit {
+		behind, _, door_hit := pick_door(shown, camera.position, forward, min(distance + DOOR_RECESS, DOOR_REACH))
+		if door_hit do return shown.instances[behind].reference
+		return shown.instances[picked].reference
+	}
+	return 0
+}
+
+// Tells the journal what E was pressed at that it couldn't use: nothing
+// within reach, or what the reticle was on.
+note_missed :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	journal := &viewer.journal
+	if viewer.missed_target == 0 {
+		note(journal, "E: nothing within reach")
+		note_end(journal)
+		return
+	}
+	scratch : [64 * KB]byte
+	what : str256
+	reference, reference_error := find_record(plugin, viewer.missed_target, &scratch)
+	if not reference_error {
+		base, has_base := form_field(plugin, reference, "NAME")
+		if has_base do what = editor_id_of(plugin, base)
+	}
+	note(journal, "E: the reticle is on ")
+	note(journal, what)
+	note(journal, " (reference ")
+	note(journal, i64(viewer.missed_target))
+	note(journal, "), not a door that leads somewhere or opens")
+	note_end(journal)
+}
+
+// A reference's door that leads somewhere: its index in the scene's
+// doors, -1 when it isn't one.
+leading_door :: fun(shown: ^Scene, reference: u32) -> i64 {
+	if reference == 0 do return -1
+	for candidate, i in shown.doors {
+		if candidate.reference == reference do return i
+	}
+	return -1
+}
+
+// `sooblivion view <mesh>`: shows a mesh in the window.
+command_view :: fun(what: []utf8, picture: Picture) {
+	directory_storage : [64 * MB]byte = void
+	directory_storage.len = 0
+	table_storage : [SOUND_ROOM + 8 * MB]byte = void
+	table_storage.len = 0
+	viewer : Viewer
+	viewer.picture = picture
+	viewer.server_address.len = 0
+	open_error := viewer_open(&viewer, &directory_storage, &table_storage)
+	if open_error {
+		print("couldn't open the viewer: %", open_error)
+		return
+	}
+	defer viewer_close(&viewer)
+	link_error := open_link(&viewer, false)
+	if link_error {
+		print("couldn't start the world: %", link_error)
+		return
+	}
+	file_room : [64 * MB]byte = void
+	file_room.len = 0
+	block_room : [16 * MB]byte = void
+	block_room.len = 0
+	model_room : [64 * MB]byte = void
+	model_room.len = 0
+	texture_room : [64 * MB]byte = void
+	texture_room.len = 0
+	viewer.room = load_room(&file_room, &block_room, &model_room, &texture_room)
+
+	shown := &viewer.shown
+	model_index := scene_model(shown, viewer_loader(&viewer), what)
+	if model_index < 0 {
+		print("couldn't load %: %", what, shown.first_failure_reason)
+		return
+	}
+	place_model(shown, model_index, what, mat4_identity(), 0)
+	set_place(&viewer, what)
+
+	// Start back from the model's middle, far enough to see all of it.
+	gpu_model := shown.models[model_index]
+	viewer.camera.position = gpu_model.center - Vec3{0, gpu_model.radius * 2, 0}
+	viewer.speed = gpu_model.radius
+	if picture.placed do place_camera(&viewer, picture)
+	for view_frame(&viewer) != .quit {}
+}
+
+// `sooblivion view-cell <editor id>`: shows an interior cell in the
+// window; its doors lead on, inside and out — after the main menu, when
+// main_menu (the game started with nothing asked: its Exit leaves before
+// anything's loaded). Joins a game hosted on this machine if there is one
+// (open_link). When it can't, it says why on the console, and gives the
+// reason back.
+command_view_cell :: fun(name: []utf8, picture: Picture, server_address: []utf8 = "", main_menu: bool = false) -> err {
+	index_storage : [96 * MB]byte = void
+	index_storage.len = 0
+	plugin, load_error := load_oblivion(&index_storage)
+	if load_error {
+		print("couldn't load the plugin: %", load_error)
+		return load_error
+	}
+	scratch : [16 * MB]byte = void
+	scratch.len = 0
+	cell, cell_error := find_interior_cell(&plugin, name, &scratch)
+	if cell_error {
+		print("no interior cell %", name)
+		return cell_error
+	}
+	directory_storage : [64 * MB]byte = void
+	directory_storage.len = 0
+	table_storage : [SOUND_ROOM + 8 * MB]byte = void
+	table_storage.len = 0
+	viewer : Viewer
+	viewer.picture = picture
+	add_what_fits(&viewer.server_address, server_address)
+	open_error := viewer_open(&viewer, &directory_storage, &table_storage)
+	if open_error {
+		print("couldn't open the viewer: %", open_error)
+		return open_error
+	}
+	defer viewer_close(&viewer)
+	file_room : [64 * MB]byte = void
+	file_room.len = 0
+	block_room : [16 * MB]byte = void
+	block_room.len = 0
+	model_room : [64 * MB]byte = void
+	model_room.len = 0
+	texture_room : [64 * MB]byte = void
+	texture_room.len = 0
+	viewer.room = load_room(&file_room, &block_room, &model_room, &texture_room)
+
+	if main_menu and not run_main_menu(&viewer) do return
+	link_error := open_link(&viewer, true)
+	if link_error {
+		print("couldn't reach the world's server: %", link_error)
+		return link_error
+	}
+	go_inside(&viewer, &plugin, cell)
+	start_in_cell(&viewer, &plugin)
+	if picture.placed do place_camera(&viewer, picture)
+	place_walker(&viewer)
+	take_place(&viewer, 0, cell, 0, 0, player_feet(&viewer))
+	take_first_person(&viewer, &plugin)
+	explore(&viewer, &plugin)
+}
+
+// `sooblivion view-world [world] [x y]`: shows a world's land and what's
+// on it around the cell at x, y on its grid.
+command_view_world :: fun(name: []utf8, x: i64, y: i64, picture: Picture, server_address: []utf8 = "") {
+	index_storage : [96 * MB]byte = void
+	index_storage.len = 0
+	plugin, load_error := load_oblivion(&index_storage)
+	if load_error {
+		print("couldn't load the plugin: %", load_error)
+		return
+	}
+	scratch : [16 * MB]byte = void
+	scratch.len = 0
+	world_id := find_world(&plugin, name, &scratch)
+	if world_id == 0 {
+		print("no world %", name)
+		return
+	}
+	directory_storage : [64 * MB]byte = void
+	directory_storage.len = 0
+	table_storage : [SOUND_ROOM + 8 * MB]byte = void
+	table_storage.len = 0
+	viewer : Viewer
+	viewer.picture = picture
+	add_what_fits(&viewer.server_address, server_address)
+	open_error := viewer_open(&viewer, &directory_storage, &table_storage)
+	if open_error {
+		print("couldn't open the viewer: %", open_error)
+		return
+	}
+	defer viewer_close(&viewer)
+	file_room : [64 * MB]byte = void
+	file_room.len = 0
+	block_room : [16 * MB]byte = void
+	block_room.len = 0
+	model_room : [64 * MB]byte = void
+	model_room.len = 0
+	texture_room : [64 * MB]byte = void
+	texture_room.len = 0
+	viewer.room = load_room(&file_room, &block_room, &model_room, &texture_room)
+
+	// In the middle of the cell, high enough to be over its land.
+	middle := Vec3{(f32(x) + 0.5) * CELL_SIZE, (f32(y) + 0.5) * CELL_SIZE, 0}
+	middle.z = ground_height(&plugin, world_id, middle, &scratch) + EYE_HEIGHT
+	if picture.placed do middle = picture.position
+	link_error := open_link(&viewer, true)
+	if link_error {
+		print("couldn't reach the world's server: %", link_error)
+		return
+	}
+	go_outside(&viewer, &plugin, world_id, middle)
+	if picture.placed do place_camera(&viewer, picture)
+	take_first_person(&viewer, &plugin)
+	explore(&viewer, &plugin)
+}
+
+// Flies or walks around until the viewer quits (on foot from where the
+// camera starts): through doors when E is pressed at one, and outside,
+// into the cells around the camera as it moves — what they need loaded a
+// little each frame.
+explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	place_walker(viewer)
+	scratch : [16 * MB]byte = void
+	scratch.len = 0
+	journal := &viewer.journal
+	for true {
+		placed_this_frame := false
+		run_link(viewer, plugin)
+		match view_frame(viewer) {
+		nothing
+		quit
+			return
+		crossed
+			placed_this_frame = true
+			x, y := grid_of(viewer.camera.position)
+			start := time_now()
+			show_error := show_exterior(&viewer.shown, plugin, viewer.shown.world, x, y)
+			// (The server takes the cells' people and weathers.)
+			take_place(viewer, viewer.shown.world, 0, x, y, player_feet(viewer))
+			choose_music(viewer, plugin, exterior_cell(plugin, viewer.shown.world, x, y), viewer.shown.world)
+			take_region_sounds(viewer, plugin)
+			note(journal, "into ")
+			note(journal, x)
+			note(journal, " ")
+			note(journal, y)
+			note(journal, ": ")
+			note(journal, viewer.shown.instances.len)
+			note(journal, " instances placed in ")
+			note(journal, elapsed_ms(start))
+			note(journal, " ms, ")
+			note(journal, viewer.shown.waiting.len + viewer.shown.waiting_land.len)
+			note(journal, " waiting to load")
+			if show_error do note(journal, " (placing the cells stopped early)")
+			note_end(journal)
+			viewer.loading_since = start
+			viewer.loading_frames = 0
+			viewer.crossing_time = time_now() - start
+		door
+			scratch.len = 0
+			there, leads, door_error := door_destination(plugin, viewer.shown.doors[viewer.chosen_door].reference, &scratch)
+			if door_error {
+				note(journal, "that door's record couldn't be read: ")
+				note_error(journal, door_error)
+				note_end(journal)
+				continue
+			}
+			if not leads {
+				note(journal, "that door leads nowhere")
+				note_end(journal)
+				continue
+			}
+			target := cell_of_reference(plugin, there.door)
+			if target == 0 {
+				note(journal, "that door's other side isn't in any cell found")
+				note_end(journal)
+				continue
+			}
+			arrival := there.position + Vec3{0, 0, EYE_HEIGHT}
+			world_id := cell_world(plugin, target)
+			if world_id != 0 do go_outside(viewer, plugin, world_id, arrival)
+			else do go_inside(viewer, plugin, target)
+			viewer.camera.position = arrival
+			viewer.camera.yaw = there.rotation.z
+			viewer.camera.pitch = 0
+			place_walker(viewer)
+			if world_id == 0 do take_place(viewer, 0, target, 0, 0, player_feet(viewer))
+		}
+		// The map of the world shown, read when it changes.
+		if viewer.shown.world != 0 and viewer.shown.world != viewer.map_world {
+			viewer.map_world = viewer.shown.world
+			read_world_map(plugin, viewer.shown.world, &viewer.world_map)
+		}
+		// What the reticle is on, named for the HUD when it changes.
+		if viewer.targeted != viewer.hud.named {
+			viewer.hud.named = viewer.targeted
+			viewer.hud.name = reference_name(plugin, viewer.targeted)
+		}
+		// A swing's sounds, when step_first_person has them begin: its swish,
+		// its blow's on someone or something. The blow told of as it lands.
+		if viewer.held.swinging {
+			play_player_sound(viewer, plugin, viewer.held.swish_sound)
+			viewer.held.swinging = false
+			viewer.swings += 1
+		}
+		if viewer.held.blow_sound != 0 {
+			play_player_sound(viewer, plugin, viewer.held.blow_sound)
+			viewer.held.blow_sound = 0
+		}
+		if viewer.held.swung {
+			note_blow(viewer, plugin)
+			viewer.held.swung = false
+			if viewer.held.struck_reference != 0 {
+				viewer.strikes += 1
+				viewer.struck = viewer.held.struck_reference
+			}
+		}
+		if viewer.missed {
+			note_missed(viewer, plugin)
+			viewer.missed = false
+		}
+		// (Not on the frame that placed cells: it's had its share of work.)
+		if not placed_this_frame do load_some(viewer, plugin)
+	}
+}
+
+// Readies the outside the nearest door out of here leads to (ready_outside),
+// and its world's distant land and what's seen from afar, so going out
+// shows it at once. Nothing when no door here leads outside.
+ready_exit :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	shown := &viewer.shown
+	scratch : [64 * KB]byte
+	world_id : u32 = 0
+	place := Vec3{0, 0, 0}
+	nearest : f32 = 0
+	for way_out, k in shown.doors {
+		scratch.len = 0
+		there, leads, door_error := door_destination(plugin, way_out.reference, &scratch)
+		if door_error or not leads do continue
+		target := cell_of_reference(plugin, there.door)
+		if target == 0 do continue
+		door_world := cell_world(plugin, target)
+		if door_world == 0 do continue
+		away := way_out.position - viewer.camera.position
+		distance := away.x * away.x + away.y * away.y + away.z * away.z
+		if world_id == 0 or distance < nearest {
+			world_id = door_world
+			place = there.position
+			nearest = distance
+			viewer.exit_door = k
+		}
+	}
+	if world_id == 0 do return
+	x, y := grid_of(place)
+	ready_outside(shown, plugin, world_id, x, y)
+	if viewer.renderer.distant_world != world_id do begin_distant_land(&viewer.renderer, world_id)
+	if shown.distant_world != world_id do begin_distant_objects(shown, world_id)
+	journal := &viewer.journal
+	note(journal, "  readying the outside the nearest door leads to: ")
+	note(journal, record_name(plugin, world_id))
+	note(journal, " (")
+	note(journal, x)
+	note(journal, " ")
+	note(journal, y)
+	note(journal, "), ")
+	note(journal, shown.waiting_land.len)
+	note(journal, " land cells")
+	note_end(journal)
+}
+
+// Shows an interior cell, its name in the window's title: what it holds
+// loaded from then on, a little each frame (load_some), then the outside
+// a door leads to readied. (The caller tells the server of the place once
+// the player's in it, where they arrive: take_place.)
+go_inside :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32) {
+	shown := &viewer.shown
+	start := time_now()
+	viewer.inside_cell = cell
+	viewer.exit_readied = false
+	viewer.exit_door = -1
+	show_error := show_interior(shown, plugin, cell, viewer_loader(viewer))
+	take_cell_sky(viewer, plugin, cell)
+	choose_music(viewer, plugin, cell, 0)
+	viewer.speed = 400
+	name := record_name(plugin, cell)
+	set_place(viewer, name)
+	journal := &viewer.journal
+	note(journal, name)
+	note(journal, ": ")
+	note(journal, shown.instances.len)
+	note(journal, " instances, ")
+	note(journal, shown.lights.len)
+	note(journal, " lights, ")
+	note(journal, shown.doors.len)
+	note(journal, " doors, in ")
+	note(journal, elapsed_ms(start))
+	note(journal, " ms; ")
+	note(journal, shown.waiting.len)
+	note(journal, " waiting to load")
+	if show_error {
+		note(journal, " (reading the cell stopped early: ")
+		note_error(journal, show_error)
+		note(journal, ")")
+	}
+	note_end(journal)
+	viewer.loading_since = start
+	viewer.loading_frames = 0
+	viewer.frame_start = time_now()
+}
+
+// Shows a world's cells around a place in it, the world's name in the
+// window's title, the camera there: the cells' land and what they hold
+// loaded from then on, a little each frame, and the world's distant land
+// and what's seen from afar after them (load_some).
+go_outside :: fun(viewer: ^Viewer, plugin: ^Plugin, world_id: u32, place: Vec3) {
+	shown := &viewer.shown
+	start := time_now()
+	viewer.inside_cell = 0
+	take_sky(viewer, plugin, world_id)
+	if viewer.renderer.distant_world != world_id do begin_distant_land(&viewer.renderer, world_id)
+	if viewer.shown.distant_world != world_id do begin_distant_objects(&viewer.shown, world_id)
+	x, y := grid_of(place)
+	show_error := show_exterior(shown, plugin, world_id, x, y)
+	take_place(viewer, world_id, 0, x, y, place - Vec3{0, 0, EYE_HEIGHT})
+	choose_music(viewer, plugin, exterior_cell(plugin, world_id, x, y), world_id)
+	viewer.loading_since = start
+	viewer.loading_frames = 0
+	viewer.camera.position = place
+	viewer.speed = 1500
+	name := record_name(plugin, world_id)
+	set_place(viewer, name)
+	journal := &viewer.journal
+	note(journal, name)
+	note(journal, " (")
+	note(journal, x)
+	note(journal, " ")
+	note(journal, y)
+	note(journal, "): ")
+	note(journal, shown.instances.len)
+	note(journal, " instances, ")
+	note(journal, shown.lights.len)
+	note(journal, " lights, ")
+	note(journal, shown.doors.len)
+	note(journal, " doors, in ")
+	note(journal, elapsed_ms(start))
+	note(journal, " ms; ")
+	note(journal, shown.waiting.len + shown.waiting_land.len)
+	note(journal, " waiting to load")
+	if show_error {
+		note(journal, " (placing the cells stopped early: ")
+		note_error(journal, show_error)
+		note(journal, ")")
+	}
+	note_end(journal)
+	viewer.frame_start = time_now()
+}
+
+// Wants the music of a place: a cell (0 for none) in a world (0 inside).
+choose_music :: fun(viewer: ^Viewer, plugin: ^Plugin, cell: u32, world_id: u32) {
+	scratch : [1 * MB]byte
+	kind, music_error := place_music(plugin, cell, world_id, &scratch)
+	if music_error {
+		note(&viewer.journal, "couldn't tell the music here: ")
+		note_error(&viewer.journal, music_error)
+		note_end(&viewer.journal)
+		kind = MUSIC_EXPLORE
+	}
+	want_music(&viewer.audio, music_kind_folder(data_path("Music"), kind))
+}
+
+// Puts the camera where one arrives in the scene's cell through a door;
+// failing that, in the middle of what's placed.
+start_in_cell :: fun(viewer: ^Viewer, plugin: ^Plugin) {
+	entrance, found := scene_entrance(&viewer.shown, plugin)
+	if found {
+		viewer.camera.position = entrance.position + Vec3{0, 0, EYE_HEIGHT}
+		viewer.camera.yaw = entrance.rotation.z
+		viewer.camera.pitch = 0
+		return
+	}
+	low := Vec3{1000000, 1000000, 1000000}
+	high := Vec3{-1000000, -1000000, -1000000}
+	for instance in viewer.shown.instances {
+		for axis in 0:3 {
+			place := instance.world[3][axis]
+			if place < low[axis] do low[axis] = place
+			if place > high[axis] do high[axis] = place
+		}
+	}
+	viewer.camera.position = (low + high) * 0.5
+}
+
+// The height of the land a world shows under a place: its nearest vertex's.
+// 0 where there's no land.
+ground_height :: fun(plugin: ^Plugin, world_id: u32, place: Vec3, scratch: ^[]byte) -> f32 {
+	x, y := grid_of(place)
+	parent, parent_error := world_parent(plugin, world_id, scratch)
+	if parent_error do parent = 0
+	land_at, found := shown_land(plugin, world_id, parent, x, y)
+	if not found do return 0
+	scratch.len = 0
+	record, record_error := record_at(plugin, land_at, scratch)
+	if record_error do return 0
+	cell_land : Land
+	read_land(plugin, record, &cell_land)
+	column := i64((place.x - f32(x * CELL_SIZE)) / LAND_SPACING + 0.5)
+	row := i64((place.y - f32(y * CELL_SIZE)) / LAND_SPACING + 0.5)
+	return cell_land.heights[row * LAND_SIDE + column]
+}

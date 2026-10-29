@@ -1,0 +1,299 @@
+// The ground of exterior cells: each cell's LAND record — heights,
+// normals, colors and texture layers — made into a model to draw.
+//
+// A cell's land is 33 by 33 vertices, 128 units apart, row by row from
+// the south, each row west to east. Its texturing is by quarters
+// (quadrants: south-west, south-east, north-west, north-east; 17 by 17
+// vertices, sharing their edges): a base texture, then up to eight layers
+// laid over it, each as opaque at each vertex as its VTXT says.
+module land
+
+use mara.core
+use mara.math
+use mara.string
+use esm
+use world
+use logging
+use indexing
+
+LAND_SIDE :: 33        // vertices along a cell's side
+LAND_SPACING :: 128    // units between them
+QUADRANT_SIDE :: 17    // vertices along a quadrant's side
+// How many times a land texture repeats across a quadrant.
+TEXTURE_REPEATS :: 6
+// The texture under a quadrant whose LAND names none.
+DEFAULT_LAND_TEXTURE :: "textures\\landscape\\terrainhddirt01.dds"
+
+// A texture laid over a quadrant: an LTEX record, and how opaque it is at
+// each of the quadrant's vertices.
+Land_Layer :: struct {
+	texture: u32
+	opacity: [289!]f32    // 17 x 17, row by row from the south
+}
+
+// A quadrant's texturing: its base texture (an LTEX, 0 for the default),
+// and the layers over it.
+Land_Quadrant :: struct {
+	base: u32
+	layers: [8]Land_Layer
+}
+
+// A cell's land, read.
+Land :: struct {
+	heights: [1089!]f32    // 33 x 33
+	normals: [1089!]Vec3
+	colors: [1089!]Vec3
+	quadrants: [4!]Land_Quadrant
+}
+
+// Reads a LAND record's fields into land (its textures' form ids as the
+// game numbers them).
+read_land :: fun(plugin: ^Plugin, record: Record, land: ^Land) {
+	data := record.data
+	for i in 0:LAND_SIDE * LAND_SIDE {
+		land.heights[i] = 0
+		land.normals[i] = Vec3{0, 0, 1}
+		land.colors[i] = Vec3{1, 1, 1}
+	}
+	for q in 0:4 {
+		land.quadrants[q].base = 0
+		land.quadrants[q].layers.len = 0
+	}
+	// The quadrant and layer an ATXT starts: its VTXT comes next.
+	layer_quadrant : i64 = -1
+	fields := Fields{data = data, at = 0, broken = false}
+	for field in next_field(&fields) {
+		kind := field.kind
+		bytes := field.data
+		if kind == "VHGT" and bytes.len >= 4 + 1089 {
+			read_heights(bytes, land)
+		elif kind == "VNML" and bytes.len >= 1089 * 3
+			for i in 0:1089 {
+				x : i8 = bytes[i * 3]
+				y : i8 = bytes[i * 3 + 1]
+				z : i8 = bytes[i * 3 + 2]
+				land.normals[i] = vec3_normalize(Vec3{f32(x), f32(y), f32(z)})
+			}
+		elif kind == "VCLR" and bytes.len >= 1089 * 3
+			for i in 0:1089 do land.colors[i] = byte_color(bytes, i * 3)
+		elif kind == "BTXT" and bytes.len >= 8
+			texture : u32 = bytes[0]
+			quadrant : u8 = bytes[4]
+			if quadrant < 4 do land.quadrants[i64(quadrant)].base = record_form(plugin, record, texture)
+		elif kind == "ATXT" and bytes.len >= 8
+			texture : u32 = bytes[0]
+			quadrant : u8 = bytes[4]
+			layer_quadrant = -1
+			layers := &land.quadrants[i64(quadrant) & 3].layers
+			if quadrant < 4 and fits(layers.len + 1, layers.cap) {
+				layer_quadrant = i64(quadrant)
+				layer := next(layers)
+				layer.texture = record_form(plugin, record, texture)
+				for k in 0:289 do layer.opacity[k] = 0
+			}
+		elif kind == "VTXT" and layer_quadrant >= 0
+			layers := &land.quadrants[layer_quadrant].layers
+			layer := &layers[layers.len - 1]
+			// Each entry: the vertex (0 to 288), 2 bytes unused, the opacity.
+			for k in 0:bytes.len / 8 {
+				place : u16 = bytes[k * 8]
+				opacity : f32 = bytes[k * 8 + 4]
+				if place < 289 do layer.opacity[i64(place)] = opacity
+			}
+			layer_quadrant = -1
+		}
+	}
+}
+
+// VHGT: a starting height, then a change for each vertex — from the vertex
+// before it in its row, or for a row's first, from the first of the row
+// below. In units of 8.
+read_heights :: fun(bytes: []byte, land: ^Land) {
+	row_start : f32 = bytes[0]
+	for y in 0:LAND_SIDE {
+		first_change : i8 = bytes[4 + y * LAND_SIDE]
+		row_start += f32(first_change)
+		height := row_start
+		land.heights[y * LAND_SIDE] = height * 8
+		for x in 1:LAND_SIDE {
+			change : i8 = bytes[4 + y * LAND_SIDE + x]
+			height += f32(change)
+			land.heights[y * LAND_SIDE + x] = height * 8
+		}
+	}
+}
+
+// The LAND record a world shows at a place on its grid (its place in the
+// plugin's data), and false when there's none. A world that's part of
+// another (a city's, of Tamriel) shows its parent's land where the parent
+// has some: what's placed in it stands on that, and its own LAND records
+// there are left over, at other heights. Elsewhere, its own.
+shown_land :: fun(plugin: ^Plugin, world_id: u32, parent_id: u32, x: i64, y: i64) -> i64, bool {
+	if parent_id != 0 {
+		parent_cell := exterior_cell(plugin, parent_id, x, y)
+		if parent_cell != 0 {
+			land_at, found := find_land(plugin, parent_cell)
+			if found do return land_at, true
+		}
+	}
+	cell := exterior_cell(plugin, world_id, x, y)
+	if cell == 0 do return 0, false
+	return find_land(plugin, cell)
+}
+
+// The LAND record of an exterior cell: its place in the plugins' data, and
+// false when the cell has none. As the last plugin file to have it has it:
+// the files' groups for the cell are looked in from the last.
+find_land :: fun(plugin: ^Plugin, cell: u32) -> i64, bool {
+	for back in 1..plugin.files.len {
+		file := plugin.files.len - back
+		group_at, found := index_get(&plugin.cell_children, cell_group_key(file, cell))
+		if not found do continue
+		group_header := group_header_at(plugin, group_at)
+		end := group_at + i64(group_header.size)
+		at := group_at + HEADER_SIZE
+		for at < end {
+			header := record_header_at(plugin, at)
+			if header.kind == "GRUP" {
+				at += HEADER_SIZE
+				continue
+			}
+			if header.kind == "LAND" and winning_copy(plugin, file, header, at) do return at, true
+			at += HEADER_SIZE + i64(header.size)
+		}
+	}
+	return 0, false
+}
+
+// The archive path of an LTEX record's texture, into path; the default
+// one when the record can't be read.
+land_texture_path :: fun(plugin: ^Plugin, texture: u32, path: ^[160]utf8, scratch: ^[]byte) {
+	path.len = 0
+	if texture != 0 {
+		record, record_error := find_record(plugin, texture, scratch)
+		if not record_error {
+			icon, has_icon := find_field(record.data, "ICON")
+			if has_icon {
+				path + "textures\\landscape\\"
+				for c in field_text(icon) {
+					if not fits(path.len + 1, path.cap) do break
+					if c == '/' do path + '\\'
+					else do path + lower(c)
+				}
+				return
+			}
+		}
+	}
+	path + DEFAULT_LAND_TEXTURE
+}
+
+// The vertices of a cell's land: its quadrants', one after another.
+LAND_MESH_VERTICES :: 1156    // 4 x 17 x 17
+// The indexes of a cell's land: two triangles for each square.
+LAND_MESH_INDICES :: 6144     // 4 x 16 x 16 x 6
+// The textures a quadrant can blend: its base, and up to 8 layers.
+QUADRANT_TEXTURES :: 9
+
+// A vertex of land as the renderer draws it: 52 bytes. Which textures
+// it blends is its quadrant's: the renderer knows a vertex's quadrant by
+// its place (each quadrant's are QUADRANT_SIDE x QUADRANT_SIDE in a row).
+Land_Vertex :: struct {
+	position: Vec3
+	normal: Vec3
+	uv: [2!]f32
+	color: Vec3
+	weights: [8!]u8     // how much of each layer over the base, 0 to 255
+}
+
+// A quadrant's textures: the archive paths of its base and its layers.
+Quadrant_Textures :: struct {
+	paths: [QUADRANT_TEXTURES!][160]utf8
+	count: i64
+}
+
+// A cell's land made ready to draw: its vertices in the world's space, a
+// quadrant's after another's, each quadrant's textures, and a sphere
+// around it all.
+Land_Mesh :: struct {
+	vertices: [LAND_MESH_VERTICES!]Land_Vertex
+	textures: [4!]Quadrant_Textures
+	center: Vec3
+	radius: f32
+}
+
+// Makes a cell's land at a place on the grid into its mesh.
+build_land_mesh :: fun(plugin: ^Plugin, land: ^Land, cell_x: i64, cell_y: i64, mesh: ^Land_Mesh) {
+	origin_x := f32(cell_x * CELL_SIZE)
+	origin_y := f32(cell_y * CELL_SIZE)
+	lowest : f32 = 1000000
+	highest : f32 = -1000000
+	scratch : [64 * 1024]byte
+	for q in 0:4 {
+		quadrant := &land.quadrants[q]
+		first_x := (q & 1) * (QUADRANT_SIDE - 1)
+		first_y := (q >> 1) * (QUADRANT_SIDE - 1)
+
+		textures := &mesh.textures[q]
+		textures.count = 1 + quadrant.layers.len
+		scratch.len = 0
+		land_texture_path(plugin, quadrant.base, &textures.paths[0], &scratch)
+		// (Layers by index: one is over 1 KB, which a for-in can't hold.)
+		for k in 0:quadrant.layers.len {
+			scratch.len = 0
+			land_texture_path(plugin, quadrant.layers[k].texture, &textures.paths[k + 1], &scratch)
+		}
+
+		for row in 0:QUADRANT_SIDE {
+			for column in 0:QUADRANT_SIDE {
+				x := first_x + column
+				y := first_y + row
+				k := y * LAND_SIDE + x
+				height := land.heights[k]
+				if height < lowest do lowest = height
+				if height > highest do highest = height
+				vertex := &mesh.vertices[q * QUADRANT_SIDE * QUADRANT_SIDE + row * QUADRANT_SIDE + column]
+				vertex.position = Vec3{origin_x + f32(x * LAND_SPACING), origin_y + f32(y * LAND_SPACING), height}
+				vertex.normal = land.normals[k]
+				vertex.uv = [f32(column) * TEXTURE_REPEATS / 16, f32(row) * TEXTURE_REPEATS / 16]
+				vertex.color = land.colors[k]
+				for i in 0:8 do vertex.weights[i] = 0
+				for i in 0:quadrant.layers.len {
+					opacity := quadrant.layers[i].opacity[row * QUADRANT_SIDE + column]
+					if opacity < 0 do opacity = 0
+					if opacity > 1 do opacity = 1
+					vertex.weights[i] = u8(opacity * 255 + 0.5)
+				}
+			}
+		}
+	}
+	middle := (lowest + highest) / 2
+	mesh.center = Vec3{origin_x + CELL_SIZE / 2, origin_y + CELL_SIZE / 2, middle}
+	// Half the cell's diagonal, and half its rise.
+	half_side : f32 = CELL_SIZE / 2
+	rise := (highest - lowest) / 2
+	mesh.radius = sqrt_f32(half_side * half_side * 2 + rise * rise)
+}
+
+// The indexes every cell's land is drawn with — each cell's vertices laid
+// out alike: for each quadrant, two triangles for each square,
+// counter-clockwise seen from above.
+land_indices :: fun(indices: ^[]u16) {
+	indices.len = 0
+	for q in 0:4 {
+		first := q * QUADRANT_SIDE * QUADRANT_SIDE
+		for row in 0:QUADRANT_SIDE - 1 {
+			for column in 0:QUADRANT_SIDE - 1 {
+				south_west := u16(first + row * QUADRANT_SIDE + column)
+				south_east := south_west + 1
+				north_west := south_west + u16(QUADRANT_SIDE)
+				north_east := north_west + 1
+				indices + south_west
+				indices + south_east
+				indices + north_east
+				indices + south_west
+				indices + north_east
+				indices + north_west
+			}
+		}
+	}
+}

@@ -1,0 +1,234 @@
+// Grass: what grows on the land outside. The game doesn't store where each
+// blade is; it works it out from the land, and so does this, each time a
+// cell's land is loaded.
+//
+// A land texture (LTEX) names the grasses that grow where it lies (GNAM:
+// GRAS records). A grass says how thickly it grows, on what slopes, how
+// near the water, and how much each blade varies. The cell's land is gone
+// over on a grid, iMinGrassSize (80 units) apart: at each point a texture
+// is chosen by how much of the point each covers, then one of its grasses,
+// which grows there or not by its density and its rules; the blade is
+// moved a little off the grid, turned, and made taller or shorter.
+module grass
+
+use mara.core
+use mara.math
+use esm
+use world
+use land
+use render
+use logging
+
+// The game's settings for grass (Oblivion.ini's [Grass]): the grid's
+// spacing, and how many of a texture's grasses grow. (Where it thins out
+// is the renderer's: GRASS_FADE_START, GRASS_FADE_END.)
+GRASS_SPACING :: 80
+GRASSES_PER_TEXTURE :: 2
+
+// How a grass's distance from the water is judged (its DATA's water rule):
+// above or below the water, or either, at least or at most so far.
+ABOVE_AT_LEAST :: 0
+ABOVE_AT_MOST :: 1
+BELOW_AT_LEAST :: 2
+BELOW_AT_MOST :: 3
+EITHER_AT_LEAST :: 4
+EITHER_AT_MOST :: 5
+EITHER_AT_MOST_ABOVE :: 6
+EITHER_AT_MOST_BELOW :: 7
+
+// What a grass (GRAS) says. Its DATA: density, least and most slope, a
+// byte unused, the distance from water (u16), two bytes unused, the water
+// rule (u32), then position range, height range, color range and wave
+// period (f32), and flags.
+Grass_Look :: struct {
+	model: [256]utf8       // its mesh's archive path
+	density: f32           // 0 to 1: at how many of the grid's points it grows
+	least_slope: f32       // degrees from level
+	most_slope: f32
+	water_distance: f32
+	water_rule: i64
+	position_range: f32    // how far a blade may be from its grid point
+	height_range: f32      // how much taller or shorter: 0.35 is up to 35% either way
+	color_range: f32       // how much darker
+	wave_period: f32       // how slowly it sways
+	uniform_scale: bool    // wider as it's taller (flag 2)
+	fit_to_slope: bool     // standing out from the land, not straight up (flag 4)
+}
+
+// A kind of grass in the scene: its look and its model.
+Grass_Kind :: struct {
+	look: Grass_Look
+	model: i64
+}
+
+// A texture in a cell's land, and the kinds of grass that grow on it (-1 for none).
+Texture_Grasses :: struct {
+	texture: u32
+	kinds: [GRASSES_PER_TEXTURE!]i64
+}
+
+// A GRAS record's look; false when it has no mesh or no DATA.
+read_grass_look :: fun(record: Record) -> Grass_Look, bool {
+	look := Grass_Look{0}
+	look.model = model_path(record)
+	data, has_data := find_field(record.data, "DATA")
+	if look.model.len == 0 or not has_data or data.len < 29 do return look, false
+	density : u8 = data[0]
+	least_slope : u8 = data[1]
+	most_slope : u8 = data[2]
+	water_distance : u16 = data[4]
+	water_rule : u32 = data[8]
+	flags : u8 = data[28]
+	look.density = f32(density) / 100
+	look.least_slope = f32(least_slope)
+	look.most_slope = f32(most_slope)
+	look.water_distance = f32(water_distance)
+	look.water_rule = i64(water_rule)
+	look.position_range = data[12]
+	look.height_range = data[16]
+	look.color_range = data[20]
+	look.wave_period = data[24]
+	look.uniform_scale = flags & 2 != 0
+	look.fit_to_slope = flags & 4 != 0
+	return look, true
+}
+
+// Whether a grass's water rule lets it grow at a height, the water at
+// water_height (far below, for a cell without water).
+near_enough_water :: fun(look: ^Grass_Look, height: f32, water_height: f32) -> bool {
+	above := height - water_height
+	distance := look.water_distance
+	rule := look.water_rule
+	if rule == ABOVE_AT_LEAST do return above >= distance
+	if rule == ABOVE_AT_MOST do return above >= 0 and above <= distance
+	if rule == BELOW_AT_LEAST do return -above >= distance
+	if rule == BELOW_AT_MOST do return above <= 0 and -above <= distance
+	if rule == EITHER_AT_LEAST do return abs_f32(above) >= distance
+	if rule == EITHER_AT_MOST do return abs_f32(above) <= distance
+	if rule == EITHER_AT_MOST_ABOVE do return above <= distance
+	if rule == EITHER_AT_MOST_BELOW do return -above <= distance
+	return true
+}
+
+// A number from 0 to 1, the same each time for the same seed.
+chance :: fun(seed: u64) -> f32 {
+	mixed := seed +% 0x9E3779B97F4A7C15
+	mixed = (mixed ~ (mixed >> 30)) *% 0xBF58476D1CE4E5B9
+	mixed = (mixed ~ (mixed >> 27)) *% 0x94D049BB133111EB
+	mixed = mixed ~ (mixed >> 31)
+	return f32(mixed >> 40) / 16777216
+}
+
+// The land's height and normal at a place in the cell (units from its
+// south-west corner): between its four nearest points.
+land_height_at :: fun(cell_land: ^Land, local_x: f32, local_y: f32) -> f32, Vec3 {
+	grid_x := local_x / LAND_SPACING
+	grid_y := local_y / LAND_SPACING
+	column := i64(grid_x)
+	row := i64(grid_y)
+	if column > LAND_SIDE - 2 do column = LAND_SIDE - 2
+	if row > LAND_SIDE - 2 do row = LAND_SIDE - 2
+	across := grid_x - f32(column)
+	up := grid_y - f32(row)
+	at := row * LAND_SIDE + column
+	height := (cell_land.heights[at] * (1 - across) + cell_land.heights[at + 1] * across) * (1 - up) +
+		(cell_land.heights[at + LAND_SIDE] * (1 - across) + cell_land.heights[at + LAND_SIDE + 1] * across) * up
+	normal := (cell_land.normals[at] * (1 - across) + cell_land.normals[at + 1] * across) * (1 - up) +
+		(cell_land.normals[at + LAND_SIDE] * (1 - across) + cell_land.normals[at + LAND_SIDE + 1] * across) * up
+	return height, vec3_normalize(normal)
+}
+
+// The texture at a place in the cell, chosen by chance in proportion to
+// how much of the place each covers: the quadrant's base under its layers,
+// each layer over those before it by its opacity there.
+texture_at :: fun(cell_land: ^Land, local_x: f32, local_y: f32, pick: f32) -> u32 {
+	half := f32(QUADRANT_SIDE - 1) * LAND_SPACING
+	right := local_x >= half
+	top := local_y >= half
+	quadrant := &cell_land.quadrants[(if right do 1 else 0) + (if top do 2 else 0)]
+	grid_x := (local_x - (if right do half else 0)) / LAND_SPACING
+	grid_y := (local_y - (if top do half else 0)) / LAND_SPACING
+	column := i64(grid_x)
+	row := i64(grid_y)
+	if column > QUADRANT_SIDE - 2 do column = QUADRANT_SIDE - 2
+	if row > QUADRANT_SIDE - 2 do row = QUADRANT_SIDE - 2
+	across := grid_x - f32(column)
+	up := grid_y - f32(row)
+	at := row * QUADRANT_SIDE + column
+
+	// Each layer's share: its opacity, less what the layers over it cover.
+	// What's left is the base's. Going down from the top layer, the pick
+	// falls in one of them.
+	left := pick
+	covered : f32 = 1
+	k := quadrant.layers.len - 1
+	for k >= 0 {
+		opacity := &quadrant.layers[k].opacity
+		here := (opacity[at] * (1 - across) + opacity[at + 1] * across) * (1 - up) +
+			(opacity[at + QUADRANT_SIDE] * (1 - across) + opacity[at + QUADRANT_SIDE + 1] * across) * up
+		if here < 0 do here = 0
+		if here > 1 do here = 1
+		share := here * covered
+		if left < share do return quadrant.layers[k].texture
+		left -= share
+		covered *= 1 - here
+		k -= 1
+	}
+	return quadrant.base
+}
+
+// The grass of a cell's land, at x, y on the grid, into blades. textures
+// are the land's textures' grasses, kinds the scene's grass kinds; the
+// water at water_height (far below, where the cell has none).
+place_grass :: fun(cell_land: ^Land, x: i64, y: i64, water_height: f32, textures: []Texture_Grasses,
+	kinds: ^[]Grass_Kind, blades: ^[]Placed_Grass)
+{
+	points := CELL_SIZE / GRASS_SPACING
+	corner := Vec3{f32(x * CELL_SIZE), f32(y * CELL_SIZE), 0}
+	// (The grid's cells go to about -100: past that, nothing's below 0.)
+	cell_seed := (u64(x + 100000) *% 0x9E3779B97F4A7C15) ~ (u64(y + 100000) *% 0xC2B2AE3D27D4EB4F)
+	for row in 0:points {
+		for column in 0:points {
+			if not fits(blades.len + 1, blades.cap) do return
+			seed := cell_seed +% u64(row * 1000 + column) *% 0x100000001B3
+			local_x := (f32(column) + 0.5) * GRASS_SPACING
+			local_y := (f32(row) + 0.5) * GRASS_SPACING
+			texture := texture_at(cell_land, local_x, local_y, chance(seed))
+			// (Each choice below takes its own number: seed, seed + 1, ….)
+			if texture == 0 do continue
+			// Its grasses: one of them, by chance.
+			kind_index : i64 = -1
+			for entry in textures {
+				if entry.texture != texture do continue
+				choice := i64(chance(seed +% 1) * GRASSES_PER_TEXTURE)
+				kind_index = entry.kinds[choice]
+				if kind_index < 0 do kind_index = entry.kinds[0]
+			}
+			if kind_index < 0 do continue
+			kind := &kinds[kind_index]
+			look := &kind.look
+			if chance(seed +% 2) >= look.density do continue
+
+			// Moved off the grid by up to its position range, staying in the cell.
+			local_x += (chance(seed +% 3) * 2 - 1) * look.position_range
+			local_y += (chance(seed +% 4) * 2 - 1) * look.position_range
+			if local_x < 0 or local_y < 0 or local_x >= CELL_SIZE or local_y >= CELL_SIZE do continue
+			height, normal := land_height_at(cell_land, local_x, local_y)
+			slope := acos_f32(normal.z) * 57.29578
+			if slope < look.least_slope or slope > look.most_slope do continue
+			if not near_enough_water(look, height, water_height) do continue
+
+			scale := 1 + (chance(seed +% 5) * 2 - 1) * look.height_range
+			blades + Placed_Grass{
+				model = kind.model,
+				position = corner + Vec3{local_x, local_y, height},
+				angle = chance(seed +% 6) * 6.2831853,
+				width = if look.uniform_scale do scale else 1,
+				height = scale,
+				up = if look.fit_to_slope do normal else Vec3{0, 0, 1},
+				normal = normal,
+				brightness = 1 - chance(seed +% 7) * look.color_range * 0.5,
+				wave_period = look.wave_period}
+		}
+	}
+}

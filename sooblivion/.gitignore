@@ -1,0 +1,14 @@
+*.exe
+*.pdb
+*.ll
+*.o
+*_build/
+profile.txt
+memory.txt
+*.nif
+*.dds
+*.png
+*.log
+compiler/
+cache/
+settings.txt

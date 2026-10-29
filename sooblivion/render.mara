@@ -1,0 +1,4173 @@
+// Drawing the world with OpenGL, in few calls.
+//
+// Meshes: every model's vertices and indexes go into one shared pair of
+// buffers on the card, each part a range of them. A model placed in the
+// world (an Instance) has what drawing it needs worked out once: its
+// matrix, a sphere around it, the lights that reach it. Each frame, the
+// instances outside the camera's view are left out, the rest gathered by
+// mesh part, and each part drawn once for all its instances (instancing),
+// many parts in each call (MultiDrawElementsIndirect).
+//
+// Textures stay as the game has them — their own format, size and
+// mipmaps — and are drawn bindless where the card can (ARB_bindless_texture):
+// each instance carries its texture's handle, so parts of any textures go
+// in one call, and the meshes take about three calls a frame. Where it
+// can't, parts are drawn in a call for each texture, bound to a unit.
+//
+// Land: every cell's land is laid out alike, so all of it shares one list
+// of indexes, and each pixel blends its quadrant's textures: their handles
+// in a storage buffer (bindless), or bound to units a quadrant at a time.
+//
+// Distant land: past the cells loaded in full, the game's own low-detail
+// land (and its far water) is drawn first, with its own depth range out
+// to where the fog ends; then the depth buffer is cleared and the near
+// cells drawn over it. The near cells are all nearer than the far land
+// (it leaves them out), so nothing near can be hidden wrongly, and each
+// gets the depth buffer's precision to itself.
+//
+// Oblivion's world has z up, x east and y north; a unit is about 1.4 cm, a
+// cell 4096 units across.
+module render
+
+use mara.core
+use mara.math
+use mara.string
+use mara.memory
+use mara.open_gl
+use model
+use dds
+use bsa
+use world
+use land
+use sky
+use particles
+use logging
+use indexing
+use sprite_layer
+
+// ---- sizes ---------------------------------------------------------------------
+
+// The lights the shader knows at once (a scene's first ones), and how many
+// light one object.
+SCENE_LIGHTS :: 4096
+LIGHTS_PER_OBJECT :: 16
+NO_LIGHT :: 0xFFFF
+
+// Room in the shared mesh buffers: vertices (48 bytes each) and indexes.
+MESH_VERTEX_ROOM :: 4194304
+MESH_INDEX_ROOM :: 33554432
+// What's held in view is drawn between these (draw_frame's held).
+HELD_NEAR :: 1
+HELD_FAR :: 1000
+// How wide across what's held is drawn (degrees), whatever the screen's
+// shape: Oblivion.ini's fDefaultFOV, which the game keeps across (a wider
+// screen sees less up and down). Wider, the left hand comes into view at
+// the end of the swing from the left (onehandattackleft.kf, 0.46 s).
+HELD_FIELD_ACROSS :: 75
+// Room for rigged parts' vertices' bones and weights (16 bytes each), and
+// for the matrices they're posed with each frame (the palette).
+INFLUENCE_ROOM :: 2097152
+PALETTE_ROOM :: 65536
+// Mesh parts on the card, textures loaded, instances drawn in a frame.
+MAX_PARTS :: 65536
+MAX_FLIPS :: 1024
+MAX_MOTIONS :: 2048
+MAX_PARTICLE_KINDS :: 1024
+MAX_PARTICLE_SQUARES :: 16384   // a frame's
+MAX_PARTICLE_RUNS :: 1024
+// How far away particles are drawn, at most (beyond, they'd be a few pixels).
+PARTICLE_REACH :: 6000
+// Effects and particles fade out over this many units as they near what's
+// behind them (a floor a mist goes into, a wall), not cut off by it.
+SOFT_DISTANCE :: 24
+MAX_FLIP_FRAMES :: 16384
+MAX_BILLBOARDS :: 4096
+MAX_TEXTURES :: 8192
+MAX_DRAWN :: 65536
+
+// Cells of land on the card at once, and their quadrants.
+LAND_SLOTS :: 64
+LAND_QUADRANTS :: 256   // LAND_SLOTS x 4
+
+// Distant land: pieces on the card at once, and room for their vertices
+// and indexes. Its near plane: the far pass starts this close.
+DISTANT_PIECES :: 256
+DISTANT_VERTEX_ROOM :: 1048576
+DISTANT_INDEX_ROOM :: 4194304
+DISTANT_NEAR :: 256
+
+// Trees: cells whose trees are on the card at once, the trees a cell can
+// have (Tamriel's most is 54), the kinds of tree in a cell.
+TREE_CELLS :: 1024
+TREES_PER_CELL :: 128
+// How far (along the ground) trees are grown in full (speedtree.mara);
+// past it, their billboards.
+TREE_NEAR :: 4096
+TREE_RUNS :: 16
+
+// Grass: blades a cell's land can have at once (its grid has 51 x 51
+// points), the parts of its kinds of grass; where it thins out to nothing
+// (the game's fGrassStartFadeDistance and fGrassEndDistance).
+GRASS_PER_CELL :: 4096
+GRASS_RUNS :: 32
+GRASS_FADE_START :: 7000
+GRASS_FADE_END :: 8000
+// How far the wind sways grass at its tips, in units, from no wind to the
+// most (fGrassWindMagnitudeMin and Max).
+GRASS_WIND_LEAST :: 5
+GRASS_WIND_MOST :: 125
+
+// The cells left out of the far land and water — those drawn in full —
+// are a bit each, HIDDEN_SIDE x HIDDEN_SIDE of them around the camera's.
+HIDDEN_SIDE :: 16
+
+// How a texture's edges go, as a NIF's texturing says: past them across
+// (s) and up (t), the picture clamped at its edge or repeated.
+CLAMP_BOTH :: 0
+CLAMP_ACROSS :: 1     // clamped across, repeating up
+CLAMP_UP :: 2         // repeating across, clamped up
+REPEAT_BOTH :: 3
+
+// How sharp textures stay seen at a slant: anisotropic filtering, at most.
+MOST_ANISOTROPY :: 16
+
+// The texture units a land quadrant's textures are bound to, without
+// bindless; their normal maps'.
+LAYER_UNITS :: [QUADRANT_TEXTURES!]GL_Texture_Unit{
+	TEXTURE0, TEXTURE1, TEXTURE2, TEXTURE3, TEXTURE4, TEXTURE5, TEXTURE6, TEXTURE7, TEXTURE8}
+LAYER_NORMAL_UNITS :: [QUADRANT_TEXTURES!]GL_Texture_Unit{
+	TEXTURE9, TEXTURE10, TEXTURE11, TEXTURE12, TEXTURE13, TEXTURE14, TEXTURE15, TEXTURE16, TEXTURE17}
+
+// ---- shaders ---------------------------------------------------------------------
+// Each is written once and compiled two ways: with `#define BINDLESS` (and
+// the extension) at its top, or without.
+
+MESH_VERTEX_SHADER :: "
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec3 normal;
+layout(location = 2) in vec2 uv;
+layout(location = 3) in vec4 color;
+layout(location = 15) in vec4 tangent;      // where the texture's x runs; w: y's way from there (1 or -1)
+// Each instance's: its matrix's columns, its lights (16, two to a word), its
+// part's material, its textures' handles, how it shines.
+layout(location = 4) in vec4 world_x;
+layout(location = 5) in vec4 world_y;
+layout(location = 6) in vec4 world_z;
+layout(location = 7) in vec4 world_w;
+layout(location = 8) in uvec4 lights_low;
+layout(location = 9) in uvec4 lights_high;
+layout(location = 10) in vec4 material;     // alpha threshold, emissive color
+layout(location = 11) in uvec4 handles;     // its texture's, its glow map's (0 for none; bound: 1 for one)
+layout(location = 12) in uvec4 normal_map;  // its normal map's handle (as the glow map's), its glossiness's bits
+layout(location = 13) in vec4 specular;     // the color it shines; rigged, where its influences start, less its first vertex's id
+layout(location = 14) in vec4 motion;       // its texture moved across and up, its opacity (as they change); rigged, where its palette starts
+
+uniform mat4 view_projection;
+uniform vec3 view_right;    // the camera's right and up, in the world: leaf cards face it
+uniform vec3 view_up;
+
+// An instance's flags (Drawn_Instance's, as PART_*).
+const uint LEAF_CARDS = 1u;
+const uint RIGGED = 2u;
+
+// Rigged parts' vertices' bones (their entries in the palette) and weights,
+// four of each, two to a word: by vertex id.
+layout(std430, binding = 4) readonly buffer Skin_Influences {
+	uvec4 skin_influences[];
+};
+// This frame's palette: the matrices rigged parts' bones move them with.
+layout(std430, binding = 5) readonly buffer Bone_Palette {
+	mat4 bone_palette[];
+};
+
+// The k-th of four 16-bit values, two to a word.
+uint sixteen_bits(uvec2 words, int k) {
+	return (words[k / 2] >> (16u * uint(k & 1))) & 0xFFFFu;
+}
+
+out vec3 world_position;
+out vec3 world_normal;
+out vec3 world_tangent;
+out float tangent_way;
+out vec2 texture_uv;
+out vec4 vertex_color;
+flat out uvec4 light_words_low;
+flat out uvec4 light_words_high;
+flat out vec4 part_material;
+flat out uvec2 part_texture;
+flat out uvec2 part_glow;
+flat out uvec2 part_normal;
+flat out vec4 part_shine;   // its specular color, its glossiness
+flat out vec4 part_motion;
+flat out uint part_flags;
+
+void main() {
+	mat4 world = mat4(world_x, world_y, world_z, world_w);
+	if ((normal_map.w & RIGGED) != 0u) {
+		// Moved by its bones: their matrices, by their weights, before its own.
+		uvec4 influence = skin_influences[gl_VertexID + int(specular.w)];
+		int palette_start = int(motion.w);
+		mat4 skinning = mat4(0.0);
+		for (int k = 0; k < 4; k++) {
+			float weight = float(sixteen_bits(influence.zw, k)) / 65535.0;
+			if (weight > 0.0) skinning += bone_palette[palette_start + int(sixteen_bits(influence.xy, k))] * weight;
+		}
+		world = world * skinning;
+	}
+	vec4 placed = world * vec4(position, 1.0);
+	world_tangent = mat3(world) * tangent.xyz;
+	if ((normal_map.w & LEAF_CARDS) != 0u) {
+		// A leaf card's corner: set off from the card's place across and up
+		// the view, as far as its tangent says (scaled with the tree). (No
+		// normal map on leaves: its tangent isn't one.)
+		placed.xyz += (view_right * tangent.x + view_up * tangent.y) * length(world_x.xyz);
+		world_tangent = vec3(0.0);
+	}
+	gl_Position = view_projection * placed;
+	world_position = placed.xyz;
+	world_normal = mat3(world) * normal;
+	tangent_way = tangent.w;
+	texture_uv = uv;
+	vertex_color = color;
+	light_words_low = lights_low;
+	light_words_high = lights_high;
+	part_material = material;
+	part_texture = handles.xy;
+	part_glow = handles.zw;
+	part_normal = normal_map.xy;
+	part_shine = vec4(specular.rgb, uintBitsToFloat(normal_map.z));
+	part_motion = motion;
+	part_flags = normal_map.w;
+}
+"
+
+MESH_FRAGMENT_SHADER :: "
+in vec3 world_position;
+in vec3 world_normal;
+in vec3 world_tangent;
+in float tangent_way;
+in vec2 texture_uv;
+in vec4 vertex_color;
+flat in uvec4 light_words_low;
+flat in uvec4 light_words_high;
+flat in vec4 part_material;
+flat in uvec2 part_texture;
+flat in uvec2 part_glow;
+flat in uvec2 part_normal;
+flat in vec4 part_shine;
+flat in vec4 part_motion;
+flat in uint part_flags;
+
+// An instance's flags (Drawn_Instance's, as PART_*).
+const uint LEAF_CARDS = 1u;
+
+#ifdef BINDLESS
+#define BASE_TEXTURE sampler2D(part_texture)
+#define GLOW_TEXTURE sampler2D(part_glow)
+#define NORMAL_TEXTURE sampler2D(part_normal)
+#else
+uniform sampler2D base_texture;
+uniform sampler2D glow_texture;
+uniform sampler2D normal_texture;
+#define BASE_TEXTURE base_texture
+#define GLOW_TEXTURE glow_texture
+#define NORMAL_TEXTURE normal_texture
+#endif
+
+uniform vec3 sun_direction;       // where the light comes from
+uniform vec3 sun_color;
+uniform vec3 ambient_color;
+// The scene's lights: where each is and how far it reaches, its color now.
+struct Scene_Light {
+	vec4 place;
+	vec4 color;
+};
+layout(std430, binding = 3) readonly buffer Scene_Lights {
+	Scene_Light scene_lights[];
+};
+uniform vec3 camera_position;
+uniform vec3 fog_color;
+uniform float fog_near;
+uniform float fog_far;            // no fog when it isn't past fog_near
+uniform int adding;               // blended by adding (fire): fogged by fading out
+// Effects fade out as they near what's behind them (the depth drawn
+// before them, in unit 2), over soft_distance units; 0 for none.
+uniform sampler2D scene_depth;
+uniform float soft_distance;
+uniform vec2 depth_range;         // the projection's near and far
+
+out vec4 fragment_color;
+
+// How far from the eye a depth (0 to 1, the depth buffer's) is.
+float eye_distance(float depth) {
+	float z = depth * 2.0 - 1.0;
+	return 2.0 * depth_range.x * depth_range.y / (depth_range.y + depth_range.x - z * (depth_range.y - depth_range.x));
+}
+
+// The k-th of the part's lights (in the scene's), 65535 after the last.
+uint light_index(int k) {
+	uint word = k < 8 ? light_words_low[k / 2] : light_words_high[(k - 8) / 2];
+	return (word >> (16u * uint(k & 1))) & 0xFFFFu;
+}
+
+// How much of a light shines off the surface toward the eye, as the
+// game's SLS2015.pso has it: the highlight raised to the glossiness; full
+// while the light faces the surface more than a little, fading as it turns
+// past.
+float shine_toward(vec3 normal, vec3 to_light, vec3 to_eye, float facing) {
+	float highlight = pow(max(dot(normal, normalize(to_light + to_eye)), 0.0), part_shine.w);
+	return facing > 0.2 ? highlight : highlight * max(facing + 0.5, 0.0);
+}
+
+void main() {
+	// Its texture where its motion has moved it to now, as opaque as it is now.
+	vec4 base = texture(BASE_TEXTURE, texture_uv + part_motion.xy) * vertex_color;
+	base.a *= part_motion.z;
+	if ((part_flags & LEAF_CARDS) != 0u) {
+		// Leaves' alpha is soft (needles' edges grey) and thins out in the
+		// smaller mipmaps, till the test leaves specks: made up for, a
+		// quarter more opaque for each level down.
+		base.a *= 1.0 + max(textureQueryLod(BASE_TEXTURE, texture_uv).x, 0.0) * 0.25;
+	}
+	if (base.a < part_material.x) discard;
+	// The surface's way, as its normal map turns it (its red along the
+	// texture's x, green along y); how much it shines, the map's alpha.
+	vec3 normal = normalize(world_normal);
+	float gloss = 0.0;
+	if (part_normal != uvec2(0u)) {
+		vec4 mapped = texture(NORMAL_TEXTURE, texture_uv);
+		vec3 bump = normalize(mapped.xyz * 2.0 - 1.0);
+		vec3 across = world_tangent - normal * dot(normal, world_tangent);
+		if (dot(across, across) > 0.000001) {
+			across = normalize(across);
+			vec3 up = cross(normal, across) * tangent_way;
+			normal = normalize(across * bump.x + up * bump.y + normal * bump.z);
+		}
+		gloss = mapped.a;
+	}
+	if (!gl_FrontFacing) normal = -normal;   // a two-sided part's back
+	vec3 to_eye = normalize(camera_position - world_position);
+	// The material's own light: through its glow map where it has one (as
+	// the game's SLS2002.pso: emittance times the map, a light the
+	// texture is lit by), else all over it.
+	vec3 emitted = part_material.yzw;
+	if (part_glow != uvec2(0u)) emitted *= texture(GLOW_TEXTURE, texture_uv).rgb;
+	float sun_facing = dot(normal, sun_direction);
+	// (Leaves let the sun through: lit half from behind.)
+	float sun_lit = (part_flags & LEAF_CARDS) != 0u ? 0.5 + 0.5 * sun_facing : max(sun_facing, 0.0);
+	vec3 light = ambient_color + emitted + sun_color * sun_lit;
+	vec3 shine = sun_color * shine_toward(normal, sun_direction, to_eye, sun_facing);
+	// Its lights, nearest first, till the first none.
+	for (int k = 0; k < 16; k++) {
+		uint index = light_index(k);
+		if (index == 65535u) break;
+		Scene_Light point = scene_lights[index];
+		vec3 to_light = point.place.xyz - world_position;
+		float distance = length(to_light);
+		to_light /= max(distance, 0.001);
+		float reach = clamp(1.0 - distance / point.place.w, 0.0, 1.0);
+		reach *= reach;
+		float facing = dot(normal, to_light);
+		light += point.color.rgb * max(facing, 0.0) * reach;
+		shine += point.color.rgb * reach * shine_toward(normal, to_light, to_eye, facing);
+	}
+	// The shine is added over the lit texture, in the part's specular color.
+	vec3 color = base.rgb * light + shine * gloss * part_shine.rgb;
+	if (fog_far > fog_near) {
+		float fog = clamp((length(world_position - camera_position) - fog_near) / (fog_far - fog_near), 0.0, 1.0);
+		if (adding != 0) base.a *= 1.0 - fog;
+		else color = mix(color, fog_color, fog);
+	}
+	if (soft_distance > 0.0) {
+		float behind = eye_distance(texelFetch(scene_depth, ivec2(gl_FragCoord.xy), 0).r);
+		base.a *= clamp((behind - eye_distance(gl_FragCoord.z)) / soft_distance, 0.0, 1.0);
+	}
+	fragment_color = vec4(color, base.a);
+}
+"
+
+// Particles: squares made each frame in the world, each corner's color
+// the light it gives and its opacity; fogged as meshes are.
+PARTICLE_VERTEX_SHADER :: "
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec2 uv;
+layout(location = 2) in vec4 color;
+
+uniform mat4 view_projection;
+
+out vec3 world_position;
+out vec2 texture_uv;
+out vec4 particle_color;
+
+void main() {
+	world_position = position;
+	texture_uv = uv;
+	particle_color = color;
+	gl_Position = view_projection * vec4(position, 1.0);
+}
+"
+
+PARTICLE_FRAGMENT_SHADER :: "
+in vec3 world_position;
+in vec2 texture_uv;
+in vec4 particle_color;
+
+uniform sampler2D particle_texture;
+uniform vec3 camera_position;
+uniform vec3 fog_color;
+uniform float fog_near;
+uniform float fog_far;            // no fog when it isn't past fog_near
+uniform int adding;               // blended by adding: fogged by fading out
+uniform float alpha_threshold;    // pixels less opaque are left out
+// Particles fade out as they near what's behind them, as effect meshes do.
+uniform sampler2D scene_depth;
+uniform float soft_distance;
+uniform vec2 depth_range;
+
+out vec4 fragment_color;
+
+float eye_distance(float depth) {
+	float z = depth * 2.0 - 1.0;
+	return 2.0 * depth_range.x * depth_range.y / (depth_range.y + depth_range.x - z * (depth_range.y - depth_range.x));
+}
+
+void main() {
+	vec4 color = texture(particle_texture, texture_uv) * particle_color;
+	if (color.a < alpha_threshold) discard;
+	if (fog_far > fog_near) {
+		float fog = clamp((length(world_position - camera_position) - fog_near) / (fog_far - fog_near), 0.0, 1.0);
+		if (adding != 0) color.a *= 1.0 - fog;
+		else color.rgb = mix(color.rgb, fog_color, fog);
+	}
+	if (soft_distance > 0.0) {
+		float behind = eye_distance(texelFetch(scene_depth, ivec2(gl_FragCoord.xy), 0).r);
+		color.a *= clamp((behind - eye_distance(gl_FragCoord.z)) / soft_distance, 0.0, 1.0);
+	}
+	fragment_color = color;
+}
+"
+
+// Rain and snow: each drop a square made from its number alone — where it
+// is across the box round the camera (fixed in the world, the pattern
+// repeating every box side, so the box follows the camera), how far it has
+// fallen (round and round, at its speed), its streak or flake — faded toward
+// the box's sides and ends. No vertices are read.
+PRECIPITATION_VERTEX_SHADER :: "
+uniform mat4 view_projection;
+uniform vec3 camera_position;
+uniform vec3 camera_right;
+uniform vec3 camera_up;
+uniform float time;
+uniform vec3 box;          // its side, how high above the camera drops start, how far they fall
+uniform float speed;       // how fast they fall
+uniform vec3 drop;         // how far off that a drop's speed may be, a drop's size, streaks (1) or flakes (0)
+
+out vec2 texture_uv;
+out float fade;
+out vec3 world_position;
+
+// A number from 0 up to 1 for a drop and which of its values.
+float chance(uint index, uint which) {
+	uint n = index * 4u + which;
+	n = (n ^ 61u) ^ (n >> 16u);
+	n *= 9u;
+	n = n ^ (n >> 4u);
+	n *= 0x27d4eb2du;
+	n = n ^ (n >> 15u);
+	return float(n & 0xFFFFFFu) / 16777216.0;
+}
+
+const vec2 corners[6] = vec2[6](vec2(-1.0, -1.0), vec2(1.0, -1.0), vec2(1.0, 1.0), vec2(-1.0, -1.0), vec2(1.0, 1.0), vec2(-1.0, 1.0));
+
+void main() {
+	uint index = uint(gl_VertexID / 6);
+	vec2 corner = corners[gl_VertexID % 6];
+	float its_speed = speed + drop.x * (chance(index, 3u) * 2.0 - 1.0);
+	vec2 across = vec2(chance(index, 0u), chance(index, 1u)) * box.x;
+	vec2 near = mod(across - camera_position.xy, box.x) - box.x * 0.5;
+	float fallen = mod(chance(index, 2u) * box.z + time * its_speed, box.z);
+	vec3 center = vec3(camera_position.xy + near, camera_position.z + box.y - fallen);
+	vec3 right;
+	vec3 up;
+	if (drop.z > 0.5) {
+		// A streak: upright, facing the eye about its fall, as long as it
+		// falls in a fortieth of a second.
+		vec3 side = cross(vec3(0.0, 0.0, 1.0), camera_position - center);
+		right = (length(side) > 0.001 ? normalize(side) : camera_right) * drop.y;
+		up = vec3(0.0, 0.0, max(its_speed / 40.0, drop.y));
+	} else {
+		// A flake: facing the camera, drifting.
+		center.xy += vec2(sin(time * 0.9 + chance(index, 0u) * 40.0), cos(time * 0.7 + chance(index, 1u) * 40.0)) * 12.0;
+		right = camera_right * drop.y;
+		up = camera_up * drop.y;
+	}
+	world_position = center + right * corner.x + up * corner.y;
+	texture_uv = corner * vec2(0.5, -0.5) + 0.5;
+	fade = (1.0 - smoothstep(0.3, 0.5, length(near) / box.x)) * smoothstep(0.0, 0.1, fallen / box.z)
+		* (1.0 - smoothstep(0.85, 1.0, fallen / box.z));
+	gl_Position = view_projection * vec4(world_position, 1.0);
+}
+"
+
+PRECIPITATION_FRAGMENT_SHADER :: "
+in vec2 texture_uv;
+in float fade;
+in vec3 world_position;
+
+uniform sampler2D drop_texture;
+uniform vec3 light;        // what it's lit by, its own light with the ambient
+uniform float strength;    // how much of it falls now, as its weather comes in or goes
+uniform vec3 camera_position;
+uniform vec3 fog_color;
+uniform float fog_near;
+uniform float fog_far;
+
+out vec4 fragment_color;
+
+void main() {
+	vec4 color = texture(drop_texture, texture_uv);
+	color.rgb *= light;
+	color.a *= fade * strength;
+	if (fog_far > fog_near) {
+		float fog = clamp((length(world_position - camera_position) - fog_near) / (fog_far - fog_near), 0.0, 1.0);
+		color.rgb = mix(color.rgb, fog_color, fog);
+	}
+	fragment_color = color;
+}
+"
+
+LAND_VERTEX_SHADER :: "
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec3 normal;
+layout(location = 2) in vec2 uv;
+layout(location = 3) in vec3 color;
+layout(location = 4) in vec4 weights_first;    // layers 1 to 4, over the base
+layout(location = 5) in vec4 weights_second;   // layers 5 to 8
+
+uniform mat4 view_projection;
+
+out vec3 world_position;
+out vec3 world_normal;
+out vec2 texture_uv;
+out vec3 vertex_color;
+out vec4 layer_weights_first;
+out vec4 layer_weights_second;
+flat out uint quadrant;   // which of the land buffer's quadrants: 289 vertices each, in a row
+
+void main() {
+	gl_Position = view_projection * vec4(position, 1.0);
+	world_position = position;
+	world_normal = normal;
+	texture_uv = uv;
+	vertex_color = color;
+	layer_weights_first = weights_first;
+	layer_weights_second = weights_second;
+	quadrant = uint(gl_VertexID) / 289u;
+}
+"
+
+LAND_FRAGMENT_SHADER :: "
+in vec3 world_position;
+in vec3 world_normal;
+in vec2 texture_uv;
+in vec3 vertex_color;
+in vec4 layer_weights_first;
+in vec4 layer_weights_second;
+flat in uint quadrant;
+
+#ifdef BINDLESS
+// Each quadrant's 9 textures' handles — its base, then its layers — then
+// their 9 normal maps'.
+layout(std430, binding = 1) readonly buffer Land_Textures {
+	uvec2 land_textures[];
+};
+vec3 layer_color(int layer) {
+	return texture(sampler2D(land_textures[quadrant * 18u + uint(layer)]), texture_uv).rgb;
+}
+vec3 layer_bump(int layer) {
+	return texture(sampler2D(land_textures[quadrant * 18u + 9u + uint(layer)]), texture_uv).xyz;
+}
+#else
+uniform sampler2D layer_textures[9];
+uniform sampler2D layer_normals[9];
+vec3 layer_color(int layer) {
+	return texture(layer_textures[layer], texture_uv).rgb;
+}
+vec3 layer_bump(int layer) {
+	return texture(layer_normals[layer], texture_uv).xyz;
+}
+#endif
+
+uniform vec3 sun_direction;
+uniform vec3 sun_color;
+uniform vec3 ambient_color;
+uniform vec3 camera_position;
+uniform vec3 fog_color;
+uniform float fog_near;
+uniform float fog_far;
+
+out vec4 fragment_color;
+
+void main() {
+	float weights[8] = float[8](layer_weights_first.x, layer_weights_first.y, layer_weights_first.z, layer_weights_first.w,
+		layer_weights_second.x, layer_weights_second.y, layer_weights_second.z, layer_weights_second.w);
+	// The layers' colors and normal maps, each over those below by its weight.
+	vec3 color = layer_color(0);
+	vec3 bump = layer_bump(0);
+	for (int i = 0; i < 8; i++) {
+		if (weights[i] > 0.0) {
+			color = mix(color, layer_color(i + 1), weights[i]);
+			bump = mix(bump, layer_bump(i + 1), weights[i]);
+		}
+	}
+	color *= vertex_color;
+	// The ground's way, as the normal maps turn it: their red east along
+	// the ground (the textures' x), green north (y).
+	vec3 normal = normalize(world_normal);
+	vec3 east = normalize(vec3(1.0, 0.0, 0.0) - normal * normal.x);
+	vec3 north = cross(normal, east);
+	bump = normalize(bump * 2.0 - 1.0);
+	normal = normalize(east * bump.x + north * bump.y + normal * bump.z);
+	color *= ambient_color + sun_color * max(dot(normal, sun_direction), 0.0);
+	if (fog_far > fog_near) {
+		float fog = clamp((length(world_position - camera_position) - fog_near) / (fog_far - fog_near), 0.0, 1.0);
+		color = mix(color, fog_color, fog);
+	}
+	fragment_color = vec4(color, 1.0);
+}
+"
+
+// Whether a place is in a cell drawn in full, so the far land and water
+// leave it out: a bit for each of 16 x 16 cells from hidden_x, hidden_y.
+HIDDEN_CELLS_FUNCTION :: "
+uniform int hidden_x;
+uniform int hidden_y;
+uniform int hidden_rows[16];
+bool hidden_cell(vec2 place) {
+	ivec2 cell = ivec2(floor(place / 4096.0)) - ivec2(hidden_x, hidden_y);
+	if (cell.x < 0 || cell.x >= 16 || cell.y < 0 || cell.y >= 16) return false;
+	return (hidden_rows[cell.y] & (1 << cell.x)) != 0;
+}
+"
+
+// Distant land: its colors, shaded by its normal map, fogged; left out
+// where the cells are drawn in full. Which piece a vertex is of comes in
+// as an instance's number: the draw command's base instance.
+DISTANT_VERTEX_SHADER :: "
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec2 uv;
+layout(location = 2) in uint piece;
+uniform mat4 view_projection;
+out vec3 world_position;
+out vec2 texture_uv;
+flat out uint piece_index;
+void main() {
+	gl_Position = view_projection * vec4(position, 1.0);
+	world_position = position;
+	texture_uv = uv;
+	piece_index = piece;
+}
+"
+
+DISTANT_FRAGMENT_SHADER :: "
+in vec3 world_position;
+in vec2 texture_uv;
+flat in uint piece_index;
+
+#ifdef BINDLESS
+// Each piece's two textures' handles: its colors', its normals'.
+layout(std430, binding = 2) readonly buffer Distant_Textures {
+	uvec2 distant_textures[];
+};
+vec3 piece_color() { return texture(sampler2D(distant_textures[piece_index * 2u]), texture_uv).rgb; }
+vec3 piece_normal() { return texture(sampler2D(distant_textures[piece_index * 2u + 1u]), texture_uv).rgb; }
+#else
+uniform sampler2D color_texture;
+uniform sampler2D normal_texture;
+vec3 piece_color() { return texture(color_texture, texture_uv).rgb; }
+vec3 piece_normal() { return texture(normal_texture, texture_uv).rgb; }
+#endif
+
+uniform vec3 sun_direction;
+uniform vec3 sun_color;
+uniform vec3 ambient_color;
+uniform vec3 camera_position;
+uniform vec3 fog_color;
+uniform float fog_near;
+uniform float fog_far;
+
+out vec4 fragment_color;
+
+void main() {
+	if (hidden_cell(world_position.xy)) discard;
+	vec3 normal = normalize(piece_normal() * 2.0 - 1.0);
+	vec3 color = piece_color() * (ambient_color + sun_color * max(dot(normal, sun_direction), 0.0));
+	if (fog_far > fog_near) {
+		float fog = clamp((length(world_position - camera_position) - fog_near) / (fog_far - fog_near), 0.0, 1.0);
+		color = mix(color, fog_color, fog);
+	}
+	fragment_color = vec4(color, 1.0);
+}
+"
+
+// Trees: each its billboard, a picture standing on the tree's place and
+// turned about z to face the camera; its pixels clear of the tree left
+// out. Each corner of the picture is a vertex (0 to 3), the tree an
+// instance.
+TREE_VERTEX_SHADER :: "
+layout(location = 0) in vec3 tree_position;
+layout(location = 1) in vec3 tree_size;     // width, height, and how bright it is
+layout(location = 2) in uvec2 tree_texture;
+uniform mat4 view_projection;
+uniform vec3 camera_position;
+uniform float grown_within;   // trees nearer than this (along the ground) are grown in full, not drawn here
+out vec3 world_position;
+out vec2 texture_uv;
+out float brightness;
+flat out uvec2 texture_handle;
+void main() {
+	// The corners: 0 bottom left, 1 bottom right, 2 top right, 3 top left,
+	// seen from the camera.
+	int corner = gl_VertexID;
+	vec2 toward = camera_position.xy - tree_position.xy;
+	float away = length(toward);
+	if (away < grown_within) {
+		gl_Position = vec4(2.0, 2.0, 2.0, 1.0);   // (outside the view: nothing drawn)
+		return;
+	}
+	vec2 right = away > 0.001 ? vec2(-toward.y, toward.x) / away : vec2(1.0, 0.0);
+	float across = (corner == 1 || corner == 2) ? 0.5 : -0.5;
+	float up = corner >= 2 ? 1.0 : 0.0;
+	world_position = tree_position + vec3(right * across * tree_size.x, up * tree_size.y);
+	texture_uv = vec2(across + 0.5, 1.0 - up);
+	brightness = tree_size.z;
+	texture_handle = tree_texture;
+	gl_Position = view_projection * vec4(world_position, 1.0);
+}
+"
+
+TREE_FRAGMENT_SHADER :: "
+in vec3 world_position;
+in vec2 texture_uv;
+in float brightness;
+flat in uvec2 texture_handle;
+
+// The game's fLODTreeMipMapLODBias: sharper than the distance asks, so
+// far trees keep their leaves.
+const float mipmap_bias = -0.75;
+#ifdef BINDLESS
+vec4 picture() { return texture(sampler2D(texture_handle), texture_uv, mipmap_bias); }
+#else
+uniform sampler2D picture_texture;
+vec4 picture() { return texture(picture_texture, texture_uv, mipmap_bias); }
+#endif
+
+uniform vec3 sun_direction;
+uniform vec3 sun_color;
+uniform vec3 ambient_color;
+uniform vec3 camera_position;
+uniform vec3 fog_color;
+uniform float fog_near;
+uniform float fog_far;
+
+out vec4 fragment_color;
+
+void main() {
+	vec4 color = picture();
+	if (color.a < 0.5) discard;
+	// The picture is shaded already: lit as a whole, more as the sun's higher.
+	vec3 lit = color.rgb * brightness * (ambient_color + sun_color * (0.35 + 0.4 * max(sun_direction.z, 0.0)));
+	if (fog_far > fog_near) {
+		float fog = clamp((length(world_position - camera_position) - fog_near) / (fog_far - fog_near), 0.0, 1.0);
+		lit = mix(lit, fog_color, fog);
+	}
+	fragment_color = vec4(lit, 1.0);
+}
+"
+
+// Grass: each blade an instance of its grass's mesh (from the shared mesh
+// buffers), turned about z, scaled, stood along the way it stands. After
+// the game's grass shaders (GRASS2020.vso, GRASS2002.pso): a vertex's
+// color's alpha is how much it sways (squared: the tips, not the roots),
+// in a wave across the field as strong as the weather's wind; its color
+// shades the sun's light on it, lit by the land's normal under it, and
+// the ambient light comes on top. Past fade_start blades go, each at its
+// own distance, till none are left at fade_end.
+GRASS_VERTEX_SHADER :: "
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec3 normal;
+layout(location = 2) in vec2 uv;
+layout(location = 3) in vec4 color;
+layout(location = 4) in vec4 place;        // where it stands; its turn about z
+layout(location = 5) in vec4 stand;        // the way it stands; its width
+layout(location = 6) in vec4 lit_by;       // the land's normal under it; its height
+layout(location = 7) in vec4 look;         // its brightness, alpha threshold, sway period
+layout(location = 8) in uvec2 texture_in;
+uniform mat4 view_projection;
+uniform vec3 camera_position;
+uniform float time;
+uniform float fade_start;
+uniform float fade_end;
+uniform float wind;            // how far the tips sway, in units
+uniform vec3 sun_direction;
+uniform vec3 sun_color;
+out vec3 world_position;
+out vec2 texture_uv;
+out vec3 sunlight;             // the sun's light on it
+flat out float threshold;
+flat out uvec2 texture_handle;
+const vec2 wind_direction = vec2(0.8, 0.6);
+
+void main() {
+	float away = distance(camera_position.xy, place.xy);
+	float fade = clamp((away - fade_start) / (fade_end - fade_start), 0.0, 1.0);
+	float its_own = fract(sin(dot(place.xy, vec2(12.9898, 78.233))) * 43758.5453);
+	if (its_own < fade) {
+		gl_Position = vec4(0.0, 0.0, -2.0, 1.0);   // (gone: behind the near plane)
+		return;
+	}
+	vec3 local = position * vec3(stand.w, stand.w, lit_by.w);
+	float c = cos(place.w);
+	float s = sin(place.w);
+	local.xy = vec2(c * local.x - s * local.y, s * local.x + c * local.y);
+	// Stood along the way it stands: straight up turned to it.
+	vec3 up = normalize(stand.xyz);
+	vec3 axis = vec3(-up.y, up.x, 0.0);
+	float sin_angle = length(axis);
+	if (sin_angle > 0.0001) {
+		axis /= sin_angle;
+		local = local * up.z + cross(axis, local) * sin_angle + axis * dot(axis, local) * (1.0 - up.z);
+	}
+	// The wave: along the field (the game's 0.0078 a unit of x + y), at
+	// the grass's own pace.
+	float sway = sin(time * 6.2831853 / max(look.z * 0.1, 0.5) + (place.x + place.y) * 0.0078);
+	local.xy += wind_direction * sway * wind * color.a * color.a;
+	world_position = place.xyz + local;
+	texture_uv = uv;
+	sunlight = sun_color * color.rgb * look.x * max(dot(normalize(lit_by.xyz), sun_direction), 0.0);
+	threshold = look.y;
+	texture_handle = texture_in;
+	gl_Position = view_projection * vec4(world_position, 1.0);
+}
+"
+
+GRASS_FRAGMENT_SHADER :: "
+in vec3 world_position;
+in vec2 texture_uv;
+in vec3 sunlight;
+flat in float threshold;
+flat in uvec2 texture_handle;
+
+// The picture, its alpha raised a quarter for each mipmap level down: the
+// smaller mipmaps average the blades' alpha with the gaps', which would
+// fall under the threshold and eat far grass away.
+#ifdef BINDLESS
+vec4 picture() {
+	vec4 color = texture(sampler2D(texture_handle), texture_uv);
+	color.a *= 1.0 + max(textureQueryLod(sampler2D(texture_handle), texture_uv).x, 0.0) * 0.25;
+	return color;
+}
+#else
+uniform sampler2D picture_texture;
+vec4 picture() {
+	vec4 color = texture(picture_texture, texture_uv);
+	color.a *= 1.0 + max(textureQueryLod(picture_texture, texture_uv).x, 0.0) * 0.25;
+	return color;
+}
+#endif
+
+uniform vec3 ambient_color;
+uniform vec3 camera_position;
+uniform vec3 fog_color;
+uniform float fog_near;
+uniform float fog_far;
+
+out vec4 fragment_color;
+
+void main() {
+	vec4 color = picture();
+	if (color.a < threshold) discard;
+	vec3 lit = color.rgb * (ambient_color + sunlight);
+	if (fog_far > fog_near) {
+		float fog = clamp((length(world_position - camera_position) - fog_near) / (fog_far - fog_near), 0.0, 1.0);
+		lit = mix(lit, fog_color, fog);
+	}
+	fragment_color = vec4(lit, 1.0);
+}
+"
+
+// The sky's color seen looking a way: up from the horizon to the top of
+// the sky, down from it to the sky's lower color. Shared by the sky and
+// the water (which shows it reflected).
+SKY_COLOR_FUNCTION :: "
+uniform vec3 sky_upper;
+uniform vec3 sky_lower;
+uniform vec3 sky_horizon;
+vec3 sky_color(vec3 direction) {
+	if (direction.z >= 0.0) return mix(sky_horizon, sky_upper, pow(min(direction.z * 1.5, 1.0), 0.6));
+	return mix(sky_horizon, sky_lower, min(-direction.z * 4.0, 1.0));
+}
+"
+
+// The sky: one triangle over the whole screen, each pixel the sky the way
+// it looks — its colors, two layers of clouds on a plane far above, the sun.
+SKY_VERTEX_SHADER :: "
+out vec2 screen;
+void main() {
+	screen = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2) * 2.0 - 1.0;
+	gl_Position = vec4(screen, 1.0, 1.0);
+}
+"
+
+SKY_FRAGMENT_SHADER :: "
+in vec2 screen;
+uniform mat4 inverse_view_projection;
+uniform vec3 camera_position;
+uniform vec3 fog_color;
+uniform vec3 sun_direction;
+uniform vec3 sun_color;
+uniform vec3 cloud_lower_color;
+uniform vec3 cloud_upper_color;
+uniform vec2 cloud_lower_offset;
+uniform vec2 cloud_upper_offset;
+uniform sampler2D cloud_lower_texture;
+uniform sampler2D cloud_upper_texture;
+uniform sampler2D cloud_lower_last_texture;   // the last weather's, going out
+uniform sampler2D cloud_upper_last_texture;
+uniform float weather_share;                  // how far the coming weather has come in
+// The night sky: its stars and nebula (turned as the night goes), in the
+// stars' color; the moons, each where it is and how big, in their phases'
+// pictures, as much as it's night; the sun's glare, as much as the weather
+// has it.
+uniform sampler2D stars_texture;
+uniform sampler2D nebula_texture;
+uniform vec3 stars_color;
+uniform float stars_turn;
+uniform sampler2D masser_texture;
+uniform sampler2D secunda_texture;
+uniform vec3 masser;                          // toward it
+uniform float masser_size;                    // how big (0: none)
+uniform vec3 secunda;
+uniform float secunda_size;
+uniform float night;
+uniform sampler2D sun_glare_texture;
+uniform float sun_glare;
+
+// A picture on a patch of sky about a direction, size across: its color
+// where the way looked is on it, else nothing.
+vec4 sky_patch(sampler2D picture, vec3 direction, vec3 center, float size) {
+	if (size <= 0.0 || dot(direction, center) <= 0.0) return vec4(0.0);
+	vec3 side = normalize(cross(center, vec3(0.0, 0.0, 1.0)));
+	vec3 up = cross(side, center);
+	vec2 at = vec2(dot(direction, side), dot(direction, up)) / size + 0.5;
+	if (any(lessThan(at, vec2(0.0))) || any(greaterThan(at, vec2(1.0)))) return vec4(0.0);
+	return texture(picture, vec2(at.x, 1.0 - at.y));
+}
+uniform sampler2D sun_texture;
+out vec4 fragment_color;
+
+void main() {
+	vec4 far = inverse_view_projection * vec4(screen, 1.0, 1.0);
+	vec3 direction = normalize(far.xyz / far.w - camera_position);
+	vec3 color = sky_color(direction);
+
+	// The stars, on the dome above (seen from below its middle), turning.
+	if (direction.z > 0.0 && night > 0.0) {
+		float c = cos(stars_turn);
+		float s = sin(stars_turn);
+		vec3 turned = vec3(c * direction.x - s * direction.y, s * direction.x + c * direction.y, direction.z);
+		vec2 on_dome = turned.xy / (1.0 + turned.z);
+		vec3 stars = texture(stars_texture, on_dome * 1.5).rgb + texture(nebula_texture, on_dome * 0.7 + 0.5).rgb * 0.6;
+		color += stars * stars_color * night * smoothstep(0.0, 0.25, direction.z);
+	}
+	// The moons, over the stars.
+	vec4 moon = sky_patch(masser_texture, direction, masser, masser_size);
+	color = mix(color, moon.rgb, moon.a * night);
+	moon = sky_patch(secunda_texture, direction, secunda, secunda_size);
+	color = mix(color, moon.rgb, moon.a * night);
+
+	// The sun: its texture on a patch of sky around its direction.
+	vec3 side = normalize(cross(sun_direction, vec3(0.0, 0.0, 1.0)));
+	vec3 up = cross(side, sun_direction);
+	if (dot(direction, sun_direction) > 0.0) {
+		vec2 at = vec2(dot(direction, side), dot(direction, up)) / 0.12 + 0.5;
+		if (all(greaterThan(at, vec2(0.0))) && all(lessThan(at, vec2(1.0)))) {
+			vec4 sun = texture(sun_texture, at);
+			color += sun_color * sun.rgb * sun.a;
+		}
+	}
+	// Its glare, as the weather has it: the glare's color where its alpha
+	// shapes it.
+	if (sun_glare > 0.0) {
+		vec4 glare = sky_patch(sun_glare_texture, direction, sun_direction, 0.6);
+		color += sun_color * glare.rgb * glare.a * sun_glare;
+	}
+
+	// The clouds: two layers on a plane above, faded toward the horizon.
+	if (direction.z > 0.0) {
+		vec2 on_plane = direction.xy / direction.z;
+		float fade = smoothstep(0.03, 0.3, direction.z);
+		vec4 upper = mix(texture(cloud_upper_last_texture, on_plane * 0.3 + cloud_upper_offset),
+			texture(cloud_upper_texture, on_plane * 0.3 + cloud_upper_offset), weather_share);
+		color = mix(color, cloud_upper_color * upper.rgb, upper.a * fade);
+		vec4 lower = mix(texture(cloud_lower_last_texture, on_plane * 0.45 + cloud_lower_offset),
+			texture(cloud_lower_texture, on_plane * 0.45 + cloud_lower_offset), weather_share);
+		color = mix(color, cloud_lower_color * lower.rgb, lower.a * fade);
+	}
+
+	// Low in the sky, it fades into the fog, as the land at its edge does.
+	color = mix(color, fog_color, 1.0 - smoothstep(-0.02, 0.12, direction.z));
+	fragment_color = vec4(color, 1.0);
+}
+"
+
+// Water, after Oblivion's own (its WATER000 pixel shader, ported): a
+// normal from a scrolling ripple texture, flattened with distance; the
+// water's color, deep to shallow by how straight down it's seen; the sky
+// reflected (the game's reflection render, here the sky's color the
+// reflected way), blended toward its reflection color; Fresnel between
+// them; the sun's glint; and its opacity from Fresnel and its depth, so
+// shallow water fades out at the shore.
+WATER_VERTEX_SHADER :: "
+layout(location = 0) in vec3 position;
+layout(location = 1) in float depth;
+uniform mat4 view_projection;
+out vec3 world_position;
+out float water_depth;
+void main() {
+	world_position = position;
+	water_depth = depth;
+	gl_Position = view_projection * vec4(position, 1.0);
+}
+"
+
+WATER_FRAGMENT_SHADER :: "
+in vec3 world_position;
+in float water_depth;
+uniform sampler2D normal_map;
+uniform vec3 camera_position;
+uniform float time;
+uniform vec2 scroll;
+uniform vec3 shallow_color;
+uniform vec3 deep_color;
+uniform vec3 reflection_color;
+uniform float reflectivity;
+uniform float fresnel_base;
+uniform float sun_power;
+uniform vec3 sun_direction;
+uniform vec3 sun_color;
+uniform float daylight;
+uniform vec3 fog_color;
+uniform float fog_near;
+uniform float fog_far;
+out vec4 fragment_color;
+
+// The game's settings (Oblivion.ini's [Water]): the least opacity
+// (fAlpha, what the shader's VarAmounts.z holds), the units of depth to
+// the depth map's 1 (uDepthRange), and the ripples' repeats across a cell
+// (fTileTextureDivisor: 4096 / 4.75 units a repeat).
+const float least_opacity = 0.5;
+const float depth_scale = 125.0;
+const float ripple_size = 862.3;
+
+void main() {
+	// (The far water leaves out the cells whose own water is drawn.)
+	if (hidden_cell(world_position.xy)) discard;
+
+	// The ripples, as strong as the original's near the eye, gone flat by
+	// 10000 units away; two layers of the texture, against its repeating.
+	float flat_distance = length(camera_position.xy - world_position.xy);
+	float near = clamp(1.0 - flat_distance * 0.0001, 0.0, 1.0);
+	vec2 at = world_position.xy / ripple_size;
+	vec3 first = texture(normal_map, at + scroll * time).xyz * 2.0 - 1.0;
+	vec3 second = texture(normal_map, at * 2.37 - scroll.yx * time * 1.4 + 0.5).xyz * 2.0 - 1.0;
+	vec3 normal = first + second;
+	normal.xy *= near * near;
+	normal = normalize(normal);
+
+	vec3 to_eye = camera_position - world_position;
+	float distance = length(to_eye);
+	vec3 eye = to_eye / distance;
+	float facing = clamp(dot(eye, normal), 0.0, 1.0);
+	float fresnel = fresnel_base + (1.0 - fresnel_base) * pow(1.0 - facing, 5.0);
+	vec3 reflected = reflect(-eye, normal);
+
+	vec3 body = mix(deep_color, shallow_color, facing);
+	vec3 reflection = mix(reflection_color, sky_color(reflected), reflectivity);
+	vec3 color = mix(body, reflection, fresnel);
+	color += sun_color * pow(clamp(dot(reflected, sun_direction), 0.0, 1.0), sun_power * 8.0) * daylight;
+
+	// Opacity, as the original: Fresnel's (at least the least), toward a
+	// quarter where it's shallow; faded out from depth 0.55 to 0.2.
+	float depth = clamp(water_depth / depth_scale, 0.0, 1.0);
+	float opaque = max(least_opacity, fresnel);
+	float opacity = mix(0.25, opaque, depth);
+	if (depth < 0.55) {
+		float shore = 1.0 - (depth - 0.2) / 0.35;
+		opacity *= 1.0 - shore * shore * shore;
+	}
+	if (depth < 0.2) opacity = 0.0;
+
+	if (fog_far > fog_near) {
+		float fog = clamp((distance - fog_near) / (fog_far - fog_near), 0.0, 1.0);
+		color = mix(color, fog_color, fog);
+		opacity = mix(opacity, 1.0, fog);
+	}
+	fragment_color = vec4(color, opacity);
+}
+"
+
+// The points of a stretch of water along each side: as many as a cell's land.
+WATER_SIDE :: 33
+WATER_VERTICES :: 1089    // 33 x 33
+WATER_INDICES :: 6144     // 32 x 32 x 6
+// Stretches of water on the card at once; and past them, a slot for the far water.
+WATER_SLOTS :: 64
+FAR_WATER_SLOT :: 64
+// The ripple texture's size.
+RIPPLE_SIZE :: 256
+
+// ---- what's on the card -------------------------------------------------------------
+
+// A mesh part on the card: its range of the shared buffers, and how it's drawn.
+Mesh_Part :: struct {
+	first_index: u32
+	index_count: u32
+	base_vertex: i32
+	texture_slot: i64      // its texture: its place in the renderer's textures
+	glow_slot: i64         // its glow map's, -1 for none
+	alpha_blend: bool
+	depth_write: bool
+	two_sided: bool
+	alpha_threshold: f32   // pixels less opaque are left out; 0 for none
+	emissive: Vec3
+	normal_slot: i64       // its normal map's texture slot, -1 for none
+	first_motion: i64      // its values that change over time (in the renderer's motions)
+	motion_count: i64
+	specular: Vec3         // the color it shines (black: not at all)
+	glossiness: f32
+	additive: bool         // blended by adding its light to what's behind (fire)
+	flip: i64              // its texture's flipbook (in the renderer's flips), -1 for none
+	billboard: i64         // turned to face the camera: its billboard (in the renderer's), -1 for none
+	leaf_cards: bool       // a tree's leaves, each card turned to face the camera (Model_Part's)
+	rigged: bool           // moved by bones: each vertex's influence in the renderer's, from influence_offset on (by vertex id)
+	influence_offset: i64  // where its influences start, less its first vertex's id (base_vertex)
+}
+
+// A flipbook on the card: its frames' textures (in the renderer's
+// flip_frames), its timing and keys (as Model_Flip's), and the texture it
+// shows this frame.
+Gpu_Flip :: struct {
+	first_frame: i64
+	frame_count: i64
+	start_time: f32
+	stop_time: f32
+	frequency: f32
+	phase: f32
+	key_times: [FLIP_KEYS]f32
+	key_values: [FLIP_KEYS]f32
+	shown: i64             // a texture slot
+}
+
+// A billboard node of a model on the card: its mode (Node's billboard_mode),
+// its place in the model, and the way back.
+Gpu_Billboard :: struct {
+	mode: i64
+	node: Mat4
+	node_inverse: Mat4
+}
+
+// A model on the card: its parts and particle systems (in the renderer's),
+// and a sphere around them in the model's space.
+Gpu_Model :: struct {
+	first_part: i64
+	part_count: i64
+	first_particles: i64
+	particles_count: i64
+	center: Vec3
+	radius: f32
+	rigged: bool           // some of its parts are moved by bones (drawn only when posed: an instance's palette_base)
+}
+
+// A particle system of a model on the card: how it plays and looks (the
+// model's), its texture's slot, and its flipbook (in the renderer's), -1
+// for none.
+Particle_Kind :: struct {
+	system: Model_Particles
+	texture_slot: i64
+	flip: i64
+}
+
+// A frame's squares of one particle system, drawn together: which kind,
+// and which squares.
+Particle_Run :: struct {
+	kind: i64
+	first_square: i64
+	square_count: i64
+}
+
+// Rain or snow round the camera, as one of a weather's precipitation
+// mesh's particle systems has it: drops falling through a box that follows
+// the camera — how many, the box's side, how high above the camera they
+// start and how far they fall, how fast (and how far off that a drop may
+// be), how big; drawn as streaks along their fall (rain) or as flakes
+// facing the camera (snow); their texture and own light.
+Precipitation_Layer :: struct {
+	texture: i64
+	count: i64
+	width: f32
+	top: f32
+	fall: f32
+	speed: f32
+	speed_variation: f32
+	size: f32
+	streak: bool
+	light: Vec3
+}
+
+// A weather's precipitation layers, at most; a layer's drops, at most.
+PRECIPITATION_LAYERS :: 3
+MAX_DROPS :: 24000
+
+// The precipitation program, and where its uniforms are.
+Precipitation_Program :: struct {
+	program: u32
+	shared: Shared_Uniforms
+	camera_right_at: i32
+	camera_up_at: i32
+	time_at: i32
+	box_at: i32
+	speed_at: i32
+	drop_at: i32
+	light_at: i32
+	strength_at: i32
+}
+
+// The particle program, and where its uniforms are.
+Particle_Program :: struct {
+	program: u32
+	shared: Shared_Uniforms
+	adding_at: i32
+	alpha_threshold_at: i32
+	soft_distance_at: i32
+	depth_range_at: i32
+}
+
+// A model placed in the world, with what drawing it needs worked out once.
+Instance :: struct {
+	model: i64             // in the models drawn
+	reference: u32         // the reference it places (its form id), 0 for none
+	world: Mat4
+	center: Vec3           // a sphere around it, in the world
+	radius: f32
+	lights: [LIGHTS_PER_OBJECT!]u16   // the scene's lights that reach it, nearest first; NO_LIGHT after
+	// A piece of a model that moves by itself: its kind and piece (the
+	// scene's), and its object's place, its world posed from that; -1 for none.
+	moving_kind: i32
+	moving_piece: i32
+	placement: Mat4
+	reach: f32             // drawn only this near the camera (along the ground, from its place); 0: at any distance
+	palette_base: i64      // a rigged model's: where its palette starts in this frame's (pose_npcs); -1 for none
+}
+
+// A cell's land on the card: where on the grid, its slot in the land
+// buffer, and a sphere around it.
+Gpu_Land :: struct {
+	x: i64
+	y: i64
+	slot: i64
+	center: Vec3
+	radius: f32
+}
+
+// A land quadrant's textures: its base's and its layers' places in the
+// renderer's textures (the base's again where it has fewer layers).
+Quadrant_Slots :: struct {
+	textures: [QUADRANT_TEXTURES!]i64
+	normal_maps: [QUADRANT_TEXTURES!]i64   // each's normal map (the flat one where it has none)
+}
+
+// A stretch of water: a rectangle at a height, and the water's depth at
+// each of WATER_SIDE x WATER_SIDE points over it, row by row from the south.
+Water_Cell :: struct {
+	low_x: f32
+	low_y: f32
+	high_x: f32
+	high_y: f32
+	height: f32
+	depths: [WATER_VERTICES!]f32
+}
+
+// A point of water as the water program reads it.
+Water_Vertex :: struct {
+	position: Vec3
+	depth: f32
+}
+
+// What the sky and the water look like: the sky's state at the hour, the
+// textures of its clouds and sun (slots in the renderer's textures), how
+// far the clouds have drifted, and the water's color.
+Sky_Look :: struct {
+	state: Sky_State
+	cloud_lower: i64
+	cloud_upper: i64
+	// The last weather's clouds, going out as the coming one's come in
+	// (weather_share 0 to 1).
+	cloud_lower_last: i64
+	cloud_upper_last: i64
+	weather_share: f32
+	sun: i64
+	// The night sky: the stars' and nebula's textures and how far they've
+	// turned; the moons' phases' textures, where they are and how big (0:
+	// none); the sun's glare's texture and how strong it is now.
+	stars: i64
+	nebula: i64
+	stars_turn: f32
+	masser: i64
+	secunda: i64
+	masser_direction: Vec3
+	secunda_direction: Vec3
+	masser_size: f32
+	secunda_size: f32
+	sun_glare: i64
+	sun_glare_strength: f32
+	// The coming weather's rain or snow, and the last one's, going.
+	precipitation: [PRECIPITATION_LAYERS]Precipitation_Layer
+	last_precipitation: [PRECIPITATION_LAYERS]Precipitation_Layer
+	cloud_lower_offset: f32
+	cloud_upper_offset: f32
+	outside: bool        // outside: a world's land, trees, grass, distant land and rain are drawn
+	sky: bool            // the sky is drawn: outside, or in an interior that behaves like an exterior
+	time: f32            // seconds, for the water's ripples and the grass's swaying
+	water: Water_Type    // its colors lit by the hour's light
+	wind: f32            // the weather's wind, 0 to 1
+}
+
+// The sky program and where its uniforms are.
+Sky_Program :: struct {
+	program: u32
+	inverse_view_projection_at: i32
+	camera_position_at: i32
+	fog_color_at: i32
+	sky_upper_at: i32
+	sky_lower_at: i32
+	sky_horizon_at: i32
+	sun_direction_at: i32
+	sun_color_at: i32
+	cloud_lower_color_at: i32
+	cloud_upper_color_at: i32
+	cloud_lower_offset_at: i32
+	cloud_upper_offset_at: i32
+	weather_share_at: i32
+	stars_color_at: i32
+	stars_turn_at: i32
+	masser_at: i32
+	masser_size_at: i32
+	secunda_at: i32
+	secunda_size_at: i32
+	night_at: i32
+	sun_glare_at: i32
+}
+
+// The cells left out of the far land or water, around the cell at x, y:
+// a bit for each of HIDDEN_SIDE x HIDDEN_SIDE, row by row from the south.
+Hidden_Cells :: struct {
+	x: i64
+	y: i64
+	rows: [HIDDEN_SIDE!]i32
+}
+
+// Where a program's hidden cells' uniforms are.
+Hidden_At :: struct {
+	x_at: i32
+	y_at: i32
+	rows_at: [HIDDEN_SIDE!]i32
+}
+
+// A point of distant land: where it is, and where on its piece's textures.
+Distant_Vertex :: struct {
+	position: Vec3
+	uv: [2!]f32
+}
+
+// A piece of distant land on the card: its range of the distant buffers,
+// a sphere around it, its textures (slots in the renderer's).
+Distant_Piece :: struct {
+	first_index: u32
+	index_count: u32
+	base_vertex: i32
+	center: Vec3
+	radius: f32
+	color_texture: i64
+	normal_texture: i64
+}
+
+// A tree placed, before it's on the card: where it stands, its size, how
+// bright it is (trees vary a little), its billboard's texture slot.
+Placed_Tree :: struct {
+	position: Vec3
+	width: f32
+	height: f32
+	brightness: f32
+	texture: i64
+}
+
+// A tree as the tree program reads it: 32 bytes.
+Tree_Instance :: struct {
+	position: Vec3
+	width: f32
+	height: f32
+	brightness: f32
+	handle: u64          // its billboard's (bindless)
+}
+
+// A run of a cell's trees with one texture: drawn in one go.
+Tree_Run :: struct {
+	first: u32           // its first tree in the cell's slot
+	count: u32
+	texture: i64
+}
+
+// A cell's trees on the card: in a slot of the tree buffer, in runs by
+// texture, inside a sphere.
+Gpu_Trees :: struct {
+	x: i64
+	y: i64
+	slot: i64
+	center: Vec3
+	radius: f32
+	runs: [TREE_RUNS]Tree_Run
+}
+
+// A blade of grass placed, before it's on the card: its grass's model,
+// where it stands, turned how far about z, its scales, the way it stands
+// and the land's normal under it, its shade, how slowly it sways.
+Placed_Grass :: struct {
+	model: i64
+	position: Vec3
+	angle: f32
+	width: f32
+	height: f32
+	up: Vec3
+	normal: Vec3
+	brightness: f32
+	wave_period: f32
+}
+
+// A blade as the grass program reads it: 72 bytes.
+Grass_Instance :: struct {
+	position: Vec3
+	angle: f32
+	up: Vec3
+	width: f32
+	normal: Vec3
+	height: f32
+	brightness: f32
+	threshold: f32         // its texture's alpha below this is left out
+	wave_period: f32
+	unused: f32
+	handle: u64            // its part's texture (bindless)
+}
+
+// A run of a cell's blades of one mesh part: drawn in one go.
+Grass_Run :: struct {
+	model: i64
+	part: i64              // in the renderer's parts
+	first: u32             // its first blade in the cell's slot
+	count: u32
+}
+
+// A cell's grass on the card: in the land's slot of the grass buffer, in
+// runs by mesh part, inside a sphere.
+Gpu_Grass :: struct {
+	x: i64
+	y: i64
+	slot: i64
+	center: Vec3
+	radius: f32
+	runs: [GRASS_RUNS]Grass_Run
+}
+
+// A grass program, and where its uniforms are.
+Grass_Program :: struct {
+	program: u32
+	shared: Shared_Uniforms
+	time_at: i32
+	fade_start_at: i32
+	fade_end_at: i32
+	wind_at: i32
+}
+
+// A tree program, and where its uniforms are.
+Tree_Program :: struct {
+	program: u32
+	shared: Shared_Uniforms
+	grown_within_at: i32
+}
+
+// A distant land program, and where its uniforms are.
+Distant_Program :: struct {
+	program: u32
+	shared: Shared_Uniforms
+	hidden: Hidden_At
+}
+
+// The water program and where its uniforms are.
+Water_Program :: struct {
+	program: u32
+	hidden: Hidden_At
+	view_projection_at: i32
+	camera_position_at: i32
+	time_at: i32
+	scroll_at: i32
+	shallow_color_at: i32
+	deep_color_at: i32
+	reflection_color_at: i32
+	reflectivity_at: i32
+	fresnel_base_at: i32
+	sun_power_at: i32
+	sky_upper_at: i32
+	sky_lower_at: i32
+	sky_horizon_at: i32
+	sun_direction_at: i32
+	sun_color_at: i32
+	daylight_at: i32
+	fog_color_at: i32
+	fog_near_at: i32
+	fog_far_at: i32
+}
+
+// A texture on the card, loaded once, by its path.
+Cached_Texture :: struct {
+	path: [160]utf8
+	id: u32
+	width: i64             // its largest mipmap's size in pixels (menus draw pictures pixel for pixel)
+	height: i64
+	handle: u64            // its bindless handle, resident; 0 without bindless, or till it's made (make_waiting_handles)
+	has_alpha: bool        // its file keeps an alpha channel (DXT3, DXT5, 32-bit): a normal map's gloss
+}
+
+// What an instance of a mesh part is drawn with, as the mesh shader reads
+// it: its matrix, its lights, the part's material, textures, shine and
+// motion — 176 bytes.
+Drawn_Instance :: struct {
+	world: Mat4
+	lights: [LIGHTS_PER_OBJECT!]u16
+	material: [4!]f32      // alpha threshold, emissive red, green, blue
+	texture: u64           // the bindless handle
+	glow: u64              // its glow map's bindless handle (without bindless, 1 when it has one); 0 for none
+	normal_map: u64        // its normal map's, as the glow map's
+	glossiness: f32
+	flags: u32             // PART_*
+	specular: [4!]f32      // the color it shines, red, green, blue; rigged, the part's influence_offset
+	motion: [4!]f32        // its texture moved across and up, its opacity; rigged, the instance's palette_base
+}
+
+// A drawn instance's flags (for the mesh program, which reads them as the
+// fourth word of its normal map's).
+PART_LEAF_CARDS :: 1   // its vertices are leaf cards (Model_Part.leaf_cards)
+PART_RIGGED :: 2       // its vertices are moved by bones (Mesh_Part.rigged)
+
+// One draw of MultiDrawElementsIndirect, as OpenGL reads it: 20 bytes.
+Draw_Command :: struct {
+	count: u32             // indexes
+	instance_count: u32
+	first_index: u32
+	base_vertex: i32
+	base_instance: u32     // the first of its instances in the instance buffer
+}
+
+// What a frame drew.
+Frame_Stats :: struct {
+	instances: i64         // placed
+	visible: i64           // in view, drawn
+	drawn_parts: i64       // part instances
+	draw_calls: i64
+	land_cells: i64        // in view, drawn
+}
+
+// Where the uniforms both kinds of program have are, in one program.
+Shared_Uniforms :: struct {
+	view_projection_at: i32
+	sun_direction_at: i32
+	sun_color_at: i32
+	ambient_color_at: i32
+	camera_position_at: i32
+	fog_color_at: i32
+	fog_near_at: i32
+	fog_far_at: i32
+}
+
+// A mesh program, and where its uniforms are.
+Mesh_Program :: struct {
+	program: u32
+	shared: Shared_Uniforms
+	adding_at: i32
+	soft_distance_at: i32
+	depth_range_at: i32
+	view_right_at: i32
+	view_up_at: i32
+}
+
+// A land program, and where its uniforms are.
+Land_Program :: struct {
+	program: u32
+	shared: Shared_Uniforms
+	layer_texture_at: [QUADRANT_TEXTURES!]i32   // without bindless: the samplers, units 0 to 8
+}
+
+// The renderer: its programs, its buffers, its textures, and room for a
+// frame's work.
+Renderer :: struct {
+	// Whether the card draws bindless, and whether it's used now (B in the
+	// viewer turns it off, to see the other way). Each program is compiled
+	// both ways when it can: [0] binds textures, [1] is bindless.
+	bindless_available: bool
+	use_bindless: bool
+	mesh_programs: [2!]Mesh_Program
+	land_programs: [2!]Land_Program
+	distant_programs: [2!]Distant_Program
+	tree_programs: [2!]Tree_Program
+	grass_programs: [2!]Grass_Program
+	sky_program: Sky_Program
+	water_program: Water_Program
+	particle_program: Particle_Program
+	precipitation_program: Precipitation_Program
+	anisotropy: f32
+
+	// The sky's triangle reads nothing but needs a vertex array; the water's
+	// rectangles are made again each frame.
+	empty_vertex_array: u32
+	water_vertex_array: u32
+	water_vertex_buffer: u32
+	water_index_buffer: u32
+	water_indirect_buffer: u32
+	water_commands: [WATER_SLOTS]Draw_Command
+	ripple_texture: u32
+	far_water_ready: bool    // the far water's slot holds it
+
+	// Distant land: the world it's of, its pieces, the buffers they're in
+	// (and how much is used), each piece's number by instance, their
+	// textures' handles (bindless), and the texture standing in for a
+	// missing normal map.
+	distant_world: u32
+	// Distant land being loaded a few pieces a frame (load_distant_land_step):
+	// the next of its places (-1: none loading), the box round its pieces so
+	// far, how many, the first that failed, since when.
+	distant_next: i64
+	distant_low: Vec3
+	distant_high: Vec3
+	distant_made: i64
+	distant_failure: err
+	distant_started: u64
+	distant_pieces: [DISTANT_PIECES]Distant_Piece
+	distant_commands: [DISTANT_PIECES]Draw_Command
+	distant_vertex_array: u32
+	distant_vertex_buffer: u32
+	distant_index_buffer: u32
+	distant_piece_buffer: u32
+	distant_texture_buffer: u32
+	distant_indirect_buffer: u32
+	distant_vertices_used: i64
+	distant_indices_used: i64
+	flat_normal_texture: i64
+
+	// Trees: their buffer (a slot of TREES_PER_CELL for each cell), the
+	// indexes of a picture's two triangles, and a frame's commands.
+	tree_vertex_array: u32
+	tree_instance_buffer: u32
+	tree_index_buffer: u32
+	tree_indirect_buffer: u32
+	tree_commands: [8192]Draw_Command
+
+	// Grass: its instances (a slot of GRASS_PER_CELL for each land slot),
+	// drawn from the mesh buffers.
+	grass_vertex_array: u32
+	grass_instance_buffer: u32
+	grass_indirect_buffer: u32
+	grass_commands: [2048]Draw_Command
+
+	// The shared mesh buffers, and how much of them is used.
+	mesh_vertex_array: u32
+	mesh_vertex_buffer: u32
+	mesh_index_buffer: u32
+	instance_buffer: u32
+	indirect_buffer: u32
+	vertices_used: i64
+	indices_used: i64
+	parts: [MAX_PARTS]Mesh_Part
+	// The parts' flipbooks (a flame's frames) and their frames' texture
+	// slots; the billboard nodes parts are under.
+	flips: [MAX_FLIPS]Gpu_Flip
+	flip_frames: [MAX_FLIP_FRAMES]i64
+	// The parts' values that change over time, and where they are this
+	// frame (each part's: its texture moved across and up, its opacity; its
+	// glow when that changes, else its own).
+	motions: [MAX_MOTIONS]Model_Motion
+	part_motions: [MAX_PARTS][4!]f32
+	part_glows: [MAX_PARTS]Vec3
+	billboards: [MAX_BILLBOARDS]Gpu_Billboard
+
+	// Particles: the models' systems; a frame's squares (made again each
+	// frame, four corners each), put on the card; the runs they're drawn in.
+	particle_kinds: [MAX_PARTICLE_KINDS]Particle_Kind
+	particle_vertex_array: u32
+	particle_vertex_buffer: u32
+	particle_index_buffer: u32
+	particle_vertices: [MAX_PARTICLE_SQUARES * 4]Particle_Vertex
+	particle_runs: [MAX_PARTICLE_RUNS]Particle_Run
+
+	// The land's buffers, its quadrants' textures, and their handles' buffer.
+	land_vertex_array: u32
+	land_vertex_buffer: u32
+	land_index_buffer: u32
+	land_indirect_buffer: u32
+	land_texture_buffer: u32                   // each quadrant's 9 handles, then its normal maps' 9 (bindless)
+
+	// The scene's lights as the mesh programs read them (binding 3).
+	light_buffer: u32
+	// The screen's 2D layer (og's sprite_layer: the HUD, menus), drawn
+	// over the frame last.
+	ui: Sprite_Layer
+	// Rigged parts' vertices' influences (binding 4), each part's after the
+	// last's; this frame's palette they're posed with (binding 5), made by
+	// pose_npcs.
+	influence_buffer: u32
+	influences_used: i64
+	palette_buffer: u32
+	palette: [PALETTE_ROOM]Mat4
+	land_quadrants: [LAND_QUADRANTS!]Quadrant_Slots
+
+	// Textures, found by their paths' hashes.
+	textures: [MAX_TEXTURES]Cached_Texture
+	// The textures whose bindless handles are still to be made (their
+	// slots): made all at once (make_waiting_handles).
+	handles_waiting: [MAX_TEXTURES]i64
+	// Names for textures, made a batch at a time (new_texture_name).
+	texture_names: [TEXTURE_NAME_BATCH!]u32
+	texture_names_left: i64
+	texture_index: Key_Index
+	// The textures that couldn't be loaded since the journal last told of
+	// them: how many, and the first's path and why. (Each is drawn white.)
+	texture_failures: i64
+	first_texture_failure: [160]utf8
+	first_texture_reason: err
+
+	// The frame is drawn into a framebuffer of its own (a color and a depth
+	// texture, the window's size); before the water and blended things its
+	// depth is copied into a texture they read (to fade out near what's
+	// behind them); last, its color is copied into the window.
+	scene_framebuffer: u32
+	scene_color: u32
+	scene_depth: u32
+	depth_copy_framebuffer: u32
+	depth_copy: u32
+	framebuffer_width: i64
+	framebuffer_height: i64
+
+	// A frame's work.
+	visible: [MAX_DRAWN]i64        // instances in view
+	part_counts: [MAX_PARTS]i64    // instances of each part this frame
+	part_starts: [MAX_PARTS]i64    // where each part's instances start in records
+	touched: [MAX_PARTS]i64        // the parts drawn, each as its sort key
+	records: [MAX_DRAWN]Drawn_Instance
+	commands: [MAX_DRAWN]Draw_Command
+	land_commands: [LAND_QUADRANTS]Draw_Command
+}
+
+// What setting up the renderer can fail with.
+Render_Error :: error {
+	Shader_Failed
+	Empty_Texture             // a texture with no image the card could take
+	Framebuffer_Incomplete    // the card can't draw into the frame's framebuffer
+}
+
+// ---- setting up ------------------------------------------------------------------
+
+// Compiles the programs (both ways where the card draws bindless), makes
+// the buffers and the white texture. The texture index is carved from
+// storage.
+renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
+	renderer.bindless_available = gl_has_extension("GL_ARB_bindless_texture") != 0
+	renderer.use_bindless = renderer.bindless_available
+	most : f32 = 0
+	GetFloatv(MAX_TEXTURE_MAX_ANISOTROPY, &most)
+	renderer.anisotropy = if most < MOST_ANISOTROPY do most else MOST_ANISOTROPY
+
+	make_mesh_program(&renderer.mesh_programs[0], false)?
+	make_land_program(&renderer.land_programs[0], false)?
+	make_sky_program(&renderer.sky_program)?
+	make_water_program(&renderer.water_program)?
+	make_distant_program(&renderer.distant_programs[0], false)?
+	make_tree_program(&renderer.tree_programs[0], false)?
+	make_grass_program(&renderer.grass_programs[0], false)?
+	make_particle_program(&renderer.particle_program)?
+	layer_open(&renderer.ui)?
+	make_precipitation_program(&renderer.precipitation_program)?
+	if renderer.bindless_available {
+		make_tree_program(&renderer.tree_programs[1], true)?
+		make_grass_program(&renderer.grass_programs[1], true)?
+		make_mesh_program(&renderer.mesh_programs[1], true)?
+		make_land_program(&renderer.land_programs[1], true)?
+		make_distant_program(&renderer.distant_programs[1], true)?
+	}
+
+	setup_mesh_buffers(renderer)
+	setup_land_buffers(renderer)
+	setup_water_buffers(renderer)
+	setup_distant_buffers(renderer)
+	setup_tree_buffers(renderer)
+	setup_grass_buffers(renderer)
+	setup_particle_buffers(renderer)
+	// The frame's framebuffers: made at the first frame's size.
+	renderer.scene_framebuffer = 0
+	renderer.depth_copy_framebuffer = 0
+	renderer.framebuffer_width = 0
+	renderer.framebuffer_height = 0
+
+	renderer.parts.len = 0
+	// Every part's count and start, by its index: all there, all 0.
+	renderer.part_counts.len = MAX_PARTS
+	renderer.part_starts.len = MAX_PARTS
+	for p in 0:MAX_PARTS {
+		renderer.part_counts[p] = 0
+		renderer.part_starts[p] = 0
+	}
+	renderer.textures.len = 0
+	renderer.handles_waiting.len = 0
+	renderer.texture_names_left = 0
+	renderer.texture_index = key_index(1 << 14, storage)
+
+	// The white texture: slot 0, for parts with none. Then a flat normal
+	// map's, straight up, for distant land missing its own.
+	_ = one_pixel_texture(renderer, [255, 255, 255, 255])
+	renderer.flat_normal_texture = one_pixel_texture(renderer, [128, 128, 255, 255])
+	for q in 0:LAND_QUADRANTS {
+		for k in 0:QUADRANT_TEXTURES {
+			renderer.land_quadrants[q].textures[k] = 0
+			renderer.land_quadrants[q].normal_maps[k] = renderer.flat_normal_texture
+		}
+	}
+}
+
+// How many texture names are made at once: making one waits for the
+// driver to catch up with all that's been asked of it (0.9 ms, with the
+// textures before it on their way to the card).
+TEXTURE_NAME_BATCH :: 256
+
+// A name for a new texture, from the batch made last.
+new_texture_name :: fun(renderer: ^Renderer) -> u32 {
+	if renderer.texture_names_left == 0 {
+		GenTextures(i32(TEXTURE_NAME_BATCH), &renderer.texture_names[0])
+		renderer.texture_names_left = TEXTURE_NAME_BATCH
+	}
+	renderer.texture_names_left -= 1
+	return renderer.texture_names[renderer.texture_names_left]
+}
+
+// A texture of one pixel, in the next slot: that slot.
+one_pixel_texture :: fun(renderer: ^Renderer, pixel: [4!]u8) -> i64 {
+	color := pixel
+	id := new_texture_name(renderer)
+	BindTexture(TEXTURE_2D, id)
+	TexImage2D(TEXTURE_2D, 0, i32(RGBA8), 1, 1, 0, RGBA, UNSIGNED_BYTE, color)
+	TexParameteri(TEXTURE_2D, TEXTURE_MAX_LEVEL, 0)
+	TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(LINEAR))
+	TexParameteri(TEXTURE_2D, TEXTURE_MAG_FILTER, i32(LINEAR))
+	entry := next(&renderer.textures)
+	entry.path.len = 0
+	entry.id = id
+	entry.width = 1
+	entry.height = 1
+	entry.handle = 0
+	entry.has_alpha = true
+	wait_for_handle(renderer, renderer.textures.len - 1)
+	return renderer.textures.len - 1
+}
+
+// Puts a texture (its slot) among those whose bindless handles are to be
+// made (make_waiting_handles); without bindless, there are none to make.
+// Its parameters are set for good once that's done.
+wait_for_handle :: fun(renderer: ^Renderer, slot: i64) {
+	if not renderer.bindless_available do return
+	if not fits(renderer.handles_waiting.len + 1, renderer.handles_waiting.cap) do make_waiting_handles(renderer)
+	&renderer.handles_waiting + slot
+}
+
+// Makes the bindless handles of the textures waiting for them, resident,
+// before anything reads them: all at once, as one made straight after its
+// texture is put on the card waits for the card (0.7 ms each; 35 us in a
+// frame's batch, 4 us a frame on).
+make_waiting_handles :: fun(renderer: ^Renderer) {
+	for slot in renderer.handles_waiting {
+		entry := &renderer.textures[slot]
+		entry.handle = GetTextureHandleARB(entry.id)
+		MakeTextureHandleResidentARB(entry.handle)
+	}
+	renderer.handles_waiting.len = 0
+}
+
+// The program a frame's drawing uses: [1], bindless, when it's in use.
+which_program :: fun(renderer: ^Renderer) -> i64 {
+	return if renderer.use_bindless do 1 else 0
+}
+
+// A shader's source: the version, then — bindless — the extension and the
+// BINDLESS define, then shared (functions it uses), then its body. Into
+// source, with a 0 after it in its room, for C (source is used again, so
+// what's past the text may be an older shader's).
+shader_source :: fun(shared: []utf8, body: []utf8, bindless: bool, source: ^[]utf8) {
+	source.len = 0
+	source + "#version 450 core\n"
+	if bindless do source + "#extension GL_ARB_bindless_texture : require\n#define BINDLESS 1\n"
+	source + shared
+	source + body
+	source + utf8(0)
+	source.len -= 1
+}
+
+// A program of a vertex and a fragment shader, compiled one way or the
+// other; shared goes before the fragment shader's body.
+compile_program :: fun(vertex_body: []utf8, fragment_body: []utf8, bindless: bool, shared: []utf8 = "") -> u32, err {
+	source : [16 * KB]utf8
+	shader_source("", vertex_body, bindless, &source)
+	vertex_shader := gl_compile_shader(VERTEX_SHADER, source)
+	shader_source(shared, fragment_body, bindless, &source)
+	fragment_shader := gl_compile_shader(FRAGMENT_SHADER, source)
+	if vertex_shader == 0 or fragment_shader == 0 do return 0, Render_Error.Shader_Failed
+	program := gl_link_program(vertex_shader, fragment_shader)
+	if program == 0 do return 0, Render_Error.Shader_Failed
+	return program
+}
+
+// Where a program's shared uniforms are.
+find_shared_uniforms :: fun(program: u32) -> Shared_Uniforms {
+	return Shared_Uniforms{
+		view_projection_at = GetUniformLocation(program, "view_projection"),
+		sun_direction_at = GetUniformLocation(program, "sun_direction"),
+		sun_color_at = GetUniformLocation(program, "sun_color"),
+		ambient_color_at = GetUniformLocation(program, "ambient_color"),
+		camera_position_at = GetUniformLocation(program, "camera_position"),
+		fog_color_at = GetUniformLocation(program, "fog_color"),
+		fog_near_at = GetUniformLocation(program, "fog_near"),
+		fog_far_at = GetUniformLocation(program, "fog_far")}
+}
+
+make_mesh_program :: fun(made: ^Mesh_Program, bindless: bool) -> err {
+	made.program = compile_program(MESH_VERTEX_SHADER, MESH_FRAGMENT_SHADER, bindless)?
+	made.shared = find_shared_uniforms(made.program)
+	made.adding_at = GetUniformLocation(made.program, "adding")
+	made.soft_distance_at = GetUniformLocation(made.program, "soft_distance")
+	made.depth_range_at = GetUniformLocation(made.program, "depth_range")
+	made.view_right_at = GetUniformLocation(made.program, "view_right")
+	made.view_up_at = GetUniformLocation(made.program, "view_up")
+	UseProgram(made.program)
+	Uniform1i(GetUniformLocation(made.program, "scene_depth"), 2)
+	if not bindless {
+		Uniform1i(GetUniformLocation(made.program, "glow_texture"), 1)
+		Uniform1i(GetUniformLocation(made.program, "normal_texture"), 3)
+	}
+}
+
+make_particle_program :: fun(made: ^Particle_Program) -> err {
+	made.program = compile_program(PARTICLE_VERTEX_SHADER, PARTICLE_FRAGMENT_SHADER, false)?
+	made.shared = find_shared_uniforms(made.program)
+	made.adding_at = GetUniformLocation(made.program, "adding")
+	made.alpha_threshold_at = GetUniformLocation(made.program, "alpha_threshold")
+	made.soft_distance_at = GetUniformLocation(made.program, "soft_distance")
+	made.depth_range_at = GetUniformLocation(made.program, "depth_range")
+	UseProgram(made.program)
+	Uniform1i(GetUniformLocation(made.program, "scene_depth"), 2)
+}
+
+make_precipitation_program :: fun(made: ^Precipitation_Program) -> err {
+	made.program = compile_program(PRECIPITATION_VERTEX_SHADER, PRECIPITATION_FRAGMENT_SHADER, false)?
+	program := made.program
+	made.shared = find_shared_uniforms(program)
+	made.camera_right_at = GetUniformLocation(program, "camera_right")
+	made.camera_up_at = GetUniformLocation(program, "camera_up")
+	made.time_at = GetUniformLocation(program, "time")
+	made.box_at = GetUniformLocation(program, "box")
+	made.speed_at = GetUniformLocation(program, "speed")
+	made.drop_at = GetUniformLocation(program, "drop")
+	made.light_at = GetUniformLocation(program, "light")
+	made.strength_at = GetUniformLocation(program, "strength")
+}
+
+make_land_program :: fun(made: ^Land_Program, bindless: bool) -> err {
+	made.program = compile_program(LAND_VERTEX_SHADER, LAND_FRAGMENT_SHADER, bindless)?
+	made.shared = find_shared_uniforms(made.program)
+	UseProgram(made.program)
+	for k in 0:QUADRANT_TEXTURES {
+		made.layer_texture_at[k] = array_uniform(made.program, "layer_textures[", k)
+		if not bindless {
+			Uniform1i(made.layer_texture_at[k], i32(k))
+			Uniform1i(array_uniform(made.program, "layer_normals[", k), i32(QUADRANT_TEXTURES + k))
+		}
+	}
+}
+
+make_sky_program :: fun(made: ^Sky_Program) -> err {
+	made.program = compile_program(SKY_VERTEX_SHADER, SKY_FRAGMENT_SHADER, false, SKY_COLOR_FUNCTION)?
+	program := made.program
+	made.inverse_view_projection_at = GetUniformLocation(program, "inverse_view_projection")
+	made.camera_position_at = GetUniformLocation(program, "camera_position")
+	made.fog_color_at = GetUniformLocation(program, "fog_color")
+	made.sky_upper_at = GetUniformLocation(program, "sky_upper")
+	made.sky_lower_at = GetUniformLocation(program, "sky_lower")
+	made.sky_horizon_at = GetUniformLocation(program, "sky_horizon")
+	made.sun_direction_at = GetUniformLocation(program, "sun_direction")
+	made.sun_color_at = GetUniformLocation(program, "sun_color")
+	made.cloud_lower_color_at = GetUniformLocation(program, "cloud_lower_color")
+	made.cloud_upper_color_at = GetUniformLocation(program, "cloud_upper_color")
+	made.cloud_lower_offset_at = GetUniformLocation(program, "cloud_lower_offset")
+	made.weather_share_at = -1
+	made.cloud_upper_offset_at = GetUniformLocation(program, "cloud_upper_offset")
+	UseProgram(program)
+	Uniform1i(GetUniformLocation(program, "cloud_lower_texture"), 0)
+	Uniform1i(GetUniformLocation(program, "cloud_upper_texture"), 1)
+	Uniform1i(GetUniformLocation(program, "sun_texture"), 2)
+	Uniform1i(GetUniformLocation(program, "cloud_lower_last_texture"), 3)
+	Uniform1i(GetUniformLocation(program, "cloud_upper_last_texture"), 4)
+	Uniform1i(GetUniformLocation(program, "stars_texture"), 5)
+	Uniform1i(GetUniformLocation(program, "nebula_texture"), 6)
+	Uniform1i(GetUniformLocation(program, "masser_texture"), 7)
+	Uniform1i(GetUniformLocation(program, "secunda_texture"), 8)
+	Uniform1i(GetUniformLocation(program, "sun_glare_texture"), 9)
+	made.weather_share_at = GetUniformLocation(program, "weather_share")
+	made.stars_color_at = GetUniformLocation(program, "stars_color")
+	made.stars_turn_at = GetUniformLocation(program, "stars_turn")
+	made.masser_at = GetUniformLocation(program, "masser")
+	made.masser_size_at = GetUniformLocation(program, "masser_size")
+	made.secunda_at = GetUniformLocation(program, "secunda")
+	made.secunda_size_at = GetUniformLocation(program, "secunda_size")
+	made.night_at = GetUniformLocation(program, "night")
+	made.sun_glare_at = GetUniformLocation(program, "sun_glare")
+}
+
+make_distant_program :: fun(made: ^Distant_Program, bindless: bool) -> err {
+	made.program = compile_program(DISTANT_VERTEX_SHADER, DISTANT_FRAGMENT_SHADER, bindless, HIDDEN_CELLS_FUNCTION)?
+	made.shared = find_shared_uniforms(made.program)
+	made.hidden = find_hidden_uniforms(made.program)
+	UseProgram(made.program)
+	if not bindless {
+		Uniform1i(GetUniformLocation(made.program, "color_texture"), 0)
+		Uniform1i(GetUniformLocation(made.program, "normal_texture"), 1)
+	}
+}
+
+make_tree_program :: fun(made: ^Tree_Program, bindless: bool) -> err {
+	made.program = compile_program(TREE_VERTEX_SHADER, TREE_FRAGMENT_SHADER, bindless)?
+	made.shared = find_shared_uniforms(made.program)
+	made.grown_within_at = GetUniformLocation(made.program, "grown_within")
+	UseProgram(made.program)
+	if not bindless do Uniform1i(GetUniformLocation(made.program, "picture_texture"), 0)
+}
+
+make_grass_program :: fun(made: ^Grass_Program, bindless: bool) -> err {
+	made.program = compile_program(GRASS_VERTEX_SHADER, GRASS_FRAGMENT_SHADER, bindless)?
+	made.shared = find_shared_uniforms(made.program)
+	made.time_at = GetUniformLocation(made.program, "time")
+	made.fade_start_at = GetUniformLocation(made.program, "fade_start")
+	made.fade_end_at = GetUniformLocation(made.program, "fade_end")
+	made.wind_at = GetUniformLocation(made.program, "wind")
+	UseProgram(made.program)
+	if not bindless do Uniform1i(GetUniformLocation(made.program, "picture_texture"), 0)
+}
+
+make_water_program :: fun(made: ^Water_Program) -> err {
+	shared : [4 * KB]utf8
+	&shared + SKY_COLOR_FUNCTION
+	&shared + HIDDEN_CELLS_FUNCTION
+	made.program = compile_program(WATER_VERTEX_SHADER, WATER_FRAGMENT_SHADER, false, shared)?
+	program := made.program
+	made.hidden = find_hidden_uniforms(program)
+	made.view_projection_at = GetUniformLocation(program, "view_projection")
+	made.camera_position_at = GetUniformLocation(program, "camera_position")
+	made.time_at = GetUniformLocation(program, "time")
+	made.scroll_at = GetUniformLocation(program, "scroll")
+	made.shallow_color_at = GetUniformLocation(program, "shallow_color")
+	made.deep_color_at = GetUniformLocation(program, "deep_color")
+	made.reflection_color_at = GetUniformLocation(program, "reflection_color")
+	made.reflectivity_at = GetUniformLocation(program, "reflectivity")
+	made.fresnel_base_at = GetUniformLocation(program, "fresnel_base")
+	made.sun_power_at = GetUniformLocation(program, "sun_power")
+	made.sky_upper_at = GetUniformLocation(program, "sky_upper")
+	made.sky_lower_at = GetUniformLocation(program, "sky_lower")
+	made.sky_horizon_at = GetUniformLocation(program, "sky_horizon")
+	made.sun_direction_at = GetUniformLocation(program, "sun_direction")
+	made.sun_color_at = GetUniformLocation(program, "sun_color")
+	made.daylight_at = GetUniformLocation(program, "daylight")
+	made.fog_color_at = GetUniformLocation(program, "fog_color")
+	made.fog_near_at = GetUniformLocation(program, "fog_near")
+	made.fog_far_at = GetUniformLocation(program, "fog_far")
+}
+
+// The sky's empty vertex array; the water's buffers — a slot of points
+// for each stretch, the indexes they share — and its ripple texture.
+setup_water_buffers :: fun(renderer: ^Renderer) {
+	GenVertexArrays(1, &renderer.empty_vertex_array)
+	GenVertexArrays(1, &renderer.water_vertex_array)
+	BindVertexArray(renderer.water_vertex_array)
+	GenBuffers(1, &renderer.water_vertex_buffer)
+	BindBuffer(ARRAY_BUFFER, renderer.water_vertex_buffer)
+	BufferData(ARRAY_BUFFER, (WATER_SLOTS + 1) * WATER_VERTICES * size_of(Water_Vertex), [], DYNAMIC_DRAW)
+	stride := i32(size_of(Water_Vertex))
+	EnableVertexAttribArray(0)
+	VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)    // position
+	EnableVertexAttribArray(1)
+	VertexAttribPointer(1, 1, FLOAT, 0, stride, 12)   // depth
+
+	// Two triangles for each square of the grid, counter-clockwise from above.
+	indices : [WATER_INDICES]u16
+	for row in 0:WATER_SIDE - 1 {
+		for column in 0:WATER_SIDE - 1 {
+			south_west := u16(row * WATER_SIDE + column)
+			south_east := south_west + 1
+			north_west := south_west + u16(WATER_SIDE)
+			north_east := north_west + 1
+			&indices + south_west
+			&indices + south_east
+			&indices + north_east
+			&indices + south_west
+			&indices + north_east
+			&indices + north_west
+		}
+	}
+	GenBuffers(1, &renderer.water_index_buffer)
+	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.water_index_buffer)
+	BufferData(ELEMENT_ARRAY_BUFFER, isize(indices.len * 2), indices, STATIC_DRAW)
+	BindVertexArray(0)
+	GenBuffers(1, &renderer.water_indirect_buffer)
+	make_ripple_texture(renderer)
+}
+
+// The ripples' normals: a texture made of many waves of whole numbers of
+// lengths across it (so it repeats without a seam), each a random way and
+// phase, the shorter ones lower; mipmapped, so far water averages to flat.
+// (The game made its ripples on the card each frame; this stands in.)
+make_ripple_texture :: fun(renderer: ^Renderer) {
+	WAVES :: 48
+	directions_x : [WAVES!]i64
+	directions_y : [WAVES!]i64
+	phase_cosines : [WAVES!]f32
+	phase_sines : [WAVES!]f32
+	heights : [WAVES!]f32
+	seed : u64 = 0x2545F4914F6CDD1D
+	for w in 0:WAVES {
+		// A wave of 2 to 14 lengths across, some way; its height the less the shorter.
+		seed = seed *% 6364136223846793005 +% 1442695040888963407
+		x := i64((seed >> 33) % 29) - 14
+		seed = seed *% 6364136223846793005 +% 1442695040888963407
+		y := i64((seed >> 33) % 29) - 14
+		if x * x + y * y < 4 do x = 2 + w % 3
+		seed = seed *% 6364136223846793005 +% 1442695040888963407
+		phase := f32((seed >> 33) % 10000) / 10000 * 6.2831853
+		phase_cosines[w] = cos_f32(phase)
+		phase_sines[w] = sin_f32(phase)
+		directions_x[w] = x
+		directions_y[w] = y
+		lengths := sqrt_f32(f32(x * x + y * y))
+		heights[w] = 1 / (lengths * sqrt_f32(lengths))
+	}
+	// A wave's whole lengths across the texture put each texel at one of
+	// RIPPLE_SIZE places along it: the cosine and sine of each, looked up
+	// (cos(place + phase) = cos place cos phase - sin place sin phase).
+	cosines : [RIPPLE_SIZE!]f32
+	sines : [RIPPLE_SIZE!]f32
+	for k in 0:RIPPLE_SIZE {
+		angle := f32(k) / RIPPLE_SIZE * 6.2831853
+		cosines[k] = cos_f32(angle)
+		sines[k] = sin_f32(angle)
+	}
+	pixels : [RIPPLE_SIZE * RIPPLE_SIZE * 4]u8
+	pixels.len = pixels.cap
+	for py in 0:RIPPLE_SIZE {
+		for px in 0:RIPPLE_SIZE {
+			// The height's slope here: each wave's.
+			slope_x : f32 = 0
+			slope_y : f32 = 0
+			for w in 0:WAVES {
+				place := (directions_x[w] * px + directions_y[w] * py) & (RIPPLE_SIZE - 1)
+				change := (cosines[place] * phase_cosines[w] - sines[place] * phase_sines[w]) * heights[w]
+				slope_x += change * f32(directions_x[w])
+				slope_y += change * f32(directions_y[w])
+			}
+			normal := vec3_normalize(Vec3{-slope_x * 0.35, -slope_y * 0.35, 1})
+			at := (py * RIPPLE_SIZE + px) * 4
+			pixels[at] = u8((normal.x * 0.5 + 0.5) * 255)
+			pixels[at + 1] = u8((normal.y * 0.5 + 0.5) * 255)
+			pixels[at + 2] = u8((normal.z * 0.5 + 0.5) * 255)
+			pixels[at + 3] = 255
+		}
+	}
+	GenTextures(1, &renderer.ripple_texture)
+	BindTexture(TEXTURE_2D, renderer.ripple_texture)
+	TexImage2D(TEXTURE_2D, 0, i32(RGBA8), RIPPLE_SIZE, RIPPLE_SIZE, 0, RGBA, UNSIGNED_BYTE, pixels)
+	GenerateMipmap(TEXTURE_2D)
+	TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(LINEAR_MIPMAP_LINEAR))
+	TexParameteri(TEXTURE_2D, TEXTURE_MAG_FILTER, i32(LINEAR))
+	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_S, i32(REPEAT))
+	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_T, i32(REPEAT))
+	if renderer.anisotropy > 1 do TexParameterf(TEXTURE_2D, TEXTURE_MAX_ANISOTROPY, renderer.anisotropy)
+	UseProgram(renderer.water_program.program)
+	Uniform1i(GetUniformLocation(renderer.water_program.program, "normal_map"), 0)
+}
+
+// Puts the stretches of water on the card, each in its slot.
+upload_waters :: fun(renderer: ^Renderer, waters: ^[]Water_Cell) {
+	for k in 0:waters.len {
+		if k == WATER_SLOTS do break
+		upload_water(renderer, &waters[k], k)
+	}
+}
+
+// Puts a stretch of water in a slot on the card: its points over its
+// rectangle, at its height, with its depths.
+upload_water :: fun(renderer: ^Renderer, water: ^Water_Cell, slot: i64) {
+	points : [WATER_VERTICES]Water_Vertex
+	for row in 0:WATER_SIDE {
+		for column in 0:WATER_SIDE {
+			x := water.low_x + (water.high_x - water.low_x) * f32(column) / (WATER_SIDE - 1)
+			y := water.low_y + (water.high_y - water.low_y) * f32(row) / (WATER_SIDE - 1)
+			&points + Water_Vertex{position = Vec3{x, y, water.height}, depth = water.depths[row * WATER_SIDE + column]}
+		}
+	}
+	BindBuffer(ARRAY_BUFFER, renderer.water_vertex_buffer)
+	BufferSubData(ARRAY_BUFFER, isize(slot * WATER_VERTICES * size_of(Water_Vertex)), points)
+}
+
+// The far water: a stretch over a rectangle at a height, deep all over.
+set_far_water :: fun(renderer: ^Renderer, low_x: f32, low_y: f32, high_x: f32, high_y: f32, height: f32) {
+	water : Water_Cell
+	water.low_x = low_x
+	water.low_y = low_y
+	water.high_x = high_x
+	water.high_y = high_y
+	water.height = height
+	for k in 0:WATER_VERTICES do water.depths[k] = 1000
+	upload_water(renderer, &water, FAR_WATER_SLOT)
+	renderer.far_water_ready = true
+}
+
+// ---- distant land ----------------------------------------------------------------
+
+// Distant land's buffers: its vertices, its indexes, each piece's number
+// (read once for each instance), its textures' handles.
+setup_distant_buffers :: fun(renderer: ^Renderer) {
+	GenVertexArrays(1, &renderer.distant_vertex_array)
+	BindVertexArray(renderer.distant_vertex_array)
+	GenBuffers(1, &renderer.distant_vertex_buffer)
+	BindBuffer(ARRAY_BUFFER, renderer.distant_vertex_buffer)
+	BufferData(ARRAY_BUFFER, DISTANT_VERTEX_ROOM * size_of(Distant_Vertex), [], STATIC_DRAW)
+	stride := i32(size_of(Distant_Vertex))
+	EnableVertexAttribArray(0)
+	VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)    // position
+	EnableVertexAttribArray(1)
+	VertexAttribPointer(1, 2, FLOAT, 0, stride, 12)   // uv
+
+	numbers : [DISTANT_PIECES]u32
+	for k in 0:DISTANT_PIECES do &numbers + u32(k)
+	GenBuffers(1, &renderer.distant_piece_buffer)
+	BindBuffer(ARRAY_BUFFER, renderer.distant_piece_buffer)
+	BufferData(ARRAY_BUFFER, DISTANT_PIECES * 4, numbers, STATIC_DRAW)
+	EnableVertexAttribArray(2)
+	VertexAttribIPointer(2, 1, UNSIGNED_INT, 4, 0)    // the piece
+	VertexAttribDivisor(2, 1)
+
+	GenBuffers(1, &renderer.distant_index_buffer)
+	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.distant_index_buffer)
+	BufferData(ELEMENT_ARRAY_BUFFER, DISTANT_INDEX_ROOM * 2, [], STATIC_DRAW)
+	BindVertexArray(0)
+	GenBuffers(1, &renderer.distant_indirect_buffer)
+	GenBuffers(1, &renderer.distant_texture_buffer)
+	BindBuffer(SHADER_STORAGE_BUFFER, renderer.distant_texture_buffer)
+	BufferData(SHADER_STORAGE_BUFFER, DISTANT_PIECES * 16, [], DYNAMIC_DRAW)
+	clear_distant_land(renderer)
+}
+
+// Makes the frame's framebuffers for a size (again when it changes): the
+// one drawn into, and the one its depth is copied into.
+size_framebuffers :: fun(renderer: ^Renderer, width: i64, height: i64) -> err {
+	if renderer.framebuffer_width == width and renderer.framebuffer_height == height do return
+	if renderer.scene_framebuffer == 0 {
+		GenFramebuffers(1, &renderer.scene_framebuffer)
+		GenFramebuffers(1, &renderer.depth_copy_framebuffer)
+	else
+		DeleteTextures(1, &renderer.scene_color)
+		DeleteTextures(1, &renderer.scene_depth)
+		DeleteTextures(1, &renderer.depth_copy)
+	}
+	renderer.framebuffer_width = 0
+	renderer.framebuffer_height = 0
+	renderer.scene_color = framebuffer_texture(u32(RGBA8), width, height)
+	renderer.scene_depth = framebuffer_texture(u32(DEPTH_COMPONENT24), width, height)
+	renderer.depth_copy = framebuffer_texture(u32(DEPTH_COMPONENT24), width, height)
+	BindFramebuffer(FRAMEBUFFER, renderer.scene_framebuffer)
+	FramebufferTexture2D(FRAMEBUFFER, COLOR_ATTACHMENT0, TEXTURE_2D, renderer.scene_color, 0)
+	FramebufferTexture2D(FRAMEBUFFER, DEPTH_ATTACHMENT, TEXTURE_2D, renderer.scene_depth, 0)
+	scene_status := CheckFramebufferStatus(FRAMEBUFFER)
+	BindFramebuffer(FRAMEBUFFER, renderer.depth_copy_framebuffer)
+	FramebufferTexture2D(FRAMEBUFFER, DEPTH_ATTACHMENT, TEXTURE_2D, renderer.depth_copy, 0)
+	copy_status := CheckFramebufferStatus(FRAMEBUFFER)
+	BindFramebuffer(FRAMEBUFFER, 0)
+	if scene_status != u32(FRAMEBUFFER_COMPLETE) or copy_status != u32(FRAMEBUFFER_COMPLETE) do return Framebuffer_Incomplete
+	renderer.framebuffer_width = width
+	renderer.framebuffer_height = height
+}
+
+// Binds the frame drawn last (the scene framebuffer's color) for reading
+// (read_pixels), as wide and high as it was drawn; false when there's no
+// framebuffer (the frame went into the window).
+bind_frame_for_reading :: fun(renderer: ^Renderer) -> bool, i64, i64 {
+	if renderer.scene_framebuffer == 0 or renderer.framebuffer_width == 0 do return false, 0, 0
+	BindFramebuffer(READ_FRAMEBUFFER, renderer.scene_framebuffer)
+	ReadBuffer(COLOR_ATTACHMENT0)
+	return true, renderer.framebuffer_width, renderer.framebuffer_height
+}
+
+// A texture to draw into: one level, read pixel for pixel.
+framebuffer_texture :: fun(format: u32, width: i64, height: i64) -> u32 {
+	id : u32 = 0
+	GenTextures(1, &id)
+	BindTexture(TEXTURE_2D, id)
+	TexStorage2D(TEXTURE_2D, 1, format, i32(width), i32(height))
+	TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(NEAREST))
+	TexParameteri(TEXTURE_2D, TEXTURE_MAG_FILTER, i32(NEAREST))
+	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_S, i32(CLAMP_TO_EDGE))
+	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_T, i32(CLAMP_TO_EDGE))
+	return id
+}
+
+// Copies the depth drawn so far into the depth copy, and puts it in unit
+// 2, for what's drawn next to read.
+copy_depth :: fun(renderer: ^Renderer) {
+	width := i32(renderer.framebuffer_width)
+	height := i32(renderer.framebuffer_height)
+	BindFramebuffer(READ_FRAMEBUFFER, renderer.scene_framebuffer)
+	BindFramebuffer(DRAW_FRAMEBUFFER, renderer.depth_copy_framebuffer)
+	BlitFramebuffer(0, 0, width, height, 0, 0, width, height, DEPTH_BUFFER_BIT, NEAREST)
+	BindFramebuffer(FRAMEBUFFER, renderer.scene_framebuffer)
+	ActiveTexture(TEXTURE2)
+	BindTexture(TEXTURE_2D, renderer.depth_copy)
+	ActiveTexture(TEXTURE0)
+}
+
+// The particles' buffers: their corners (filled each frame), and the
+// indexes of every square's two triangles (made once).
+setup_particle_buffers :: fun(renderer: ^Renderer) {
+	GenVertexArrays(1, &renderer.particle_vertex_array)
+	BindVertexArray(renderer.particle_vertex_array)
+	GenBuffers(1, &renderer.particle_vertex_buffer)
+	BindBuffer(ARRAY_BUFFER, renderer.particle_vertex_buffer)
+	BufferData(ARRAY_BUFFER, MAX_PARTICLE_SQUARES * 4 * size_of(Particle_Vertex), [], STREAM_DRAW)
+	stride := i32(size_of(Particle_Vertex))
+	EnableVertexAttribArray(0)
+	VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)    // position
+	EnableVertexAttribArray(1)
+	VertexAttribPointer(1, 2, FLOAT, 0, stride, 12)   // uv
+	EnableVertexAttribArray(2)
+	VertexAttribPointer(2, 4, FLOAT, 0, stride, 20)   // color
+
+	indices : [MAX_PARTICLE_SQUARES * 6]u32
+	for square in 0:MAX_PARTICLE_SQUARES {
+		corner := u32(square * 4)
+		&indices + corner
+		&indices + (corner + 1)
+		&indices + (corner + 2)
+		&indices + corner
+		&indices + (corner + 2)
+		&indices + (corner + 3)
+	}
+	GenBuffers(1, &renderer.particle_index_buffer)
+	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.particle_index_buffer)
+	BufferData(ELEMENT_ARRAY_BUFFER, isize(indices.len * 4), indices, STATIC_DRAW)
+	BindVertexArray(0)
+}
+
+// No distant land, and no far water. (Their textures stay loaded.)
+clear_distant_land :: fun(renderer: ^Renderer) {
+	renderer.distant_world = 0
+	renderer.distant_next = -1
+	renderer.distant_pieces.len = 0
+	renderer.distant_vertices_used = 0
+	renderer.distant_indices_used = 0
+	renderer.far_water_ready = false
+}
+
+// Puts a piece of distant land on the card: a model's part, its colors'
+// and normals' textures. False when there's no room.
+upload_distant_piece :: fun(renderer: ^Renderer, part: ^Model_Part, color_texture: i64, normal_texture: i64) -> bool {
+	vertex_count := part.vertices.len
+	index_count := part.indices.len
+	if vertex_count == 0 or index_count == 0 do return false
+	if not fits(renderer.distant_pieces.len + 1, renderer.distant_pieces.cap) do return false
+	if renderer.distant_vertices_used + vertex_count > DISTANT_VERTEX_ROOM do return false
+	if renderer.distant_indices_used + index_count > DISTANT_INDEX_ROOM do return false
+
+	// Its vertices as the program reads them, and the box around them.
+	points : [65536]Distant_Vertex
+	low := part.vertices[0].position
+	high := low
+	for vertex in part.vertices {
+		&points + Distant_Vertex{position = vertex.position, uv = vertex.uv}
+		for axis in 0:3 {
+			if vertex.position[axis] < low[axis] do low[axis] = vertex.position[axis]
+			if vertex.position[axis] > high[axis] do high[axis] = vertex.position[axis]
+		}
+	}
+	BindVertexArray(0)   // (binding an index buffer would change a bound vertex array's)
+	BindBuffer(ARRAY_BUFFER, renderer.distant_vertex_buffer)
+	BufferSubData(ARRAY_BUFFER, isize(renderer.distant_vertices_used * size_of(Distant_Vertex)), points)
+	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.distant_index_buffer)
+	BufferSubData(ELEMENT_ARRAY_BUFFER, isize(renderer.distant_indices_used * 2), part.indices)
+
+	piece_number := renderer.distant_pieces.len
+	if renderer.bindless_available {
+		make_waiting_handles(renderer)
+		handles : [2!]u64 = [renderer.textures[color_texture].handle, renderer.textures[normal_texture].handle]
+		BindBuffer(SHADER_STORAGE_BUFFER, renderer.distant_texture_buffer)
+		BufferSubData(SHADER_STORAGE_BUFFER, isize(piece_number * 16), handles)
+	}
+	&renderer.distant_pieces + Distant_Piece{
+		first_index = u32(renderer.distant_indices_used),
+		index_count = u32(index_count),
+		base_vertex = i32(renderer.distant_vertices_used),
+		center = (low + high) * 0.5,
+		radius = vec3_length(high - low) * 0.5,
+		color_texture = color_texture,
+		normal_texture = normal_texture}
+	renderer.distant_vertices_used += vertex_count
+	renderer.distant_indices_used += index_count
+	return true
+}
+
+// ---- trees ------------------------------------------------------------------------
+
+// The trees' buffers: their instances, a slot for each cell's, and the
+// indexes of a picture's two triangles, counter-clockwise from the camera.
+setup_tree_buffers :: fun(renderer: ^Renderer) {
+	GenVertexArrays(1, &renderer.tree_vertex_array)
+	BindVertexArray(renderer.tree_vertex_array)
+	GenBuffers(1, &renderer.tree_instance_buffer)
+	BindBuffer(ARRAY_BUFFER, renderer.tree_instance_buffer)
+	BufferData(ARRAY_BUFFER, TREE_CELLS * TREES_PER_CELL * size_of(Tree_Instance), [], STATIC_DRAW)
+	stride := i32(size_of(Tree_Instance))
+	EnableVertexAttribArray(0)
+	VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)            // position
+	VertexAttribDivisor(0, 1)
+	EnableVertexAttribArray(1)
+	VertexAttribPointer(1, 3, FLOAT, 0, stride, 12)           // width, height, brightness
+	VertexAttribDivisor(1, 1)
+	EnableVertexAttribArray(2)
+	VertexAttribIPointer(2, 2, UNSIGNED_INT, stride, 24)      // texture handle
+	VertexAttribDivisor(2, 1)
+	corners : [6!]u16 = [0, 1, 2, 0, 2, 3]
+	GenBuffers(1, &renderer.tree_index_buffer)
+	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.tree_index_buffer)
+	BufferData(ELEMENT_ARRAY_BUFFER, 12, corners, STATIC_DRAW)
+	BindVertexArray(0)
+	GenBuffers(1, &renderer.tree_indirect_buffer)
+}
+
+// Puts a cell's trees on the card in a slot: grouped by texture, each
+// group a run. Trees past the slot's room, or of kinds past TREE_RUNS,
+// are left out.
+upload_trees :: fun(renderer: ^Renderer, trees: ^[]Placed_Tree, x: i64, y: i64, slot: i64) -> Gpu_Trees {
+	placed := Gpu_Trees{x = x, y = y, slot = slot, center = Vec3{0, 0, 0}, radius = 0, runs = []}
+	if trees.len == 0 do return placed
+	make_waiting_handles(renderer)
+	instances : [TREES_PER_CELL]Tree_Instance
+	low := trees[0].position
+	high := low
+	// Run by run: each texture's trees, in the order the textures first come.
+	for k in 0:trees.len {
+		texture := trees[k].texture
+		seen := false
+		for run in placed.runs {
+			if run.texture == texture do seen = true
+		}
+		if seen or not fits(placed.runs.len + 1, placed.runs.cap) do continue
+		run := next(&placed.runs)
+		run.first = u32(instances.len)
+		run.count = 0
+		run.texture = texture
+		for tree in trees[k : trees.len] {
+			if tree.texture != texture or not fits(instances.len + 1, instances.cap) do continue
+			&instances + Tree_Instance{position = tree.position, width = tree.width, height = tree.height,
+				brightness = tree.brightness, handle = renderer.textures[texture].handle}
+			run.count += 1
+			top := tree.position + Vec3{0, 0, tree.height}
+			for axis in 0:3 {
+				if tree.position[axis] < low[axis] do low[axis] = tree.position[axis]
+				if top[axis] > high[axis] do high[axis] = top[axis]
+			}
+		}
+	}
+	// The sphere around them all, wide enough for the widest's pictures.
+	widest : f32 = 0
+	for tree in trees {
+		if tree.width > widest do widest = tree.width
+	}
+	placed.center = (low + high) * 0.5
+	placed.radius = vec3_length(high - low) * 0.5 + widest * 0.5
+	if instances.len > 0 {
+		BindBuffer(ARRAY_BUFFER, renderer.tree_instance_buffer)
+		BufferSubData(ARRAY_BUFFER, isize(slot * TREES_PER_CELL * size_of(Tree_Instance)), instances)
+	}
+	return placed
+}
+
+// Draws the trees in view: near, those of the cells hidden from the far
+// pass (drawn in full); else the rest. Bindless, in one call; else a call
+// for each run, its texture bound.
+draw_trees :: fun(renderer: ^Renderer, tree_cells: ^[]Gpu_Trees, hidden: ^Hidden_Cells, near: bool, planes: ^View_Planes,
+	view_projection: Mat4, lighting: Cell_Lighting, sun: Vec3, camera: Camera, stats: ^Frame_Stats)
+{
+	renderer.tree_commands.len = 0
+	for &cell in tree_cells {
+		if cell.runs.len == 0 do continue
+		if hidden_cell_at(hidden, cell.x, cell.y) != near do continue
+		if not sphere_in_view(planes, cell.center, cell.radius) do continue
+		for run in cell.runs {
+			if not fits(renderer.tree_commands.len + 1, renderer.tree_commands.cap) do break
+			&renderer.tree_commands + Draw_Command{count = 6, instance_count = run.count, first_index = 0,
+				base_vertex = 0, base_instance = u32(cell.slot * TREES_PER_CELL) + run.first}
+		}
+	}
+	if renderer.tree_commands.len == 0 do return
+
+	bindless := renderer.use_bindless
+	made := &renderer.tree_programs[which_program(renderer)]
+	UseProgram(made.program)
+	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
+	Uniform1f(made.grown_within_at, TREE_NEAR)
+	BindVertexArray(renderer.tree_vertex_array)
+	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.tree_indirect_buffer)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.tree_commands.len * size_of(Draw_Command)), renderer.tree_commands, STREAM_DRAW)
+	Disable(CULL_FACE)
+	if bindless {
+		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, 0, i32(renderer.tree_commands.len), 0)
+		stats.draw_calls += 1
+	else
+		// The commands' runs, in the order they were made: each with its texture.
+		k : i64 = 0
+		for &cell in tree_cells {
+			if cell.runs.len == 0 or hidden_cell_at(hidden, cell.x, cell.y) != near do continue
+			if not sphere_in_view(planes, cell.center, cell.radius) do continue
+			for run in cell.runs {
+				if k == renderer.tree_commands.len do break
+				BindTexture(TEXTURE_2D, renderer.textures[run.texture].id)
+				MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, usize(k * size_of(Draw_Command)), 1, 0)
+				stats.draw_calls += 1
+				k += 1
+			}
+		}
+	}
+	Enable(CULL_FACE)
+}
+
+// ---- grass ----------------------------------------------------------------------
+
+// The grass's buffers: the mesh buffers' vertices and indexes (set up
+// first: setup_mesh_buffers), read with the grass's instances.
+setup_grass_buffers :: fun(renderer: ^Renderer) {
+	GenVertexArrays(1, &renderer.grass_vertex_array)
+	BindVertexArray(renderer.grass_vertex_array)
+	BindBuffer(ARRAY_BUFFER, renderer.mesh_vertex_buffer)
+	stride := i32(size_of(Vertex))
+	EnableVertexAttribArray(0)
+	VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)    // position
+	EnableVertexAttribArray(1)
+	VertexAttribPointer(1, 3, FLOAT, 0, stride, 12)   // normal
+	EnableVertexAttribArray(2)
+	VertexAttribPointer(2, 2, FLOAT, 0, stride, 24)   // uv
+	EnableVertexAttribArray(3)
+	VertexAttribPointer(3, 4, FLOAT, 0, stride, 32)   // color
+	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.mesh_index_buffer)
+
+	GenBuffers(1, &renderer.grass_instance_buffer)
+	BindBuffer(ARRAY_BUFFER, renderer.grass_instance_buffer)
+	BufferData(ARRAY_BUFFER, LAND_SLOTS * GRASS_PER_CELL * size_of(Grass_Instance), [], STATIC_DRAW)
+	instance_stride := i32(size_of(Grass_Instance))
+	for column in 0:4 {
+		location := u32(4 + column)
+		EnableVertexAttribArray(location)
+		VertexAttribPointer(location, 4, FLOAT, 0, instance_stride, usize(column * 16))
+		VertexAttribDivisor(location, 1)
+	}
+	EnableVertexAttribArray(8)
+	VertexAttribIPointer(8, 2, UNSIGNED_INT, instance_stride, 64)   // texture handle
+	VertexAttribDivisor(8, 1)
+	BindVertexArray(0)
+	GenBuffers(1, &renderer.grass_indirect_buffer)
+}
+
+// Puts a cell's grass on the card in a land slot: its blades grouped into
+// runs by mesh part, each model's parts in turn. Blades past the slot's
+// room, or of parts past GRASS_RUNS, are left out.
+upload_grass :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, blades: ^[]Placed_Grass, x: i64, y: i64, slot: i64) -> Gpu_Grass {
+	placed := Gpu_Grass{x = x, y = y, slot = slot, center = Vec3{0, 0, 0}, radius = 0, runs = []}
+	if blades.len == 0 do return placed
+	make_waiting_handles(renderer)
+	instances : [GRASS_PER_CELL]Grass_Instance
+	low := blades[0].position
+	high := low
+	for k in 0:blades.len {
+		blade_model := blades[k].model
+		seen := false
+		for run in placed.runs {
+			if run.model == blade_model do seen = true
+		}
+		if seen do continue
+		gpu := models[blade_model]
+		for p in 0:gpu.part_count {
+			if not fits(placed.runs.len + 1, placed.runs.cap) do break
+			part_index := gpu.first_part + p
+			part := renderer.parts[part_index]
+			// Grass is cut out of its texture, whatever its alpha says.
+			threshold := part.alpha_threshold
+			if threshold <= 0 do threshold = 0.5
+			handle := renderer.textures[part.texture_slot].handle
+			run := next(&placed.runs)
+			run.model = blade_model
+			run.part = part_index
+			run.first = u32(instances.len)
+			run.count = 0
+			for &blade in blades[k : blades.len] {
+				if blade.model != blade_model or not fits(instances.len + 1, instances.cap) do continue
+				&instances + Grass_Instance{position = blade.position, angle = blade.angle, up = blade.up,
+					width = blade.width, normal = blade.normal, height = blade.height, brightness = blade.brightness,
+					threshold = threshold, wave_period = blade.wave_period, unused = 0, handle = handle}
+				run.count += 1
+				for axis in 0:3 {
+					if blade.position[axis] < low[axis] do low[axis] = blade.position[axis]
+					if blade.position[axis] > high[axis] do high[axis] = blade.position[axis]
+				}
+			}
+		}
+	}
+	// The sphere around them, with room for a tall blade.
+	placed.center = (low + high) * 0.5
+	placed.radius = vec3_length(high - low) * 0.5 + 200
+	if instances.len > 0 {
+		BindBuffer(ARRAY_BUFFER, renderer.grass_instance_buffer)
+		BufferSubData(ARRAY_BUFFER, isize(slot * GRASS_PER_CELL * size_of(Grass_Instance)), instances)
+	}
+	return placed
+}
+
+// Draws the grass in view and near enough (fade_end): bindless, in one
+// call; else a call for each run, its texture bound.
+draw_grass :: fun(renderer: ^Renderer, grass_cells: ^[]Gpu_Grass, planes: ^View_Planes, view_projection: Mat4,
+	lighting: Cell_Lighting, sun: Vec3, camera: Camera, look: ^Sky_Look, fade_start: f32, fade_end: f32, stats: ^Frame_Stats)
+{
+	renderer.grass_commands.len = 0
+	for &cell in grass_cells {
+		if cell.runs.len == 0 do continue
+		if vec3_length(cell.center - camera.position) > fade_end + cell.radius do continue
+		if not sphere_in_view(planes, cell.center, cell.radius) do continue
+		for run in cell.runs {
+			if not fits(renderer.grass_commands.len + 1, renderer.grass_commands.cap) do break
+			part := &renderer.parts[run.part]
+			&renderer.grass_commands + Draw_Command{count = part.index_count, instance_count = run.count,
+				first_index = part.first_index, base_vertex = part.base_vertex,
+				base_instance = u32(cell.slot * GRASS_PER_CELL) + run.first}
+		}
+	}
+	if renderer.grass_commands.len == 0 do return
+
+	made := &renderer.grass_programs[which_program(renderer)]
+	UseProgram(made.program)
+	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
+	Uniform1f(made.time_at, look.time)
+	Uniform1f(made.wind_at, GRASS_WIND_LEAST + (GRASS_WIND_MOST - GRASS_WIND_LEAST) * look.wind)
+	Uniform1f(made.fade_start_at, fade_start)
+	Uniform1f(made.fade_end_at, fade_end)
+	BindVertexArray(renderer.grass_vertex_array)
+	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.grass_indirect_buffer)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.grass_commands.len * size_of(Draw_Command)), renderer.grass_commands, STREAM_DRAW)
+	Disable(CULL_FACE)
+	if renderer.use_bindless {
+		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, 0, i32(renderer.grass_commands.len), 0)
+		stats.draw_calls += 1
+	else
+		// The commands' runs, in the order they were made: each with its texture.
+		ActiveTexture(TEXTURE0)
+		k : i64 = 0
+		for &cell in grass_cells {
+			if cell.runs.len == 0 do continue
+			if vec3_length(cell.center - camera.position) > fade_end + cell.radius do continue
+			if not sphere_in_view(planes, cell.center, cell.radius) do continue
+			for run in cell.runs {
+				if k == renderer.grass_commands.len do break
+				BindTexture(TEXTURE_2D, renderer.textures[renderer.parts[run.part].texture_slot].id)
+				MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, usize(k * size_of(Draw_Command)), 1, 0)
+				stats.draw_calls += 1
+				k += 1
+			}
+		}
+	}
+	Enable(CULL_FACE)
+}
+
+// ---- the cells drawn in full ------------------------------------------------------
+
+// No cells hidden yet, around the cell a place is in.
+hidden_around :: fun(place: Vec3) -> Hidden_Cells {
+	x, y := grid_of(place)
+	hidden := Hidden_Cells{x = x - HIDDEN_SIDE / 2, y = y - HIDDEN_SIDE / 2, rows = []}
+	for row in 0:HIDDEN_SIDE do hidden.rows[row] = 0
+	return hidden
+}
+
+// Hides a cell, if it's among those around.
+hide_cell :: fun(hidden: ^Hidden_Cells, x: i64, y: i64) {
+	column := x - hidden.x
+	row := y - hidden.y
+	if column < 0 or column >= HIDDEN_SIDE or row < 0 or row >= HIDDEN_SIDE do return
+	hidden.rows[row] = hidden.rows[row] | i32(1 << column)
+}
+
+// Whether a cell is hidden.
+hidden_cell_at :: fun(hidden: ^Hidden_Cells, x: i64, y: i64) -> bool {
+	column := x - hidden.x
+	row := y - hidden.y
+	if column < 0 or column >= HIDDEN_SIDE or row < 0 or row >= HIDDEN_SIDE do return false
+	return hidden.rows[row] & i32(1 << column) != 0
+}
+
+find_hidden_uniforms :: fun(program: u32) -> Hidden_At {
+	at := Hidden_At{x_at = GetUniformLocation(program, "hidden_x"), y_at = GetUniformLocation(program, "hidden_y"), rows_at = []}
+	for row in 0:HIDDEN_SIDE do at.rows_at[row] = array_uniform(program, "hidden_rows[", row)
+	return at
+}
+
+set_hidden_cells :: fun(at: ^Hidden_At, hidden: ^Hidden_Cells) {
+	Uniform1i(at.x_at, i32(hidden.x))
+	Uniform1i(at.y_at, i32(hidden.y))
+	for row in 0:HIDDEN_SIDE do Uniform1i(at.rows_at[row], hidden.rows[row])
+}
+
+// Where an item of a uniform array is in a program: name[index].
+array_uniform :: fun(program: u32, name_start: []utf8, index: i64) -> i32 {
+	name : str64
+	&name + name_start
+	&name + int_text(index)
+	&name + "]"
+	return GetUniformLocation(program, name)   // (the list, its room past the name 0s: C reads up to one)
+}
+
+// Gives a program its shared uniforms for a frame.
+set_shared_uniforms :: fun(at: Shared_Uniforms, view_projection: Mat4, lighting: Cell_Lighting, sun: Vec3, camera: Camera) {
+	matrix := view_projection
+	UniformMatrix4fv(at.view_projection_at, 1, 0, &matrix[0][0])
+	Uniform3f(at.sun_direction_at, sun.x, sun.y, sun.z)
+	Uniform3f(at.sun_color_at, lighting.directional.x, lighting.directional.y, lighting.directional.z)
+	Uniform3f(at.ambient_color_at, lighting.ambient.x, lighting.ambient.y, lighting.ambient.z)
+	Uniform3f(at.camera_position_at, camera.position.x, camera.position.y, camera.position.z)
+	Uniform3f(at.fog_color_at, lighting.fog_color.x, lighting.fog_color.y, lighting.fog_color.z)
+	Uniform1f(at.fog_near_at, lighting.fog_near)
+	Uniform1f(at.fog_far_at, lighting.fog_far)
+}
+
+// The shared mesh buffers, the instance buffer and the indirect buffer,
+// and how the mesh programs read them.
+setup_mesh_buffers :: fun(renderer: ^Renderer) {
+	GenVertexArrays(1, &renderer.mesh_vertex_array)
+	BindVertexArray(renderer.mesh_vertex_array)
+
+	GenBuffers(1, &renderer.mesh_vertex_buffer)
+	BindBuffer(ARRAY_BUFFER, renderer.mesh_vertex_buffer)
+	BufferData(ARRAY_BUFFER, MESH_VERTEX_ROOM * size_of(Vertex), [], STATIC_DRAW)
+	stride := i32(size_of(Vertex))
+	EnableVertexAttribArray(0)
+	VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)    // position
+	EnableVertexAttribArray(1)
+	VertexAttribPointer(1, 3, FLOAT, 0, stride, 12)   // normal
+	EnableVertexAttribArray(2)
+	VertexAttribPointer(2, 2, FLOAT, 0, stride, 24)   // uv
+	EnableVertexAttribArray(3)
+	VertexAttribPointer(3, 4, FLOAT, 0, stride, 32)   // color
+	EnableVertexAttribArray(15)
+	VertexAttribPointer(15, 4, FLOAT, 0, stride, 48)  // tangent (normal maps; leaf cards' corners)
+
+	GenBuffers(1, &renderer.mesh_index_buffer)
+	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.mesh_index_buffer)
+	BufferData(ELEMENT_ARRAY_BUFFER, MESH_INDEX_ROOM * 2, [], STATIC_DRAW)
+
+	GenBuffers(1, &renderer.influence_buffer)
+	BindBuffer(SHADER_STORAGE_BUFFER, renderer.influence_buffer)
+	BufferData(SHADER_STORAGE_BUFFER, INFLUENCE_ROOM * size_of(Skin_Influence), [], STATIC_DRAW)
+	renderer.influences_used = 0
+	GenBuffers(1, &renderer.palette_buffer)
+	BindBuffer(SHADER_STORAGE_BUFFER, renderer.palette_buffer)
+	BufferData(SHADER_STORAGE_BUFFER, PALETTE_ROOM * size_of(Mat4), [], STREAM_DRAW)
+	renderer.palette.len = 0
+
+	// The instances: one Drawn_Instance each, read once for each instance.
+	GenBuffers(1, &renderer.instance_buffer)
+	BindBuffer(ARRAY_BUFFER, renderer.instance_buffer)
+	BufferData(ARRAY_BUFFER, MAX_DRAWN * size_of(Drawn_Instance), [], STREAM_DRAW)
+	instance_stride := i32(size_of(Drawn_Instance))
+	for column in 0:4 {
+		location := u32(4 + column)
+		EnableVertexAttribArray(location)
+		VertexAttribPointer(location, 4, FLOAT, 0, instance_stride, usize(column * 16))
+		VertexAttribDivisor(location, 1)
+	}
+	EnableVertexAttribArray(8)
+	VertexAttribIPointer(8, 4, UNSIGNED_INT, instance_stride, 64)      // lights 1 to 8, two to a word
+	VertexAttribDivisor(8, 1)
+	EnableVertexAttribArray(9)
+	VertexAttribIPointer(9, 4, UNSIGNED_INT, instance_stride, 80)      // lights 9 to 16
+	VertexAttribDivisor(9, 1)
+	EnableVertexAttribArray(10)
+	VertexAttribPointer(10, 4, FLOAT, 0, instance_stride, 96)          // material
+	VertexAttribDivisor(10, 1)
+	EnableVertexAttribArray(11)
+	VertexAttribIPointer(11, 4, UNSIGNED_INT, instance_stride, 112)    // texture and glow map handles
+	VertexAttribDivisor(11, 1)
+	EnableVertexAttribArray(12)
+	VertexAttribIPointer(12, 4, UNSIGNED_INT, instance_stride, 128)    // normal map handle, glossiness, flags
+	VertexAttribDivisor(12, 1)
+	EnableVertexAttribArray(13)
+	VertexAttribPointer(13, 4, FLOAT, 0, instance_stride, 144)         // specular color
+	VertexAttribDivisor(13, 1)
+	EnableVertexAttribArray(14)
+	VertexAttribPointer(14, 4, FLOAT, 0, instance_stride, 160)         // motion
+	VertexAttribDivisor(14, 1)
+	BindVertexArray(0)
+
+	GenBuffers(1, &renderer.indirect_buffer)
+}
+
+// The land's buffers — its slots of vertices, the indexes they share, its
+// quadrants' textures' handles — and how the land programs read them.
+setup_land_buffers :: fun(renderer: ^Renderer) {
+	GenVertexArrays(1, &renderer.land_vertex_array)
+	BindVertexArray(renderer.land_vertex_array)
+
+	GenBuffers(1, &renderer.land_vertex_buffer)
+	BindBuffer(ARRAY_BUFFER, renderer.land_vertex_buffer)
+	BufferData(ARRAY_BUFFER, LAND_SLOTS * LAND_MESH_VERTICES * size_of(Land_Vertex), [], STATIC_DRAW)
+	stride := i32(size_of(Land_Vertex))
+	EnableVertexAttribArray(0)
+	VertexAttribPointer(0, 3, FLOAT, 0, stride, 0)            // position
+	EnableVertexAttribArray(1)
+	VertexAttribPointer(1, 3, FLOAT, 0, stride, 12)           // normal
+	EnableVertexAttribArray(2)
+	VertexAttribPointer(2, 2, FLOAT, 0, stride, 24)           // uv
+	EnableVertexAttribArray(3)
+	VertexAttribPointer(3, 3, FLOAT, 0, stride, 32)           // color
+	EnableVertexAttribArray(4)
+	VertexAttribPointer(4, 4, UNSIGNED_BYTE, 1, stride, 44)   // weights 1 to 4, 0 to 1
+	EnableVertexAttribArray(5)
+	VertexAttribPointer(5, 4, UNSIGNED_BYTE, 1, stride, 48)   // weights 5 to 8
+
+	indices : [LAND_MESH_INDICES]u16
+	land_indices(&indices)
+	GenBuffers(1, &renderer.land_index_buffer)
+	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.land_index_buffer)
+	BufferData(ELEMENT_ARRAY_BUFFER, isize(indices.len * 2), indices, STATIC_DRAW)
+	BindVertexArray(0)
+	GenBuffers(1, &renderer.land_indirect_buffer)
+
+	GenBuffers(1, &renderer.land_texture_buffer)
+	BindBuffer(SHADER_STORAGE_BUFFER, renderer.land_texture_buffer)
+	BufferData(SHADER_STORAGE_BUFFER, LAND_QUADRANTS * QUADRANT_TEXTURES * 2 * 8, [], DYNAMIC_DRAW)
+
+	GenBuffers(1, &renderer.light_buffer)
+	BindBuffer(SHADER_STORAGE_BUFFER, renderer.light_buffer)
+	BufferData(SHADER_STORAGE_BUFFER, SCENE_LIGHTS * size_of(Light_Record), [], DYNAMIC_DRAW)
+}
+
+// ---- textures --------------------------------------------------------------------
+
+// The slot of the texture at path in the archive (an index into the
+// renderer's textures), loaded onto the card the first time it's asked
+// for; the white texture's (0) when it can't be read. scratch is room for
+// reading and decoding it. clamp_mode is how its edges go, as a NIF says
+// (CLAMP_* : repeating both ways unless asked); a texture asked for with
+// two is loaded twice, as a texture's handle keeps its edges for good.
+texture_for :: fun(renderer: ^Renderer, archives: ^Archives, path: []utf8, scratch: ^[]byte, clamp_mode: u32 = REPEAT_BOTH) -> i64 {
+	if path.len == 0 do return 0
+	key := texture_key(path, clamp_mode)
+	known, found := index_get(&renderer.texture_index, key)
+	if found do return known
+	if not fits(renderer.textures.len + 1, renderer.textures.cap) do return 0
+	id, has_alpha, width, height, load_error := load_texture(renderer, archives, path, scratch, clamp_mode)
+	slot : i64 = 0
+	if load_error {
+		renderer.texture_failures += 1
+		if renderer.texture_failures == 1 {
+			renderer.first_texture_failure.len = 0
+			add_what_fits(&renderer.first_texture_failure, path)
+			renderer.first_texture_reason = load_error
+		}
+	else
+		slot = renderer.textures.len
+		entry := next(&renderer.textures)
+		entry.path.len = 0
+		&entry.path + path
+		entry.id = id
+		entry.width = width
+		entry.height = height
+		entry.handle = 0
+		entry.has_alpha = has_alpha
+		wait_for_handle(renderer, slot)
+	}
+	_ = index_put(&renderer.texture_index, key, slot)
+	return slot
+}
+
+// A texture's key in the renderer's index: its path's hash, and how its
+// edges go.
+texture_key :: fun(path: []utf8, clamp_mode: u32) -> u64 {
+	key := text_hash(path)
+	if clamp_mode != REPEAT_BOTH do key = (key ~ (u64(clamp_mode + 1) *% 0x9E3779B97F4A7C15)) | 1
+	return key
+}
+
+// The slot of a texture loaded before (as texture_for loads it), and
+// false when it hasn't been: a look that needs no room to read one into.
+known_texture :: fun(renderer: ^Renderer, path: []utf8, clamp_mode: u32 = REPEAT_BOTH) -> i64, bool {
+	if path.len == 0 do return 0, true
+	return index_get(&renderer.texture_index, texture_key(path, clamp_mode))
+}
+
+// Puts a texture made of pixels (red, green, blue, alpha, rows from the
+// top) onto the card as path's, so a part naming path is drawn with it (its
+// edges repeating, as most are): its slot. A path it has already keeps the
+// texture it has.
+texture_from_pixels :: fun(renderer: ^Renderer, path: []utf8, pixels: []byte, width: i64, height: i64) -> i64 {
+	key := text_hash(path)
+	known, found := index_get(&renderer.texture_index, key)
+	if found do return known
+	if not fits(renderer.textures.len + 1, renderer.textures.cap) or pixels.len < width * height * 4 do return 0
+	id := new_texture_name(renderer)
+	BindTexture(TEXTURE_2D, id)
+	TexImage2D(TEXTURE_2D, 0, i32(RGBA8), i32(width), i32(height), 0, RGBA, UNSIGNED_BYTE, pixels)
+	GenerateMipmap(TEXTURE_2D)
+	TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(LINEAR_MIPMAP_LINEAR))
+	TexParameteri(TEXTURE_2D, TEXTURE_MAG_FILTER, i32(LINEAR))
+	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_S, i32(REPEAT))
+	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_T, i32(REPEAT))
+	if renderer.anisotropy > 1 do TexParameterf(TEXTURE_2D, TEXTURE_MAX_ANISOTROPY, renderer.anisotropy)
+	slot := renderer.textures.len
+	entry := next(&renderer.textures)
+	entry.path.len = 0
+	add_what_fits(&entry.path, path)
+	entry.id = id
+	entry.width = width
+	entry.height = height
+	entry.handle = 0
+	entry.has_alpha = false
+	wait_for_handle(renderer, slot)
+	_ = index_put(&renderer.texture_index, key, slot)
+	return slot
+}
+
+// Reads a texture from the archives onto the card: block compressed ones as
+// they are, the rest decoded to plain pixels; its mipmaps as many as it
+// has, sharp at a slant.
+load_texture :: fun(renderer: ^Renderer, archives: ^Archives, path: []utf8, scratch: ^[]byte, clamp_mode: u32) -> u32, bool, i64, i64, err {
+	texture := read_archive_texture(archives, path, scratch)?
+	has_alpha := texture.format == .dxt3 or texture.format == .dxt5 or texture.format == .bgra8 or texture.format == .bgra4
+
+	id := new_texture_name(renderer)
+	BindTexture(TEXTURE_2D, id)
+	levels : i64 = 0
+	for mip, level in texture.mips {
+		width := i32(mip.width)
+		height := i32(mip.height)
+		pixels := texture.pixels[mip.at : mip.at + mip.size]
+		match texture.format {
+		dxt1
+			CompressedTexImage2D(TEXTURE_2D, i32(level), RGBA_S3TC_DXT1, width, height, 0, pixels)
+		dxt3
+			CompressedTexImage2D(TEXTURE_2D, i32(level), RGBA_S3TC_DXT3, width, height, 0, pixels)
+		dxt5
+			CompressedTexImage2D(TEXTURE_2D, i32(level), RGBA_S3TC_DXT5, width, height, 0, pixels)
+		else
+			decoded, decode_error := decode_rgba(texture, level, scratch)
+			if decode_error do break
+			TexImage2D(TEXTURE_2D, i32(level), i32(RGBA8), width, height, 0, RGBA, UNSIGNED_BYTE, decoded)
+		}
+		levels += 1
+	}
+	if levels == 0 do return 0, false, 0, 0, Empty_Texture
+	// Its mipmaps, as many as it has (many stop short of 1 pixel).
+	TexParameteri(TEXTURE_2D, TEXTURE_MAX_LEVEL, i32(levels - 1))
+	TexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, i32(LINEAR_MIPMAP_LINEAR))
+	TexParameteri(TEXTURE_2D, TEXTURE_MAG_FILTER, i32(LINEAR))
+	// Past its edges: the picture again, or its edge's pixels drawn on.
+	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_S, i32(if clamp_mode & 2 != 0 do REPEAT else CLAMP_TO_EDGE))
+	TexParameteri(TEXTURE_2D, TEXTURE_WRAP_T, i32(if clamp_mode & 1 != 0 do REPEAT else CLAMP_TO_EDGE))
+	if renderer.anisotropy > 1 do TexParameterf(TEXTURE_2D, TEXTURE_MAX_ANISOTROPY, renderer.anisotropy)
+	return id, has_alpha, texture.width, texture.height
+}
+
+// A texture from the archives, its header read: into scratch (len set to 0).
+read_archive_texture :: fun(archives: ^Archives, path: []utf8, scratch: ^[]byte) -> Texture, err {
+	scratch.len = 0
+	texture_file, found := find_archived(archives, path)
+	if not found do return Texture(), Not_Found
+	data := read_archived(archives, texture_file, scratch)?
+	return read_texture(data)
+}
+
+// ---- meshes --------------------------------------------------------------------------
+
+// What putting a model on the card can fail with.
+Upload_Error :: error {
+	No_Room_On_Card   // the shared buffers or the parts table are full
+}
+
+// Puts a model's parts into the shared buffers, their textures read from
+// the archive: the model on the card.
+upload_model :: fun(renderer: ^Renderer, built: ^Model, archives: ^Archives, scratch: ^[]byte) -> Gpu_Model, err {
+	vertex_total : i64 = 0
+	index_total : i64 = 0
+	influence_total : i64 = 0
+	for part in built.parts {
+		vertex_total += part.vertices.len
+		index_total += part.indices.len
+		influence_total += part.influences.len
+	}
+	if renderer.vertices_used + vertex_total > MESH_VERTEX_ROOM or renderer.indices_used + index_total > MESH_INDEX_ROOM {
+		return Gpu_Model{0}, No_Room_On_Card
+	}
+	if renderer.influences_used + influence_total > INFLUENCE_ROOM do return Gpu_Model{0}, No_Room_On_Card
+	if renderer.parts.len + built.parts.len > renderer.parts.cap do return Gpu_Model{0}, No_Room_On_Card
+	if renderer.billboards.len + built.parts.len > renderer.billboards.cap do return Gpu_Model{0}, No_Room_On_Card
+	if renderer.particle_kinds.len + built.particles.len > renderer.particle_kinds.cap do return Gpu_Model{0}, No_Room_On_Card
+	if renderer.motions.len + built.motions.len > renderer.motions.cap do return Gpu_Model{0}, No_Room_On_Card
+	frame_total : i64 = 0
+	for &flip in built.flips do frame_total += flip.frames.len
+	if renderer.flips.len + built.flips.len > renderer.flips.cap or renderer.flip_frames.len + frame_total > renderer.flip_frames.cap {
+		return Gpu_Model{0}, No_Room_On_Card
+	}
+
+	// Its flipbooks: each frame's texture, its edges as the first part
+	// flipping it has them.
+	first_flip := renderer.flips.len
+	for &flip, flip_index in built.flips {
+		clamp_mode : u32 = REPEAT_BOTH
+		for part in built.parts {
+			if part.flip == flip_index {
+				clamp_mode = part.clamp_mode
+				break
+			}
+		}
+		made := next(&renderer.flips)
+		made.first_frame = renderer.flip_frames.len
+		made.frame_count = flip.frames.len
+		for frame in flip.frames do &renderer.flip_frames + texture_for(renderer, archives, frame, scratch, clamp_mode)
+		made.start_time = flip.start_time
+		made.stop_time = flip.stop_time
+		made.frequency = flip.frequency
+		made.phase = flip.phase
+		made.key_times = flip.key_times
+		made.key_values = flip.key_values
+		made.shown = renderer.flip_frames[made.first_frame]
+	}
+
+	// Its particle systems, with their textures.
+	first_particles := renderer.particle_kinds.len
+	for &system in built.particles {
+		kind := next(&renderer.particle_kinds)
+		kind.system = system^
+		kind.texture_slot = texture_for(renderer, archives, system.look.texture, scratch, system.look.clamp_mode)
+		kind.flip = -1
+		if system.look.flip >= 0 do kind.flip = first_flip + system.look.flip
+	}
+
+	BindVertexArray(0)   // (binding an index buffer would change a bound vertex array's)
+	gpu := Gpu_Model{
+		first_part = renderer.parts.len,
+		part_count = 0,
+		first_particles = first_particles,
+		particles_count = built.particles.len,
+		center = (built.bounds_min + built.bounds_max) * 0.5,
+		radius = vec3_length(built.bounds_max - built.bounds_min) * 0.5,
+		rigged = false}
+	for part, part_index in built.parts {
+		if part.indices.len == 0 or part.vertices.len == 0 do continue
+		BindBuffer(ARRAY_BUFFER, renderer.mesh_vertex_buffer)
+		BufferSubData(ARRAY_BUFFER, isize(renderer.vertices_used * size_of(Vertex)), part.vertices)
+		BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.mesh_index_buffer)
+		BufferSubData(ELEMENT_ARRAY_BUFFER, isize(renderer.indices_used * 2), part.indices)
+		// Rigged, its vertices' influences, by vertex id from its first.
+		rigged := part.influences.len > 0 and part.influences.len == part.vertices.len
+		influence_offset := renderer.influences_used - renderer.vertices_used
+		if rigged {
+			BindBuffer(SHADER_STORAGE_BUFFER, renderer.influence_buffer)
+			BufferSubData(SHADER_STORAGE_BUFFER, isize(renderer.influences_used * size_of(Skin_Influence)), part.influences)
+			renderer.influences_used += part.influences.len
+			gpu.rigged = true
+		}
+
+		threshold : f32 = 0
+		if part.alpha_test do threshold = part.alpha_threshold
+		// It shines where its normal map's alpha says: one without an alpha
+		// channel (DXT1, as the game's matte stone and wood have) not at all.
+		normal_slot := normal_map_for(renderer, archives, &part, scratch)
+		shines := normal_slot >= 0 and renderer.textures[normal_slot].has_alpha
+		// Its values that change over time.
+		first_motion := renderer.motions.len
+		for &motion in built.motions {
+			if motion.part == part_index do &renderer.motions + motion^
+		}
+		flip : i64 = -1
+		if part.flip >= 0 do flip = first_flip + part.flip
+		billboard : i64 = -1
+		if part.billboard_mode >= 0 {
+			billboard = renderer.billboards.len
+			&renderer.billboards + Gpu_Billboard{
+				mode = part.billboard_mode,
+				node = part.billboard_node,
+				node_inverse = mat4_inverse(part.billboard_node)}
+		}
+		next(&renderer.parts)^ = Mesh_Part{
+			first_index = u32(renderer.indices_used),
+			index_count = u32(part.indices.len),
+			base_vertex = i32(renderer.vertices_used),
+			texture_slot = texture_for(renderer, archives, part.texture, scratch, part.clamp_mode),
+			glow_slot = glow_map_for(renderer, archives, &part, scratch),
+			normal_slot = normal_slot,
+			first_motion = first_motion,
+			motion_count = renderer.motions.len - first_motion,
+			specular = if shines do part.specular else Vec3{0, 0, 0},
+			glossiness = part.glossiness,
+			alpha_blend = part.alpha_blend,
+			depth_write = part.depth_write,
+			two_sided = part.two_sided,
+			alpha_threshold = threshold,
+			emissive = part.emissive,
+			additive = part.additive,
+			flip = flip,
+			billboard = billboard,
+			leaf_cards = part.leaf_cards,
+			rigged = rigged,
+			influence_offset = influence_offset}
+		renderer.vertices_used += part.vertices.len
+		renderer.indices_used += part.indices.len
+		gpu.part_count += 1
+	}
+	return gpu
+}
+
+// A part's glow map: where its material's own light shows, in the
+// material's emissive color. Its texturing's glow map if it names one,
+// else its texture's with _g, as the game finds them (runestone02a.dds,
+// runestone02a_g.dds). Its texture slot; -1 for none, or when its
+// material emits nothing (the map would show nothing).
+glow_map_for :: fun(renderer: ^Renderer, archives: ^Archives, part: ^Model_Part, scratch: ^[]byte) -> i64 {
+	if part.emissive.x <= 0 and part.emissive.y <= 0 and part.emissive.z <= 0 do return -1
+	path : [160]utf8
+	if part.glow_texture.len > 0 {
+		&path + part.glow_texture
+	elif part.texture.len > 4 and ends_with(part.texture, ".dds")
+		&path + part.texture[0 : part.texture.len - 4]
+		&path + "_g.dds"
+	else
+		return -1
+	}
+	_, found := find_archived(archives, path)
+	if not found do return -1
+	return texture_for(renderer, archives, path, scratch, part.clamp_mode)
+}
+
+// A part's normal map: its texture's with _n, as the game finds them
+// (doorlow.dds, doorlow_n.dds). Its texture slot; -1 for none, or when it
+// couldn't be loaded (the white texture would tip every pixel).
+normal_map_for :: fun(renderer: ^Renderer, archives: ^Archives, part: ^Model_Part, scratch: ^[]byte) -> i64 {
+	if part.texture.len <= 4 or not ends_with(part.texture, ".dds") do return -1
+	path : [160]utf8
+	&path + part.texture[0 : part.texture.len - 4]
+	&path + "_n.dds"
+	_, found := find_archived(archives, path)
+	if not found do return -1
+	slot := texture_for(renderer, archives, path, scratch, part.clamp_mode)
+	return if slot == 0 do -1 else slot
+}
+
+// An instance of a model placed in the world: its sphere worked out, no
+// lights yet (choose_lights).
+place_instance :: fun(gpu: Gpu_Model, model_index: i64, placement: Mat4, reference: u32 = 0) -> Instance {
+	placed := mat4_mul_vec4(placement, Vec4{gpu.center.x, gpu.center.y, gpu.center.z, 1})
+	// The scale: how long the matrix's x axis is.
+	scale := vec3_length(Vec3{placement[0][0], placement[0][1], placement[0][2]})
+	instance := Instance{
+		model = model_index,
+		world = placement,
+		center = Vec3{placed.x, placed.y, placed.z},
+		radius = gpu.radius * scale,
+		reference = reference,
+		lights = [],
+		moving_kind = -1,
+		moving_piece = 0,
+		placement = placement,
+		reach = 0,
+		palette_base = -1}
+	for k in 0:LIGHTS_PER_OBJECT do instance.lights[k] = NO_LIGHT
+	return instance
+}
+
+// Chooses the lights that light an instance: those of the scene's first
+// SCENE_LIGHTS whose reach meets its sphere, the nearest first.
+choose_lights :: fun(instance: ^Instance, lights: ^[]Point_Light) {
+	distances : [LIGHTS_PER_OBJECT!]f32
+	count : i64 = 0
+	for k in 0:instance.lights.len do instance.lights[k] = NO_LIGHT
+	last := lights.len
+	if last > SCENE_LIGHTS do last = SCENE_LIGHTS
+	for index in 0:last {
+		light := lights[index]
+		distance := vec3_length(light.position - instance.center)
+		if distance > light.radius + instance.radius do continue
+		if count == LIGHTS_PER_OBJECT and distance >= distances[LIGHTS_PER_OBJECT - 1] do continue
+		at := count
+		if count < LIGHTS_PER_OBJECT do count += 1
+		else do at = LIGHTS_PER_OBJECT - 1
+		for at > 0 and distances[at - 1] > distance {
+			instance.lights[at] = instance.lights[at - 1]
+			distances[at] = distances[at - 1]
+			at -= 1
+		}
+		instance.lights[at] = u16(index)
+		distances[at] = distance
+	}
+}
+
+// A light as the mesh programs read it: where it is now and how far it
+// reaches, its color as bright as it is now.
+Light_Record :: struct {
+	place: [4!]f32
+	color: [4!]f32
+}
+
+// Gives the mesh programs the scene's lights, as they are now: its first
+// SCENE_LIGHTS, into the light buffer.
+set_scene_lights :: fun(renderer: ^Renderer, lights: ^[]Point_Light) {
+	records : [SCENE_LIGHTS]Light_Record
+	for &light in lights {
+		if not fits(records.len + 1, records.cap) do break
+		at := light.position + light.drift
+		shown := light.color * light.brightness
+		&records + Light_Record{place = [at.x, at.y, at.z, light.radius], color = [shown.x, shown.y, shown.z, 0]}
+	}
+	if records.len == 0 do return
+	BindBuffer(SHADER_STORAGE_BUFFER, renderer.light_buffer)
+	BufferSubData(SHADER_STORAGE_BUFFER, 0, records)
+}
+
+// Puts this frame's palette (pose_npcs's) on the card.
+upload_palette :: fun(renderer: ^Renderer) {
+	if renderer.palette.len == 0 do return
+	BindBuffer(SHADER_STORAGE_BUFFER, renderer.palette_buffer)
+	BufferData(SHADER_STORAGE_BUFFER, PALETTE_ROOM * size_of(Mat4), [], STREAM_DRAW)   // (a fresh buffer: no waiting on last frame's)
+	BufferSubData(SHADER_STORAGE_BUFFER, 0, renderer.palette)
+}
+
+// ---- land ---------------------------------------------------------------------------------
+
+// Puts the land of the cell at x, y on the card: its quadrants' textures
+// and their normal maps (loaded the first time each is asked for, their
+// handles where the quadrant's land reads them), its vertices into a slot
+// (0 to LAND_SLOTS - 1, one no other land is in).
+upload_land :: fun(renderer: ^Renderer, mesh: ^Land_Mesh, x: i64, y: i64, slot: i64, archives: ^Archives, scratch: ^[]byte) -> Gpu_Land {
+	for q in 0:4 {
+		textures := &mesh.textures[q]
+		quadrant := &renderer.land_quadrants[slot * 4 + q]
+		handles : [QUADRANT_TEXTURES * 2!]u64
+		for k in 0:QUADRANT_TEXTURES {
+			texture_slot := quadrant.textures[0]
+			normal_slot := quadrant.normal_maps[0]
+			if k < textures.count {
+				texture_slot = texture_for(renderer, archives, textures.paths[k], scratch)
+				normal_slot = land_normal_for(renderer, archives, textures.paths[k], scratch)
+			}
+			quadrant.textures[k] = texture_slot
+			quadrant.normal_maps[k] = normal_slot
+		}
+		make_waiting_handles(renderer)
+		for k in 0:QUADRANT_TEXTURES {
+			handles[k] = renderer.textures[quadrant.textures[k]].handle
+			handles[QUADRANT_TEXTURES + k] = renderer.textures[quadrant.normal_maps[k]].handle
+		}
+		if renderer.bindless_available {
+			BindBuffer(SHADER_STORAGE_BUFFER, renderer.land_texture_buffer)
+			BufferSubData(SHADER_STORAGE_BUFFER, isize((slot * 4 + q) * QUADRANT_TEXTURES * 2 * 8), handles)
+		}
+	}
+	BindBuffer(ARRAY_BUFFER, renderer.land_vertex_buffer)
+	BufferSubData(ARRAY_BUFFER, isize(slot * LAND_MESH_VERTICES * size_of(Land_Vertex)), mesh.vertices)
+	return Gpu_Land{x = x, y = y, slot = slot, center = mesh.center, radius = mesh.radius}
+}
+
+// A land texture's normal map (its path with _n): its texture slot; the
+// flat normal map's where it has none.
+land_normal_for :: fun(renderer: ^Renderer, archives: ^Archives, texture: []utf8, scratch: ^[]byte) -> i64 {
+	if texture.len <= 4 or not ends_with(texture, ".dds") do return renderer.flat_normal_texture
+	path : [160]utf8
+	&path + texture[0 : texture.len - 4]
+	&path + "_n.dds"
+	_, found := find_archived(archives, path)
+	if not found do return renderer.flat_normal_texture
+	slot := texture_for(renderer, archives, path, scratch)
+	return if slot == 0 do renderer.flat_normal_texture else slot
+}
+
+// ---- the reticle ---------------------------------------------------------------------
+
+// A dot in the middle of the screen, where the eyes point: white with a
+// dark rim (seen on the sky and on snow), yellow when it's on something
+// to use. Two small clears, no shader.
+draw_reticle :: fun(width: i64, height: i64, on_something: bool) {
+	middle_x := i32(width / 2)
+	middle_y := i32(height / 2)
+	Enable(SCISSOR_TEST)
+	Scissor(middle_x - 3, middle_y - 3, 6, 6)
+	ClearColor(0.05, 0.05, 0.05, 1)
+	Clear(COLOR_BUFFER_BIT)
+	Scissor(middle_x - 2, middle_y - 2, 4, 4)
+	if on_something do ClearColor(1, 0.85, 0.3, 1)
+	else do ClearColor(0.95, 0.95, 0.95, 1)
+	Clear(COLOR_BUFFER_BIT)
+	Disable(SCISSOR_TEST)
+}
+
+// ---- the camera ----------------------------------------------------------------------
+
+// Where the camera is and which way it looks.
+Camera :: struct {
+	position: Vec3
+	yaw: f32      // turned from looking north (+y), clockwise seen from above
+	pitch: f32    // up from level
+	field_of_view: f32 = 1.2   // vertical, in radians
+	near: f32 = 10   // as the game's (Oblivion.ini fNearDistance)
+	far: f32 = 60000
+}
+
+// The way the camera looks, and its right and up.
+camera_axes :: fun(camera: Camera) -> Vec3, Vec3, Vec3 {
+	forward := Vec3{sin_f32(camera.yaw) * cos_f32(camera.pitch), cos_f32(camera.yaw) * cos_f32(camera.pitch), sin_f32(camera.pitch)}
+	right := Vec3{cos_f32(camera.yaw), -sin_f32(camera.yaw), 0}
+	up := cross(right, forward)
+	return forward, right, up
+}
+
+// The matrix taking the world to the camera's view: the camera looking
+// down its -z, as OpenGL has it.
+view_matrix :: fun(camera: Camera) -> Mat4 {
+	forward, right, up := camera_axes(camera)
+	view := mat4_identity()
+	view[0][0] = right.x
+	view[1][0] = right.y
+	view[2][0] = right.z
+	view[0][1] = up.x
+	view[1][1] = up.y
+	view[2][1] = up.z
+	view[0][2] = -forward.x
+	view[1][2] = -forward.y
+	view[2][2] = -forward.z
+	view[3][0] = -dot(right, camera.position)
+	view[3][1] = -dot(up, camera.position)
+	view[3][2] = dot(forward, camera.position)
+	return view
+}
+
+// The six planes bounding what a view and projection see, each as its
+// normal (pointing in) and distance: a point p is inside a plane when
+// dot(normal, p) + distance >= 0.
+View_Planes :: struct {
+	planes: [6!][4!]f32
+}
+
+view_planes :: fun(view_projection: Mat4) -> View_Planes {
+	m := view_projection
+	result := View_Planes{0}
+	// Each plane: the matrix's last row, plus or minus one of its first
+	// three (row i: the columns' i-th items) — left, right, bottom, top,
+	// near, far.
+	for p in 0:6 {
+		row := p / 2
+		sign : f32 = 1
+		if p % 2 == 1 do sign = -1
+		plane : [4!]f32
+		for k in 0:4 do plane[k] = m[k][3] + sign * m[k][row]
+		scale := sqrt_f32(plane[0] * plane[0] + plane[1] * plane[1] + plane[2] * plane[2])
+		if scale > 0 {
+			for k in 0:4 do plane[k] = plane[k] / scale
+		}
+		result.planes[p] = plane
+	}
+	return result
+}
+
+// Whether any of a sphere is in view.
+sphere_in_view :: fun(planes: ^View_Planes, center: Vec3, radius: f32) -> bool {
+	for p in 0:6 {
+		plane := planes.planes[p]
+		if plane[0] * center.x + plane[1] * center.y + plane[2] * center.z + plane[3] < -radius do return false
+	}
+	return true
+}
+
+// ---- drawing a frame -----------------------------------------------------------------
+
+// Draws a frame width by height pixels from the camera: the land in view,
+// then the instances in view — opaque parts, then blended — lit by the
+// lighting and the lights set with set_scene_lights. Tells what it drew.
+// When the frame's framebuffer can't be made, it's drawn into the window
+// (its effects cut off where they meet what's behind them), and why is
+// given back.
+draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, distant_instances: ^[]Instance, grounds: ^[]Gpu_Land,
+	waters: ^[]Water_Cell, tree_cells: ^[]Gpu_Trees, grass_cells: ^[]Gpu_Grass, held: ^[]Instance, look: ^Sky_Look, lighting: Cell_Lighting,
+	camera: Camera, width: i64, height: i64) -> Frame_Stats, err
+{
+	stats := Frame_Stats{instances = 0, visible = 0, drawn_parts = 0, draw_calls = 0, land_cells = 0}
+	make_waiting_handles(renderer)
+	framebuffer_error := size_framebuffers(renderer, width, height)
+	soft := not framebuffer_error
+	if soft do BindFramebuffer(FRAMEBUFFER, renderer.scene_framebuffer)
+	Viewport(0, 0, i32(width), i32(height))
+	fog := lighting.fog_color
+	ClearColor(fog.x, fog.y, fog.z, 1.0)
+	Clear(COLOR_BUFFER_BIT | DEPTH_BUFFER_BIT)
+	Enable(DEPTH_TEST)
+	DepthFunc(LEQUAL)
+	Enable(CULL_FACE)
+	Disable(BLEND)
+	DepthMask(1)
+	ActiveTexture(TEXTURE0)
+
+	projection := mat4_perspective(camera.field_of_view, f32(width) / f32(height), camera.near, camera.far)
+	view_projection := mat4_mul(projection, view_matrix(camera))
+	planes := view_planes(view_projection)
+	sun := vec3_normalize(lighting.direction)
+
+	BindBufferBase(SHADER_STORAGE_BUFFER, 3, renderer.light_buffer)
+	BindBufferBase(SHADER_STORAGE_BUFFER, 4, renderer.influence_buffer)
+	BindBufferBase(SHADER_STORAGE_BUFFER, 5, renderer.palette_buffer)
+	if look.sky do draw_sky(renderer, look, view_projection, lighting, camera, &stats)
+	// The cells drawn in full: what the far pass leaves out.
+	near_cells := hidden_around(camera.position)
+	for ground in grounds do hide_cell(&near_cells, ground.x, ground.y)
+	if look.outside and renderer.distant_pieces.len > 0 {
+		// The far pass: out to where the fog ends, then the depth cleared
+		// for the near.
+		reach := lighting.fog_far * 1.1
+		if reach < camera.far do reach = camera.far
+		far_projection := mat4_perspective(camera.field_of_view, f32(width) / f32(height), DISTANT_NEAR, reach)
+		far_view_projection := mat4_mul(far_projection, view_matrix(camera))
+		far_planes := view_planes(far_view_projection)
+		draw_distant_land(renderer, grounds, &far_planes, far_view_projection, lighting, sun, camera, &stats)
+		// What's seen from afar, but in the cells drawn in full (there, its
+		// own references are).
+		if distant_instances.len > 0 {
+			gather_meshes(renderer, models, distant_instances, &far_planes, &near_cells, camera, look.time, &stats)
+			draw_mesh_runs(renderer, far_view_projection, lighting, sun, camera, false, false, &stats)
+		}
+		if tree_cells.len > 0 do draw_trees(renderer, tree_cells, &near_cells, false, &far_planes, far_view_projection, lighting, sun, camera, &stats)
+		draw_far_water(renderer, waters, look, far_view_projection, lighting, camera, &stats)
+		if distant_instances.len > 0 do draw_mesh_runs(renderer, far_view_projection, lighting, sun, camera, true, false, &stats)
+		DepthMask(1)   // (a clear writes depth only where depth may be written)
+		Clear(DEPTH_BUFFER_BIT)
+	}
+	if grounds.len > 0 do draw_land(renderer, grounds, &planes, view_projection, lighting, sun, camera, &stats)
+	nothing_left_out := hidden_around(camera.position)
+	gather_meshes(renderer, models, instances, &planes, &nothing_left_out, camera, look.time, &stats)
+	draw_mesh_runs(renderer, view_projection, lighting, sun, camera, false, false, &stats)
+	if look.outside and tree_cells.len > 0 do draw_trees(renderer, tree_cells, &near_cells, true, &planes, view_projection, lighting, sun, camera, &stats)
+	if look.outside and grass_cells.len > 0 {
+		draw_grass(renderer, grass_cells, &planes, view_projection, lighting, sun, camera, look, GRASS_FADE_START, GRASS_FADE_END, &stats)
+	}
+	if soft do copy_depth(renderer)
+	if waters.len > 0 do draw_water(renderer, waters, &planes, look, view_projection, lighting, camera, &stats)
+	draw_mesh_runs(renderer, view_projection, lighting, sun, camera, true, soft, &stats)
+	draw_particles(renderer, models, instances, view_projection, lighting, sun, camera, look.time, soft, &stats)
+	if look.outside do draw_precipitation(renderer, look, view_projection, lighting, sun, camera, &stats)
+	// What's held in view (the first-person arms and weapon): last, in a
+	// depth of its own from a nearer near plane, so no wall cuts into it.
+	if held.len > 0 {
+		DepthMask(1)
+		Clear(DEPTH_BUFFER_BIT)
+		// Framed as the game frames it (HELD_FIELD_ACROSS), however wide the
+		// world's view is: its height's angle, 2 atan(tan(across / 2) /
+		// aspect), the atan as an acos.
+		aspect := f32(width) / f32(height)
+		slope := tan(to_radians(HELD_FIELD_ACROSS) / 2) / aspect
+		held_field := 2 * acos(1 / sqrt_f32(1 + slope * slope))
+		held_projection := mat4_perspective(held_field, aspect, HELD_NEAR, HELD_FAR)
+		held_view_projection := mat4_mul(held_projection, view_matrix(camera))
+		held_planes := view_planes(held_view_projection)
+		nothing_hidden := hidden_around(camera.position)
+		gather_meshes(renderer, models, held, &held_planes, &nothing_hidden, camera, look.time, &stats)
+		draw_mesh_runs(renderer, held_view_projection, lighting, sun, camera, false, false, &stats)
+		draw_mesh_runs(renderer, held_view_projection, lighting, sun, camera, true, false, &stats)
+	}
+
+	DepthMask(1)
+	Disable(BLEND)
+	ActiveTexture(TEXTURE0)
+	BindVertexArray(0)
+	// The 2D layer over it all.
+	layer_draw(&renderer.ui, width, height)
+	Enable(CULL_FACE)
+	Enable(DEPTH_TEST)
+	// The frame into the window.
+	if soft {
+		BindFramebuffer(READ_FRAMEBUFFER, renderer.scene_framebuffer)
+		BindFramebuffer(DRAW_FRAMEBUFFER, 0)
+		BlitFramebuffer(0, 0, i32(width), i32(height), 0, 0, i32(width), i32(height), COLOR_BUFFER_BIT, NEAREST)
+		BindFramebuffer(FRAMEBUFFER, 0)
+	}
+	return stats, framebuffer_error
+}
+
+// Draws the sky behind everything: its triangle over the screen, the
+// depth buffer neither read nor written.
+draw_sky :: fun(renderer: ^Renderer, look: ^Sky_Look, view_projection: Mat4, lighting: Cell_Lighting, camera: Camera, stats: ^Frame_Stats) {
+	made := &renderer.sky_program
+	state := &look.state
+	UseProgram(made.program)
+	inverse := mat4_inverse(view_projection)
+	UniformMatrix4fv(made.inverse_view_projection_at, 1, 0, &inverse[0][0])
+	Uniform3f(made.camera_position_at, camera.position.x, camera.position.y, camera.position.z)
+	Uniform3f(made.fog_color_at, lighting.fog_color.x, lighting.fog_color.y, lighting.fog_color.z)
+	Uniform3f(made.sky_upper_at, state.upper.x, state.upper.y, state.upper.z)
+	Uniform3f(made.sky_lower_at, state.lower.x, state.lower.y, state.lower.z)
+	Uniform3f(made.sky_horizon_at, state.horizon.x, state.horizon.y, state.horizon.z)
+	Uniform3f(made.sun_direction_at, state.sun_direction.x, state.sun_direction.y, state.sun_direction.z)
+	Uniform3f(made.sun_color_at, state.sun_color.x, state.sun_color.y, state.sun_color.z)
+	Uniform3f(made.cloud_lower_color_at, state.cloud_lower_color.x, state.cloud_lower_color.y, state.cloud_lower_color.z)
+	Uniform3f(made.cloud_upper_color_at, state.cloud_upper_color.x, state.cloud_upper_color.y, state.cloud_upper_color.z)
+	Uniform2f(made.cloud_lower_offset_at, look.cloud_lower_offset, look.cloud_lower_offset * 0.3)
+	Uniform2f(made.cloud_upper_offset_at, look.cloud_upper_offset, look.cloud_upper_offset * 0.3)
+	ActiveTexture(TEXTURE0)
+	BindTexture(TEXTURE_2D, renderer.textures[look.cloud_lower].id)
+	ActiveTexture(TEXTURE1)
+	BindTexture(TEXTURE_2D, renderer.textures[look.cloud_upper].id)
+	ActiveTexture(TEXTURE2)
+	BindTexture(TEXTURE_2D, renderer.textures[look.sun].id)
+	ActiveTexture(TEXTURE3)
+	BindTexture(TEXTURE_2D, renderer.textures[look.cloud_lower_last].id)
+	ActiveTexture(TEXTURE4)
+	BindTexture(TEXTURE_2D, renderer.textures[look.cloud_upper_last].id)
+	sky_textures : [5!]i64 = [look.stars, look.nebula, look.masser, look.secunda, look.sun_glare]
+	sky_units : [5!]GL_Texture_Unit = [TEXTURE5, TEXTURE6, TEXTURE7, TEXTURE8, TEXTURE9]
+	for k in 0:5 {
+		ActiveTexture(sky_units[k])
+		BindTexture(TEXTURE_2D, renderer.textures[sky_textures[k]].id)
+	}
+	ActiveTexture(TEXTURE0)
+	Uniform1f(made.weather_share_at, look.weather_share)
+	Uniform3f(made.stars_color_at, state.stars_color.x, state.stars_color.y, state.stars_color.z)
+	Uniform1f(made.stars_turn_at, look.stars_turn)
+	Uniform3f(made.masser_at, look.masser_direction.x, look.masser_direction.y, look.masser_direction.z)
+	Uniform1f(made.masser_size_at, look.masser_size)
+	Uniform3f(made.secunda_at, look.secunda_direction.x, look.secunda_direction.y, look.secunda_direction.z)
+	Uniform1f(made.secunda_size_at, look.secunda_size)
+	Uniform1f(made.night_at, 1 - state.daylight)
+	Uniform1f(made.sun_glare_at, look.sun_glare_strength)
+	Disable(DEPTH_TEST)
+	DepthMask(0)
+	BindVertexArray(renderer.empty_vertex_array)
+	DrawArrays(TRIANGLES, 0, 3)
+	Enable(DEPTH_TEST)
+	DepthMask(1)
+	stats.draw_calls += 1
+}
+
+// Draws the distant land in view, but for the cells whose own land is
+// drawn: bindless, in one call; else a call for each piece, its textures
+// bound to units 0 and 1.
+draw_distant_land :: fun(renderer: ^Renderer, grounds: ^[]Gpu_Land, planes: ^View_Planes, view_projection: Mat4,
+	lighting: Cell_Lighting, sun: Vec3, camera: Camera, stats: ^Frame_Stats)
+{
+	renderer.distant_commands.len = 0
+	for piece, k in renderer.distant_pieces {
+		if not sphere_in_view(planes, piece.center, piece.radius) do continue
+		&renderer.distant_commands + Draw_Command{count = piece.index_count, instance_count = 1,
+			first_index = piece.first_index, base_vertex = piece.base_vertex, base_instance = u32(k)}
+	}
+	if renderer.distant_commands.len == 0 do return
+	hidden := hidden_around(camera.position)
+	for ground in grounds do hide_cell(&hidden, ground.x, ground.y)
+
+	made := &renderer.distant_programs[which_program(renderer)]
+	UseProgram(made.program)
+	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
+	set_hidden_cells(&made.hidden, &hidden)
+	BindVertexArray(renderer.distant_vertex_array)
+	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.distant_indirect_buffer)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.distant_commands.len * size_of(Draw_Command)), renderer.distant_commands, STREAM_DRAW)
+	if renderer.use_bindless {
+		BindBufferBase(SHADER_STORAGE_BUFFER, 2, renderer.distant_texture_buffer)
+		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, 0, i32(renderer.distant_commands.len), 0)
+		stats.draw_calls += 1
+		return
+	}
+	for command, k in renderer.distant_commands {
+		piece := &renderer.distant_pieces[command.base_instance]
+		ActiveTexture(TEXTURE0)
+		BindTexture(TEXTURE_2D, renderer.textures[piece.color_texture].id)
+		ActiveTexture(TEXTURE1)
+		BindTexture(TEXTURE_2D, renderer.textures[piece.normal_texture].id)
+		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, usize(k * size_of(Draw_Command)), 1, 0)
+		stats.draw_calls += 1
+	}
+	ActiveTexture(TEXTURE0)
+}
+
+// Draws the far water, but for the cells whose own water is drawn.
+draw_far_water :: fun(renderer: ^Renderer, waters: ^[]Water_Cell, look: ^Sky_Look, view_projection: Mat4,
+	lighting: Cell_Lighting, camera: Camera, stats: ^Frame_Stats)
+{
+	if not renderer.far_water_ready do return
+	hidden := hidden_around(camera.position)
+	for &water in waters {
+		x, y := grid_of(Vec3{(water.low_x + water.high_x) / 2, (water.low_y + water.high_y) / 2, 0})
+		hide_cell(&hidden, x, y)
+	}
+	renderer.water_commands.len = 0
+	&renderer.water_commands + Draw_Command{count = WATER_INDICES, instance_count = 1, first_index = 0,
+		base_vertex = i32(FAR_WATER_SLOT * WATER_VERTICES), base_instance = 0}
+	draw_water_commands(renderer, look, view_projection, lighting, camera, &hidden, stats)
+}
+
+// Draws the water in view (put on the card with upload_waters): one call
+// for all of it.
+draw_water :: fun(renderer: ^Renderer, waters: ^[]Water_Cell, planes: ^View_Planes, look: ^Sky_Look, view_projection: Mat4,
+	lighting: Cell_Lighting, camera: Camera, stats: ^Frame_Stats)
+{
+	renderer.water_commands.len = 0
+	for k in 0:waters.len {
+		if k == WATER_SLOTS do break
+		water := &waters[k]
+		middle := Vec3{(water.low_x + water.high_x) / 2, (water.low_y + water.high_y) / 2, water.height}
+		radius := vec3_length(Vec3{water.high_x - water.low_x, water.high_y - water.low_y, 0}) / 2
+		if not sphere_in_view(planes, middle, radius) do continue
+		&renderer.water_commands + Draw_Command{count = WATER_INDICES, instance_count = 1, first_index = 0,
+			base_vertex = i32(k * WATER_VERTICES), base_instance = 0}
+	}
+	if renderer.water_commands.len == 0 do return
+	nothing_hidden := hidden_around(camera.position)
+	draw_water_commands(renderer, look, view_projection, lighting, camera, &nothing_hidden, stats)
+}
+
+// Draws the water program's commands: blended over what's below, the
+// depth buffer read but not written; leaving out the hidden cells.
+draw_water_commands :: fun(renderer: ^Renderer, look: ^Sky_Look, view_projection: Mat4,
+	lighting: Cell_Lighting, camera: Camera, hidden: ^Hidden_Cells, stats: ^Frame_Stats)
+{
+	made := &renderer.water_program
+	state := &look.state
+	water := &look.water
+	UseProgram(made.program)
+	set_hidden_cells(&made.hidden, hidden)
+	matrix := view_projection
+	UniformMatrix4fv(made.view_projection_at, 1, 0, &matrix[0][0])
+	Uniform3f(made.camera_position_at, camera.position.x, camera.position.y, camera.position.z)
+	Uniform1f(made.time_at, look.time)
+	Uniform2f(made.scroll_at, water.scroll[0], water.scroll[1])
+	Uniform3f(made.shallow_color_at, water.shallow.x, water.shallow.y, water.shallow.z)
+	Uniform3f(made.deep_color_at, water.deep.x, water.deep.y, water.deep.z)
+	Uniform3f(made.reflection_color_at, water.reflection.x, water.reflection.y, water.reflection.z)
+	Uniform1f(made.reflectivity_at, water.reflectivity)
+	Uniform1f(made.fresnel_base_at, water.fresnel)
+	Uniform1f(made.sun_power_at, water.sun_power)
+	Uniform3f(made.sky_upper_at, state.upper.x, state.upper.y, state.upper.z)
+	Uniform3f(made.sky_lower_at, state.lower.x, state.lower.y, state.lower.z)
+	Uniform3f(made.sky_horizon_at, state.horizon.x, state.horizon.y, state.horizon.z)
+	Uniform3f(made.sun_direction_at, state.sun_direction.x, state.sun_direction.y, state.sun_direction.z)
+	Uniform3f(made.sun_color_at, state.sun_color.x, state.sun_color.y, state.sun_color.z)
+	Uniform1f(made.daylight_at, state.daylight)
+	Uniform3f(made.fog_color_at, lighting.fog_color.x, lighting.fog_color.y, lighting.fog_color.z)
+	Uniform1f(made.fog_near_at, lighting.fog_near)
+	Uniform1f(made.fog_far_at, lighting.fog_far)
+	ActiveTexture(TEXTURE0)
+	BindTexture(TEXTURE_2D, renderer.ripple_texture)
+	BindVertexArray(renderer.water_vertex_array)
+	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.water_indirect_buffer)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.water_commands.len * size_of(Draw_Command)), renderer.water_commands, STREAM_DRAW)
+	Disable(CULL_FACE)   // (seen from under the water too)
+	Enable(BLEND)
+	BlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
+	DepthMask(0)
+	MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, 0, i32(renderer.water_commands.len), 0)
+	DepthMask(1)
+	Disable(BLEND)
+	Enable(CULL_FACE)
+	stats.draw_calls += 1
+}
+
+// Draws the land in view: bindless, in one call; else a call for each
+// quadrant, its textures bound to units 0 to 8.
+draw_land :: fun(renderer: ^Renderer, grounds: ^[]Gpu_Land, planes: ^View_Planes, view_projection: Mat4,
+	lighting: Cell_Lighting, sun: Vec3, camera: Camera, stats: ^Frame_Stats)
+{
+	bindless := renderer.use_bindless
+	renderer.land_commands.len = 0
+	for ground in grounds {
+		if not sphere_in_view(planes, ground.center, ground.radius) do continue
+		stats.land_cells += 1
+		if bindless {
+			// The whole cell: its four quadrants' indexes, its slot's vertices.
+			&renderer.land_commands + Draw_Command{
+				count = LAND_MESH_INDICES, instance_count = 1, first_index = 0,
+				base_vertex = i32(ground.slot * LAND_MESH_VERTICES), base_instance = 0}
+		else
+			quadrant_indices := LAND_MESH_INDICES / 4
+			for q in 0:4 {
+				&renderer.land_commands + Draw_Command{
+					count = u32(quadrant_indices), instance_count = 1, first_index = u32(q * quadrant_indices),
+					base_vertex = i32(ground.slot * LAND_MESH_VERTICES), base_instance = u32(ground.slot * 4 + q)}
+			}
+		}
+	}
+	if renderer.land_commands.len == 0 do return
+
+	made := &renderer.land_programs[which_program(renderer)]
+	UseProgram(made.program)
+	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
+	BindVertexArray(renderer.land_vertex_array)
+	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.land_indirect_buffer)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.land_commands.len * size_of(Draw_Command)), renderer.land_commands, STREAM_DRAW)
+	if bindless {
+		BindBufferBase(SHADER_STORAGE_BUFFER, 1, renderer.land_texture_buffer)
+		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, 0, i32(renderer.land_commands.len), 0)
+		stats.draw_calls += 1
+		return
+	}
+	// A quadrant at a time: its textures (named by its command's base
+	// instance) on units 0 to 8, then its command.
+	for command, k in renderer.land_commands {
+		quadrant := &renderer.land_quadrants[command.base_instance]
+		for unit in 0:QUADRANT_TEXTURES {
+			ActiveTexture(LAYER_UNITS[unit])
+			BindTexture(TEXTURE_2D, renderer.textures[quadrant.textures[unit]].id)
+			ActiveTexture(LAYER_NORMAL_UNITS[unit])
+			BindTexture(TEXTURE_2D, renderer.textures[quadrant.normal_maps[unit]].id)
+		}
+		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, usize(k * size_of(Draw_Command)), 1, 0)
+		stats.draw_calls += 1
+	}
+	ActiveTexture(TEXTURE0)
+}
+
+// A part's sort key: blended parts after opaque ones — those writing depth
+// first, those adding last; within those, the two-sided after the rest;
+// without bindless, then by texture — so each run of one key is one draw
+// call. The part's index in the low bits.
+part_key :: fun(renderer: ^Renderer, part: Mesh_Part, part_index: i64, bindless: bool) -> i64 {
+	group_key : i64 = 0
+	if not bindless do group_key = shown_texture(renderer, part)
+	if part.two_sided do group_key += MAX_TEXTURES
+	if part.alpha_blend do group_key += 2 * MAX_TEXTURES
+	if part.alpha_blend and not part.depth_write do group_key += 4 * MAX_TEXTURES
+	if part.additive do group_key += 8 * MAX_TEXTURES
+	return (group_key << 20) | part_index
+}
+
+// The texture a part shows this frame (its slot): its flipbook's frame now,
+// else its own.
+shown_texture :: fun(renderer: ^Renderer, part: Mesh_Part) -> i64 {
+	if part.flip >= 0 do return renderer.flips[part.flip].shown
+	return part.texture_slot
+}
+
+// Which of its frames a flipbook shows at a time (seconds): the time
+// played at its frequency from its phase, round and round its span; then
+// its keys' value there (between two, in a line) is the frame's number —
+// or, with no keys, the frames in turn across the span.
+flip_frame :: fun(flip: ^Gpu_Flip, time: f32) -> i64 {
+	span := flip.stop_time - flip.start_time
+	at := time * flip.frequency + flip.phase
+	if span > 0 do at -= floor_f32((at - flip.start_time) / span) * span
+	value : f32 = 0
+	if flip.key_times.len == 0 {
+		if span > 0 do value = (at - flip.start_time) / span * f32(flip.frame_count)
+	elif at <= flip.key_times[0]
+		value = flip.key_values[0]
+	else
+		value = flip.key_values[flip.key_times.len - 1]
+		for k in 1:flip.key_times.len {
+			if at < flip.key_times[k] {
+				before := flip.key_times[k - 1]
+				share := (at - before) / (flip.key_times[k] - before)
+				value = flip.key_values[k - 1] + (flip.key_values[k] - flip.key_values[k - 1]) * share
+				break
+			}
+		}
+	}
+	frame := i64(value)
+	if frame >= flip.frame_count do frame = flip.frame_count - 1
+	if frame < 0 do frame = 0
+	return frame
+}
+
+// Where a billboard part is drawn: its node turned to face the camera —
+// all the way (the node's x to the camera's right, y to its up, z back
+// toward it); in modes 3 and 4 the same but z toward the eye itself; or in
+// modes 1, 5 and 9 about the node's own up (y) only, z toward the eye —
+// keeping the node's place and scale. (The part's vertices are in the
+// model's space: taken back through the node first.)
+billboard_world :: fun(billboard: ^Gpu_Billboard, placement: Mat4, camera_right: Vec3, camera_up: Vec3, eye: Vec3) -> Mat4 {
+	placed := mat4_mul(placement, billboard.node)
+	origin := Vec3{placed[3][0], placed[3][1], placed[3][2]}
+	scale := vec3_length(Vec3{placed[0][0], placed[0][1], placed[0][2]})
+	across := camera_right
+	upward := camera_up
+	if billboard.mode == 1 or billboard.mode == 5 or billboard.mode == 9 {
+		upward = vec3_normalize(Vec3{placed[1][0], placed[1][1], placed[1][2]})
+		to_eye := eye - origin
+		toward := to_eye - upward * dot(to_eye, upward)
+		if vec3_length(toward) < 0.001 do return placement   // the eye right above or below: as placed
+		across = cross(upward, vec3_normalize(toward))
+	elif billboard.mode == 3 or billboard.mode == 4
+		toward := eye - origin
+		if vec3_length(toward) > 0.001 {
+			toward = vec3_normalize(toward)
+			level := camera_up - toward * dot(camera_up, toward)
+			if vec3_length(level) > 0.001 {
+				upward = vec3_normalize(level)
+				across = cross(upward, toward)
+			}
+		}
+	}
+	back := cross(across, upward)
+	turned := mat4_identity()
+	turned[0][0] = across.x * scale
+	turned[0][1] = across.y * scale
+	turned[0][2] = across.z * scale
+	turned[1][0] = upward.x * scale
+	turned[1][1] = upward.y * scale
+	turned[1][2] = upward.z * scale
+	turned[2][0] = back.x * scale
+	turned[2][1] = back.y * scale
+	turned[2][2] = back.z * scale
+	turned[3][0] = origin.x
+	turned[3][1] = origin.y
+	turned[3][2] = origin.z
+	return mat4_mul(turned, billboard.node_inverse)
+}
+
+// Gathers the instances in view for drawing: their parts — each part's
+// instances together, the parts of one state (and, without bindless, one
+// texture) together — into the records and the commands, both put on the
+// card. draw_mesh_runs draws them, a call for each gathering. The camera
+// turns billboards; the time (seconds) is the flipbooks'.
+gather_meshes :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, planes: ^View_Planes,
+	left_out: ^Hidden_Cells, camera: Camera, time: f32, stats: ^Frame_Stats)
+{
+	bindless := renderer.use_bindless
+	for &flip in renderer.flips do flip.shown = renderer.flip_frames[flip.first_frame + flip_frame(flip, time)]
+	_, camera_right, camera_up := camera_axes(camera)
+
+	// The instances in view (but in the cells left out), and how many of
+	// each part they draw.
+	renderer.visible.len = 0
+	renderer.touched.len = 0
+	record_count : i64 = 0
+	for &instance, index in instances {
+		if not sphere_in_view(planes, instance.center, instance.radius) do continue
+		if instance.reach > 0 {
+			away_x := instance.world[3][0] - camera.position.x
+			away_y := instance.world[3][1] - camera.position.y
+			if away_x * away_x + away_y * away_y > instance.reach * instance.reach do continue
+		}
+		x, y := grid_of(Vec3{instance.world[3][0], instance.world[3][1], 0})
+		if hidden_cell_at(left_out, x, y) do continue
+		placed_model := models[instance.model]
+		// (A rigged model not posed this frame isn't drawn: its vertices are
+		// where its bones would move them from.)
+		if placed_model.rigged and instance.palette_base < 0 do continue
+		if record_count + placed_model.part_count > MAX_DRAWN do break
+		&renderer.visible + index
+		for p in placed_model.first_part:placed_model.first_part + placed_model.part_count {
+			if renderer.part_counts[p] == 0 do &renderer.touched + part_key(renderer, renderer.parts[p], p, bindless)
+			renderer.part_counts[p] += 1
+		}
+		record_count += placed_model.part_count
+	}
+	stats.instances += instances.len
+	stats.visible += renderer.visible.len
+	stats.drawn_parts += record_count
+	renderer.commands.len = 0
+	if record_count == 0 do return
+
+	// The instances in view, nearest first: opaque parts are drawn so (what's
+	// hidden fails the depth test early), blended ones the other way round.
+	for k in 0:renderer.visible.len {
+		index := renderer.visible[k]
+		distance := i64(vec3_length(instances[index].center - camera.position))
+		renderer.visible[k] = (distance << 24) | index
+	}
+	sort_keys(&renderer.visible)
+	for k in 0:renderer.visible.len do renderer.visible[k] = renderer.visible[k] & 0xFFFFFF
+
+	// The parts that change over time: where their motions are now.
+	for key in renderer.touched {
+		p := key & 0xFFFFF
+		renderer.part_motions[p] = [0, 0, 1, 0]
+		part := renderer.parts[p]
+		renderer.part_glows[p] = part.emissive
+		for m in part.first_motion:part.first_motion + part.motion_count {
+			motion := &renderer.motions[m]
+			value := motion_value(motion, time)
+			if motion.what == MOTION_TEXTURE_U do renderer.part_motions[p][0] = value.x
+			if motion.what == MOTION_TEXTURE_V do renderer.part_motions[p][1] = value.x
+			if motion.what == MOTION_ALPHA do renderer.part_motions[p][2] = value.x
+			if motion.what == MOTION_GLOW do renderer.part_glows[p] = value
+		}
+	}
+
+	// The parts in drawing order; each one's instances' place in the records.
+	sort_keys(&renderer.touched)
+	renderer.commands.len = 0
+	start : i64 = 0
+	for key in renderer.touched {
+		p := key & 0xFFFFF
+		part := renderer.parts[p]
+		&renderer.commands + Draw_Command{
+			count = part.index_count,
+			instance_count = u32(renderer.part_counts[p]),
+			first_index = part.first_index,
+			base_vertex = part.base_vertex,
+			base_instance = u32(start)}
+		renderer.part_starts[p] = start
+		start += renderer.part_counts[p]
+		renderer.part_counts[p] = 0   // counts again as the records fill
+	}
+
+	// The records: each part's instances in their place — the opaque parts'
+	// nearest first, the blended parts' farthest first.
+	renderer.records.len = record_count
+	for k in 0:renderer.visible.len * 2 {
+		blended := k >= renderer.visible.len
+		index := if blended do renderer.visible[2 * renderer.visible.len - 1 - k] else renderer.visible[k]
+		instance := &instances[index]
+		placed_model := models[instance.model]
+		for p in placed_model.first_part:placed_model.first_part + placed_model.part_count {
+			part := renderer.parts[p]
+			if part.alpha_blend != blended do continue
+			record := &renderer.records[renderer.part_starts[p] + renderer.part_counts[p]]
+			renderer.part_counts[p] += 1
+			record.world = instance.world
+			if part.billboard >= 0 {
+				record.world = billboard_world(&renderer.billboards[part.billboard], instance.world, camera_right, camera_up, camera.position)
+			}
+			record.lights = instance.lights
+			glow := renderer.part_glows[p]
+			record.material = [part.alpha_threshold, glow.x, glow.y, glow.z]
+			record.motion = renderer.part_motions[p]
+			record.texture = renderer.textures[shown_texture(renderer, part)].handle
+			record.glow = 0
+			if part.glow_slot >= 0 do record.glow = if bindless do renderer.textures[part.glow_slot].handle else 1
+			record.normal_map = 0
+			if part.normal_slot >= 0 do record.normal_map = if bindless do renderer.textures[part.normal_slot].handle else 1
+			record.glossiness = max(part.glossiness, 1)
+			record.flags = if part.leaf_cards do PART_LEAF_CARDS else 0
+			record.specular = [part.specular.x, part.specular.y, part.specular.z, 0]
+			if part.rigged {
+				record.flags |= PART_RIGGED
+				record.specular[3] = f32(part.influence_offset)
+				record.motion[3] = f32(instance.palette_base)
+			}
+		}
+	}
+	for key in renderer.touched do renderer.part_counts[key & 0xFFFFF] = 0
+
+	BindBuffer(ARRAY_BUFFER, renderer.instance_buffer)
+	BufferData(ARRAY_BUFFER, MAX_DRAWN * size_of(Drawn_Instance), [], STREAM_DRAW)   // (a fresh buffer: no waiting on last frame's)
+	BufferSubData(ARRAY_BUFFER, 0, renderer.records[0 : record_count])
+	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.indirect_buffer)
+	BufferData(DRAW_INDIRECT_BUFFER, isize(renderer.commands.len * size_of(Draw_Command)), renderer.commands, STREAM_DRAW)
+}
+
+// Draws the gathered meshes' opaque runs, or their blended ones (after the
+// water): a call for each run of commands of one key. Soft: effects (blended,
+// writing no depth) fade out near what's behind them (the depth copy).
+draw_mesh_runs :: fun(renderer: ^Renderer, view_projection: Mat4, lighting: Cell_Lighting, sun: Vec3, camera: Camera,
+	blended: bool, soft: bool, stats: ^Frame_Stats)
+{
+	if renderer.commands.len == 0 do return
+	bindless := renderer.use_bindless
+	made := &renderer.mesh_programs[which_program(renderer)]
+	UseProgram(made.program)
+	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
+	BindVertexArray(renderer.mesh_vertex_array)
+	BindBuffer(DRAW_INDIRECT_BUFFER, renderer.indirect_buffer)
+	if blended do Enable(BLEND)
+	Uniform1i(made.adding_at, 0)
+	Uniform1f(made.soft_distance_at, 0)
+	Uniform2f(made.depth_range_at, camera.near, camera.far)
+	_, right, up := camera_axes(camera)
+	Uniform3f(made.view_right_at, right.x, right.y, right.z)
+	Uniform3f(made.view_up_at, up.x, up.y, up.z)
+	run_start : i64 = 0
+	for run_start < renderer.commands.len {
+		group_key := renderer.touched[run_start] >> 20
+		run_end := run_start + 1
+		for run_end < renderer.commands.len and renderer.touched[run_end] >> 20 == group_key do run_end += 1
+
+		first_part := renderer.parts[renderer.touched[run_start] & 0xFFFFF]
+		if first_part.alpha_blend != blended {
+			run_start = run_end
+			continue
+		}
+		if first_part.two_sided do Disable(CULL_FACE)
+		else do Enable(CULL_FACE)
+		DepthMask(if first_part.depth_write do 1 else 0)
+		if blended {
+			if first_part.additive do BlendFunc(SRC_ALPHA, ONE)
+			else do BlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
+			Uniform1i(made.adding_at, if first_part.additive do 1 else 0)
+			Uniform1f(made.soft_distance_at, if soft and not first_part.depth_write do SOFT_DISTANCE else 0)
+		}
+		if not bindless {
+			BindTexture(TEXTURE_2D, renderer.textures[shown_texture(renderer, first_part)].id)
+			if first_part.glow_slot >= 0 {
+				ActiveTexture(TEXTURE1)
+				BindTexture(TEXTURE_2D, renderer.textures[first_part.glow_slot].id)
+				ActiveTexture(TEXTURE0)
+			}
+			if first_part.normal_slot >= 0 {
+				ActiveTexture(TEXTURE3)
+				BindTexture(TEXTURE_2D, renderer.textures[first_part.normal_slot].id)
+				ActiveTexture(TEXTURE0)
+			}
+		}
+		MultiDrawElementsIndirect(TRIANGLES, UNSIGNED_SHORT, usize(run_start * size_of(Draw_Command)), i32(run_end - run_start), 0)
+		stats.draw_calls += 1
+		run_start = run_end
+	}
+	// As it was: what's drawn next (the near pass, after the far's blended
+	// meshes) writes depth, unblended, culled.
+	DepthMask(1)
+	Disable(BLEND)
+	Enable(CULL_FACE)
+}
+
+// Draws the particles of the instances in view (gather_meshes' last: the
+// near pass's), farthest first: each system's squares made for the time,
+// blended, after the blended meshes. An instance's particles are seeded by
+// its reference (its index without one), so no two fires are alike. Soft:
+// they fade out near what's behind them (the depth copy).
+draw_particles :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Instance, view_projection: Mat4,
+	lighting: Cell_Lighting, sun: Vec3, camera: Camera, time: f32, soft: bool, stats: ^Frame_Stats)
+{
+	renderer.particle_runs.len = 0
+	renderer.particle_vertices.len = 0
+	_, camera_right, camera_up := camera_axes(camera)
+	for k in 0:renderer.visible.len {
+		index := renderer.visible[renderer.visible.len - 1 - k]
+		instance := &instances[index]
+		placed_model := models[instance.model]
+		if placed_model.particles_count == 0 do continue
+		if vec3_length(instance.center - camera.position) - instance.radius > PARTICLE_REACH do continue
+		seed := instance.reference
+		if seed == 0 do seed = u32(index)
+		for kind_index in placed_model.first_particles:placed_model.first_particles + placed_model.particles_count {
+			if not fits(renderer.particle_runs.len + 1, renderer.particle_runs.cap) do break
+			first := renderer.particle_vertices.len / 4
+			add_particle_squares(&renderer.particle_kinds[kind_index].system, instance.world, f64(time),
+				seed ~ u32(kind_index * 7919), camera_right, camera_up, lighting.ambient, lighting.directional,
+				&renderer.particle_vertices)
+			count := renderer.particle_vertices.len / 4 - first
+			if count > 0 do &renderer.particle_runs + Particle_Run{kind = kind_index, first_square = first, square_count = count}
+		}
+	}
+	if renderer.particle_runs.len == 0 do return
+
+	BindBuffer(ARRAY_BUFFER, renderer.particle_vertex_buffer)
+	BufferData(ARRAY_BUFFER, MAX_PARTICLE_SQUARES * 4 * size_of(Particle_Vertex), [], STREAM_DRAW)   // (a fresh buffer)
+	BufferSubData(ARRAY_BUFFER, 0, renderer.particle_vertices)
+	made := &renderer.particle_program
+	UseProgram(made.program)
+	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
+	Uniform2f(made.depth_range_at, camera.near, camera.far)
+	BindVertexArray(renderer.particle_vertex_array)
+	Enable(BLEND)
+	Disable(CULL_FACE)
+	ActiveTexture(TEXTURE0)
+	for run in renderer.particle_runs {
+		kind := &renderer.particle_kinds[run.kind]
+		look := &kind.system.look
+		DepthMask(if look.depth_write do 1 else 0)
+		if look.additive do BlendFunc(SRC_ALPHA, ONE)
+		else do BlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
+		Uniform1i(made.adding_at, if look.additive do 1 else 0)
+		Uniform1f(made.alpha_threshold_at, if look.alpha_test do look.alpha_threshold else 0)
+		Uniform1f(made.soft_distance_at, if soft and not look.depth_write do SOFT_DISTANCE else 0)
+		slot := kind.texture_slot
+		if kind.flip >= 0 do slot = renderer.flips[kind.flip].shown
+		BindTexture(TEXTURE_2D, renderer.textures[slot].id)
+		DrawElements(TRIANGLES, i32(run.square_count * 6), UNSIGNED_INT, usize(run.first_square * 6 * 4))
+		stats.draw_calls += 1
+	}
+	DepthMask(1)
+	Disable(BLEND)
+	Enable(CULL_FACE)
+}
+
+// Draws the rain or snow round the camera: the last weather's, going, and
+// the coming one's, coming in (by how far the weather has come).
+draw_precipitation :: fun(renderer: ^Renderer, look: ^Sky_Look, view_projection: Mat4, lighting: Cell_Lighting, sun: Vec3,
+	camera: Camera, stats: ^Frame_Stats)
+{
+	if look.precipitation.len == 0 and look.last_precipitation.len == 0 do return
+	made := &renderer.precipitation_program
+	UseProgram(made.program)
+	set_shared_uniforms(made.shared, view_projection, lighting, sun, camera)
+	_, camera_right, camera_up := camera_axes(camera)
+	Uniform3f(made.camera_right_at, camera_right.x, camera_right.y, camera_right.z)
+	Uniform3f(made.camera_up_at, camera_up.x, camera_up.y, camera_up.z)
+	Uniform1f(made.time_at, look.time)
+	BindVertexArray(renderer.empty_vertex_array)
+	Enable(BLEND)
+	BlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
+	DepthMask(0)
+	Disable(CULL_FACE)
+	ActiveTexture(TEXTURE0)
+	for layer in look.last_precipitation do draw_precipitation_layer(renderer, layer, 1 - look.weather_share, lighting, stats)
+	for layer in look.precipitation do draw_precipitation_layer(renderer, layer, look.weather_share, lighting, stats)
+	DepthMask(1)
+	Disable(BLEND)
+	Enable(CULL_FACE)
+}
+
+draw_precipitation_layer :: fun(renderer: ^Renderer, layer: Precipitation_Layer, strength: f32, lighting: Cell_Lighting, stats: ^Frame_Stats) {
+	if strength <= 0.001 or layer.count == 0 do return
+	made := &renderer.precipitation_program
+	Uniform3f(made.box_at, layer.width, layer.top, layer.fall)
+	Uniform1f(made.speed_at, layer.speed)
+	Uniform3f(made.drop_at, layer.speed_variation, layer.size, if layer.streak do 1 else 0)
+	light := layer.light + lighting.ambient
+	Uniform3f(made.light_at, light.x, light.y, light.z)
+	Uniform1f(made.strength_at, strength)
+	BindTexture(TEXTURE_2D, renderer.textures[layer.texture].id)
+	DrawArrays(TRIANGLES, 0, i32(layer.count * 6))
+	stats.draw_calls += 1
+}
+
+// Sorts keys, smallest first (Shell's sort: a few thousand at most).
+sort_keys :: fun(keys: ^[]i64) {
+	gap := keys.len / 2
+	for gap > 0 {
+		for i in gap:keys.len {
+			value := keys[i]
+			k := i
+			for k >= gap and keys[k - gap] > value {
+				keys[k] = keys[k - gap]
+				k -= gap
+			}
+			keys[k] = value
+		}
+		gap /= 2
+	}
+}

@@ -1,0 +1,326 @@
+// Reading DirectDraw Surface textures (.dds): Oblivion's textures.
+//
+// A DDS is "DDS ", a 124-byte header, then the image and its smaller
+// copies (mipmaps), each half the size of the one before, largest first.
+// Oblivion's are mostly block compressed — DXT1, DXT3, DXT5: each 4x4
+// pixels in 8 or 16 bytes, which graphics cards draw from as they are — and
+// a few are plain 24- or 32-bit pixels.
+module dds
+
+use mara.core
+
+// How a texture's pixels are stored.
+Pixel_Format :: union {
+	unknown = 0
+	dxt1         // 8 bytes a block: two colors and 2 bits a pixel; or 1-bit alpha
+	dxt3         // 16 bytes a block: 4 bits of alpha a pixel, then a DXT1 color block
+	dxt5         // 16 bytes a block: interpolated alpha, then a DXT1 color block
+	bgra8        // 32 bits a pixel: blue, green, red, alpha
+	bgr8         // 24 bits a pixel: blue, green, red
+	luminance8   // 8 bits a pixel, gray: Oblivion's glow maps
+	bgra4        // 16 bits a pixel, 4 each of blue, green, red, alpha: menu icons
+}
+
+// What reading a texture can fail with.
+Texture_Error :: error {
+	Not_A_Texture      // it doesn't start with "DDS "
+	Unknown_Format     // pixels stored a way this doesn't read
+	Truncated          // its images run past the end of the file
+}
+
+// The header's pixel format part, as the file has it.
+Dds_Pixel_Format :: struct {
+	size: u32
+	flags: u32           // DDPF_*
+	four_cc: [4!]utf8    // "DXT1"…, when flags has DDPF_FOUR_CC
+	bit_count: u32
+	red_mask: u32
+	green_mask: u32
+	blue_mask: u32
+	alpha_mask: u32
+}
+
+// The header after "DDS ", as the file has it: 124 bytes.
+Dds_Header :: struct {
+	size: u32
+	flags: u32
+	height: u32
+	width: u32
+	pitch: u32
+	depth: u32
+	mip_count: u32
+	reserved: [11!]u32
+	pixel_format: Dds_Pixel_Format
+	caps: [4!]u32
+	reserved2: u32
+}
+
+DDPF_ALPHA_PIXELS :: 0x1
+DDPF_FOUR_CC :: 0x4
+DDPF_RGB :: 0x40
+DDPF_LUMINANCE :: 0x20000
+
+// A texture's size and format, and where each of its images is.
+Texture :: struct {
+	width: i64 = 0
+	height: i64 = 0
+	format: Pixel_Format = .unknown
+	mips: [16]Mip            // largest first
+	pixels: []byte           // all of them: what follows the header
+}
+
+// One image of a texture: its size, and its bytes in the texture's pixels.
+Mip :: struct {
+	width: i64
+	height: i64
+	at: i64
+	size: i64
+}
+
+// The bytes an image of this size takes.
+image_size :: fun(format: Pixel_Format, width: i64, height: i64) -> i64 {
+	blocks_wide := (width + 3) / 4
+	blocks_high := (height + 3) / 4
+	match format {
+	dxt1
+		return blocks_wide * blocks_high * 8
+	dxt3
+		return blocks_wide * blocks_high * 16
+	dxt5
+		return blocks_wide * blocks_high * 16
+	bgra8
+		return width * height * 4
+	bgr8
+		return width * height * 3
+	luminance8
+		return width * height
+	bgra4
+		return width * height * 2
+	unknown
+		return 0
+	}
+}
+
+// Reads a texture's header: its size, its format, and where its images are
+// in data (which it views, no copy).
+read_texture :: fun(data: []byte) -> Texture, err {
+	texture := Texture()
+	texture.pixels = data[0:0]
+	if data.len < 128 do return texture, Not_A_Texture
+	magic : [4!]utf8 = data[0]
+	if magic != "DDS " do return texture, Not_A_Texture
+	header : Dds_Header = data[4]
+
+	pixel_format := header.pixel_format
+	if pixel_format.flags & DDPF_FOUR_CC != 0 {
+		code := pixel_format.four_cc
+		if code == "DXT1" do texture.format = .dxt1
+		elif code == "DXT3" do texture.format = .dxt3
+		elif code == "DXT5" do texture.format = .dxt5
+	elif pixel_format.flags & DDPF_RGB != 0
+		if pixel_format.bit_count == 32 and pixel_format.blue_mask == 0xFF do texture.format = .bgra8
+		elif pixel_format.bit_count == 24 and pixel_format.blue_mask == 0xFF do texture.format = .bgr8
+		elif pixel_format.bit_count == 16 and pixel_format.blue_mask == 0xF and pixel_format.alpha_mask == 0xF000 do texture.format = .bgra4
+	elif pixel_format.flags & DDPF_LUMINANCE != 0
+		if pixel_format.bit_count == 8 do texture.format = .luminance8
+	}
+	if texture.format == .unknown do return texture, Unknown_Format
+
+	texture.width = i64(header.width)
+	texture.height = i64(header.height)
+	texture.pixels = data[128 : data.len]
+
+	// The images, each half the one before, down to 1 pixel or the count given.
+	count := i64(header.mip_count)
+	if count < 1 do count = 1
+	if count > 16 do count = 16
+	width := texture.width
+	height := texture.height
+	at : i64 = 0
+	for i in 0:count {
+		size := image_size(texture.format, width, height)
+		if at + size > texture.pixels.len do break
+		&texture.mips + Mip{width = width, height = height, at = at, size = size}
+		at += size
+		if width == 1 and height == 1 do break
+		if width > 1 do width /= 2
+		if height > 1 do height /= 2
+	}
+	if texture.mips.len == 0 do return texture, Truncated
+	return texture
+}
+
+// ---- decoding to plain pixels ---------------------------------------------
+
+// What decoding can fail with, beyond reading.
+Decode_Error :: error {
+	No_Room   // the output can't hold the image
+}
+
+// One of a texture's images as plain pixels: 8 bits each of red, green,
+// blue and alpha, row by row from the top. Into out, after what it holds
+// (its len moved past them); a view of them.
+decode_rgba :: fun(texture: Texture, mip_index: i64, out: ^[]byte) -> []byte, err {
+	mip := texture.mips[mip_index]
+	start := out.len
+	size := mip.width * mip.height * 4
+	if start + size > out.cap do return out[start : start], No_Room
+	pixels := out[start : start + size]
+	source := texture.pixels[mip.at : mip.at + mip.size]
+
+	match texture.format {
+	dxt1
+		decode_blocks(source, &pixels, mip.width, mip.height, .dxt1)
+	dxt3
+		decode_blocks(source, &pixels, mip.width, mip.height, .dxt3)
+	dxt5
+		decode_blocks(source, &pixels, mip.width, mip.height, .dxt5)
+	bgra8
+		for i in 0:mip.width * mip.height {
+			pixels[i * 4] = source[i * 4 + 2]
+			pixels[i * 4 + 1] = source[i * 4 + 1]
+			pixels[i * 4 + 2] = source[i * 4]
+			pixels[i * 4 + 3] = source[i * 4 + 3]
+		}
+	bgr8
+		for i in 0:mip.width * mip.height {
+			pixels[i * 4] = source[i * 3 + 2]
+			pixels[i * 4 + 1] = source[i * 3 + 1]
+			pixels[i * 4 + 2] = source[i * 3]
+			pixels[i * 4 + 3] = u8(255)
+		}
+	luminance8
+		for i in 0:mip.width * mip.height {
+			gray : u8 = source[i]
+			pixels[i * 4] = gray
+			pixels[i * 4 + 1] = gray
+			pixels[i * 4 + 2] = gray
+			pixels[i * 4 + 3] = u8(255)
+		}
+	bgra4
+		for i in 0:mip.width * mip.height {
+			packed : u16 = source[i * 2]
+			pixels[i * 4] = u8(((packed >> 8) & 15) * 17)
+			pixels[i * 4 + 1] = u8(((packed >> 4) & 15) * 17)
+			pixels[i * 4 + 2] = u8((packed & 15) * 17)
+			pixels[i * 4 + 3] = u8(((packed >> 12) & 15) * 17)
+		}
+	unknown
+		for i in 0:size do pixels[i] = u8(255)
+	}
+	out.len = start + size
+	return out[start : out.len]
+}
+
+// Decodes block compressed pixels: each 4x4 block into its place, the
+// blocks at the right and bottom edges cut to the image.
+decode_blocks :: fun(source: []byte, pixels: ^[]byte, width: i64, height: i64, format: Pixel_Format) {
+	block_size : i64 = 16
+	if format == .dxt1 do block_size = 8
+	blocks_wide := (width + 3) / 4
+	blocks_high := (height + 3) / 4
+	block : [64!]u8   // the block's 16 pixels, 4 bytes each
+	for block_y in 0:blocks_high {
+		for block_x in 0:blocks_wide {
+			at := (block_y * blocks_wide + block_x) * block_size
+			if format == .dxt1 {
+				decode_color_block(source, at, false, &block)
+			elif format == .dxt3
+				decode_color_block(source, at + 8, true, &block)
+				decode_explicit_alpha(source, at, &block)
+			else
+				decode_color_block(source, at + 8, true, &block)
+				decode_interpolated_alpha(source, at, &block)
+			}
+			for row in 0:4 {
+				y := block_y * 4 + row
+				if y >= height do break
+				for column in 0:4 {
+					x := block_x * 4 + column
+					if x >= width do break
+					to := (y * width + x) * 4
+					from := (row * 4 + column) * 4
+					for c in 0:4 do pixels[to + c] = block[from + c]
+				}
+			}
+		}
+	}
+}
+
+// A 5-6-5 color as 8 bits each of red, green and blue.
+expand_565 :: fun(color: u16) -> i64, i64, i64 {
+	red := i64((color >> 11) & 31)
+	green := i64((color >> 5) & 63)
+	blue := i64(color & 31)
+	return (red << 3) | (red >> 2), (green << 2) | (green >> 4), (blue << 3) | (blue >> 2)
+}
+
+// A DXT color block: two colors, two more between them, and 2 bits a pixel
+// choosing among the four. In DXT1, when the first color isn't the larger,
+// there's one color between and the fourth choice is transparent.
+decode_color_block :: fun(source: []byte, at: i64, always_four: bool, block: ^[64!]u8) {
+	first : u16 = source[at]
+	second : u16 = source[at + 2]
+	choices : u32 = source[at + 4]
+
+	palette : [16!]i64
+	palette[0], palette[1], palette[2] = expand_565(first)
+	palette[4], palette[5], palette[6] = expand_565(second)
+	palette[3] = 255
+	palette[7] = 255
+	if always_four or first > second {
+		for c in 0:3 {
+			palette[8 + c] = (2 * palette[c] + palette[4 + c]) / 3
+			palette[12 + c] = (palette[c] + 2 * palette[4 + c]) / 3
+		}
+		palette[11] = 255
+		palette[15] = 255
+	else
+		for c in 0:3 {
+			palette[8 + c] = (palette[c] + palette[4 + c]) / 2
+			palette[12 + c] = 0
+		}
+		palette[11] = 255
+		palette[15] = 0
+	}
+	for i in 0:16 {
+		choice := i64((choices >> u32(i * 2)) & 3)
+		for c in 0:4 do block[i * 4 + c] = u8(palette[choice * 4 + c])
+	}
+}
+
+// DXT3's alpha: 4 bits a pixel, as they are.
+decode_explicit_alpha :: fun(source: []byte, at: i64, block: ^[64!]u8) {
+	alphas : u64 = source[at]
+	for i in 0:16 {
+		alpha := i64((alphas >> u64(i * 4)) & 15)
+		block[i * 4 + 3] = u8(alpha * 17)
+	}
+}
+
+// DXT5's alpha: two values, six or four between them (and then 0 and
+// 255), and 3 bits a pixel choosing among the eight.
+decode_interpolated_alpha :: fun(source: []byte, at: i64, block: ^[64!]u8) {
+	first_byte : u8 = source[at]
+	second_byte : u8 = source[at + 1]
+	first := i64(first_byte)
+	second := i64(second_byte)
+	values : [8!]i64
+	values[0] = first
+	values[1] = second
+	if first > second {
+		for i in 1..6 do values[i + 1] = ((7 - i) * first + i * second) / 7
+	else
+		for i in 1..4 do values[i + 1] = ((5 - i) * first + i * second) / 5
+		values[6] = 0
+		values[7] = 255
+	}
+	// The 48 bits of choices, in the 6 bytes after the two values.
+	low : u32 = source[at + 2]
+	high : u16 = source[at + 6]
+	choices := u64(low) | (u64(high) << 32)
+	for i in 0:16 {
+		choice := i64((choices >> u64(i * 3)) & 7)
+		block[i * 4 + 3] = u8(values[choice])
+	}
+}

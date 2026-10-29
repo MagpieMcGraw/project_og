@@ -1,0 +1,366 @@
+// Walking: a body that walks on the land and into the models' collision,
+// as the player does — falling, climbing steps, sliding along walls.
+//
+// The body is three spheres stacked up its height, the lowest above the
+// step height, so a step or a small ledge passes under it, to be climbed.
+// Each frame it moves a little at a time, its spheres pushed out of the
+// triangles they've run into; then a line straight down from above its
+// knees finds the ground: the land, or the highest triangle under it.
+//
+// Collision is looked for in the instances near it, each in its model's
+// own space: the body is taken there (so no triangle is moved), and the
+// pushes brought back.
+module walking
+
+use mara.core
+use mara.math
+use world
+use land
+use render
+use scene
+use logging
+
+// The body: its radius, its height, how high a step it climbs.
+WALKER_RADIUS :: 24
+WALKER_HEIGHT :: 128
+STEP_HEIGHT :: 40
+// Gravity (9.8 m/s², at about 70 units a meter), and how fast a jump starts up.
+GRAVITY :: 690
+JUMP_SPEED :: 320
+// How far below it the ground can drop and a walker on it stay on it
+// (going down a slope or steps), not fall.
+SNAP_DOWN :: 40
+// The instances near enough to be looked at, at most.
+NEAR_INSTANCES :: 256
+
+// A walker: where its feet are, how fast it's going up (or, below 0,
+// down), whether it stands on something.
+Walker :: struct {
+	position: Vec3
+	rising: f32
+	on_ground: bool
+}
+
+// An instance near the walker: its model's collision, and the way into
+// the model's space and back.
+Nearby :: struct {
+	first: i64             // its model's points in the scene's collision
+	count: i64
+	world: Mat4            // the model's space to the world
+	to_model: Mat4         // and back
+	scale: f32             // how much bigger the instance is than its model
+	upright: f32           // its model's upright cylinder (Collision_Range): radius and height; 0 for none
+	upright_height: f32
+}
+
+// Moves a walker a frame through the scene: going across the ground (units
+// a second, z unused), jumping when asked and it can. inside: the scene is
+// an interior (no land to stand on).
+walk :: fun(walker: ^Walker, shown: ^Scene, going: Vec3, jump: bool, seconds: f32) {
+	nearby : [NEAR_INSTANCES]Nearby
+	reach := WALKER_HEIGHT + vec3_length(going) * seconds + SNAP_DOWN
+	find_nearby(walker, shown, reach, &nearby)
+
+	if jump and walker.on_ground {
+		walker.rising = JUMP_SPEED
+		walker.on_ground = false
+	}
+	if not walker.on_ground do walker.rising -= GRAVITY * seconds
+
+	// A little at a time, under half its radius each: through nothing.
+	move := Vec3{going.x * seconds, going.y * seconds, walker.rising * seconds}
+	steps := i64(vec3_length(move) / (WALKER_RADIUS * 0.5)) + 1
+	if steps > 16 do steps = 16
+	for s in 0:steps {
+		walker.position = walker.position + move * (1 / f32(steps))
+		for pass in 0:2 do push_out(walker, shown, &nearby)
+	}
+
+	// The ground: stepped up onto, landed on, kept to going down; or not there.
+	ground, found := ground_below(walker, shown, &nearby)
+	if not found {
+		// Land or floors that aren't loaded yet: held where it is, not
+		// dropped through.
+		if anything_waiting(shown) or (shown.world != 0 and not land_here(shown, walker.position)) {
+			walker.rising = 0
+			walker.on_ground = true
+			return
+		}
+		walker.on_ground = false
+		return
+	}
+	if walker.position.z <= ground {
+		walker.position.z = ground
+		if walker.rising < 0 do walker.rising = 0
+		walker.on_ground = walker.rising <= 0
+	elif walker.on_ground and walker.rising <= 0 and walker.position.z - ground <= SNAP_DOWN
+		walker.position.z = ground
+	else
+		walker.on_ground = false
+	}
+}
+
+// The instances whose spheres come within reach of the walker, with
+// collision: into nearby.
+find_nearby :: fun(walker: ^Walker, shown: ^Scene, reach: f32, nearby: ^[]Nearby) {
+	middle := walker.position + Vec3{0, 0, WALKER_HEIGHT * 0.5}
+	for &instance in shown.instances {
+		range := shown.model_collision[instance.model]
+		if range.count == 0 and range.upright == 0 do continue
+		if vec3_length(instance.center - middle) > instance.radius + reach do continue
+		if not fits(nearby.len + 1, nearby.cap) do return
+		nearby + Nearby{first = range.first, count = range.count, world = instance.world,
+			to_model = mat4_inverse(instance.world),
+			scale = vec3_length(Vec3{instance.world[0][0], instance.world[0][1], instance.world[0][2]}),
+			upright = range.upright, upright_height = range.upright_height}
+	}
+}
+
+// Pushes the walker's spheres out of the triangles they're in, one
+// triangle at a time; and the walker out of the upright cylinders it's in,
+// across.
+push_out :: fun(walker: ^Walker, shown: ^Scene, nearby: ^[]Nearby) {
+	for &near in nearby {
+		if near.upright == 0 do continue
+		foot := Vec3{near.world[3][0], near.world[3][1], near.world[3][2]}
+		if walker.position.z + WALKER_HEIGHT < foot.z or walker.position.z + STEP_HEIGHT > foot.z + near.upright_height * near.scale do continue
+		reach := near.upright * near.scale + WALKER_RADIUS
+		away_x := walker.position.x - foot.x
+		away_y := walker.position.y - foot.y
+		distance := sqrt_f32(away_x * away_x + away_y * away_y)
+		if distance >= reach do continue
+		// (Right on its middle: out any way.)
+		if distance < 0.001 {
+			away_x = 1
+			away_y = 0
+			distance = 1
+		}
+		walker.position.x = foot.x + away_x / distance * reach
+		walker.position.y = foot.y + away_y / distance * reach
+	}
+	heights : [3!]f32 = [STEP_HEIGHT + WALKER_RADIUS, WALKER_HEIGHT * 0.5 + STEP_HEIGHT * 0.5, WALKER_HEIGHT - WALKER_RADIUS]
+	for height in heights {
+		for &near in nearby {
+			radius := WALKER_RADIUS / near.scale
+			center := to_space(near.to_model, walker.position + Vec3{0, 0, height}, 1)
+			for t in 0:near.count / 3 {
+				at := near.first + t * 3
+				a := shown.collision_points[at]
+				b := shown.collision_points[at + 1]
+				c := shown.collision_points[at + 2]
+				if not near_triangle(center, radius, a, b, c) do continue
+				closest := closest_on_triangle(center, a, b, c)
+				away := center - closest
+				distance := vec3_length(away)
+				if distance >= radius do continue
+				// Out along the way from the triangle (or its face's, when on it).
+				out_way := if distance > 0.0001 do away * (1 / distance) else vec3_normalize(cross(b - a, c - a))
+				push := out_way * (radius - distance)
+				center = center + push
+				walker.position = walker.position + to_space(near.world, push, 0)
+			}
+		}
+	}
+}
+
+// A point (w 1) or a direction (w 0) through a matrix.
+to_space :: fun(matrix: Mat4, v: Vec3, w: f32) -> Vec3 {
+	at := mat4_mul_vec4(matrix, Vec4{v.x, v.y, v.z, w})
+	return Vec3{at.x, at.y, at.z}
+}
+
+// Whether a sphere could touch a triangle: not wholly to one side of it
+// on any axis.
+near_triangle :: fun(center: Vec3, radius: f32, a: Vec3, b: Vec3, c: Vec3) -> bool {
+	for axis in 0:3 {
+		low := min_f32(a[axis], min_f32(b[axis], c[axis]))
+		high := max_f32(a[axis], max_f32(b[axis], c[axis]))
+		if center[axis] + radius < low or center[axis] - radius > high do return false
+	}
+	return true
+}
+
+// The point of a triangle nearest a point (Ericson's, by its regions).
+closest_on_triangle :: fun(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
+	ab := b - a
+	ac := c - a
+	ap := p - a
+	d1 := dot(ab, ap)
+	d2 := dot(ac, ap)
+	if d1 <= 0 and d2 <= 0 do return a
+	bp := p - b
+	d3 := dot(ab, bp)
+	d4 := dot(ac, bp)
+	if d3 >= 0 and d4 <= d3 do return b
+	vc := d1 * d4 - d3 * d2
+	if vc <= 0 and d1 >= 0 and d3 <= 0 do return a + ab * (d1 / (d1 - d3))
+	cp := p - c
+	d5 := dot(ab, cp)
+	d6 := dot(ac, cp)
+	if d6 >= 0 and d5 <= d6 do return c
+	vb := d5 * d2 - d1 * d6
+	if vb <= 0 and d2 >= 0 and d6 <= 0 do return a + ac * (d2 / (d2 - d6))
+	va := d3 * d6 - d5 * d4
+	if va <= 0 and d4 - d3 >= 0 and d5 - d6 >= 0 do return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)))
+	denominator := 1 / (va + vb + vc)
+	return a + ab * (vb * denominator) + ac * (vc * denominator)
+}
+
+// The highest ground under the walker, no higher than a step above its
+// feet: the land's, or a triangle's. False when there's none.
+ground_below :: fun(walker: ^Walker, shown: ^Scene, nearby: ^[]Nearby) -> f32, bool {
+	top := walker.position + Vec3{0, 0, STEP_HEIGHT}
+	best : f32 = -1000000000
+	found := false
+	if shown.world != 0 {
+		height, has_land := land_height(shown, walker.position)
+		if has_land and height <= top.z {
+			best = height
+			found = true
+		}
+	}
+	// A line from above the knees straight down, in each model's space.
+	for &near in nearby {
+		start := to_space(near.to_model, top, 1)
+		down := to_space(near.to_model, Vec3{0, 0, -1}, 0)
+		for t in 0:near.count / 3 {
+			at := near.first + t * 3
+			distance, hit := line_hits(start, down, shown.collision_points[at], shown.collision_points[at + 1], shown.collision_points[at + 2])
+			if not hit do continue
+			height := top.z - distance
+			if height > best {
+				best = height
+				found = true
+			}
+		}
+	}
+	return best, found
+}
+
+// How far along a line (from start, by way: its length a world unit) it
+// meets a triangle, if it does, going forward (Möller and Trumbore's).
+line_hits :: fun(start: Vec3, way: Vec3, a: Vec3, b: Vec3, c: Vec3) -> f32, bool {
+	edge_one := b - a
+	edge_two := c - a
+	across := cross(way, edge_two)
+	determinant := dot(edge_one, across)
+	if abs_f32(determinant) < 0.0000001 do return 0, false
+	inverse := 1 / determinant
+	from_a := start - a
+	u := dot(from_a, across) * inverse
+	if u < 0 or u > 1 do return 0, false
+	up := cross(from_a, edge_one)
+	v := dot(way, up) * inverse
+	if v < 0 or u + v > 1 do return 0, false
+	distance := dot(edge_two, up) * inverse
+	if distance < 0 do return 0, false
+	return distance, true
+}
+
+// Whether the land under a place is loaded.
+land_here :: fun(shown: ^Scene, place: Vec3) -> bool {
+	x, y := grid_of(place)
+	for ground in shown.grounds {
+		if ground.x == x and ground.y == y do return true
+	}
+	return false
+}
+
+// The land's height under a place, as it's drawn (each square two
+// triangles, split from its south-west corner to its north-east); false
+// where its land isn't loaded.
+land_height :: fun(shown: ^Scene, place: Vec3) -> f32, bool {
+	x, y := grid_of(place)
+	for ground in shown.grounds {
+		if ground.x != x or ground.y != y do continue
+		heights := &shown.land_heights[ground.slot]
+		grid_x := (place.x - f32(x * CELL_SIZE)) / LAND_SPACING
+		grid_y := (place.y - f32(y * CELL_SIZE)) / LAND_SPACING
+		column := i64(grid_x)
+		row := i64(grid_y)
+		if column > LAND_SIDE - 2 do column = LAND_SIDE - 2
+		if row > LAND_SIDE - 2 do row = LAND_SIDE - 2
+		if column < 0 do column = 0
+		if row < 0 do row = 0
+		across := grid_x - f32(column)
+		up := grid_y - f32(row)
+		at := row * LAND_SIDE + column
+		south_west := heights[at]
+		south_east := heights[at + 1]
+		north_west := heights[at + LAND_SIDE]
+		north_east := heights[at + LAND_SIDE + 1]
+		if across >= up do return south_west + across * (south_east - south_west) + up * (north_east - south_east), true
+		return south_west + up * (north_west - south_west) + across * (north_east - north_west), true
+	}
+	return 0, false
+}
+
+// What the eyes look at: the instance whose collision a line from them
+// (by way, its length 1) meets first, within reach — walls in the way
+// first, as they are. Its index in the scene's instances, and how far;
+// false when nothing is met.
+pick :: fun(shown: ^Scene, from: Vec3, way: Vec3, reach: f32) -> i64, f32, bool {
+	nearest : f32 = reach
+	picked : i64 = -1
+	for &instance, index in shown.instances {
+		distance, hit := line_meets(shown, instance, from, way, nearest)
+		if hit {
+			nearest = distance
+			picked = index
+		}
+	}
+	return picked, nearest, picked >= 0
+}
+
+// The door the eyes look at, nothing in front of it counted: the nearest
+// instance of a door (one that leads somewhere or opens in place) whose
+// collision the line meets within reach. (Some walls' collision runs
+// straight across a load door's doorway — the castles' tower walls — the
+// door drawn in a recess behind it.)
+pick_door :: fun(shown: ^Scene, from: Vec3, way: Vec3, reach: f32) -> i64, f32, bool {
+	nearest : f32 = reach
+	picked : i64 = -1
+	for &instance, index in shown.instances {
+		if not is_door(shown, instance.reference) do continue
+		distance, hit := line_meets(shown, instance, from, way, nearest)
+		if hit {
+			nearest = distance
+			picked = index
+		}
+	}
+	return picked, nearest, picked >= 0
+}
+
+// Whether a reference is a door: one that leads somewhere, or opens in place.
+is_door :: fun(shown: ^Scene, reference: u32) -> bool {
+	if reference == 0 do return false
+	for &door in shown.doors {
+		if door.reference == reference do return true
+	}
+	for &door in shown.swinging {
+		if door.reference == reference do return true
+	}
+	return false
+}
+
+// Where a line (from, by way, its length 1) meets an instance's collision
+// first, if it does before nearest.
+line_meets :: fun(shown: ^Scene, instance: ^Instance, from: Vec3, way: Vec3, nearest: f32) -> f32, bool {
+	range := shown.model_collision[instance.model]
+	if range.count == 0 do return nearest, false
+	// Only those whose sphere the line passes through.
+	to_center := instance.center - from
+	along := dot(to_center, way)
+	if along < -instance.radius or along > nearest + instance.radius do return nearest, false
+	if vec3_length(to_center - way * along) > instance.radius do return nearest, false
+	to_model := mat4_inverse(instance.world)
+	start := to_space(to_model, from, 1)
+	local_way := to_space(to_model, way, 0)
+	met := nearest
+	for t in 0:range.count / 3 {
+		at := range.first + t * 3
+		distance, hit := line_hits(start, local_way, shown.collision_points[at], shown.collision_points[at + 1], shown.collision_points[at + 2])
+		if hit and distance < met do met = distance
+	}
+	return met, met < nearest
+}

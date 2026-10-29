@@ -1,0 +1,146 @@
+// Distant land: the game's own low-detail land, drawn beyond the cells
+// loaded in full, out to where the fog hides everything.
+//
+// A world's is in pieces of 32 x 32 cells. Each is a mesh already in the
+// world's units (meshes\landscape\lod\), with two textures the editor made
+// for it (textures\landscapelod\generated\): its colors, and its normals
+// (_fn, in the world's axes: x east, y north, z up), which give its shading.
+// A piece is named for its world's form id and its lowest cell:
+// 60.-32.00.32 is Tamriel's from cell -32, 0.
+//
+// The far water goes with it: one stretch at sea level under all of it,
+// as the game drew it.
+module distant
+
+use mara.core
+use mara.math
+use mara.string
+use mara.time
+use bsa
+use nif
+use model
+use render
+use scene
+
+// The cells along each side of a piece.
+LOD_CELLS :: 32
+// How far from the world's middle pieces are looked for, in cells.
+LOD_REACH :: 512
+
+// The lowest cell of the piece a cell is in.
+lod_corner :: fun(cell: i64) -> i64 {
+	if cell >= 0 do return cell / LOD_CELLS * LOD_CELLS
+	return -((-cell + LOD_CELLS - 1) / LOD_CELLS) * LOD_CELLS
+}
+
+// A grid number as the pieces' names have it: two digits at least, "-"
+// before it when it's below 0.
+grid_number_text :: fun(number: i64, text: ^[]utf8) {
+	size := number
+	if number < 0 {
+		text + "-"
+		size = -number
+	}
+	if size < 10 do text + "0"
+	text + int_text(size)
+}
+
+// A piece's name, from its world and its lowest cell: "60.-32.00.32".
+lod_name :: fun(world_id: u32, x: i64, y: i64) -> str64 {
+	name : str64
+	&name + int_text(i64(world_id))
+	&name + "."
+	grid_number_text(x, &name)
+	&name + "."
+	grid_number_text(y, &name)
+	&name + ".32"
+	return name
+}
+
+// Starts putting a world's distant land on the card in place of what's
+// there: every piece of it the archives have (Tamriel has 36), loaded a few
+// a frame from then on (load_distant_land_step), then the far water under
+// all of it. A piece whose mesh can't be read is left out (the first such
+// failure kept: distant_failure); one whose normals are missing is lit as
+// if flat.
+begin_distant_land :: fun(renderer: ^Renderer, world_id: u32) {
+	clear_distant_land(renderer)
+	renderer.distant_world = world_id
+	renderer.distant_next = 0
+	renderer.distant_low = Vec3{1000000000, 1000000000, 0}
+	renderer.distant_high = Vec3{-1000000000, -1000000000, 0}
+	renderer.distant_made = 0
+	no_failure : err
+	renderer.distant_failure = no_failure
+	renderer.distant_started = time_now()
+}
+
+// Loads the distant land's next pieces till budget nanoseconds have gone
+// (one at least): true when it's all loaded, or none is loading. Done, the
+// far water's put round it.
+load_distant_land_step :: fun(renderer: ^Renderer, loader: Loader, budget: u64) -> bool {
+	if renderer.distant_next < 0 do return true
+	start := time_now()
+	room := loader.room
+	steps := LOD_REACH * 2 / LOD_CELLS
+	for renderer.distant_next < steps * steps {
+		if time_now() - start > budget do return false
+		place := renderer.distant_next
+		renderer.distant_next += 1
+		x := (place % steps) * LOD_CELLS - LOD_REACH
+		y := (place / steps) * LOD_CELLS - LOD_REACH
+		name := lod_name(renderer.distant_world, x, y)
+		piece_file, found := find_archived(loader.archives, lod_mesh_path(name))
+		if not found do continue
+		built, read_error := read_lod_mesh(loader.archives, room, piece_file)
+		if read_error {
+			if not renderer.distant_failure do renderer.distant_failure = read_error
+			continue
+		}
+
+		path : [256]utf8
+		&path + "textures\\landscapelod\\generated\\"
+		&path + name
+		&path + ".dds"
+		colors := texture_for(renderer, loader.archives, path, &room.texture)
+		path.len = path.len - 4
+		&path + "_fn.dds"
+		normals := texture_for(renderer, loader.archives, path, &room.texture)
+		if normals == 0 do normals = renderer.flat_normal_texture
+
+		for k in 0:built.parts.len {
+			if upload_distant_piece(renderer, &built.parts[k], colors, normals) do renderer.distant_made += 1
+		}
+		low := &renderer.distant_low
+		high := &renderer.distant_high
+		if built.bounds_min.x < low.x do low.x = built.bounds_min.x
+		if built.bounds_min.y < low.y do low.y = built.bounds_min.y
+		if built.bounds_max.x > high.x do high.x = built.bounds_max.x
+		if built.bounds_max.y > high.y do high.y = built.bounds_max.y
+	}
+	if renderer.distant_made > 0 {
+		set_far_water(renderer, renderer.distant_low.x, renderer.distant_low.y, renderer.distant_high.x, renderer.distant_high.y, 0)
+	}
+	renderer.distant_next = -1
+	return true
+}
+
+// A piece's mesh's archive path, by the piece's name.
+lod_mesh_path :: fun(name: []utf8) -> [256]utf8 {
+	path : [256]utf8
+	&path + "meshes\\landscape\\lod\\"
+	&path + name
+	&path + ".nif"
+	return path
+}
+
+// A piece's mesh (a file found in the archives) as a model, made in room.
+read_lod_mesh :: fun(archives: ^Archives, room: ^Load_Room, piece_file: Archived_File) -> Model, err {
+	room.file.len = 0
+	data := read_archived(archives, piece_file, &room.file)?
+	room.blocks.len = 0
+	failure := Nif_Failure{block = 0, type_name = room.file[0:0]}
+	mesh := read_nif(data, &room.blocks, &failure)?
+	room.model.len = 0
+	return build_model(&mesh, &room.model)
+}

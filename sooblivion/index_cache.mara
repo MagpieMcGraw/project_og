@@ -1,0 +1,170 @@
+// The plugins' index kept in the cache folder (INDEX_CACHE_PATH), so a
+// start reads it instead of walking every record: each file's span (what
+// indexing found of it with the rest), then the tables as they are in
+// memory, each its count, keys and values. Its
+// stamp says what it was made from: the plugin files (their names, sizes
+// and times written) and the program (a build may index otherwise). When
+// the stamp differs, or the file isn't whole, the plugins are indexed
+// again and the file written afresh. Its header goes in last, so a file
+// left half written isn't read.
+module index_cache
+
+use mara.core
+use mara.os
+use mara.memory
+use disk
+use file_cache
+use world
+use indexing
+
+INDEX_CACHE_PATH :: "cache\\plugins.index"
+// (The magic is "SOOINDEX".)
+INDEX_MAGIC :: 0x5845444E494F4F53
+
+Index_Cache_Error :: error {
+	Stale_Index   // made from other plugin files, by another build, or not whole
+}
+
+// The index file's header: 32 bytes.
+Index_Header :: struct {
+	magic: u64       // 0 till the rest is written
+	stamp: u64
+	file_count: i64
+	size: i64        // the whole file's, in bytes
+}
+
+// A stamp of the plugin files in the load order (names, sizes, times
+// written: paths, their data folder's) and the program's own file.
+plugins_stamp :: fun(paths: []Path) -> u64, err {
+	program := exe_path()?
+	stamp := file_stamp(program)?
+	for path in paths {
+		stamp = mix_key(stamp, file_stamp(path)?)
+		for c in path do stamp = mix_key(stamp, u64(c | 0x20))
+	}
+	return stamp
+}
+
+// Reads the index kept for the plugins (plugin.files' names and spans in
+// the data set), its tables carved from storage, if it was made with
+// stamp: true when it was. Storage is as it was when it wasn't.
+read_plugin_index :: fun(plugin: ^Plugin, stamp: u64, storage: ^[]byte) -> bool {
+	file, open_error := file_open_read(INDEX_CACHE_PATH)
+	if open_error do return false
+	defer file_close(file)
+	start := storage.len
+	read_error := read_index_file(file, plugin, stamp, storage)
+	if read_error {
+		storage.len = start
+		return false
+	}
+	return true
+}
+
+read_index_file :: fun(file: File_Id, plugin: ^Plugin, stamp: u64, storage: ^[]byte) -> err {
+	header_bytes : [32!]byte
+	header_view := header_bytes[:]
+	read_exactly(file, &header_view)?
+	header : Index_Header = header_bytes[0]
+	if header.magic != INDEX_MAGIC or header.stamp != stamp or header.file_count != plugin.files.len do return Stale_Index
+	if file_size(file)? != header.size do return Stale_Index
+
+	// Each file's span, read into the room past what storage holds (used
+	// again after).
+	span_size := size_of(Plugin_Span)
+	if storage.len + header.file_count * span_size > storage.cap do return Stale_Index
+	spans := storage[storage.len : storage.len + header.file_count * span_size]
+	read_exactly(file, &spans)?
+	for k in 0:header.file_count {
+		span : Plugin_Span = spans[k * span_size]
+		plugin.files[k] = span
+	}
+
+	read_table(file, &plugin.records, RECORD_SLOTS, storage)?
+	read_table(file, &plugin.cell_children, CELL_SLOTS, storage)?
+	read_table(file, &plugin.exterior_cells, CELL_SLOTS, storage)?
+	read_table(file, &plugin.cell_worlds, CELL_SLOTS, storage)?
+	read_table(file, &plugin.persistent_cells, WORLD_SLOTS, storage)?
+}
+
+// Reads a table as write_table wrote it, its keys and values read straight
+// into their room carved from storage.
+read_table :: fun(file: File_Id, index: ^Key_Index, slots: i64, storage: ^[]byte) -> err {
+	count_bytes : [8!]byte
+	count_view := count_bytes[:]
+	read_exactly(file, &count_view)?
+	count : i64 = count_bytes[0]
+	if storage.len + slots * 12 + 16 > storage.cap do return Stale_Index
+	keys := slice([:slots]u64, storage)
+	keys.len = slots
+	keys_bytes := storage[storage.len - slots * 8 : storage.len]
+	read_exactly(file, &keys_bytes)?
+	values := slice([:slots]u32, storage)
+	values.len = slots
+	values_bytes := storage[storage.len - slots * 4 : storage.len]
+	read_exactly(file, &values_bytes)?
+	index^ = Key_Index{keys = keys, values = values, count = count}
+}
+
+// Writes the plugins' index into the cache folder, made with stamp.
+write_plugin_index :: fun(plugin: ^Plugin, stamp: u64) -> err {
+	make_folder(CACHE_FOLDER)
+	file := file_open_own(INDEX_CACHE_PATH, true)?
+	defer file_close(file)
+	header := Index_Header{magic = 0, stamp = stamp, file_count = plugin.files.len, size = 0}
+	chunk : [1 * MB]byte
+	chunk.len = 32
+	chunk[0] = header
+	for span in plugin.files {
+		at := chunk.len
+		chunk.len += size_of(Plugin_Span)
+		chunk[at] = span
+	}
+	written := chunk.len
+	_ = file_write(file, chunk)?
+	written += write_table(file, &plugin.records, &chunk)?
+	written += write_table(file, &plugin.cell_children, &chunk)?
+	written += write_table(file, &plugin.exterior_cells, &chunk)?
+	written += write_table(file, &plugin.cell_worlds, &chunk)?
+	written += write_table(file, &plugin.persistent_cells, &chunk)?
+
+	// Whole: the header, saying so.
+	header.magic = INDEX_MAGIC
+	header.size = written
+	header_bytes : [32!]byte
+	header_bytes[0] = header
+	_ = file_seek(file, 0, SEEK_SET)?
+	_ = file_write(file, header_bytes)?
+}
+
+// Writes a table: its count, then its keys and its values as they are in
+// memory, through chunk. How many bytes that was.
+write_table :: fun(file: File_Id, index: ^Key_Index, chunk: ^[]byte) -> i64, err {
+	chunk.len = 8
+	chunk[0] = index.count
+	written : i64 = 0
+	for key in index.keys {
+		if chunk.len + 8 > chunk.cap {
+			_ = file_write(file, chunk^)?
+			written += chunk.len
+			chunk.len = 0
+		}
+		at := chunk.len
+		chunk.len += 8
+		chunk[at] = key
+	}
+	for value in index.values {
+		if chunk.len + 4 > chunk.cap {
+			_ = file_write(file, chunk^)?
+			written += chunk.len
+			chunk.len = 0
+		}
+		at := chunk.len
+		chunk.len += 4
+		chunk[at] = value
+	}
+	_ = file_write(file, chunk^)?
+	written += chunk.len
+	chunk.len = 0
+	return written
+}

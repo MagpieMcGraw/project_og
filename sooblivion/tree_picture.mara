@@ -1,0 +1,261 @@
+// `sooblivion tree-picture <TREE editor id> <out.png> [seed | bare]`: a tree
+// grown as the viewer grows it, drawn by hand (no window) from the front,
+// lit by a sun from the front left, beside the game's billboard of it at
+// the same scale: to see how near the grown trees come to the game's
+// without starting the game. Bare: without its leaves, to see its
+// branches.
+module sooblivion
+
+use mara.core
+use mara.os
+use mara.math
+use mara.memory
+use mara.string
+use bsa
+use dds
+use png
+use model
+use world
+use speedtree
+use scene
+
+TREE_PICTURE_SIDE :: 512
+
+// A picture being drawn: its pixels (red, green, blue, alpha, rows from the
+// top), and the depth of what's drawn at each (nearer: smaller).
+Canvas :: struct {
+	pixels: []byte
+	depth: []f32
+	width: i64
+	height: i64
+}
+
+// A texture decoded for drawing by hand: its pixels as Canvas's.
+Painted_Texture :: struct {
+	pixels: []byte
+	width: i64
+	height: i64
+}
+
+command_tree_picture :: fun(name: []utf8, out_path: []utf8, seed_or_bare: []utf8) {
+	bare := seed_or_bare == "bare"
+	seed_text := if bare do out_path[0:0] else seed_or_bare
+	index_storage : [96 * MB]byte
+	plugin, load_error := load_oblivion(&index_storage)
+	if load_error {
+		print("couldn't load the plugins: %", load_error)
+		return
+	}
+	scratch : [1 * MB]byte
+	tree_id, found := find_by_editor_id(&plugin, name, &scratch)
+	if not found {
+		print("no record %", name)
+		return
+	}
+	record, record_error := find_record(&plugin, tree_id, &scratch)
+	look, is_tree := tree_look(record)
+	if record_error or not is_tree {
+		print("% isn't a tree", name)
+		return
+	}
+	directory_storage : [64 * MB]byte
+	archives : Archives
+	open_error := open_all_archives(&archives, &directory_storage)
+	if open_error {
+		print("couldn't open the archives: %", open_error)
+		return
+	}
+	defer close_archives(&archives)
+
+	file_storage : [16 * MB]byte
+	model_storage : [32 * MB]byte
+	tree := Speed_Tree{0}
+	spt, spt_found := find_archived(&archives, look.model)
+	if not spt_found {
+		print("no % in the archives", look.model)
+		return
+	}
+	spt_data, spt_error := read_archived(&archives, spt, &file_storage)
+	tree_error := if spt_error do spt_error else read_speed_tree(spt_data, &tree)
+	if tree_error {
+		print("couldn't read %: %", look.model, tree_error)
+		return
+	}
+	seed := if look.seeds.len > 0 do look.seeds[0] else tree.seed
+	if seed_text.len > 0 {
+		number, is_number := parse_number(seed_text)
+		if is_number do seed = i64(number)
+	}
+	// The billboard: its size fits the tree, and it's drawn beside it.
+	billboard_file : [4 * MB]byte
+	billboard_pixels : [8 * MB]byte
+	billboard, billboard_error := paint_texture(&archives, look.billboard, 0, &billboard_file, &billboard_pixels)
+	if billboard_error do print("couldn't read %: %", look.billboard, billboard_error)
+	// The fit as the scene finds it: from mipmaps at least 64 wide.
+	fit := Tree_Fit{width = 0, height = 0, leaf_fill = 0}
+	small_file : [4 * MB]byte
+	small_pixels : [1 * MB]byte
+	small_billboard, small_billboard_error := paint_texture(&archives, look.billboard, 64, &small_file, &small_pixels)
+	if not small_billboard_error {
+		fit = billboard_fit(small_billboard.pixels, small_billboard.width, small_billboard.height, look.width, look.height)
+	}
+	small_file.len = 0
+	small_pixels.len = 0
+	small_leaves, small_leaves_error := paint_texture(&archives, look.leaves, 64, &small_file, &small_pixels)
+	if small_leaves_error do print("couldn't read %: %", look.leaves, small_leaves_error)
+	else do fit.leaf_fill = leaf_fill(small_leaves.pixels)
+	grown, report, grow_error := grow_tree(&tree, seed, look.leaves, fit, &model_storage)
+	if grow_error {
+		print("couldn't grow %: %", look.model, grow_error)
+		return
+	}
+
+	// The picture: the grown tree on the left, the billboard on the right,
+	// both at one scale: the taller of the two filling nine tenths.
+	canvas_pixels : [TREE_PICTURE_SIDE * TREE_PICTURE_SIDE * 8]byte
+	canvas_depth : [TREE_PICTURE_SIDE * TREE_PICTURE_SIDE * 2]f32
+	canvas_pixels.len = canvas_pixels.cap
+	canvas_depth.len = canvas_depth.cap
+	canvas := Canvas{pixels = canvas_pixels[:], depth = canvas_depth[:], width = 2 * TREE_PICTURE_SIDE, height = TREE_PICTURE_SIDE}
+	for k in 0:canvas.width * canvas.height {
+		canvas.pixels[4 * k] = u8(190)
+		canvas.pixels[4 * k + 1] = u8(196)
+		canvas.pixels[4 * k + 2] = u8(204)
+		canvas.pixels[4 * k + 3] = u8(255)
+		canvas.depth[k] = 1000000
+	}
+	tallest := max(max(grown.bounds_max.z, look.height), 1)
+	scale := f32(TREE_PICTURE_SIDE) * 0.9 / tallest
+
+	texture_storage : [64 * MB]byte
+	pixel_storage : [64 * MB]byte
+	for &part in grown.parts {
+		if bare and part.leaf_cards do continue
+		file_storage.len = 0
+		texture_storage.len = 0
+		painted, texture_error := paint_texture(&archives, part.texture, 0, &file_storage, &texture_storage)
+		if texture_error {
+			print("couldn't read %: %", part.texture, texture_error)
+			continue
+		}
+		draw_tree_part(&canvas, part, &painted, scale)
+	}
+	if not billboard_error do draw_billboard(&canvas, &billboard, look.width * scale, look.height * scale)
+
+	png_storage : [16 * MB]byte
+	row_storage : [16 * MB]byte
+	encode_png(canvas.pixels, canvas.width, canvas.height, &png_storage, &row_storage)
+	write_error := write_entire_file(out_path, png_storage)
+	if write_error {
+		print("couldn't write %: %", out_path, write_error)
+		return
+	}
+	print("% (%, seed %): % branches, % leaves (% of its texture opaque); % by % units, the billboard's tree % by %; drawn into %",
+		name, look.model, seed, report.branches, report.leaves, fit.leaf_fill, grown.bounds_max.x - grown.bounds_min.x,
+		grown.bounds_max.z, fit.width, fit.height, out_path)
+}
+
+// A texture from the archives, decoded into pixels: its smallest mipmap at
+// least smallest_width wide (0: its largest).
+paint_texture :: fun(archives: ^Archives, path: []utf8, smallest_width: i64, file_storage: ^[]byte, pixels: ^[]byte) -> Painted_Texture, err {
+	found, in_archives := find_archived(archives, path)
+	if not in_archives do return Painted_Texture{0}, Not_In_Archive
+	data := read_archived(archives, found, file_storage)?
+	texture := read_texture(data)?
+	mip : i64 = 0
+	for smallest_width > 0 and mip + 1 < texture.mips.len and texture.mips[mip + 1].width >= smallest_width do mip += 1
+	decoded := decode_rgba(texture, mip, pixels)?
+	return Painted_Texture{pixels = decoded, width = texture.mips[mip].width, height = texture.mips[mip].height}
+}
+
+// A part of a tree drawn from the front (looking along +y: x across, z up)
+// into the left half, its trunk's foot at the bottom middle: its triangles
+// textured, cut out where the texture's alpha is below the part's test,
+// lit by a sun from the front left. Leaf cards face the view.
+draw_tree_part :: fun(canvas: ^Canvas, part: ^Model_Part, texture: ^Painted_Texture, scale: f32) {
+	sun := vec3_normalize(Vec3{-0.4, -0.7, 0.6})
+	test := if part.alpha_test do part.alpha_threshold else 0
+	for t in 0:part.indices.len / 3 {
+		corners : [3!]Vec3
+		uvs : [3!][2!]f32
+		for k in 0:3 {
+			vertex := part.vertices[i64(part.indices[3 * t + k])]
+			place := vertex.position
+			if part.leaf_cards do place = place + Vec3{vertex.tangent[0], 0, vertex.tangent[1]}
+			corners[k] = Vec3{f32(TREE_PICTURE_SIDE) / 2 + place.x * scale, f32(TREE_PICTURE_SIDE) * 0.95 - place.z * scale, place.y}
+			uvs[k] = vertex.uv
+		}
+		first := part.vertices[i64(part.indices[3 * t])]
+		// (As the mesh program lights them: leaves let the sun through.)
+		facing := dot(first.normal, sun)
+		light := 0.45 + 0.6 * (if part.leaf_cards do 0.5 + 0.5 * facing else max(facing, 0))
+		shade := Vec3{first.color[0], first.color[1], first.color[2]} * light
+		fill_triangle(canvas, corners, uvs, texture, test, shade)
+	}
+}
+
+// Fills a triangle (corners in pixels, their depths) with its texture,
+// nearest texel, wrapping; pixels nearer than what's drawn, and opaque
+// enough, are drawn, times shade (red, green, blue).
+fill_triangle :: fun(canvas: ^Canvas, corners: [3!]Vec3, uvs: [3!][2!]f32, texture: ^Painted_Texture, test: f32, shade: Vec3) {
+	a := corners[0]
+	b := corners[1]
+	c := corners[2]
+	area := (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+	if abs_f32(area) < 0.0001 do return
+	low_x := max(i64(floor_f32(min(a.x, min(b.x, c.x)))), 0)
+	high_x := min(i64(ceil_f32(max(a.x, max(b.x, c.x)))), canvas.width - 1)
+	low_y := max(i64(floor_f32(min(a.y, min(b.y, c.y)))), 0)
+	high_y := min(i64(ceil_f32(max(a.y, max(b.y, c.y)))), canvas.height - 1)
+	for y in low_y..high_y {
+		for x in low_x..high_x {
+			px := f32(x) + 0.5
+			py := f32(y) + 0.5
+			// How much of each corner: the share of the area across from it.
+			wa := ((b.x - px) * (c.y - py) - (b.y - py) * (c.x - px)) / area
+			wb := ((c.x - px) * (a.y - py) - (c.y - py) * (a.x - px)) / area
+			wc := 1 - wa - wb
+			if wa < 0 or wb < 0 or wc < 0 do continue
+			depth := wa * a.z + wb * b.z + wc * c.z
+			at := y * canvas.width + x
+			if depth >= canvas.depth[at] do continue
+			u := wa * uvs[0][0] + wb * uvs[1][0] + wc * uvs[2][0]
+			v := wa * uvs[0][1] + wb * uvs[1][1] + wc * uvs[2][1]
+			u = u - floor_f32(u)
+			v = v - floor_f32(v)
+			tx := min(i64(u * f32(texture.width)), texture.width - 1)
+			ty := min(i64(v * f32(texture.height)), texture.height - 1)
+			texel := 4 * (ty * texture.width + tx)
+			if f32(texture.pixels[texel + 3]) / 255 < test do continue
+			canvas.depth[at] = depth
+			for channel in 0:3 {
+				lit := f32(texture.pixels[texel + channel]) * shade[channel]
+				canvas.pixels[4 * at + channel] = u8(min(lit, 255))
+			}
+		}
+	}
+}
+
+// The billboard drawn into the right half, width by height pixels, its
+// foot at the bottom middle, over what's there by its alpha.
+draw_billboard :: fun(canvas: ^Canvas, billboard: ^Painted_Texture, width: f32, height: f32) {
+	left := f32(TREE_PICTURE_SIDE) * 1.5 - width / 2
+	top := f32(TREE_PICTURE_SIDE) * 0.95 - height
+	for y in 0:canvas.height {
+		for x in TREE_PICTURE_SIDE:canvas.width {
+			u := (f32(x) + 0.5 - left) / width
+			v := (f32(y) + 0.5 - top) / height
+			if u < 0 or u >= 1 or v < 0 or v >= 1 do continue
+			tx := min(i64(u * f32(billboard.width)), billboard.width - 1)
+			ty := min(i64(v * f32(billboard.height)), billboard.height - 1)
+			texel := 4 * (ty * billboard.width + tx)
+			alpha := f32(billboard.pixels[texel + 3]) / 255
+			at := 4 * (y * canvas.width + x)
+			for channel in 0:3 {
+				over := f32(billboard.pixels[texel + channel])
+				under := f32(canvas.pixels[at + channel])
+				canvas.pixels[at + channel] = u8(under + (over - under) * alpha)
+			}
+		}
+	}
+}

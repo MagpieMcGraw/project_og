@@ -1,0 +1,155 @@
+// `sooblivion npc-picture <editor id> <out.png>`: an NPC's head drawn by
+// hand (no window) from the front, lit from the front left: on the left as
+// its race's parts are, on the right shaped by its own face (FaceGen:
+// facegen.mara). To see faces without starting the game. Each skin made
+// for its face goes beside the picture: <out>.skin<k>.png.
+module sooblivion
+
+use mara.core
+use mara.os
+use mara.math
+use mara.memory
+use mara.string
+use bsa
+use png
+use model
+use world
+use scene
+use facegen
+
+// How much of the NPC the picture shows: this many units round its head.
+HEAD_PICTURE_SPAN :: 30
+
+command_npc_picture :: fun(name: []utf8, out_path: []utf8) {
+	index_storage : [96 * MB]byte
+	plugin, load_error := load_oblivion(&index_storage)
+	if load_error {
+		print("couldn't load the plugins: %", load_error)
+		return
+	}
+	scratch : [1 * MB]byte
+	npc_id, found := find_by_editor_id(&plugin, name, &scratch)
+	if not found {
+		print("no record %", name)
+		return
+	}
+	look : Npc_Look
+	look_error := read_npc_look(&plugin, npc_id, &look)
+	if look_error {
+		print("couldn't read its look: %", look_error)
+		return
+	}
+	directory_storage : [64 * MB]byte
+	archives : Archives
+	open_error := open_all_archives(&archives, &directory_storage)
+	if open_error {
+		print("couldn't open the archives: %", open_error)
+		return
+	}
+	defer close_archives(&archives)
+	file_room : [16 * MB]byte
+	block_room : [16 * MB]byte
+	model_room : [64 * MB]byte
+	texture_room : [1 * KB]byte
+	room := load_room(&file_room, &block_room, &model_room, &texture_room)
+	skeleton : Npc_Skeleton
+	skeleton_error := read_skeleton(&archives, &room, look.skeleton, &skeleton)
+	if skeleton_error {
+		print("couldn't read its skeleton: %", skeleton_error)
+		return
+	}
+
+	canvas_pixels : [TREE_PICTURE_SIDE * TREE_PICTURE_SIDE * 8]byte
+	canvas_depth : [TREE_PICTURE_SIDE * TREE_PICTURE_SIDE * 2]f32
+	canvas_pixels.len = canvas_pixels.cap
+	canvas_depth.len = canvas_depth.cap
+	canvas := Canvas{pixels = canvas_pixels[:], depth = canvas_depth[:], width = 2 * TREE_PICTURE_SIDE, height = TREE_PICTURE_SIDE}
+	for k in 0:canvas.width * canvas.height {
+		canvas.pixels[4 * k] = u8(190)
+		canvas.pixels[4 * k + 1] = u8(196)
+		canvas.pixels[4 * k + 2] = u8(204)
+		canvas.pixels[4 * k + 3] = u8(255)
+		canvas.depth[k] = 1000000
+	}
+	file_storage : [16 * MB]byte
+	texture_storage : [64 * MB]byte
+	skins : [4]Face_Skin
+	skin_storage : [2 * MB]byte
+	shaped := look.has_face
+	for side in 0:2 {
+		look.has_face = shaped and side == 1
+		report := Npc_Report{failures = 0, first = [], reason = Not_In_Archive}
+		skin_storage.len = 0
+		whole := assemble_npc(&archives, &room, &look, skeleton.bones, false, &report, &skins, &skin_storage)
+		if report.failures > 0 do print("% parts left out; the first: %, %", report.failures, report.first, report.reason)
+		// Framed on the head: the top of the NPC, HEAD_PICTURE_SPAN high.
+		middle := Vec3{0, 0, whole.bounds_max.z - HEAD_PICTURE_SPAN / 2}
+		scale := f32(TREE_PICTURE_SIDE) / HEAD_PICTURE_SPAN
+		left := f32(side * TREE_PICTURE_SIDE)
+		for &part in whole.parts {
+			file_storage.len = 0
+			texture_storage.len = 0
+			// A face's skin, made for it, or a texture from the archives.
+			painted := Painted_Texture{0}
+			made_skin := false
+			for &skin in skins {
+				if skin.path == part.texture {
+					painted = Painted_Texture{pixels = skin.pixels, width = skin.width, height = skin.height}
+					made_skin = true
+				}
+			}
+			if not made_skin {
+				read, texture_error := paint_texture(&archives, part.texture, 0, &file_storage, &texture_storage)
+				if texture_error do continue
+				painted = read
+			}
+			draw_face_part(&canvas, part, &painted, middle, scale, left)
+		}
+	}
+	png_storage : [16 * MB]byte
+	row_storage : [16 * MB]byte
+	encode_png(canvas.pixels, canvas.width, canvas.height, &png_storage, &row_storage)
+	write_error := write_entire_file(out_path, png_storage)
+	if write_error {
+		print("couldn't write %: %", out_path, write_error)
+		return
+	}
+	print("% (% face values): drawn into %", name, if shaped do "with" else "without", out_path)
+	for &skin, k in skins {
+		skin_path : Path
+		&skin_path + out_path
+		&skin_path + ".skin"
+		&skin_path + int_text(k)
+		&skin_path + ".png"
+		encode_png(skin.pixels, skin.width, skin.height, &png_storage, &row_storage)
+		skin_error := write_entire_file(skin_path, png_storage)
+		if skin_error do print("couldn't write %: %", skin_path, skin_error)
+		else do print("  its skin for % into %", skin.path, skin_path)
+	}
+}
+
+// A part of a person drawn from in front of them (looking along -y: their
+// left on the picture's right), its middle at the middle of the picture's
+// half starting at left, scale pixels a unit; textured, cut out where its
+// texture's alpha is below a half if it has a test or blends, lit from the
+// front left.
+draw_face_part :: fun(canvas: ^Canvas, part: ^Model_Part, texture: ^Painted_Texture, middle: Vec3, scale: f32, left: f32) {
+	light := vec3_normalize(Vec3{0.4, 0.8, 0.5})
+	test := if part.alpha_test do part.alpha_threshold else (if part.alpha_blend do 0.5 else 0)
+	half := f32(TREE_PICTURE_SIDE) / 2
+	for t in 0:part.indices.len / 3 {
+		corners : [3!]Vec3
+		uvs : [3!][2!]f32
+		facing : f32 = 0
+		for k in 0:3 {
+			vertex := part.vertices[i64(part.indices[3 * t + k])]
+			place := vertex.position - middle
+			corners[k] = Vec3{left + half - place.x * scale, half - place.z * scale, -place.y}
+			uvs[k] = vertex.uv
+			facing += dot(vertex.normal, light) / 3
+		}
+		first := part.vertices[i64(part.indices[3 * t])]
+		shade := Vec3{first.color[0], first.color[1], first.color[2]} * (0.35 + 0.75 * max(facing, 0))
+		fill_triangle(canvas, corners, uvs, texture, test, shade)
+	}
+}
