@@ -13,6 +13,7 @@ use mara.os
 use mara.time
 use bsa
 use logging
+use ui_layer
 render :: use render
 
 // How high the screen is in the menus' units, and the margin the menus
@@ -244,7 +245,7 @@ draw_text :: fun(renderer: ^render.Renderer, font: ^Font, text: []utf8, x: f32, 
 	for c in text {
 		glyph := &font.glyphs[i64(c)]
 		if glyph.width > 0 and glyph.height > 0 {
-			render.ui_image(renderer, font.texture, pen + glyph.before * scale, baseline - glyph.above * scale,
+			ui_image(&renderer.ui, renderer.textures[font.texture].id, pen + glyph.before * scale, baseline - glyph.above * scale,
 				glyph.width * scale, glyph.height * scale, glyph.u0, glyph.v0, glyph.u1, glyph.v1, color)
 		}
 		pen += (glyph.before + glyph.width + glyph.after) * scale

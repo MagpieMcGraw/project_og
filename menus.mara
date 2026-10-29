@@ -21,6 +21,7 @@ use mara.string
 use bsa
 use logging
 use xml
+use ui_layer
 render :: use render
 
 // Room for all the menus read: their tiles, traits and operations, and
@@ -965,7 +966,7 @@ draw_menu_image :: fun(book: ^Menu_Book, item: Menu_Drawn, renderer: ^render.Ren
 		width = right - left
 		height = bottom - top
 	}
-	render.ui_image(renderer, texture, x * scale, y * scale, width * scale, height * scale, u0, v0, u1, v1, color)
+	ui_image(&renderer.ui, renderer.textures[texture].id, x * scale, y * scale, width * scale, height * scale, u0, v0, u1, v1, color)
 }
 
 // A text tile's size: as wide as its longest line, as high as its lines

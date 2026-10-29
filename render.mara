@@ -43,6 +43,7 @@ use sky
 use particles
 use logging
 use indexing
+use ui_layer
 
 // ---- sizes ---------------------------------------------------------------------
 
@@ -55,10 +56,6 @@ NO_LIGHT :: 0xFFFF
 // Room in the shared mesh buffers: vertices (48 bytes each) and indexes.
 MESH_VERTEX_ROOM :: 4194304
 MESH_INDEX_ROOM :: 33554432
-// The screen's 2D layer's room: a frame's vertices (six to a picture),
-// and its runs of one texture each.
-UI_VERTICES :: 24576
-UI_RUNS :: 1024
 // What's held in view is drawn between these (draw_frame's held).
 HELD_NEAR :: 1
 HELD_FAR :: 1000
@@ -391,31 +388,6 @@ void main() {
 
 // Particles: squares made each frame in the world, each corner's color
 // the light it gives and its opacity; fogged as meshes are.
-// The screen's 2D layer: pictures in pixels from the top left, tinted.
-UI_VERTEX_SHADER :: "
-layout(location = 0) in vec2 position;
-layout(location = 1) in vec2 uv;
-layout(location = 2) in vec4 color;
-uniform vec2 screen_size;
-out vec2 texture_uv;
-out vec4 tint;
-void main() {
-	gl_Position = vec4(position.x / screen_size.x * 2.0 - 1.0, 1.0 - position.y / screen_size.y * 2.0, 0.0, 1.0);
-	texture_uv = uv;
-	tint = color;
-}
-"
-
-UI_FRAGMENT_SHADER :: "
-in vec2 texture_uv;
-in vec4 tint;
-uniform sampler2D image;
-out vec4 fragment_color;
-void main() {
-	fragment_color = texture(image, texture_uv) * tint;
-}
-"
-
 PARTICLE_VERTEX_SHADER :: "
 layout(location = 0) in vec3 position;
 layout(location = 1) in vec2 uv;
@@ -1566,21 +1538,6 @@ Water_Program :: struct {
 }
 
 // A texture on the card, loaded once, by its path.
-// A corner of a picture on the screen's 2D layer: where (pixels from the
-// top left), where in its texture, its tint (red, green, blue, opacity).
-Ui_Vertex :: struct {
-	position: [2!]f32
-	uv: [2!]f32
-	color: [4!]f32
-}
-
-// A run of the 2D layer's vertices drawn with one texture (its slot).
-Ui_Run :: struct {
-	texture: i64
-	first: i64
-	count: i64
-}
-
 Cached_Texture :: struct {
 	path: [160]utf8
 	id: u32
@@ -1769,15 +1726,9 @@ Renderer :: struct {
 
 	// The scene's lights as the mesh programs read them (binding 3).
 	light_buffer: u32
-	// The screen's 2D layer (the HUD, menus): this frame's pictures, two
-	// triangles each, in runs of one texture (ui_image); drawn over the
-	// frame last (draw_ui).
-	ui_program: u32
-	ui_screen_size_at: i32
-	ui_vertex_array: u32
-	ui_vertex_buffer: u32
-	ui_vertices: [UI_VERTICES]Ui_Vertex
-	ui_runs: [UI_RUNS]Ui_Run
+	// The screen's 2D layer (og's ui_layer: the HUD, menus), drawn over the
+	// frame last.
+	ui: Ui_Layer
 	// Rigged parts' vertices' influences (binding 4), each part's after the
 	// last's; this frame's palette they're posed with (binding 5), made by
 	// pose_npcs.
@@ -1851,10 +1802,7 @@ renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
 	make_tree_program(&renderer.tree_programs[0], false)?
 	make_grass_program(&renderer.grass_programs[0], false)?
 	make_particle_program(&renderer.particle_program)?
-	renderer.ui_program = compile_program(UI_VERTEX_SHADER, UI_FRAGMENT_SHADER, false)?
-	renderer.ui_screen_size_at = GetUniformLocation(renderer.ui_program, "screen_size")
-	UseProgram(renderer.ui_program)
-	Uniform1i(GetUniformLocation(renderer.ui_program, "image"), 0)
+	ui_layer_open(&renderer.ui)?
 	make_precipitation_program(&renderer.precipitation_program)?
 	if renderer.bindless_available {
 		make_tree_program(&renderer.tree_programs[1], true)?
@@ -1871,7 +1819,6 @@ renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
 	setup_tree_buffers(renderer)
 	setup_grass_buffers(renderer)
 	setup_particle_buffers(renderer)
-	setup_ui_buffers(renderer)
 	// The frame's framebuffers: made at the first frame's size.
 	renderer.scene_framebuffer = 0
 	renderer.depth_copy_framebuffer = 0
@@ -2436,24 +2383,6 @@ setup_particle_buffers :: fun(renderer: ^Renderer) {
 	BindBuffer(ELEMENT_ARRAY_BUFFER, renderer.particle_index_buffer)
 	BufferData(ELEMENT_ARRAY_BUFFER, isize(indices.len * 4), indices, STATIC_DRAW)
 	BindVertexArray(0)
-}
-
-setup_ui_buffers :: fun(renderer: ^Renderer) {
-	GenVertexArrays(1, &renderer.ui_vertex_array)
-	BindVertexArray(renderer.ui_vertex_array)
-	GenBuffers(1, &renderer.ui_vertex_buffer)
-	BindBuffer(ARRAY_BUFFER, renderer.ui_vertex_buffer)
-	BufferData(ARRAY_BUFFER, UI_VERTICES * size_of(Ui_Vertex), [], STREAM_DRAW)
-	stride := i32(size_of(Ui_Vertex))
-	EnableVertexAttribArray(0)
-	VertexAttribPointer(0, 2, FLOAT, 0, stride, 0)    // position
-	EnableVertexAttribArray(1)
-	VertexAttribPointer(1, 2, FLOAT, 0, stride, 8)    // uv
-	EnableVertexAttribArray(2)
-	VertexAttribPointer(2, 4, FLOAT, 0, stride, 16)   // color
-	BindVertexArray(0)
-	renderer.ui_vertices.len = 0
-	renderer.ui_runs.len = 0
 }
 
 // No distant land, and no far water. (Their textures stay loaded.)
@@ -3410,64 +3339,6 @@ draw_reticle :: fun(width: i64, height: i64, on_something: bool) {
 	Disable(SCISSOR_TEST)
 }
 
-// ---- the screen's 2D layer ----------------------------------------------------------
-
-// Starts this frame's 2D layer: nothing on it.
-ui_begin :: fun(renderer: ^Renderer) {
-	renderer.ui_vertices.len = 0
-	renderer.ui_runs.len = 0
-}
-
-// Puts a picture on the 2D layer: a texture (its slot), or the part of it
-// from u0, v0 to u1, v1, in a rectangle (pixels from the screen's top
-// left), tinted (red, green, blue, opacity; 1 each to leave it be).
-ui_image :: fun(renderer: ^Renderer, texture: i64, x: f32, y: f32, width: f32, height: f32, u0: f32, v0: f32, u1: f32, v1: f32,
-	color: [4!]f32)
-{
-	if not fits(renderer.ui_vertices.len + 6, renderer.ui_vertices.cap) do return
-	runs := &renderer.ui_runs
-	if runs.len == 0 or runs[runs.len - 1].texture != texture {
-		if not fits(runs.len + 1, runs.cap) do return
-		runs + Ui_Run{texture = texture, first = renderer.ui_vertices.len, count = 0}
-	}
-	top_left := Ui_Vertex{position = [x, y], uv = [u0, v0], color = color}
-	top_right := Ui_Vertex{position = [x + width, y], uv = [u1, v0], color = color}
-	bottom_right := Ui_Vertex{position = [x + width, y + height], uv = [u1, v1], color = color}
-	bottom_left := Ui_Vertex{position = [x, y + height], uv = [u0, v1], color = color}
-	&renderer.ui_vertices + top_left
-	&renderer.ui_vertices + top_right
-	&renderer.ui_vertices + bottom_right
-	&renderer.ui_vertices + top_left
-	&renderer.ui_vertices + bottom_right
-	&renderer.ui_vertices + bottom_left
-	runs[runs.len - 1].count += 6
-}
-
-// Draws the 2D layer over what's drawn, in the order it was put there,
-// blended by its opacity.
-draw_ui :: fun(renderer: ^Renderer, width: i64, height: i64) {
-	if renderer.ui_vertices.len == 0 do return
-	UseProgram(renderer.ui_program)
-	Uniform2f(renderer.ui_screen_size_at, f32(width), f32(height))
-	BindVertexArray(renderer.ui_vertex_array)
-	BindBuffer(ARRAY_BUFFER, renderer.ui_vertex_buffer)
-	BufferData(ARRAY_BUFFER, UI_VERTICES * size_of(Ui_Vertex), [], STREAM_DRAW)   // (a fresh buffer: no waiting on last frame's)
-	BufferSubData(ARRAY_BUFFER, 0, renderer.ui_vertices)
-	Disable(DEPTH_TEST)
-	Disable(CULL_FACE)
-	Enable(BLEND)
-	BlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
-	ActiveTexture(TEXTURE0)
-	for run in renderer.ui_runs {
-		BindTexture(TEXTURE_2D, renderer.textures[run.texture].id)
-		DrawArrays(TRIANGLES, i32(run.first), i32(run.count))
-	}
-	Disable(BLEND)
-	Enable(CULL_FACE)
-	Enable(DEPTH_TEST)
-	BindVertexArray(0)
-}
-
 // ---- the camera ----------------------------------------------------------------------
 
 // Where the camera is and which way it looks.
@@ -3644,7 +3515,7 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 	ActiveTexture(TEXTURE0)
 	BindVertexArray(0)
 	// The 2D layer over it all.
-	draw_ui(renderer, width, height)
+	draw_ui(&renderer.ui, width, height)
 	// The frame into the window.
 	if soft {
 		BindFramebuffer(READ_FRAMEBUFFER, renderer.scene_framebuffer)
