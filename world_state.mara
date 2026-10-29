@@ -26,6 +26,22 @@ ARRIVED :: 1.0
 // The room, in pixels.
 ROOM_WIDTH :: 800.0
 ROOM_HEIGHT :: 600.0
+// How players look: one of the seven samurai each (art.mara's SAMURAI),
+// the first player the first.
+LOOKS :: 7
+// The ways a player can face, as the game's sprites are drawn: toward the
+// viewer (down the screen), then turning clockwise as seen on the screen.
+FACING_DOWN :: 0
+FACING_DOWN_LEFT :: 1
+FACING_LEFT :: 2
+FACING_UP_LEFT :: 3
+FACING_UP :: 4
+FACING_UP_RIGHT :: 5
+FACING_RIGHT :: 6
+FACING_DOWN_RIGHT :: 7
+// tan 22.5°: a way across this much steeper or shallower than a diagonal
+// is straight.
+STRAIGHT_SLANT :: 0.41421356
 // The port a game is hosted on, unless told another (not the original
 // game's 63078: both may run on one machine).
 GAME_PORT :: 27200
@@ -51,12 +67,15 @@ Welcome_Message :: struct {
 }
 
 // A player as every client's told of them: their number, where they are,
-// whether they're walking.
+// whether they're walking, which way they face (FACING_*), how they look
+// (which samurai).
 Player_Seen :: struct {
 	id: i64
 	x: f32
 	y: f32
 	walking: bool
+	facing: i64
+	look: i64
 }
 
 // Something the server tells a player: who joined, who left.
@@ -65,7 +84,8 @@ Note_Message :: struct {
 }
 
 // A player in the world: their number (0: nobody in this slot), where they
-// are, where they're walking to, whether they're walking.
+// are, where they're walking to, whether they're walking, which way they
+// face, how they look.
 Player_State :: struct {
 	id: i64
 	x: f32
@@ -73,6 +93,8 @@ Player_State :: struct {
 	to_x: f32
 	to_y: f32
 	walking: bool
+	facing: i64
+	look: i64
 }
 
 // The world: its players in slots (a client's slot is its player's), the
@@ -99,6 +121,17 @@ player_clear :: fun(player: ^Player_State, id: i64, slot: i64) {
 	player.to_x = player.x
 	player.to_y = player.y
 	player.walking = false
+	player.facing = FACING_DOWN
+	player.look = if id > 0 do (id - 1) % LOOKS else 0
+}
+
+// Which way someone faces going across and down (screen pixels, down
+// positive): the nearest of the eight.
+facing_toward :: fun(across: f32, down: f32) -> i64 {
+	if abs(across) * f32(STRAIGHT_SLANT) >= abs(down) do return if across > 0 do FACING_RIGHT else FACING_LEFT
+	if abs(down) * f32(STRAIGHT_SLANT) >= abs(across) do return if down > 0 do FACING_DOWN else FACING_UP
+	if across < 0 do return if down > 0 do FACING_DOWN_LEFT else FACING_UP_LEFT
+	return if down > 0 do FACING_DOWN_RIGHT else FACING_UP_RIGHT
 }
 
 // A player told to walk to a spot (kept inside the room).
@@ -117,6 +150,7 @@ world_step :: fun(state: ^World_State) {
 		across := player.to_x - player.x
 		down := player.to_y - player.y
 		distance := sqrt(across * across + down * down)
+		if distance >= f32(ARRIVED) do player.facing = facing_toward(across, down)
 		if distance <= step or distance < f32(ARRIVED) {
 			player.x = player.to_x
 			player.y = player.to_y
@@ -134,7 +168,7 @@ players_seen :: fun(state: ^World_State) -> [MAX_PLAYERS]Player_Seen {
 	seen : [MAX_PLAYERS]Player_Seen
 	for &player in state.players {
 		if player.id == 0 do continue
-		&seen + Player_Seen{id = player.id, x = player.x, y = player.y, walking = player.walking}
+		&seen + Player_Seen{id = player.id, x = player.x, y = player.y, walking = player.walking, facing = player.facing, look = player.look}
 	}
 	return seen
 }

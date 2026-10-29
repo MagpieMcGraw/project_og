@@ -10,7 +10,7 @@ ramps, rooms and a wilderness built from placed pictures, up to 8 players
 together. Quests are scripts that wait on events.
 
 What's shared with the other ports (sooblivion so far) is written down in
-C:\Code\project_og.md.
+C:\Code\og\project_og.md.
 
 
 ## Building and running
@@ -21,27 +21,34 @@ builds what build.mara says (the build named sothrone, optimized).
 `update_compiler.bat` brings the compiler from C:\Code\Mara\release, and
 MARA_VERSION.txt says which it is.
 
-For now the program is the game's skeleton: one room (800 × 600), players
-as coloured squares, each walking where its player clicks (held, they
-follow the mouse). The server keeps the world: players say where they want
-to go, it walks them there 30 times a second and tells everyone where
-everyone is.
+For now the program is the game's skeleton: one bare room (800 × 600),
+each player one of the seven samurai, read from the game's Samurai.lot,
+walking where its player clicks (held, they follow the mouse): running
+the way they go, standing once there. The server keeps the world: players
+say where they want to go, it walks them there 30 times a second, turns
+them the way they're going, and tells everyone where everyone is. Without
+the game's files the players are coloured squares.
 
     sothrone                            the game: joins one on this machine, else hosts
     sothrone connect <address[:port]>   the game, joining the one at an address
     sothrone serve [port] [seconds] [open]   a server alone, no window
     sothrone bot [seconds] [address]    a player with no window, walking about
-    sothrone picture <out.png> [seconds] [address]   the game in a window never shown, its last frame written
+    sothrone picture <out.png> [seconds] [address] [click x y]   the game in a window never shown, its last frame written
+    sothrone sprite <archive> <path | folder> <out.png>   a sprite's frames as the game's atlas lays them out
 
 Opened twice, the second copy joins the first's game (port 27200, this
 machine only). Each run writes a journal: the first of sothrone.log,
-sothrone_2.log, … not in use.
+sothrone_2.log, … not in use. The game's files are read from
+`D:\Games\Disciples 2\Throne of Darkness\LotFiles` (art.mara's
+LOT_FOLDER).
 
 The modules: `world_state` (the world and its messages), `world_server`,
 `world_copy` (a client's view of the world), `game_link` (join or host),
-`sothrone` (the commands, the window). From C:\Code\og, the modules the
-ports share (build.mara names the folder): `wire`, `logging`, `disk`,
-`sdl_platform`, `png`, `inflate`.
+`lot` (the archives), `spr8` (the sprites), `art` (the samurai's
+pictures on the card), `sothrone` (the commands, the window). From
+C:\Code\og, the modules the ports share (build.mara names the folder):
+`wire`, `logging`, `disk`, `sdl_platform`, `png`, `inflate`, `lzo`,
+`sprite_layer`.
 
 
 ## What sooblivion already has
@@ -100,8 +107,7 @@ and later Bink video.
 The shared layer would be: platform (window, input, GL), the audio mixer,
 codecs (inflate, png, mp3, wav, lzo, lzw, later Bink), disk, logging and
 caches, wire, Key_Index, XML. Each game brings its archives, its formats
-and its rules. C:\Code\project_og.md has the details and the open
-question of how modules get shared.
+and its rules. C:\Code\og\project_og.md has the details.
 
 
 ## Tools
@@ -115,4 +121,7 @@ Python prototypes (run with `python -I`):
   frame of a sprite on one sheet.
 - `rex.py <file.rex>`: a resource bundle's table.
 - `walk_lzw.py <file.walk.sp>`: tries LZW starts on a walk grid.
+- `atlas_check.py <archive.lot> <sprite path> <atlas.png>`: builds the
+  atlas `sothrone sprite` writes with the Python decoder and counts the
+  pixels that differ (the Leader's run: none).
 - `lzo.py`, `lot.py`: the LZO1X decoder and the archive reader they use.

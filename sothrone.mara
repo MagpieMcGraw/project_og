@@ -27,6 +27,10 @@ use world_copy
 use game_link
 use wire
 use sdl_platform
+use sprite_layer
+use lot
+use spr8
+use art
 use png
 use logging
 
@@ -84,36 +88,97 @@ fill :: fun(platform: ^Platform, x: f32, y: f32, width: f32, height: f32, colour
 	Clear(COLOR_BUFFER_BIT)
 }
 
-// Draws the world as the server's told it: the room, and each player a
-// square of their colour (ours with a light edge).
-draw_world :: fun(platform: ^Platform, seen: ^World_Copy) {
+// What the window draws with: the layer pictures go on, the samurai's
+// pictures (if they could be read), when the game started (for frames).
+Game_View :: struct {
+	layer: Sprite_Layer
+	art: Samurai_Art
+	started: u64
+}
+
+// The view made ready (a GL context current). When the samurai can't be
+// read, the journal says why and players are drawn as squares.
+view_open :: fun(view: ^Game_View, journal: ^Journal) {
+	view.started = time_now()
+	view.art.ready = false
+	layer_error := layer_open(&view.layer)
+	if layer_error {
+		note(journal, "can't draw pictures: ")
+		note_error(journal, layer_error)
+		note_end(journal)
+		return
+	}
+	start := time_now()
+	art_error := load_samurai_art(&view.art)
+	if art_error {
+		note(journal, "couldn't read the samurai (players drawn as squares): ")
+		note_error(journal, art_error)
+		note_end(journal)
+		return
+	}
+	note(journal, "samurai read in ")
+	note(journal, i64((time_now() - start) / 1000000))
+	note(journal, " ms")
+	note_end(journal)
+}
+
+// Draws the world as the server's told it: the room, and each player — a
+// samurai, those higher on the screen first so lower ones stand in front;
+// ours with a light mark at its feet. (Squares, without the samurai.)
+draw_world :: fun(platform: ^Platform, seen: ^World_Copy, view: ^Game_View) {
 	Disable(SCISSOR_TEST)
 	ClearColor(0.04, 0.04, 0.05, 1)
 	Clear(COLOR_BUFFER_BIT)
 	Enable(SCISSOR_TEST)
-	view := view_of(platform)
-	fill(platform, view.left, view.top, f32(ROOM_WIDTH) * view.scale, f32(ROOM_HEIGHT) * view.scale, [3!]f32{0.16, 0.13, 0.1})
-	half := f32(PLAYER_SIZE) / 2 * view.scale
-	for player in seen.players {
-		x := view.left + player.x * view.scale
-		y := view.top + player.y * view.scale
-		if player.id == seen.me do fill(platform, x - half - 2, y - half - 2, half * 2 + 4, half * 2 + 4, [3!]f32{1, 1, 0.85})
-		colour := PLAYER_COLOURS[(player.id - 1) % 8]
-		fill(platform, x - half, y - half, half * 2, half * 2, colour)
+	room := view_of(platform)
+	fill(platform, room.left, room.top, f32(ROOM_WIDTH) * room.scale, f32(ROOM_HEIGHT) * room.scale, [3!]f32{0.16, 0.13, 0.1})
+	if not view.art.ready {
+		half := f32(PLAYER_SIZE) / 2 * room.scale
+		for player in seen.players {
+			x := room.left + player.x * room.scale
+			y := room.top + player.y * room.scale
+			if player.id == seen.me do fill(platform, x - half - 2, y - half - 2, half * 2 + 4, half * 2 + 4, [3!]f32{1, 1, 0.85})
+			colour := PLAYER_COLOURS[(player.id - 1) % 8]
+			fill(platform, x - half, y - half, half * 2, half * 2, colour)
+		}
+		Disable(SCISSOR_TEST)
+		return
+	}
+	// The players by how far down they stand.
+	order : [MAX_PLAYERS]i64
+	for player, k in seen.players {
+		&order + k
+		at := order.len - 1
+		for at > 0 and seen.players[order[at - 1]].y > player.y {
+			order[at] = order[at - 1]
+			at -= 1
+		}
+		order[at] = k
+	}
+	seconds := f64(time_now() - view.started) / 1000000000
+	layer_begin(&view.layer)
+	for k in order {
+		player := seen.players[k]
+		x := room.left + player.x * room.scale
+		y := room.top + player.y * room.scale
+		if player.id == seen.me do fill(platform, x - 12 * room.scale, y - 2 * room.scale, 24 * room.scale, 4 * room.scale, [3!]f32{1, 1, 0.85})
+		action := if player.walking do ACTION_RUN else ACTION_STAND
+		draw_samurai(&view.layer, &view.art, player.look, action, player.facing, seconds, x, y, room.scale)
 	}
 	Disable(SCISSOR_TEST)
+	layer_draw(&view.layer, platform.width, platform.height)
 }
 
 // One frame of the game: where the left mouse button is pressed the player
 // walks to (held, they follow it), the link run, the world drawn.
-game_frame :: fun(platform: ^Platform, input: ^Input, link: ^Link, journal: ^Journal) {
+game_frame :: fun(platform: ^Platform, input: ^Input, link: ^Link, journal: ^Journal, view: ^Game_View) {
 	if input.mouse_held[1] {
-		view := view_of(platform)
-		send_go(outgoing(link), (input.mouse_x - view.left) / view.scale, (input.mouse_y - view.top) / view.scale)
+		room := view_of(platform)
+		send_go(outgoing(link), (input.mouse_x - room.left) / room.scale, (input.mouse_y - room.top) / room.scale)
 	}
 	link_run(link, journal)
 	Viewport(0, 0, i32(platform.width), i32(platform.height))
-	draw_world(platform, &link.seen)
+	draw_world(platform, &link.seen, view)
 }
 
 // The game in a window: joining the game at an address, or with none, the
@@ -139,24 +204,27 @@ command_play :: fun(address: []utf8) -> bool {
 		return false
 	}
 	defer platform_close(&platform)
+	view : Game_View
+	view_open(&view, &journal)
 	input : Input
 	for true {
 		work := Timer()
 		read_input(&platform, &input)
 		if input.quit or input.pressed[Escape] do break
-		game_frame(&platform, &input, &link, &journal)
+		game_frame(&platform, &input, &link, &journal, &view)
 		_ = present(&platform)
 		sleep(work, FRAME_RATE)
 	}
 	return true
 }
 
-// `sothrone picture <out.png> [seconds] [address]`: the game as a player
-// opening it sees it (linked as command_play links), in a window that's
-// never shown, for that many seconds (2 unless told); its player clicked
-// to walk toward the room's bottom right at the start. The last frame is
-// written to out.png. For looking at what the game draws without a window.
-command_picture :: fun(path: []utf8, seconds: f64, address: []utf8) {
+// `sothrone picture <out.png> [seconds] [address] [click x y]`: the game as
+// a player opening it sees it (linked as command_play links), in a window
+// that's never shown, for that many seconds (2 unless told); its player
+// clicked at the start to walk to a spot — x and y shares of the window
+// across and down, 0.8 0.8 unless told. The last frame is written to
+// out.png. For looking at what the game draws without a window.
+command_picture :: fun(path: []utf8, seconds: f64, address: []utf8, click_x: f32, click_y: f32) {
 	journal := open_journal()
 	defer journal_close(&journal)
 	link : Link
@@ -172,15 +240,17 @@ command_picture :: fun(path: []utf8, seconds: f64, address: []utf8) {
 		return
 	}
 	defer platform_close(&platform)
+	view : Game_View
+	view_open(&view, &journal)
 	input : Input
 	start := time_now()
 	for true {
 		work := Timer()
 		gone := f64(time_now() - start) / 1000000000
 		input.mouse_held[1] = gone > 0.1 and gone < 0.2
-		input.mouse_x = f32(platform.width) * 0.8
-		input.mouse_y = f32(platform.height) * 0.8
-		game_frame(&platform, &input, &link, &journal)
+		input.mouse_x = f32(platform.width) * click_x
+		input.mouse_y = f32(platform.height) * click_y
+		game_frame(&platform, &input, &link, &journal, &view)
 		if gone >= seconds {
 			save_frame(&platform, path, &journal)
 			break
@@ -339,7 +409,62 @@ usage :: fun() {
 	print("sothrone connect <address[:port]>        the game, joining the one at an address")
 	print("sothrone serve [port] [seconds] [open]   a server alone, no window (port %)", GAME_PORT)
 	print("sothrone bot [seconds] [address]         a player with no window, walking about")
-	print("sothrone picture <out.png> [seconds] [address]   the game unseen, its last frame written")
+	print("sothrone picture <out.png> [seconds] [address] [click x y]   the game unseen, its last frame written")
+	print("sothrone sprite <archive> <path | folder> <out.png>   a sprite's frames as the game's atlas lays them out")
+}
+
+// `sothrone sprite <archive> <path | folder> <out.png>`: a sprite from one
+// of the game's archives (a name in the game's LotFiles, or a path) — the
+// file at path, or the first .s8 in the folder — drawn as the game's atlas
+// for it lays its frames out (art.mara), written to out.png. No window.
+command_sprite :: fun(archive_name: []utf8, path: []utf8, out_path: []utf8) {
+	archive : Lot
+	directory : [1 * MB]byte = void
+	open_error := lot_open(&archive, lot_file_path(archive_name), &directory)
+	if open_error {
+		print("couldn't open %: %", archive_name, open_error)
+		return
+	}
+	defer lot_close(&archive)
+	print("% holds % files", archive_name, archive.files.len)
+	sprite : [SPRITE_ROOM]byte = void
+	image : [ATLAS_ROOM]byte = void
+	atlas := Atlas{0}
+	atlas_error : err
+	file, found := lot_find(&archive, path)
+	if found {
+		read_error := lot_read(&archive, file, &sprite)
+		if read_error {
+			print("couldn't read %: %", path, read_error)
+			return
+		}
+		check_error := spr8_check(sprite)
+		if check_error {
+			print("% isn't a sprite: %", path, check_error)
+			return
+		}
+		palette, palette_error := spr8_palette(sprite)
+		if palette_error {
+			print("% has no palette: %", path, palette_error)
+			return
+		}
+		atlas, atlas_error = atlas_shape(sprite)
+		if not atlas_error do atlas_error = atlas_draw(sprite, &palette, &atlas, &image)
+	else
+		atlas, atlas_error = read_atlas(&archive, path, &sprite, &image)
+	}
+	if atlas_error {
+		print("couldn't draw %: %", path, atlas_error)
+		return
+	}
+	print("% frames: % across, % down, cells % x % (canvas % x %, cells from % %)", atlas.columns * atlas.rows, atlas.columns,
+		atlas.rows, atlas.cell_width, atlas.cell_height, atlas.canvas_width, atlas.canvas_height, atlas.left, atlas.top)
+	png_storage : [ATLAS_ROOM]byte = void
+	row_storage : [ATLAS_ROOM + 8 * KB]byte = void
+	encode_png(image, atlas.width, atlas.height, &png_storage, &row_storage)
+	write_error := write_entire_file(out_path, png_storage)
+	if write_error do print("couldn't write %: %", out_path, write_error)
+	else do print("written to %", out_path)
 }
 
 wait_for_enter :: fun() {
@@ -380,12 +505,28 @@ main :: (args: [][]utf8) {
 	elif command == "picture" and args.len > 2
 		seconds : f64 = 2
 		address := args[1][0:0]
-		if args.len > 3 {
-			number, is_number := parse_number(args[3])
+		click_x : f32 = 0.8
+		click_y : f32 = 0.8
+		k := 3
+		for k < args.len {
+			if args[k] == "click" and k + 2 < args.len {
+				x, x_ok := parse_number(args[k + 1])
+				y, y_ok := parse_number(args[k + 2])
+				if x_ok and y_ok {
+					click_x = f32(x)
+					click_y = f32(y)
+				}
+				k += 3
+				continue
+			}
+			number, is_number := parse_number(args[k])
 			if is_number do seconds = number
+			else do address = args[k]
+			k += 1
 		}
-		if args.len > 4 do address = args[4]
-		command_picture(args[2], seconds, address)
+		command_picture(args[2], seconds, address, click_x, click_y)
+	elif command == "sprite" and args.len > 4
+		command_sprite(args[2], args[3], args[4])
 	elif command == "bot"
 		seconds : f64 = 10
 		address := args[1][0:0]

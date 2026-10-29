@@ -1,0 +1,237 @@
+// Throne of Darkness's archives (LotFiles\*.lot): each file's data, then
+// a directory, then a u32, the directory's size. Files and the directory
+// are packed in blocks, a 0 after the last (unpack_blocks). The directory,
+// unpacked: u32 0xBEEFFACE, then the root folder — a folder is u32 file
+// count, its files (u8 name length, name, u32 size, u32 offset, u32 kind,
+// u32 0), u32 subfolder count, its subfolders (u8 name length, name, a
+// folder). A file of kind 1 is stored as it is, not in blocks (the movies
+// and music). FORMATS.md says more.
+//
+// The archive is mapped, not read: a file's bytes are unpacked from the
+// mapping when asked for (lot_read).
+module lot
+
+use mara.core
+use mara.os
+use mara.memory
+use mara.string
+use lzo
+use logging
+
+LOT_MAGIC :: 0xBEEFFACE
+// Files in an archive at most (World.lot has 2491), and room for their
+// paths.
+LOT_FILES :: 4096
+LOT_PATHS :: 512 * KB
+// Folders deep at most.
+LOT_DEPTH :: 16
+
+Lot_Error :: error {
+	Not_A_Lot        // too short, or its directory isn't one
+	Bad_Block        // a block of a kind not known, or not the size it says
+	Too_Many_Files   // more files or longer paths than LOT_FILES and LOT_PATHS
+	Not_Found        // no file at that path
+}
+
+// A file in an archive: its path (in the archive's paths: folders joined by
+// '/', lowercase), its size unpacked, where it starts, whether it's stored
+// as it is.
+Lot_File :: struct {
+	path_at: i64
+	path_size: i64
+	size: i64
+	at: i64
+	raw: bool
+}
+
+Lot :: struct {
+	bytes: []byte              // the archive, mapped (read only)
+	files: [LOT_FILES]Lot_File
+	paths: [LOT_PATHS]utf8
+}
+
+// Opens the archive at path: mapped, its directory read. scratch is room to
+// unpack the directory in (Base.lot's takes about 200 KB).
+lot_open :: fun(lot: ^Lot, path: []utf8, scratch: ^[]byte) -> err {
+	lot.files.len = 0
+	lot.paths.len = 0
+	lot.bytes = file_map(path)?
+	if lot.bytes.len < 8 do return Not_A_Lot
+	directory_size : u32 = lot.bytes[lot.bytes.len - 4]
+	directory_at := lot.bytes.len - 4 - i64(directory_size)
+	if directory_at < 0 do return Not_A_Lot
+	scratch.len = 0
+	_ = unpack_blocks(lot.bytes, directory_at, scratch)?
+	if scratch.len < 4 do return Not_A_Lot
+	magic : u32 = scratch[0]
+	if magic != LOT_MAGIC do return Not_A_Lot
+	table := Table_Reader{bytes = scratch^, at = 4}
+	folder : [LOT_DEPTH * 64]utf8
+	read_folder(lot, &table, &folder, 0)?
+}
+
+lot_close :: fun(lot: ^Lot) {
+	file_unmap(lot.bytes)
+	lot.bytes = []
+	lot.files.len = 0
+}
+
+// Where in the directory its reading is.
+Table_Reader :: struct {
+	bytes: []byte
+	at: i64
+}
+
+table_u32 :: fun(table: ^Table_Reader) -> i64, err {
+	if table.at + 4 > table.bytes.len do return 0, Not_A_Lot
+	value : u32 = table.bytes[table.at]
+	table.at += 4
+	return i64(value)
+}
+
+// A name in the directory (its length a byte before it), lowercase, put
+// after path.
+table_name :: fun(table: ^Table_Reader, path: ^[]utf8) -> err {
+	if table.at >= table.bytes.len do return Not_A_Lot
+	length := i64(table.bytes[table.at])
+	table.at += 1
+	if table.at + length > table.bytes.len do return Not_A_Lot
+	if path.len + length > path.cap do return Too_Many_Files
+	for k in 0:length do path + lower_letter(utf8(table.bytes[table.at + k]))
+	table.at += length
+}
+
+// A folder of the directory and the ones in it, its path folder (empty: the
+// root's), depth folders deep.
+read_folder :: fun(lot: ^Lot, table: ^Table_Reader, folder: ^[]utf8, depth: i64) -> err {
+	if depth >= LOT_DEPTH do return Not_A_Lot
+	file_count := table_u32(table)?
+	for k in 0:file_count {
+		path_at := lot.paths.len
+		if not fits(lot.paths.len + folder.len, lot.paths.cap) do return Too_Many_Files
+		&lot.paths + folder^
+		table_name(table, &lot.paths)?
+		size := table_u32(table)?
+		at := table_u32(table)?
+		kind := table_u32(table)?
+		_ = table_u32(table)?
+		if not fits(lot.files.len + 1, lot.files.cap) do return Too_Many_Files
+		&lot.files + Lot_File{path_at = path_at, path_size = lot.paths.len - path_at, size = size, at = at, raw = kind == 1}
+	}
+	folder_count := table_u32(table)?
+	for k in 0:folder_count {
+		before := folder.len
+		table_name(table, folder)?
+		if folder.len + 1 > folder.cap do return Too_Many_Files
+		folder + '/'
+		read_folder(lot, table, folder, depth + 1)?
+		folder.len = before
+	}
+}
+
+lower_letter :: fun(c: utf8) -> utf8 {
+	if c >= 'A' and c <= 'Z' do return c + ('a' - 'A')
+	return c
+}
+
+// A file's path in the archive.
+lot_path :: fun(lot: ^Lot, file: i64) -> []utf8 {
+	entry := lot.files[file]
+	return lot.paths[entry.path_at : entry.path_at + entry.path_size]
+}
+
+// Whether a file's path is this one: letters' case aside, '\' as '/'.
+same_path :: fun(stored: []utf8, path: []utf8) -> bool {
+	if stored.len != path.len do return false
+	for c, k in path {
+		wanted := if c == '\\' do '/' else lower_letter(c)
+		if stored[k] != wanted do return false
+	}
+	return true
+}
+
+// The file at a path (as same_path matches it): its number, false when
+// there's none.
+lot_find :: fun(lot: ^Lot, path: []utf8) -> i64, bool {
+	for k in 0:lot.files.len {
+		if same_path(lot_path(lot, k), path) do return k, true
+	}
+	return -1, false
+}
+
+// The first file in a folder (its path then '/', as same_path matches it)
+// whose name ends with ending (".s8"): its number, false when there's none.
+lot_find_in :: fun(lot: ^Lot, folder: []utf8, ending: []utf8) -> i64, bool {
+	for k in 0:lot.files.len {
+		path := lot_path(lot, k)
+		if path.len <= folder.len + 1 or path.len < folder.len + ending.len do continue
+		if not same_path(path[0 : folder.len], folder) or path[folder.len] != '/' do continue
+		// (Only files right in the folder, not in its folders.)
+		in_folder := true
+		for c in path[folder.len + 1 : path.len] {
+			if c == '/' do in_folder = false
+		}
+		if in_folder and same_path(path[path.len - ending.len : path.len], ending) do return k, true
+	}
+	return -1, false
+}
+
+// A file's bytes, unpacked into out (what it held replaced).
+lot_read :: fun(lot: ^Lot, file: i64, out: ^[]byte) -> err {
+	entry := lot.files[file]
+	out.len = 0
+	if entry.raw {
+		if entry.at + entry.size > lot.bytes.len do return Bad_Block
+		if not fits(entry.size, out.cap) do return Out_Of_Room
+		for k in 0:entry.size do out + lot.bytes[entry.at + k]
+		return
+	}
+	_ = unpack_blocks(lot.bytes, entry.at, out)?
+	if out.len != entry.size do return Bad_Block
+}
+
+// Unpacks the blocks that start at at onto out: where they end, after the 0
+// that closes them. A block is its kind — the low 7 bits 4 for LZO1X, 1 for
+// stored as it is; 0x80 for a small block — then its size less 1 and its
+// packed size less 1 (u16 each, a byte each in a small block), then its
+// packed bytes. A block holds 64 KB at most.
+unpack_blocks :: fun(bytes: []byte, at: i64, out: ^[]byte) -> i64, err {
+	place := at
+	for true {
+		if place >= bytes.len do return place, Bad_Block
+		kind := i64(bytes[place])
+		if kind == 0 do return place + 1
+		size : i64 = 0
+		packed : i64 = 0
+		head : i64 = 0
+		if kind & 0x80 != 0 {
+			if place + 3 > bytes.len do return place, Bad_Block
+			size = i64(bytes[place + 1]) + 1
+			packed = i64(bytes[place + 2]) + 1
+			head = 3
+		else
+			if place + 5 > bytes.len do return place, Bad_Block
+			size_less : u16 = bytes[place + 1]
+			packed_less : u16 = bytes[place + 3]
+			size = i64(size_less) + 1
+			packed = i64(packed_less) + 1
+			head = 5
+		}
+		from := place + head
+		if from + packed > bytes.len do return place, Bad_Block
+		packing := kind & 0x7F
+		before := out.len
+		if packing == 4 {
+			used := lzo_unpack(bytes[from : from + packed], out)?
+			if used != packed or out.len - before != size do return place, Bad_Block
+		elif packing == 1
+			if size != packed do return place, Bad_Block
+			if out.len + size > out.cap do return place, Out_Of_Room
+			for k in 0:size do out + bytes[from + k]
+		else
+			return place, Bad_Block
+		}
+		place = from + packed
+	}
+	return place
+}

@@ -1,0 +1,152 @@
+// Throne of Darkness's sprites (.s8, "SPR8v3.1"): frames of 256-colour
+// pixels, each frame packed row by row. FORMATS.md says more.
+//
+// The file: "SPR8v3.1", u32 its size; at 22 the u16 frame count; at 32 a
+// u32, where its palette is; at 36 a u32, where its table of frames is (a
+// u32 offset each). The palette: a u32, then 256 colours (RGB565); colour 0
+// is the see-through key. A frame: u16 canvas width and height, then the
+// top, bottom, left and right of what's drawn on it, u16 0 and 1; then its
+// rows. Each byte: its low 2 bits say what it is, its high 6 a number n:
+//
+//     00  n pixels see-through
+//     01  one pixel of alpha n (of 63), its colour the next byte
+//     10  the next row, after n see-through pixels
+//     11  n + 1 solid pixels, their colours following
+module spr8
+
+use mara.core
+use mara.math
+
+SPR8_MAGIC :: "SPR8v3.1"
+SPR8_HEAD :: 40
+
+Spr8_Error :: error {
+	Not_A_Sprite   // too short, the wrong magic, or a table pointing outside
+	Bad_Frame      // a frame's rows run outside it, or past where it's drawn
+}
+
+// A frame: its canvas, and the box on it its pixels fill.
+Spr8_Frame :: struct {
+	canvas_width: i64
+	canvas_height: i64
+	top: i64
+	bottom: i64
+	left: i64
+	right: i64
+	at: i64       // where its rows start in the file
+	end: i64      // where they end
+}
+
+// A palette as red, green, blue, alpha bytes, colour by colour.
+Palette :: [256!][4!]u8
+
+// Whether bytes are a sprite: its magic, and room for its head.
+spr8_check :: fun(bytes: []byte) -> err {
+	if bytes.len < SPR8_HEAD do return Not_A_Sprite
+	for c, k in SPR8_MAGIC {
+		if utf8(bytes[k]) != c do return Not_A_Sprite
+	}
+}
+
+spr8_frame_count :: fun(bytes: []byte) -> i64 {
+	count : u16 = bytes[22]
+	return i64(count)
+}
+
+// The palette of a sprite (or of a PAL_n.s8, which only carries one):
+// colour 0 see-through, the rest solid.
+spr8_palette :: fun(bytes: []byte) -> Palette, err {
+	palette : Palette
+	place : u32 = bytes[32]
+	at := i64(place) + 4
+	if at + 512 > bytes.len do return palette, Not_A_Sprite
+	for k in 0:256 {
+		colour : u16 = bytes[at + k * 2]
+		red := i64(colour >> 11) & 31
+		green := i64(colour >> 5) & 63
+		blue := i64(colour) & 31
+		palette[k] = [u8((red << 3) | (red >> 2)), u8((green << 2) | (green >> 4)), u8((blue << 3) | (blue >> 2)), u8(if k == 0 do 0 else 255)]
+	}
+	return palette
+}
+
+// Frame k's head: its canvas and box, where its rows are.
+spr8_frame :: fun(bytes: []byte, k: i64) -> Spr8_Frame, err {
+	none := Spr8_Frame{canvas_width = 0, canvas_height = 0, top = 0, bottom = 0, left = 0, right = 0, at = 0, end = 0}
+	count := spr8_frame_count(bytes)
+	if k < 0 or k >= count do return none, Not_A_Sprite
+	table_place : u32 = bytes[36]
+	table := i64(table_place)
+	if table + count * 4 > bytes.len do return none, Not_A_Sprite
+	start_place : u32 = bytes[table + k * 4]
+	start := i64(start_place)
+	end := bytes.len
+	if k + 1 < count {
+		end_place : u32 = bytes[table + (k + 1) * 4]
+		end = i64(end_place)
+	}
+	if start + 16 > end or end > bytes.len do return none, Not_A_Sprite
+	head : [8!]u16 = bytes[start]
+	frame := Spr8_Frame{canvas_width = i64(head[0]), canvas_height = i64(head[1]), top = i64(head[2]), bottom = i64(head[3]),
+		left = i64(head[4]), right = i64(head[5]), at = start + 16, end = end}
+	if frame.bottom < frame.top or frame.right < frame.left do return none, Not_A_Sprite
+	return frame
+}
+
+// The box round every frame's on their canvas: left, top, right, bottom.
+spr8_bounds :: fun(bytes: []byte) -> [4!]i64, err {
+	bounds : [4!]i64 = [1 << 30, 1 << 30, -(1 << 30), -(1 << 30)]
+	for k in 0:spr8_frame_count(bytes) {
+		frame := spr8_frame(bytes, k)?
+		bounds[0] = min(bounds[0], frame.left)
+		bounds[1] = min(bounds[1], frame.top)
+		bounds[2] = max(bounds[2], frame.right)
+		bounds[3] = max(bounds[3], frame.bottom)
+	}
+	return bounds
+}
+
+// Draws frame k into an image of red, green, blue, alpha bytes, width
+// pixels across: its top left (its box's) at x, y. Pixels outside the
+// image aren't drawn; its see-through ones are left as they are.
+spr8_draw :: fun(bytes: []byte, k: i64, palette: ^Palette, image: ^[]byte, width: i64, x: i64, y: i64) -> err {
+	frame := spr8_frame(bytes, k)?
+	frame_width := frame.right - frame.left
+	frame_height := frame.bottom - frame.top
+	height := image.len / (width * 4)
+	column : i64 = 0
+	row : i64 = 0
+	at := frame.at
+	for at < frame.end {
+		code := i64(bytes[at])
+		at += 1
+		n := code >> 2
+		what := code & 3
+		if what == 0 {
+			column += n
+		elif what == 1
+			if at >= frame.end do return Bad_Frame
+			put_pixel(image, width, height, x + column, y + row, palette[i64(bytes[at])], n * 4 + n / 16)
+			at += 1
+			column += 1
+		elif what == 2
+			row += 1
+			column = n
+		else
+			if at + n + 1 > frame.end do return Bad_Frame
+			for j in 0:n + 1 do put_pixel(image, width, height, x + column + j, y + row, palette[i64(bytes[at + j])], 255)
+			at += n + 1
+			column += n + 1
+		}
+		if column > frame_width or row > frame_height do return Bad_Frame
+	}
+}
+
+put_pixel :: fun(image: ^[]byte, width: i64, height: i64, x: i64, y: i64, colour: [4!]u8, alpha: i64) {
+	if x < 0 or y < 0 or x >= width or y >= height or colour[3] == 0 do return
+	at := (y * width + x) * 4
+	image[at] = colour[0]
+	image[at + 1] = colour[1]
+	image[at + 2] = colour[2]
+	image[at + 3] = u8(min(alpha, 255))
+}

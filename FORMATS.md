@@ -78,8 +78,9 @@ by moving along the ramp (Throne.cfg has light radius settings).
 variants of the same drawings (monsters have up to six, samurai armour
 four).
 
-A frame: u16 canvas width and height (640 × 480 for characters; guess:
-the character stands at its centre), then top, bottom, left and right of
+A frame: u16 canvas width and height (640 × 480 for characters, who stand
+at its centre: every samurai's frames are centred across it, and drawn so
+in the game their feet meet the spot they stand on), then top, bottom, left and right of
 what's drawn, u16 0, u16 1. Then its rows, top first. Each byte's low 2
 bits say what it is and its high 6 bits are a number n:
 
@@ -91,9 +92,13 @@ bits say what it is and its high 6 bits are a number n:
 
 A frame's bytes are padded to an even count with a 0.
 
-One file holds a whole action: 8 directions × its frames (a run is 80 =
-8 × 10). Checked by drawing them: `pictures\bake_run.png` is the haunted
-armour (BakeYoroi) running, all 80 frames.
+One file holds a whole action: 8 directions × its frames, direction by
+direction — toward the viewer (down the screen) first, then turning
+clockwise as seen on the screen: down-left, left, up-left, up, up-right,
+right, down-right. A monster's run is 80 = 8 × 10; a samurai's run 96 =
+8 × 12, its standing (neutral) 80 = 8 × 10. Checked by drawing them
+(`pictures\bake_run.png`: the haunted armour, BakeYoroi, running) and by
+the game: samurai walking left and down-right face that way.
 
 Where they are: `Characters\<Name>\Weapon<n>\ANIM_<action>\*.s8` for
 monsters and people, `Characters\<Class>\Armor<n>\Weapon<n>\ANIM_<action>`
