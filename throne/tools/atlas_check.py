@@ -1,6 +1,6 @@
-"""atlas_check.py <archive.lot> <sprite path in it> <atlas.png from `sothrone sprite`>
+"""atlas_check.py <archive.lot> <sprite path in it> <atlas.png from `throne sprite`>
 
-Builds the atlas `sothrone sprite` writes (art.mara's layout: a row per
+Builds the atlas `throne sprite` writes (art.mara's layout: a row per
 direction, a column per frame, cells the box round all frames) with the
 Python decoder, and compares it with the PNG pixel by pixel.
 """

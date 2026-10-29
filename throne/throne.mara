@@ -1,4 +1,4 @@
-// sothrone: a source port of Throne of Darkness (Click Entertainment,
+// throne: a source port of Throne of Darkness (Click Entertainment,
 // 2001), written in Mara. It will run on the game's own files (its
 // LotFiles\*.lot archives: FORMATS.md says what's in them).
 //
@@ -6,12 +6,12 @@
 // each walking where they click, the world kept by a server (server and
 // client from the start). Opened twice, the second joins the first's game.
 //
-//     sothrone                          the game: joins one on this machine, else hosts
-//     sothrone connect <address>        the game, joining the one at an address
-//     sothrone serve [port] [seconds] [open]   a server alone, no window
-//     sothrone bot [seconds] [address]  a player with no window, walking about
-//     sothrone picture <out.png> [seconds] [address]   the game unseen, its last frame written
-module sothrone
+//     throne                          the game: joins one on this machine, else hosts
+//     throne connect <address>        the game, joining the one at an address
+//     throne serve [port] [seconds] [open]   a server alone, no window
+//     throne bot [seconds] [address]  a player with no window, walking about
+//     throne picture <out.png> [seconds] [address]   the game unseen, its last frame written
+module throne
 
 use mara.core
 use mara.os
@@ -46,12 +46,12 @@ FRAME_RATE :: 60.0
 // A player as drawn: a square this many room pixels across.
 PLAYER_SIZE :: 24.0
 
-// The journal: a log file, the first of sothrone.log, sothrone_2.log, …
+// The journal: a log file, the first of throne.log, throne_2.log, …
 // that no other copy of the game is writing; the console only when none.
 open_journal :: fun() -> Journal {
 	for copy in 1..8 {
 		path : str64
-		&path + "sothrone"
+		&path + "throne"
 		if copy > 1 {
 			&path + "_"
 			&path + int_text(copy)
@@ -310,7 +310,7 @@ command_play :: fun(address: []utf8) -> bool {
 		return false
 	}
 	defer link_close(&link)
-	platform, open_error := platform_open("sothrone", WINDOW_WIDTH, WINDOW_HEIGHT)
+	platform, open_error := platform_open("throne", WINDOW_WIDTH, WINDOW_HEIGHT)
 	if open_error {
 		note(&journal, "couldn't open the window: ")
 		note_error(&journal, open_error)
@@ -332,7 +332,7 @@ command_play :: fun(address: []utf8) -> bool {
 	return true
 }
 
-// `sothrone picture <out.png> [seconds] [address] [click x y]`: the game as
+// `throne picture <out.png> [seconds] [address] [click x y]`: the game as
 // a player opening it sees it (linked as command_play links), in a window
 // that's never shown, for that many seconds (2 unless told); its player
 // clicked at the start to walk to a spot — x and y shares of the window
@@ -349,7 +349,7 @@ command_picture :: fun(path: []utf8, seconds: f64, address: []utf8, click_x: f32
 		return
 	}
 	defer link_close(&link)
-	platform, open_error := platform_open("sothrone", WINDOW_WIDTH, WINDOW_HEIGHT, true)
+	platform, open_error := platform_open("throne", WINDOW_WIDTH, WINDOW_HEIGHT, true)
 	if open_error {
 		print("couldn't open the window: %", open_error)
 		return
@@ -422,8 +422,8 @@ write_entire_file :: fun(path: []utf8, data: []byte) -> err {
 
 // ---- without a window -------------------------------------------------------
 
-// `sothrone serve [port] [seconds] [open]`: the game's server alone, no
-// window, players connecting to it (`sothrone connect`): on this machine's
+// `throne serve [port] [seconds] [open]`: the game's server alone, no
+// window, players connecting to it (`throne connect`): on this machine's
 // own address only, or open to others; for that many seconds (0: till it's
 // stopped). Who joins and leaves is told.
 command_serve :: fun(port: i64, seconds: f64, open: bool) {
@@ -452,7 +452,7 @@ command_serve :: fun(port: i64, seconds: f64, open: bool) {
 BOT_WALK_EVERY :: 2.0
 BOT_STATUS_EVERY :: 1.0
 
-// `sothrone bot [seconds] [address]`: a player with no window, linked as
+// `throne bot [seconds] [address]`: a player with no window, linked as
 // the game links (game_link: the game at the address, or the one on this
 // machine, else hosting), walking somewhere new every BOT_WALK_EVERY
 // seconds, for that many seconds (10 unless told). Every second it says
@@ -527,15 +527,15 @@ bot_status :: fun(link: ^Link, journal: ^Journal) {
 // ---- starting -----------------------------------------------------------------
 
 usage :: fun() {
-	print("sothrone                                 the game: joins one on this machine, else hosts")
-	print("sothrone connect <address[:port]>        the game, joining the one at an address")
-	print("sothrone serve [port] [seconds] [open]   a server alone, no window (port %)", GAME_PORT)
-	print("sothrone bot [seconds] [address]         a player with no window, walking about")
-	print("sothrone picture <out.png> [seconds] [address] [click x y]   the game unseen, its last frame written")
-	print("sothrone sprite <archive> <path | folder> <out.png>   a sprite's frames as the game's atlas lays them out")
+	print("throne                                 the game: joins one on this machine, else hosts")
+	print("throne connect <address[:port]>        the game, joining the one at an address")
+	print("throne serve [port] [seconds] [open]   a server alone, no window (port %)", GAME_PORT)
+	print("throne bot [seconds] [address]         a player with no window, walking about")
+	print("throne picture <out.png> [seconds] [address] [click x y]   the game unseen, its last frame written")
+	print("throne sprite <archive> <path | folder> <out.png>   a sprite's frames as the game's atlas lays them out")
 }
 
-// `sothrone sprite <archive> <path | folder> <out.png>`: a sprite from one
+// `throne sprite <archive> <path | folder> <out.png>`: a sprite from one
 // of the game's archives (a name in the game's LotFiles, or a path) — the
 // file at path, or the first .s8 in the folder — drawn as the game's atlas
 // for it lays its frames out (art.mara), written to out.png. No window.

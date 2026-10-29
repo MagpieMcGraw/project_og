@@ -1,4 +1,4 @@
-# sothrone
+# throne
 
 A source port of Throne of Darkness (Click Entertainment, 2001) in Mara,
 reading the game's own files. Nothing is decompiled: the formats are
@@ -15,10 +15,10 @@ project_og.md, in the folder above (project_og holds og/ and every port).
 
 ## Building and running
 
-`build.bat` builds sothrone.exe with project_og's Mara compiler, the one
+`build.bat` builds throne.exe with project_og's Mara compiler, the one
 every port builds with (`..\compiler\`, not checked in):
 `..\compiler\Mara.exe build`, which builds what build.mara says (the
-build named sothrone, optimized). `..\update_compiler.bat` brings the
+build named throne, optimized). `..\update_compiler.bat` brings the
 compiler from C:\Code\Mara\release, and ..\MARA_VERSION.txt says which it
 is.
 
@@ -34,16 +34,16 @@ grids aren't read yet), turns them the way they're going, and tells
 everyone where everyone is and which level they're in. Without the game's
 files the level is a bare room and the players coloured squares.
 
-    sothrone                            the game: joins one on this machine, else hosts
-    sothrone connect <address[:port]>   the game, joining the one at an address
-    sothrone serve [port] [seconds] [open]   a server alone, no window
-    sothrone bot [seconds] [address]    a player with no window, walking about
-    sothrone picture <out.png> [seconds] [address] [click x y]   the game in a window never shown, its last frame written
-    sothrone sprite <archive> <path | folder> <out.png>   a sprite's frames as the game's atlas lays them out
+    throne                            the game: joins one on this machine, else hosts
+    throne connect <address[:port]>   the game, joining the one at an address
+    throne serve [port] [seconds] [open]   a server alone, no window
+    throne bot [seconds] [address]    a player with no window, walking about
+    throne picture <out.png> [seconds] [address] [click x y]   the game in a window never shown, its last frame written
+    throne sprite <archive> <path | folder> <out.png>   a sprite's frames as the game's atlas lays them out
 
 Opened twice, the second copy joins the first's game (port 27200, this
-machine only). Each run writes a journal: the first of sothrone.log,
-sothrone_2.log, … not in use. The game's files are read from
+machine only). Each run writes a journal: the first of throne.log,
+throne_2.log, … not in use. The game's files are read from
 `D:\Games\Disciples 2\Throne of Darkness\LotFiles` (art.mara's
 LOT_FOLDER).
 
@@ -52,7 +52,7 @@ The modules: `world_state` (the world and its messages), `world_server`,
 `lot` (the archives), `spr8` (the sprites), `art` (the samurai's
 pictures on the card), `rex` (a level's bundles), `lex` (a level's
 layout), `level` (World.ini, a level read), `level_art` (a level's
-pictures on the card), `sothrone` (the commands, the window). From
+pictures on the card), `throne` (the commands, the window). From
 ../og, the modules the ports share (build.mara names the folder):
 `wire`, `logging`, `disk`, `sdl_platform`, `png`, `inflate`, `lzo`,
 `sprite_layer`.
@@ -133,6 +133,6 @@ Python prototypes (run with `python -I`):
   draws a whole level from its layout and bundles (the prototype of
   level_art.mara).
 - `atlas_check.py <archive.lot> <sprite path> <atlas.png>`: builds the
-  atlas `sothrone sprite` writes with the Python decoder and counts the
+  atlas `throne sprite` writes with the Python decoder and counts the
   pixels that differ (the Leader's run: none).
 - `lzo.py`, `lot.py`: the LZO1X decoder and the archive reader they use.

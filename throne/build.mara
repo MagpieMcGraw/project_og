@@ -1,0 +1,8 @@
+// How throne is built: `..\compiler\Mara.exe build` (build.bat) builds
+// the one named as the folder. The modules shared with the other ports are
+// in ../og (../project_og.md says more); throne keeps no copies of them.
+module build
+
+use mara.build
+
+throne :: Build(){release = true, dirs = ["../og"]}
