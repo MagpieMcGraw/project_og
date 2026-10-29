@@ -32,6 +32,14 @@ ROUTE_RISE :: 96
 // be in its way as it swings); how near a swinging door one waits for it.
 DOOR_AHEAD :: 128
 DOOR_CLEAR :: 192
+// A straight line's floor is looked for this often along it (units), and
+// from one look to the next may rise a step (STEP_HEIGHT) or drop this
+// much (stairs drop a step at a time: more than a step between looks).
+FLOOR_STEP :: 32
+FLOOR_DROP :: 64
+// The floor's looked for this far to each side of a straight line too: a
+// body needs that much of it (a railing's top is narrower).
+FLOOR_SIDE :: 16
 
 // A point people can stand at: where (on the floor or the ground there);
 // its links — in its grid's links, links of them from first_link — each
@@ -229,15 +237,16 @@ Route_Open :: struct {
 	point: i64
 }
 
-// A route over a grid from one place to another (into route): the point
-// nearest from, through the grid's points by the shortest way (A*), to
-// the point nearest to — then to itself. False when the grid has no points
-// or no way between them, or the way's longer than a route holds.
-find_route :: fun(grid: ^Path_Grid, from: Vec3, to: Vec3, route: ^Route) -> bool {
+// A route over a grid from one place to another (into route): from the
+// point nearest from that's in a clear line from it (reachable_point),
+// through the grid's points by the shortest way (A*), to the one nearest
+// to — then to itself. False when the grid has no points or no way between
+// them, or the way's longer than a route holds.
+find_route :: fun(grid: ^Path_Grid, place: ^Scene, from: Vec3, to: Vec3, route: ^Route) -> bool {
 	route.points.len = 0
 	route.next = 0
-	start := nearest_point(grid, from)
-	goal := nearest_point(grid, to)
+	start := reachable_point(grid, place, from)
+	goal := reachable_point(grid, place, to)
 	if start < 0 or goal < 0 do return false
 	count := grid.points.len
 	costs : [PATH_POINTS]f32 = void
@@ -291,19 +300,41 @@ find_route :: fun(grid: ^Path_Grid, from: Vec3, to: Vec3, route: ^Route) -> bool
 	return true
 }
 
-// The grid's point nearest a place (up or down counted twice: a point on
-// its floor before one above or below it); -1 for a grid without points.
-nearest_point :: fun(grid: ^Path_Grid, place: Vec3) -> i64 {
-	nearest : i64 = -1
-	nearest_distance : f32 = 0
-	for point, k in grid.points {
-		away := point.position - place
-		distance := away.x * away.x + away.y * away.y + 4 * away.z * away.z
-		if nearest >= 0 and distance >= nearest_distance do continue
-		nearest = k
-		nearest_distance = distance
+// How many of the grid's points nearest a place reachable_point looks at.
+REACHABLE_TRIED :: 8
+
+// Of the grid's points nearest a place (REACHABLE_TRIED of them, nearest
+// first), the first in a clear line from it — not one through a wall, on
+// a floor above, behind a railing; with none, the nearest. -1 for a grid
+// without points.
+reachable_point :: fun(grid: ^Path_Grid, place: ^Scene, at: Vec3) -> i64 {
+	tried : [REACHABLE_TRIED]i64
+	for tried.len < tried.cap {
+		nearest : i64 = -1
+		nearest_distance : f32 = 0
+		for point, k in grid.points {
+			distance := point_distance(point.position, at)
+			if nearest >= 0 and distance >= nearest_distance do continue
+			already := false
+			for t in tried {
+				if t == k do already = true
+			}
+			if already do continue
+			nearest = k
+			nearest_distance = distance
+		}
+		if nearest < 0 do break
+		if clear_line(place, at, grid.points[nearest].position) do return nearest
+		&tried + nearest
 	}
-	return nearest
+	return if tried.len > 0 do tried[0] else -1
+}
+
+// How near a point is to a place (squared), up or down counted twice: a
+// point on its floor before one above or below it.
+point_distance :: fun(point: Vec3, at: Vec3) -> f32 {
+	away := point - at
+	return away.x * away.x + away.y * away.y + 4 * away.z * away.z
 }
 
 // The height of the grid's point nearest a place across the ground (on
@@ -400,16 +431,56 @@ door_swinging_near :: fun(place: ^Scene, feet: Vec3) -> bool {
 }
 
 // Whether one could walk straight from feet to a place: nothing between at
-// the waist, and no steeper than a slope one walks up (or a step or two up
-// or down, near).
+// the knees (just over a step) or the waist, no steeper than a slope one walks up (or a step or two up or
+// down, near), and floor all the way — every FLOOR_STEP along it, ground no
+// more than a step up or FLOOR_DROP down from the last, and as high to
+// either side (FLOOR_SIDE, give or take a step): not along a railing's
+// top, over a gap or a drop.
 clear_line :: fun(place: ^Scene, feet: Vec3, to: Vec3) -> bool {
 	across := vec3_length(Vec3{to.x - feet.x, to.y - feet.y, 0})
 	if abs_f32(to.z - feet.z) > max_f32(ROUTE_RISE, across * 0.75) do return false
 	away := to - feet
 	far := vec3_length(away)
 	if far < 1 do return true
-	_, _, in_the_way := pick(place, feet + Vec3{0, 0, WALKER_HEIGHT / 2}, away * (1 / far), far)
-	return not in_the_way
+	for height in [STEP_HEIGHT + 8, WALKER_HEIGHT / 2] {
+		_, _, in_the_way := pick(place, feet + Vec3{0, 0, f32(height)}, away * (1 / far), far)
+		if in_the_way do return false
+	}
+	underfoot := feet.z
+	side := Vec3{-away.y, away.x, 0} * (FLOOR_SIDE / across)
+	walked : f32 = FLOOR_STEP
+	for true {
+		last := walked >= across
+		at := if last do to else feet + Vec3{away.x, away.y, 0} * (walked / across)
+		ground, found := floor_below(place, Vec3{at.x, at.y, underfoot + STEP_HEIGHT}, STEP_HEIGHT + FLOOR_DROP)
+		if not found do return false
+		for edge in [at + side, at - side] {
+			beside, found_beside := floor_below(place, Vec3{edge.x, edge.y, ground + STEP_HEIGHT}, STEP_HEIGHT * 2)
+			if not found_beside or abs_f32(beside - ground) > STEP_HEIGHT do return false
+		}
+		underfoot = ground
+		if last do break
+		walked += FLOOR_STEP
+	}
+	return true
+}
+
+// The highest ground below a place within reach under it: the land, or
+// something's top. False when there's none so near.
+floor_below :: fun(place: ^Scene, from: Vec3, reach: f32) -> f32, bool {
+	best : f32 = 0
+	found := false
+	_, distance, hit := pick(place, from, Vec3{0, 0, -1}, reach)
+	if hit {
+		best = from.z - distance
+		found = true
+	}
+	height, has_land := land_height(place, from)
+	if has_land and height <= from.z and height >= from.z - reach and (not found or height > best) {
+		best = height
+		found = true
+	}
+	return best, found
 }
 
 // Skips a route's places one needn't go through from feet: while the one

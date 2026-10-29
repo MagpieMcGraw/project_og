@@ -1865,7 +1865,7 @@ command_path_check :: fun(name: []utf8, from: Vec3, to: Vec3) {
 	print("the path grid: % points, % links, read in % ms", grid.points.len, grid.links.len, elapsed_ms(grid_start))
 	route : Route = void
 	route_start := time_now()
-	found := find_route(&grid, from, to, &route)
+	found := find_route(&grid, &place, from, to, &route)
 	if not found {
 		print("no route from % to %", from, to)
 		return

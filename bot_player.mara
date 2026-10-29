@@ -395,7 +395,7 @@ bot_way_to :: fun(bot: ^Bot, target: Vec3, running: bool, seconds: f32) -> Vec3 
 		return bot_toward(bot, straight, running, seconds)
 	}
 	if not bot.routed or vec3_length(bot.route.points[bot.route.points.len - 1] - target) > REROUTE {
-		bot.routed = find_route(&bot.grid, feet, target, &bot.route)
+		bot.routed = find_route(&bot.grid, &bot.place, feet, target, &bot.route)
 		if bot.routed do route_shortcut(&bot.route, &bot.place, feet)
 	}
 	if bot.routed {
