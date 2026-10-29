@@ -1,0 +1,63 @@
+// A game's settings kept between runs in a file written as Mara: a value
+// of the game's settings struct, a `name = number` line for each setting
+// (whole numbers), read back a line at a time — a line that isn't one is
+// passed over, and what the game does with each is its own (a setting
+// missing keeps its default).
+//
+// Came from sooblivion's game_settings.mara (83fce8a), its volumes left
+// there.
+module settings_file
+
+use mara.core
+use mara.os
+use mara.memory
+use mara.string
+use logging
+
+// A setting as the file has it: its name (up to 32 bytes kept) and number.
+Setting :: struct {
+	name: [32]utf8
+	number: f64
+}
+
+// The `name = number` lines of a settings file (up to 16 KB of it), into
+// settings after what they hold (those past their room left out).
+read_settings_file :: fun(path: []utf8, settings: ^[]Setting) -> err {
+	storage : [16 * KB]byte = void
+	storage.len = 0
+	data := read_entire_file(path, &storage)?
+	text : []utf8 = data
+	start : i64 = 0
+	for at in 0..text.len {
+		if at < text.len and text[at] != '\n' do continue
+		line := trimmed(text[start : at])
+		start = at + 1
+		equals, has_equals := find_byte(line, '=')
+		if not has_equals do continue
+		number, is_number := parse_number(trimmed(line[equals + 1 : line.len]))
+		if not is_number or not fits(settings.len + 1, settings.cap) do continue
+		setting := next(settings)
+		setting.name.len = 0
+		add_what_fits(&setting.name, trimmed(line[0 : equals]))
+		setting.number = number
+	}
+}
+
+// Writes settings to a file, over what was there: the heading (comments,
+// then the value's start: `settings :: Game_Settings{`, each line ending
+// in '\n'), a `name = number` line each (rounded to whole), then `}`.
+write_settings_file :: fun(path: []utf8, heading: []utf8, settings: []Setting) -> err {
+	text : [4 * KB]utf8
+	add_what_fits(&text, heading)
+	for setting in settings {
+		add_what_fits(&text, "\t")
+		add_what_fits(&text, setting.name)
+		add_what_fits(&text, " = ")
+		add_what_fits(&text, int_text(i64(setting.number + 0.5)))
+		add_what_fits(&text, "\n")
+	}
+	add_what_fits(&text, "}\n")
+	file := file_open_write(path)?
+	defer file_close(file)
+	file_write_text(file, text)?
+}

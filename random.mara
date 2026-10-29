@@ -1,0 +1,37 @@
+// Chance: a run of numbers from a seed, and rolls that come out the same
+// for everyone who makes them with the same seed and numbers (so the
+// players of one game roll alike with nothing kept in step but the seed).
+// Came from sooblivion's world.mara (83fce8a).
+module random
+
+use mara.core
+
+// The next number of a seed's run (xorshift), the seed moved on.
+next_random :: fun(seed: ^u64) -> u64 {
+	value := seed^
+	value = value ~ (value << 13)
+	value = value ~ (value >> 7)
+	value = value ~ (value << 17)
+	seed^ = value
+	return value
+}
+
+// A number from 0 up to 1, the seed moved on.
+random_share :: fun(seed: ^u64) -> f32 {
+	return f32(next_random(seed) >> 40) / 16777216
+}
+
+// A number from 0 up to 1 that's always the same for the same seed and the
+// same four numbers (a time's slot, a place, what it's for): chance that
+// every player of a game rolls alike, by itself, with nothing to keep in
+// step but the game's seed and clock.
+chance_at :: fun(seed: u64, a: i64, b: i64, c: i64, d: u64) -> f32 {
+	mixed := seed
+	for part in [u64(a), u64(b), u64(c), d] {
+		mixed = (mixed ~ part) *% 0x9E3779B97F4A7C15
+		mixed = mixed ~ (mixed >> 29)
+		mixed = mixed *% 0xBF58476D1CE4E5B9
+		mixed = mixed ~ (mixed >> 32)
+	}
+	return f32(mixed >> 40) / 16777216
+}

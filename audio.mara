@@ -1,0 +1,376 @@
+// A game's sound: its clips (WAV files, 16-bit PCM, mono or stereo, at
+// their own rates) played through SDL3's audio, mixed here — each voice
+// resampled to the mix's rate, as loud as the game says on each side. The
+// mix is handed to SDL a frame at a time, kept a little ahead of what's
+// heard. The music (music.mara: MP3s streamed from a folder) is mixed in
+// with them.
+//
+// What's the game's own: where its clips come from (it reads a file's
+// bytes into the clips' room and adds it: clip_fits, add_clip), how loud a
+// sound is at a distance and its pitch, its kinds of sound (each heard as
+// loud as its volume) and which music plays where.
+//
+// Came from sooblivion's audio.mara (83fce8a), Oblivion's sound records
+// left there.
+module audio
+
+use mara.core
+use mara.math
+use mara.string
+use mara.sdl
+use indexing
+use random
+use logging
+
+// The mix: its rate, and how far ahead of what's heard it's kept (frames:
+// what a slow frame of the game can take before the sound stops).
+MIX_RATE :: 44100
+AHEAD :: 4410
+// Voices playing at once, at most; clips loaded.
+MAX_VOICES :: 48
+MAX_CLIPS :: 1024
+// All the mix's voices are this loud together, so that several at once
+// don't clip.
+MASTER_VOLUME :: 0.8
+// How far to one side a sound right beside the listener is heard: all the
+// way (1) would leave the other ear with nothing.
+SIDE_SPREAD :: 0.7
+// The kinds of sound a game can have, each heard as loud as its volume
+// (numbered by the game, from 0).
+SOUND_KINDS :: 8
+
+Audio_Error :: error {
+	No_Audio          // SDL's audio couldn't be started
+	No_Device         // no device to play on
+	Not_Wave          // a sound file that isn't a WAV
+	Not_Pcm           // a WAV of a kind not played: 16-bit PCM only
+	Empty_Folder      // a folder of sounds or music with no files
+	No_Room_For_Sound // the clips' room is full
+	Wrong_Rate        // music at a rate other than the mix's
+}
+
+// A sound file loaded: its samples (16-bit, the channels interleaved, a
+// view of the clips' room), its channels and rate, how many frames.
+Clip :: struct {
+	samples: []byte
+	channels: i64
+	rate: i64
+	frames: i64
+}
+
+// A clip playing: where in it (in its frames, between two of them), how far
+// it moves each frame of the mix (its rate and pitch), whether it loops;
+// its loudness on the left and right now, and where they go by the end of
+// the next mix; what it plays for (a placed sound's key, 0 for a one-shot)
+// and whether that still wants it.
+Voice :: struct {
+	clip: i64
+	at: f64
+	step: f64
+	looping: bool
+	gains: [2!]f32
+	targets: [2!]f32
+	source: u64
+	wanted: bool
+	ended: bool
+	sound: i64      // the kind of sound it is (0 up to SOUND_KINDS), heard as loud as its volume
+}
+
+// The sound: SDL's stream (when it could be opened), the clips (found by
+// their keys) and the room they're in, the voices, the mix, and what
+// couldn't be played since the journal last told (how many, the first's
+// name and why). How loud things are heard, 0 to 1 (as the game's menus
+// set them): everything (master), each kind of sound, and the music.
+Mixer :: struct {
+	stream: sdl.AudioStream
+	open: bool
+	clips: [MAX_CLIPS]Clip
+	clip_index: Key_Index
+	clip_room: []byte
+	voices: [MAX_VOICES]Voice
+	mix: [AHEAD * 2]f32
+	seed: u64
+	failures: i64
+	first_failure: [160]utf8
+	first_failure_reason: err
+	music: Music
+	master: f32
+	kind_volumes: [SOUND_KINDS!]f32
+	music_volume: f32
+}
+
+// Sets the audio up, closed: no clips, no voices, everything as loud as
+// it's made; the clips' room (room_size bytes) and index carved from
+// storage.
+audio_init :: fun(audio: ^Mixer, room_size: i64, storage: ^[]byte) {
+	audio.open = false
+	audio.clips.len = 0
+	audio.voices.len = 0
+	audio.seed = 0x2545F4914F6CDD1D
+	audio.failures = 0
+	audio.first_failure.len = 0
+	audio.master = 1
+	for k in 0:SOUND_KINDS do audio.kind_volumes[k] = 1
+	audio.music_volume = 1
+	audio.clip_index = key_index(MAX_CLIPS * 2, storage)
+	audio.clip_room = slice([:room_size]byte, storage)
+	music_reset(&audio.music)
+}
+
+// Starts SDL's audio and opens the default device for a stereo mix.
+// Failing, the audio stays closed (and silent): what's played is let go.
+audio_open :: fun(audio: ^Mixer) -> err {
+	if not sdl.InitSubSystem(sdl.Init_Flags.Audio) do return No_Audio
+	audio.stream = sdl.OpenAudioDeviceStream(sdl.AUDIO_DEVICE_DEFAULT_PLAYBACK, sdl.AudioSpec{format = .F32, channels = 2, freq = MIX_RATE})
+	if audio.stream == void do return No_Device
+	_ = sdl.ResumeAudioStreamDevice(audio.stream)
+	audio.open = true
+}
+
+audio_close :: fun(audio: ^Mixer) {
+	stop_track(&audio.music)
+	if audio.open do sdl.DestroyAudioStream(audio.stream)
+	audio.open = false
+}
+
+// ---- clips -------------------------------------------------------------------------
+
+// A WAV file's sound: its 16-bit PCM samples (a view of data), channels
+// and rate.
+read_wave :: fun(data: []byte) -> Clip, err {
+	clip := Clip{samples = data[0:0], channels = 0, rate = 0, frames = 0}
+	if data.len < 12 do return clip, Not_Wave
+	riff : [4!]utf8 = data[0]
+	wave : [4!]utf8 = data[8]
+	if riff != "RIFF" or wave != "WAVE" do return clip, Not_Wave
+	at : i64 = 12
+	bits : i64 = 0
+	for at + 8 <= data.len {
+		chunk : [4!]utf8 = data[at]
+		size : u32 = data[at + 4]
+		body := at + 8
+		end := min(body + i64(size), data.len)
+		if chunk == "fmt " and end - body >= 16 {
+			format : u16 = data[body]
+			channels : u16 = data[body + 2]
+			rate : u32 = data[body + 4]
+			sample_bits : u16 = data[body + 14]
+			if format != 1 do return clip, Not_Pcm
+			clip.channels = i64(channels)
+			clip.rate = i64(rate)
+			bits = i64(sample_bits)
+		elif chunk == "data"
+			clip.samples = data[body : end]
+		}
+		at = body + i64(size) + i64(size & 1)
+	}
+	if bits != 16 or clip.channels < 1 or clip.channels > 2 or clip.rate == 0 do return clip, Not_Pcm
+	clip.frames = clip.samples.len / (2 * clip.channels)
+	return clip
+}
+
+// The clip loaded under a key (its index in the clips: a path's text_hash,
+// say), and false when none is.
+known_clip :: fun(audio: ^Mixer, key: u64) -> i64, bool {
+	return index_get(&audio.clip_index, key)
+}
+
+// Whether there's room for another clip, its file size bytes long.
+clip_fits :: fun(audio: ^Mixer, size: i64) -> bool {
+	return audio.clips.len < audio.clips.cap and size <= audio.clip_room.cap - audio.clip_room.len
+}
+
+// Adds a clip under a key from its WAV file's bytes, which the game read
+// into the clips' room (audio.clip_room, after what it holds: they're kept
+// there while the mixer is): its index in the clips.
+add_clip :: fun(audio: ^Mixer, key: u64, data: []byte) -> i64, err {
+	if audio.clips.len == audio.clips.cap do return -1, No_Room_For_Sound
+	clip := read_wave(data)?
+	&audio.clips + clip
+	index_put(&audio.clip_index, key, audio.clips.len - 1)?
+	return audio.clips.len - 1
+}
+
+// Remembers a sound that couldn't be played: how many, the first's name
+// and why (for the journal).
+note_sound_failure :: fun(audio: ^Mixer, what: []utf8, reason: err) {
+	audio.failures += 1
+	if audio.failures == 1 {
+		audio.first_failure.len = 0
+		add_what_fits(&audio.first_failure, what)
+		audio.first_failure_reason = reason
+	}
+}
+
+// ---- what's heard -------------------------------------------------------------------
+
+// Where the sound's heard from: a place, and its right.
+Listener :: struct {
+	position: Vec3
+	right: Vec3
+}
+
+// How loud a sound is (as a share of full) at a distance: full within near,
+// then falling off as near / distance, faded out over the last quarter of
+// the way to far, where it's gone.
+distance_loudness :: fun(distance: f32, near: f32, far: f32) -> f32 {
+	if distance >= far do return 0
+	closest := max(near, 1)
+	if distance <= closest do return 1
+	falloff := closest / distance
+	fade := (far - distance) / (far - closest)
+	return falloff * min(1, fade * 4)
+}
+
+// The left and right gains of a sound at a place, as loud as given: by
+// which side of the listener it's on (one heard all round, on both alike),
+// keeping its power.
+side_gains :: fun(position: Vec3, listener: Listener, loud: f32, all_round: bool) -> [2!]f32 {
+	pan : f32 = 0
+	if not all_round {
+		toward := position - listener.position
+		distance := vec3_length(toward)
+		if distance > 1 do pan = dot(toward, listener.right) / distance * SIDE_SPREAD
+	}
+	return [loud * sqrt_f32((1 - pan) / 2) * 1.41421, loud * sqrt_f32((1 + pan) / 2) * 1.41421]
+}
+
+// Starts a voice playing a clip at a pitch (1: as it was made), heard as a
+// kind of sound (0 up to SOUND_KINDS), its gains starting at gains (a
+// looping one from a place in its clip at random, so loops of one sound
+// don't play in step), playing for a source (0 for none): its index, -1
+// when no voice is free.
+start_voice :: fun(audio: ^Mixer, clip_index: i64, source: u64, gains: [2!]f32, looping: bool, pitch: f32, sound: i64) -> i64 {
+	if not fits(audio.voices.len + 1, audio.voices.cap) do return -1
+	clip := audio.clips[clip_index]
+	if clip.frames == 0 do return -1
+	voice := next(&audio.voices)
+	voice.clip = clip_index
+	voice.at = 0
+	if looping do voice.at = f64(random_share(&audio.seed)) * f64(clip.frames)
+	voice.step = f64(clip.rate) / MIX_RATE * f64(pitch)
+	voice.looping = looping
+	voice.gains = if looping do [0, 0] else gains   // (a loop fades in)
+	voice.targets = gains
+	voice.source = source
+	voice.wanted = true
+	voice.ended = false
+	voice.sound = sound
+	return audio.voices.len - 1
+}
+
+// The voice playing for a source (its index), -1 for none.
+voice_of :: fun(audio: ^Mixer, source: u64) -> i64 {
+	for &voice, k in audio.voices {
+		if voice.source == source do return k
+	}
+	return -1
+}
+
+// Hearing a frame's sounds: hear_start, then for each sound still heard
+// keep_hearing (or start_voice, for one not playing), then hear_finish
+// fades out the voices whose sound is gone or out of range.
+hear_start :: fun(audio: ^Mixer) {
+	for &voice in audio.voices do voice.wanted = voice.source == 0
+}
+
+// Keeps a voice playing (its index), its gains moving to where they are now.
+keep_hearing :: fun(audio: ^Mixer, voice: i64, gains: [2!]f32) {
+	audio.voices[voice].targets = gains
+	audio.voices[voice].wanted = true
+}
+
+hear_finish :: fun(audio: ^Mixer) {
+	for &voice in audio.voices {
+		if not voice.wanted do voice.targets = [0, 0]
+	}
+}
+
+// ---- the mix -------------------------------------------------------------------------
+
+// How long the sound device takes to play what it's handed, past what's
+// queued for it (a guess: Windows' shared mode and SDL's buffer).
+DEVICE_DELAY :: 0.02
+
+// How long a sound started now takes to be heard (seconds): what's queued
+// ahead of it, and the device's own delay. 0 with no sound.
+sound_delay :: fun(audio: ^Mixer) -> f32 {
+	if not audio.open do return 0
+	queued := i64(sdl.GetAudioStreamQueued(audio.stream)) / 8
+	return f32(queued) / MIX_RATE + DEVICE_DELAY
+}
+
+// Mixes as much as keeps the stream AHEAD frames ahead of what's heard,
+// and hands it to SDL; voices that ended (or faded out, unwanted) are let go.
+mix_ahead :: fun(audio: ^Mixer) {
+	if not audio.open do return
+	queued := i64(sdl.GetAudioStreamQueued(audio.stream)) / 8
+	frames := AHEAD - queued
+	if frames <= 0 do return
+	audio.mix.len = frames * 2
+	for k in 0:audio.mix.len do audio.mix[k] = 0
+	for &voice in audio.voices do mix_voice(audio, voice, frames)
+	mix_music(audio, frames)
+	master := MASTER_VOLUME * audio.master
+	for k in 0:audio.mix.len do audio.mix[k] = max(-1, min(1, audio.mix[k] * master))
+	_ = sdl.PutAudioStreamData(audio.stream, audio.mix)
+
+	// Let go of the voices done: ended, or faded out and not wanted.
+	kept : i64 = 0
+	for k in 0:audio.voices.len {
+		voice := audio.voices[k]
+		silent := voice.gains[0] < 0.0001 and voice.gains[1] < 0.0001 and voice.targets[0] < 0.0001 and voice.targets[1] < 0.0001
+		if voice.ended or (silent and not voice.wanted) do continue
+		audio.voices[kept] = voice
+		kept += 1
+	}
+	audio.voices.len = kept
+}
+
+// Adds a voice's next frames to the mix: its clip resampled (between two
+// of its frames, in a line), its gains moving to their targets across them,
+// as loud as its kind of sound's volume.
+mix_voice :: fun(audio: ^Mixer, voice: ^Voice, frames: i64) {
+	if voice.ended do return
+	clip := audio.clips[voice.clip]
+	samples := clip.samples
+	stereo := clip.channels == 2
+	volume := audio.kind_volumes[voice.sound]
+	left_step := (voice.targets[0] - voice.gains[0]) / f32(frames)
+	right_step := (voice.targets[1] - voice.gains[1]) / f32(frames)
+	left_gain := voice.gains[0]
+	right_gain := voice.gains[1]
+	for k in 0:frames {
+		frame := i64(voice.at)
+		share := f32(voice.at - f64(frame))
+		after := frame + 1
+		if after >= clip.frames do after = if voice.looping do 0 else frame
+		left, right := clip_frame(samples, frame, stereo)
+		next_left, next_right := clip_frame(samples, after, stereo)
+		left_gain += left_step
+		right_gain += right_step
+		audio.mix[k * 2] += (left + (next_left - left) * share) * left_gain * volume
+		audio.mix[k * 2 + 1] += (right + (next_right - right) * share) * right_gain * volume
+		voice.at += voice.step
+		if voice.at >= f64(clip.frames) {
+			if not voice.looping {
+				voice.ended = true
+				break
+			}
+			voice.at -= f64(clip.frames)
+		}
+	}
+	voice.gains = voice.targets
+}
+
+// A clip's frame as left and right samples, -1 to 1 (a mono clip's on both).
+clip_frame :: fun(samples: []byte, frame: i64, stereo: bool) -> f32, f32 {
+	if stereo {
+		left : i16 = samples[frame * 4]
+		right : i16 = samples[frame * 4 + 2]
+		return f32(left) / 32768, f32(right) / 32768
+	}
+	middle : i16 = samples[frame * 2]
+	value := f32(middle) / 32768
+	return value, value
+}

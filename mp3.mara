@@ -1,0 +1,756 @@
+// Decoding MP3 (MPEG-1 audio, Layer III: ISO/IEC 11172-3), as Oblivion's
+// and Throne of Darkness's music is. Came from sooblivion (83fce8a).
+//
+// A file is frames of 1152 samples of each channel, in two granules of 576.
+// A frame is a header, side information (how each granule's channels are
+// coded), then main data, which may begin in the frames before it (the bit
+// reservoir). A granule's channel is scalefactors (each band's loudness)
+// and the values of its 576 frequency lines, Huffman-coded. They're turned
+// back into sound by requantizing the values, mid/side stereo, reordering
+// short blocks, antialiasing, the inverse MDCT (into 32 subbands' samples)
+// and the polyphase synthesis filterbank.
+//
+// Not decoded: MPEG-2's and 2.5's lower rates, Layers I and II, free-format
+// bit rates, and intensity stereo — Oblivion's files use none of them.
+module mp3
+
+use mara.core
+use mara.math
+
+Mp3_Error :: error {
+	No_Frame          // no frame header in the data
+	Not_Layer_3       // a frame of MPEG-2 or 2.5, or of Layer I or II
+	Free_Bit_Rate     // a frame of a free-format bit rate
+	Intensity_Stereo  // a frame using intensity stereo
+	Bad_Side_Info     // side information that can't be: an unused table, too many values, a switched window of block type 0
+}
+
+// A frame's samples of each channel; a granule's (its frequency lines).
+FRAME_SAMPLES :: 1152
+GRANULE_LINES :: 576
+
+// The bit rates (bits a second) of MPEG-1 Layer III by the header's index
+// (0: free format, 15: none), and the sample rates.
+BIT_RATES :: [16!]i64{0, 32000, 40000, 48000, 56000, 64000, 80000, 96000, 112000, 128000, 160000, 192000, 224000, 256000, 320000, 0}
+SAMPLE_RATES :: [4!]i64{44100, 48000, 32000, 0}
+
+// Channel modes; mode extension bits of joint stereo.
+MODE_JOINT_STEREO :: 1
+MODE_MONO :: 3
+MID_SIDE :: 2
+INTENSITY :: 1
+
+// Block types: a switched window's start, short (three windows of 192
+// lines each) and stop blocks; 0 is a normal long block.
+START_BLOCK :: 1
+SHORT_BLOCK :: 2
+STOP_BLOCK :: 3
+
+// The long blocks' 22 scalefactor bands' widths (lines) at 44.1, 48 and
+// 32 kHz, one rate after another; the short blocks' 13 (each window's).
+LONG_WIDTHS :: [66!]i64{
+	4, 4, 4, 4, 4, 4, 6, 6, 8, 8, 10, 12, 16, 20, 24, 28, 34, 42, 50, 54, 76, 158,
+	4, 4, 4, 4, 4, 4, 6, 6, 6, 8, 10, 12, 16, 18, 22, 28, 34, 40, 46, 54, 54, 192,
+	4, 4, 4, 4, 4, 4, 6, 6, 8, 10, 12, 16, 20, 24, 30, 38, 46, 56, 68, 84, 102, 26}
+SHORT_WIDTHS :: [39!]i64{
+	4, 4, 4, 4, 6, 8, 10, 12, 14, 18, 22, 30, 56,
+	4, 4, 4, 4, 6, 6, 10, 12, 14, 16, 20, 26, 66,
+	4, 4, 4, 4, 6, 8, 12, 16, 20, 26, 34, 42, 12}
+LONG_BANDS :: 22
+SHORT_BANDS :: 13
+
+// What a granule with preflag set raises each long band's scalefactor by.
+PRETAB :: [22!]i64{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 3, 2, 0}
+
+// The scalefactors' bit lengths by scalefac_compress: slen1 for the low
+// bands (long 0 to 10, short 0 to 5), slen2 for the rest.
+SLEN1 :: [16!]i64{0, 0, 0, 0, 3, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4}
+SLEN2 :: [16!]i64{0, 1, 2, 3, 0, 1, 2, 3, 1, 2, 3, 1, 2, 3, 2, 3}
+
+// The long bands' four groups a granule 1 may take from granule 0 (scfsi):
+// each from its start up to the next's.
+SCFSI_BANDS :: [5!]i64{0, 6, 11, 16, 21}
+
+// The antialiasing butterflies' coefficients (c[i] of the standard).
+ANTIALIAS :: [8!]f64{-0.6, -0.535, -0.33, -0.185, -0.095, -0.041, -0.0142, -0.0037}
+
+// The tree nodes all the Huffman tables need (each table's codes less one,
+// with room).
+HUFFMAN_NODES :: 1400
+// A value's size past which its linbits are read (the largest a table holds).
+LINBITS_FROM :: 15
+// The largest value: 15 and 13 linbits.
+LARGEST_VALUE :: 8206
+// The main data kept from frames before: as far back as a frame may reach
+// (511 bytes), and the next frame's.
+REACH_BACK :: 511
+MAIN_DATA_ROOM :: 4096
+
+// What's worked out from the tables in mp3_tables.mara, once for a decoder.
+Mp3_Tables :: struct {
+	// The Huffman codes as trees: each node's two children (for a 0 bit
+	// and a 1); a child below 0 is a leaf, -1 less its value (x * 16 + y for
+	// a pair; the four bits for a quad); 0 is no child yet (node 0 is a
+	// root, never a child). Each pair table's root (-1: none), and quad
+	// table A's.
+	nodes: [HUFFMAN_NODES][2!]i32
+	roots: [32!]i64
+	quad_root: i64
+	// i^(4/3) for each value i.
+	powers: [8207!]f32
+	// The inverse MDCTs' cosines: cos(pi / 2n * (2i + 1 + n/2) * (2k + 1))
+	// for the long one (n = 36) and short one (n = 12), by i then k.
+	long_cosines: [36!][18!]f32
+	short_cosines: [12!][6!]f32
+	// The windows by block type (a short block's is its first 12).
+	windows: [4!][36!]f32
+	// The antialiasing butterflies' cs and ca.
+	antialias_cs: [8!]f32
+	antialias_ca: [8!]f32
+	// The synthesis filterbank's matrix (N: 64 by 32) and window (D).
+	matrix: [64!][32!]f32
+	window: [512!]f32
+}
+
+// A frame's header: whether a CRC follows it; the bit rate, the sample rate
+// and its index; padding (a byte more); the channel mode and its extension;
+// the channels; the frame's size in bytes, header and all.
+Frame_Header :: struct {
+	protected: bool
+	bit_rate: i64
+	sample_rate: i64
+	rate_index: i64
+	padding: i64
+	mode: i64
+	mode_extension: i64
+	channels: i64
+	size: i64
+}
+
+// How a granule's channel is coded.
+Granule_Info :: struct {
+	part_2_3_length: i64     // the bits of its scalefactors and values
+	big_values: i64          // its values' pairs coded by the pair tables
+	global_gain: i64
+	scalefac_compress: i64   // its scalefactors' bit lengths (SLEN1, SLEN2)
+	block_type: i64
+	mixed: bool              // short blocks with the lowest two subbands long
+	table_select: [3!]i64    // each region's pair table
+	subblock_gain: [3!]i64   // each short window's gain (down by 4 of 2^-1/4)
+	region1_start: i64       // where regions 1 and 2 start (lines)
+	region2_start: i64
+	preflag: bool            // the high long bands raised by PRETAB
+	scalefac_scale: i64      // scalefactors in steps of 2^-1/2 (0) or 2^-1 (1)
+	count1_table: i64        // the quads' table: 0 is A, 1 is B
+}
+
+// A frame's side information: where its main data begins (bytes back from
+// the end of the frames' before), which groups of granule 1's long bands
+// take granule 0's scalefactors (each channel's), and each granule's
+// channels.
+Side_Info :: struct {
+	main_data_begin: i64
+	scfsi: [2!][4!]bool
+	granules: [2!][2!]Granule_Info
+}
+
+// Bits read from bytes, each byte's highest first; past the end, 0s.
+Bit_Reader :: struct {
+	data: []byte
+	at: i64   // the bits read
+}
+
+// An MP3 being decoded: its data and the next frame's start; the channels
+// and sample rate (the last frame's); the tables; the main data kept for
+// the next frames; each channel's scalefactors (granule 0's kept for
+// granule 1), values and lines (frequency lines, then subband samples by
+// subband * 18 + time), the inverse MDCTs' second halves for the next
+// granule, the synthesis' V (1024, circling: its newest 64 from
+// synthesis_at); and the last frame's samples, -1 to 1, the channels
+// interleaved.
+Mp3_Decoder :: struct {
+	data: []byte
+	at: i64
+	channels: i64
+	sample_rate: i64
+	tables: Mp3_Tables
+	main_data: [MAIN_DATA_ROOM]byte
+	long_scalefactors: [2!][22!]i64
+	short_scalefactors: [2!][13!][3!]i64
+	values: [576!]i64
+	lines: [2!][576!]f32
+	reordered: [576!]f32
+	overlap: [2!][576!]f32
+	synthesis: [2!][1024!]f32
+	synthesis_at: [2!]i64
+	samples: [2304]f32
+}
+
+// ---- starting --------------------------------------------------------------------
+
+// Starts decoding an MP3 file's data (a view kept): past an ID3 tag at its
+// start, to its first frame, which gives the channels and rate (a Xing or
+// Info frame, the file's description, is passed over).
+mp3_start :: fun(decoder: ^Mp3_Decoder, data: []byte) -> err {
+	decoder.data = data
+	decoder.at = 0
+	// An ID3v2 tag: "ID3", its version and flags, then its size in four
+	// bytes of 7 bits.
+	if data.len >= 10 and data[0] == 0x49 and data[1] == 0x44 and data[2] == 0x33 {
+		size := (i64(data[6]) << 21) | (i64(data[7]) << 14) | (i64(data[8]) << 7) | i64(data[9])
+		decoder.at = 10 + size
+	}
+	decoder.at = find_header(data, decoder.at)
+	if decoder.at < 0 do return No_Frame
+	header := read_header(data, decoder.at)?
+	decoder.channels = header.channels
+	decoder.sample_rate = header.sample_rate
+	main_at := decoder.at + 4 + side_info_size(header)
+	if main_at + 4 <= data.len {
+		tag : [4!]utf8 = data[main_at]
+		if tag == "Xing" or tag == "Info" do decoder.at += header.size
+	}
+
+	decoder.main_data.len = 0
+	for channel in 0:2 {
+		for k in 0:GRANULE_LINES do decoder.overlap[channel][k] = 0
+		for k in 0:1024 do decoder.synthesis[channel][k] = 0
+		decoder.synthesis_at[channel] = 0
+		for band in 0:LONG_BANDS do decoder.long_scalefactors[channel][band] = 0
+	}
+	decoder.samples.len = 0
+	build_tables(&decoder.tables)
+}
+
+// Works the decoder's tables out.
+build_tables :: fun(tables: ^Mp3_Tables) {
+	tables.nodes.len = 0
+	for table in 0:32 {
+		tables.roots[table] = -1
+		first := HUFFMAN_FIRST[table]
+		if first < 0 do continue
+		// (Tables 17 to 23 have table 16's codes, 25 to 31 table 24's.)
+		if table > 16 and table < 24 {
+			tables.roots[table] = tables.roots[16]
+			continue
+		}
+		if table > 24 {
+			tables.roots[table] = tables.roots[24]
+			continue
+		}
+		root := new_node(tables)
+		size := HUFFMAN_SIZE[table]
+		for x in 0:size {
+			for y in 0:size {
+				at := first + x * size + y
+				add_code(tables, root, i64(HUFFMAN_CODES[at]), i64(HUFFMAN_LENGTHS[at]), x * 16 + y)
+			}
+		}
+		tables.roots[table] = root
+	}
+	tables.quad_root = new_node(tables)
+	for value in 0:16 do add_code(tables, tables.quad_root, i64(QUAD_CODES[value]), i64(QUAD_LENGTHS[value]), value)
+
+	for value in 0..LARGEST_VALUE do tables.powers[value] = f32(pow(f64(value), 4.0 / 3))
+
+	for i in 0:36 {
+		for k in 0:18 do tables.long_cosines[i][k] = f32(cos(f64(2 * i + 1 + 18) * f64(2 * k + 1) * PI / 72))
+	}
+	for i in 0:12 {
+		for k in 0:6 do tables.short_cosines[i][k] = f32(cos(f64(2 * i + 1 + 6) * f64(2 * k + 1) * PI / 24))
+	}
+	for i in 0:36 {
+		long := sin((f64(i) + 0.5) * PI / 36)
+		tables.windows[0][i] = f32(long)
+		// The start block: the long window's rise, flat, the short one's fall.
+		start : f64 = 0
+		if i < 18 do start = long
+		elif i < 24 do start = 1
+		elif i < 30 do start = sin((f64(i - 18) + 0.5) * PI / 12)
+		tables.windows[START_BLOCK][i] = f32(start)
+		// The stop block: the short window's rise, flat, the long one's fall.
+		stop : f64 = 0
+		if i >= 18 do stop = long
+		elif i >= 12 do stop = 1
+		elif i >= 6 do stop = sin((f64(i - 6) + 0.5) * PI / 12)
+		tables.windows[STOP_BLOCK][i] = f32(stop)
+		tables.windows[SHORT_BLOCK][i] = if i < 12 do f32(sin((f64(i) + 0.5) * PI / 12)) else 0
+	}
+	for i in 0:8 {
+		c := ANTIALIAS[i]
+		tables.antialias_cs[i] = f32(1 / sqrt(1 + c * c))
+		tables.antialias_ca[i] = f32(c / sqrt(1 + c * c))
+	}
+
+	for i in 0:64 {
+		for k in 0:32 do tables.matrix[i][k] = f32(cos(f64((16 + i) * (2 * k + 1)) * PI / 64))
+	}
+	for i in 0..256 {
+		value := f32(SYNTHESIS_WINDOW[i]) / 65536
+		tables.window[i] = value
+		if i > 0 do tables.window[512 - i] = if i % 64 == 0 do value else -value
+	}
+}
+
+// A new node of the Huffman trees, without children: its index.
+new_node :: fun(tables: ^Mp3_Tables) -> i64 {
+	node := next(&tables.nodes)
+	node[0] = 0
+	node[1] = 0
+	return tables.nodes.len - 1
+}
+
+// Adds a code to the tree from root: its bits from the highest, the nodes on
+// the way made where missing, its last bit's child the leaf of value.
+add_code :: fun(tables: ^Mp3_Tables, root: i64, code: i64, code_length: i64, value: i64) {
+	node := root
+	for k in 0:code_length {
+		bit := (code >> (code_length - 1 - k)) & 1
+		if k == code_length - 1 {
+			tables.nodes[node][bit] = i32(-1 - value)
+			return
+		}
+		child := i64(tables.nodes[node][bit])
+		if child == 0 {
+			child = new_node(tables)
+			tables.nodes[node][bit] = i32(child)
+		}
+		node = child
+	}
+}
+
+// ---- frames ------------------------------------------------------------------------
+
+// Where the next frame header is from at (passing over what isn't one: a
+// tag, damage), -1 when there's none.
+find_header :: fun(data: []byte, from: i64) -> i64 {
+	at := from
+	for at + 4 <= data.len {
+		if looks_like_header(data, at) do return at
+		at += 1
+	}
+	return -1
+}
+
+// Whether 4 bytes are a frame header's: the sync bits, then a version,
+// layer, bit rate and sample rate that are some (read_header says which
+// aren't decoded).
+looks_like_header :: fun(data: []byte, at: i64) -> bool {
+	if data[at] != 0xFF or (u8(data[at + 1]) & 0xE0) != 0xE0 do return false
+	version := (i64(data[at + 1]) >> 3) & 3
+	layer := (i64(data[at + 1]) >> 1) & 3
+	bit_rate := i64(data[at + 2]) >> 4
+	rate := (i64(data[at + 2]) >> 2) & 3
+	return version != 1 and layer != 0 and bit_rate != 15 and rate != 3
+}
+
+// The frame header at a place (one that looks_like_header).
+read_header :: fun(data: []byte, at: i64) -> Frame_Header, err {
+	header := Frame_Header{0}
+	second := i64(data[at + 1])
+	third := i64(data[at + 2])
+	fourth := i64(data[at + 3])
+	version := (second >> 3) & 3   // 3: MPEG-1
+	layer := (second >> 1) & 3     // 1: Layer III
+	if version != 3 or layer != 1 do return header, Not_Layer_3
+	header.protected = (second & 1) == 0
+	header.bit_rate = BIT_RATES[third >> 4]
+	header.rate_index = (third >> 2) & 3
+	header.sample_rate = SAMPLE_RATES[header.rate_index]
+	if header.bit_rate == 0 do return header, Free_Bit_Rate
+	header.padding = (third >> 1) & 1
+	header.mode = fourth >> 6
+	header.mode_extension = (fourth >> 4) & 3
+	header.channels = if header.mode == MODE_MONO do 1 else 2
+	header.size = 144 * header.bit_rate / header.sample_rate + header.padding
+	return header
+}
+
+// The bytes after the header before the main data: the CRC, if there is
+// one, and the side information.
+side_info_size :: fun(header: Frame_Header) -> i64 {
+	size : i64 = if header.channels == 1 do 17 else 32
+	if header.protected do size += 2
+	return size
+}
+
+// Decodes the next frame into decoder.samples (its 1152 samples of each
+// channel): false at the data's end. A frame whose main data begins in
+// frames that weren't read (the first after starting) is silence.
+mp3_next_frame :: fun(decoder: ^Mp3_Decoder) -> bool, err {
+	decoder.samples.len = 0
+	at := find_header(decoder.data, decoder.at)
+	if at < 0 do return false
+	header := read_header(decoder.data, at)?
+	if header.mode == MODE_JOINT_STEREO and (header.mode_extension & INTENSITY) != 0 do return false, Intensity_Stereo
+	frame_end := at + header.size
+	main_at := at + 4 + side_info_size(header)
+	if frame_end > decoder.data.len do return false   // (a frame cut off: the end)
+	decoder.at = frame_end
+	decoder.channels = header.channels
+	decoder.sample_rate = header.sample_rate
+
+	side_at := if header.protected do at + 6 else at + 4
+	side_reader := Bit_Reader{data = decoder.data[side_at : main_at], at = 0}
+	side := read_side_info(&side_reader, header)?
+	start := add_main_data(decoder, decoder.data[main_at : frame_end], side.main_data_begin)
+
+	channels := header.channels
+	decoder.samples.len = FRAME_SAMPLES * channels
+	if start < 0 {
+		for k in 0:decoder.samples.len do decoder.samples[k] = 0
+		return true
+	}
+	reader := Bit_Reader{data = decoder.main_data[start : decoder.main_data.len], at = 0}
+	mid_side := header.mode == MODE_JOINT_STEREO and (header.mode_extension & MID_SIDE) != 0
+	for granule in 0:2 {
+		for channel in 0:channels {
+			info := &side.granules[granule][channel]
+			part_end := reader.at + info.part_2_3_length
+			read_scalefactors(decoder, &reader, info, side.scfsi[channel], granule, channel)
+			read_values(decoder, &reader, info, part_end)
+			requantize(decoder, info, header.rate_index, channel)
+			reader.at = part_end
+		}
+		if mid_side do undo_mid_side(decoder)
+		for channel in 0:channels {
+			info := &side.granules[granule][channel]
+			if info.block_type == SHORT_BLOCK do reorder(decoder, info, header.rate_index, channel)
+			antialias(decoder, info, channel)
+			inverse_mdct(decoder, info, channel)
+			synthesize(decoder, channel, granule * GRANULE_LINES, channels)
+		}
+	}
+	return true
+}
+
+// Reads a frame's side information (after its header and CRC).
+read_side_info :: fun(reader: ^Bit_Reader, header: Frame_Header) -> Side_Info, err {
+	side := Side_Info{0}
+	channels := header.channels
+	side.main_data_begin = read_bits(reader, 9)
+	_ = read_bits(reader, if channels == 1 do 5 else 3)   // (private bits)
+	for channel in 0:channels {
+		for band_group in 0:4 do side.scfsi[channel][band_group] = read_bit(reader) == 1
+	}
+	for granule in 0:2 {
+		for channel in 0:channels {
+			info := &side.granules[granule][channel]
+			info.part_2_3_length = read_bits(reader, 12)
+			info.big_values = read_bits(reader, 9)
+			info.global_gain = read_bits(reader, 8)
+			info.scalefac_compress = read_bits(reader, 4)
+			switched := read_bit(reader) == 1
+			if switched {
+				info.block_type = read_bits(reader, 2)
+				info.mixed = read_bit(reader) == 1
+				for region in 0:2 do info.table_select[region] = read_bits(reader, 5)
+				for window in 0:3 do info.subblock_gain[window] = read_bits(reader, 3)
+				if info.block_type == 0 do return side, Bad_Side_Info
+				// (Region 0 is the lowest 36 lines; region 1 the rest.)
+				info.region1_start = 36
+				info.region2_start = GRANULE_LINES
+			else
+				for region in 0:3 do info.table_select[region] = read_bits(reader, 5)
+				region0_count := read_bits(reader, 4)
+				region1_count := read_bits(reader, 3)
+				info.region1_start = long_band_start(header.rate_index, region0_count + 1)
+				info.region2_start = long_band_start(header.rate_index, region0_count + region1_count + 2)
+			}
+			info.preflag = read_bit(reader) == 1
+			info.scalefac_scale = read_bit(reader)
+			info.count1_table = read_bit(reader)
+			if info.big_values > GRANULE_LINES / 2 do return side, Bad_Side_Info
+			for region in 0:3 {
+				table := info.table_select[region]
+				if table == 4 or table == 14 do return side, Bad_Side_Info
+			}
+		}
+	}
+	return side
+}
+
+// Where a long scalefactor band starts (lines; past the last, the end).
+long_band_start :: fun(rate_index: i64, band: i64) -> i64 {
+	start : i64 = 0
+	for k in 0:min(band, LONG_BANDS) do start += LONG_WIDTHS[rate_index * LONG_BANDS + k]
+	return start
+}
+
+// Adds a frame's main data to what's kept (keeping no more of the frames'
+// before than a frame can reach back): where this frame's begins in it, -1
+// when it begins before what's kept.
+add_main_data :: fun(decoder: ^Mp3_Decoder, data: []byte, reach_back: i64) -> i64 {
+	if decoder.main_data.len + data.len > decoder.main_data.cap {
+		keep := min(decoder.main_data.len, REACH_BACK)
+		from := decoder.main_data.len - keep
+		for k in 0:keep do decoder.main_data[k] = decoder.main_data[from + k]
+		decoder.main_data.len = keep
+	}
+	start := decoder.main_data.len - reach_back
+	&decoder.main_data + data
+	if start < 0 do return -1
+	return start
+}
+
+// ---- bits ----------------------------------------------------------------------------
+
+read_bit :: fun(reader: ^Bit_Reader) -> i64 {
+	byte_at := reader.at >> 3
+	bit : i64 = 0
+	if byte_at < reader.data.len do bit = (i64(reader.data[byte_at]) >> (7 - (reader.at & 7))) & 1
+	reader.at += 1
+	return bit
+}
+
+// The next count bits as a number, the first highest.
+read_bits :: fun(reader: ^Bit_Reader, count: i64) -> i64 {
+	value : i64 = 0
+	for k in 0:count do value = (value << 1) | read_bit(reader)
+	return value
+}
+
+// The value of the next code, by the tree from root.
+read_code :: fun(reader: ^Bit_Reader, tables: ^Mp3_Tables, root: i64) -> i64 {
+	node := root
+	// (No code is longer than 19 bits; each tree is a whole code, so every
+	// way down it ends in a leaf.)
+	for k in 0:20 {
+		child := i64(tables.nodes[node][read_bit(reader)])
+		if child < 0 do return -1 - child
+		node = child
+	}
+	return 0
+}
+
+// ---- values --------------------------------------------------------------------------
+
+// Reads a granule's channel's scalefactors: a short block's for each band's
+// three windows (a mixed block's lowest 8 bands long); a long block's in
+// four groups, which granule 1 may take from granule 0 (as its scfsi says).
+read_scalefactors :: fun(decoder: ^Mp3_Decoder, reader: ^Bit_Reader, info: ^Granule_Info, scfsi: [4!]bool, granule: i64, channel: i64) {
+	low_bits := SLEN1[info.scalefac_compress]
+	high_bits := SLEN2[info.scalefac_compress]
+	if info.block_type == SHORT_BLOCK {
+		first_short : i64 = 0
+		if info.mixed {
+			for band in 0:8 do decoder.long_scalefactors[channel][band] = read_bits(reader, low_bits)
+			first_short = 3
+		}
+		for band in first_short:12 {
+			bits := if band < 6 do low_bits else high_bits
+			for window in 0:3 do decoder.short_scalefactors[channel][band][window] = read_bits(reader, bits)
+		}
+		for window in 0:3 do decoder.short_scalefactors[channel][12][window] = 0
+		return
+	}
+	for band_group in 0:4 {
+		if granule == 1 and scfsi[band_group] do continue
+		bits := if band_group < 2 do low_bits else high_bits
+		for band in SCFSI_BANDS[band_group]:SCFSI_BANDS[band_group + 1] do decoder.long_scalefactors[channel][band] = read_bits(reader, bits)
+	}
+	decoder.long_scalefactors[channel][21] = 0
+}
+
+// Reads a granule's channel's values: its big values' pairs (in up to
+// three regions, each with its table), then quads of values up to 1 until
+// its part's bits end (a quad running past the end isn't one); the rest 0.
+read_values :: fun(decoder: ^Mp3_Decoder, reader: ^Bit_Reader, info: ^Granule_Info, part_end: i64) {
+	tables := &decoder.tables
+	for k in 0:GRANULE_LINES do decoder.values[k] = 0
+	line : i64 = 0
+	for line < info.big_values * 2 {
+		table := info.table_select[2]
+		if line < info.region1_start do table = info.table_select[0]
+		elif line < info.region2_start do table = info.table_select[1]
+		if HUFFMAN_FIRST[table] >= 0 {
+			pair := read_code(reader, tables, tables.roots[table])
+			linbits := HUFFMAN_LINBITS[table]
+			decoder.values[line] = read_value(reader, pair >> 4, linbits)
+			decoder.values[line + 1] = read_value(reader, pair & 15, linbits)
+		}
+		line += 2
+	}
+	for line + 4 <= GRANULE_LINES and reader.at < part_end {
+		quad : i64 = 0
+		if info.count1_table == 1 do quad = 15 - read_bits(reader, 4)
+		else do quad = read_code(reader, tables, tables.quad_root)
+		for k in 0:4 {
+			if ((quad >> (3 - k)) & 1) == 1 {
+				decoder.values[line + k] = if read_bit(reader) == 1 do -1 else 1
+			}
+		}
+		if reader.at > part_end {
+			for k in 0:4 do decoder.values[line + k] = 0
+			break
+		}
+		line += 4
+	}
+}
+
+// A value: its size from the code, 15 with linbits more bits added to it,
+// then its sign bit (none for 0).
+read_value :: fun(reader: ^Bit_Reader, size: i64, linbits: i64) -> i64 {
+	value := size
+	if linbits > 0 and value == LINBITS_FROM do value += read_bits(reader, linbits)
+	if value != 0 and read_bit(reader) == 1 do value = -value
+	return value
+}
+
+// Turns a granule's channel's values into its frequency lines: each
+// |value|^(4/3), its sign, by the granule's gain and its band's
+// scalefactor (and a short window's gain).
+requantize :: fun(decoder: ^Mp3_Decoder, info: ^Granule_Info, rate_index: i64, channel: i64) {
+	gain := f64(info.global_gain - 210) / 4
+	multiplier : f64 = if info.scalefac_scale == 1 do 1 else 0.5
+	line : i64 = 0
+	if info.block_type == SHORT_BLOCK {
+		first_short : i64 = 0
+		if info.mixed {
+			for band in 0:8 {
+				scale := pow(2.0, gain - multiplier * f64(decoder.long_scalefactors[channel][band]))
+				line = requantize_band(decoder, channel, line, LONG_WIDTHS[rate_index * LONG_BANDS + band], f32(scale))
+			}
+			first_short = 3
+		}
+		for band in first_short:SHORT_BANDS {
+			width := SHORT_WIDTHS[rate_index * SHORT_BANDS + band]
+			for window in 0:3 {
+				exponent := gain - 2 * f64(info.subblock_gain[window]) - multiplier * f64(decoder.short_scalefactors[channel][band][window])
+				line = requantize_band(decoder, channel, line, width, f32(pow(2.0, exponent)))
+			}
+		}
+		return
+	}
+	for band in 0:LONG_BANDS {
+		raised := decoder.long_scalefactors[channel][band]
+		if info.preflag do raised += PRETAB[band]
+		scale := pow(2.0, gain - multiplier * f64(raised))
+		line = requantize_band(decoder, channel, line, LONG_WIDTHS[rate_index * LONG_BANDS + band], f32(scale))
+	}
+}
+
+// Requantizes count lines from a line by a scale: the line after them.
+requantize_band :: fun(decoder: ^Mp3_Decoder, channel: i64, from: i64, count: i64, scale: f32) -> i64 {
+	for line in from:from + count {
+		value := decoder.values[line]
+		size := decoder.tables.powers[min(abs(value), LARGEST_VALUE)] * scale
+		decoder.lines[channel][line] = if value < 0 do -size else size
+	}
+	return from + count
+}
+
+// ---- stereo and blocks ---------------------------------------------------------------
+
+// Mid/side stereo back to left and right: the mid's lines in the left
+// channel's, the side's in the right's.
+undo_mid_side :: fun(decoder: ^Mp3_Decoder) {
+	for line in 0:GRANULE_LINES {
+		middle := decoder.lines[0][line]
+		side := decoder.lines[1][line]
+		decoder.lines[0][line] = (middle + side) * 0.70710678
+		decoder.lines[1][line] = (middle - side) * 0.70710678
+	}
+}
+
+// A short block's lines, coded band by band (each band's three windows one
+// after another), put in order for the inverse MDCT: each line's three
+// windows together. A mixed block's lowest 36 lines (long) stay.
+reorder :: fun(decoder: ^Mp3_Decoder, info: ^Granule_Info, rate_index: i64, channel: i64) {
+	first_short : i64 = if info.mixed do 3 else 0
+	start : i64 = 0   // the band's first line in each window
+	for band in 0:first_short do start += SHORT_WIDTHS[rate_index * SHORT_BANDS + band]
+	from := start * 3
+	for band in first_short:SHORT_BANDS {
+		width := SHORT_WIDTHS[rate_index * SHORT_BANDS + band]
+		for window in 0:3 {
+			for k in 0:width do decoder.reordered[(start + k) * 3 + window] = decoder.lines[channel][start * 3 + window * width + k]
+		}
+		start += width
+	}
+	for line in from:GRANULE_LINES do decoder.lines[channel][line] = decoder.reordered[line]
+}
+
+// The antialiasing butterflies between neighbouring subbands' lines: all
+// 31 of a long block's boundaries, a mixed block's lowest only, none in a
+// short block.
+antialias :: fun(decoder: ^Mp3_Decoder, info: ^Granule_Info, channel: i64) {
+	boundaries : i64 = 31
+	if info.block_type == SHORT_BLOCK do boundaries = if info.mixed do 1 else 0
+	for subband in 1..boundaries {
+		for i in 0:8 {
+			lower := decoder.lines[channel][subband * 18 - 1 - i]
+			upper := decoder.lines[channel][subband * 18 + i]
+			decoder.lines[channel][subband * 18 - 1 - i] = lower * decoder.tables.antialias_cs[i] - upper * decoder.tables.antialias_ca[i]
+			decoder.lines[channel][subband * 18 + i] = upper * decoder.tables.antialias_cs[i] + lower * decoder.tables.antialias_ca[i]
+		}
+	}
+}
+
+// Each subband's 18 lines through the inverse MDCT into its 18 samples:
+// 36 outputs windowed (a short block's three 12-output windows, overlapped,
+// placed from 6), the first half added to the last granule's second half,
+// and the second half kept for the next. Then every odd subband's odd
+// samples turned over (the synthesis wants them so).
+inverse_mdct :: fun(decoder: ^Mp3_Decoder, info: ^Granule_Info, channel: i64) {
+	tables := &decoder.tables
+	outputs : [36!]f32
+	for subband in 0:32 {
+		block_type := info.block_type
+		if info.mixed and subband < 2 do block_type = 0
+		base := subband * 18
+		for i in 0:36 do outputs[i] = 0
+		if block_type == SHORT_BLOCK {
+			for window in 0:3 {
+				for i in 0:12 {
+					sum : f32 = 0
+					for k in 0:6 do sum += decoder.lines[channel][base + k * 3 + window] * tables.short_cosines[i][k]
+					outputs[6 + window * 6 + i] += sum * tables.windows[SHORT_BLOCK][i]
+				}
+			}
+		else
+			for i in 0:36 {
+				sum : f32 = 0
+				for k in 0:18 do sum += decoder.lines[channel][base + k] * tables.long_cosines[i][k]
+				outputs[i] = sum * tables.windows[block_type][i]
+			}
+		}
+		for i in 0:18 {
+			decoder.lines[channel][base + i] = outputs[i] + decoder.overlap[channel][base + i]
+			decoder.overlap[channel][base + i] = outputs[18 + i]
+		}
+		if subband % 2 == 1 {
+			for i in 0:9 do decoder.lines[channel][base + i * 2 + 1] = -decoder.lines[channel][base + i * 2 + 1]
+		}
+	}
+}
+
+// The polyphase synthesis: each of a granule's 18 times, the 32 subbands'
+// samples through the matrix into V's newest 64, then 32 samples of sound
+// from V's last 16 (U) by the window. Into the samples from first (a
+// sample of each channel), this channel's.
+synthesize :: fun(decoder: ^Mp3_Decoder, channel: i64, first: i64, channels: i64) {
+	tables := &decoder.tables
+	subbands : [32!]f32
+	for time in 0:18 {
+		for k in 0:32 do subbands[k] = decoder.lines[channel][k * 18 + time]
+		at := (decoder.synthesis_at[channel] - 64) & 1023
+		decoder.synthesis_at[channel] = at
+		for i in 0:64 {
+			sum : f32 = 0
+			for k in 0:32 do sum += tables.matrix[i][k] * subbands[k]
+			decoder.synthesis[channel][(at + i) & 1023] = sum
+		}
+		for j in 0:32 {
+			// U's 16 rows of 32: its even rows from V's even 64s' first
+			// halves, its odd rows from V's odd 64s' second halves.
+			sum : f32 = 0
+			for row in 0:16 {
+				from := (row >> 1) * 128 + j
+				if row % 2 == 1 do from += 96
+				sum += decoder.synthesis[channel][(at + from) & 1023] * tables.window[j + 32 * row]
+			}
+			decoder.samples[((first + time * 32 + j) * channels) + channel] = sum
+		}
+	}
+}
