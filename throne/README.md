@@ -148,10 +148,9 @@ Python prototypes (run with `python -I`):
   a level's walk grid shaded over its picture (blocked red, open green):
   how the grid's place on the level was checked.
 - `walk_fit.py <level folder>:<lex name> ...`: fits where levels' walk
-  grids lie, on their walls' outlines and named spots (the shrine: within
-  a cell of the hand fit; the Oda shrine's comes out about 7 cells
-  along from the Mori one's, so each level has its own corner, from
-  somewhere not found yet).
+  grids lie, on their walls' outlines and named spots (the Mori shrine:
+  1612, −215; the Citadel02 shrine 1612, −200, but the Citadel03 one
+  1482, 500: where a level's corner comes from isn't found yet).
 - `level.py <World.lot> <level folder> <lex name> <out.png> [file|y]`:
   draws a whole level from its layout and bundles (the prototype of
   level_art.mara).

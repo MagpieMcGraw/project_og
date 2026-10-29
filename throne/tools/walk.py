@@ -5,8 +5,9 @@ the block's size less 1, then its bytes) to the end. The blocks' bytes
 joined are LZW from their bit 3: 9-bit codes and wider as the table grows
 (to 12), lowest bit first, the table's new entries from 256, no clear or
 end codes; at 4096 entries the table starts over. Unpacked, a bit per
-cell, row by row, the high bit first: 1 blocked, 0 open; exactly width x
-height bits (all 110 of the game's). The rows run from the level's far end.
+cell, row by row, the low bit of each byte first: 1 blocked, 0 open;
+exactly width x height bits (all 110 of the game's). The rows run from the
+level's far end.
 
 walk.py <World.lot> <level folder> <lex name> <out.png> [cell_w cell_h x0 y0]
 draws the level (level.py) with the blocked cells shaded over it, the
@@ -70,7 +71,7 @@ def walk_grid(body):
         row = []
         for x in range(width):
             k = y * width + x
-            row.append((bits[k >> 3] >> (7 - (k & 7))) & 1)
+            row.append((bits[k >> 3] >> (k & 7)) & 1)
         rows.append(row)
     return width, height, rows
 
@@ -78,7 +79,7 @@ def walk_grid(body):
 if __name__ == '__main__':
     import lot, lex, spr8, level
     world_lot, folder, lex_name, out = sys.argv[1:5]
-    cell_w, cell_h, x0, y0 = (float(v) for v in sys.argv[5:9]) if len(sys.argv) > 8 else (32, 16, 1552, -256)
+    cell_w, cell_h, x0, y0 = (float(v) for v in sys.argv[5:9]) if len(sys.argv) > 8 else (32, 16, 1612, -215)
     data = open(world_lot, 'rb').read()
     table, start = lot.directory(data)
     files = {e[0].lower(): e for e in lot.entries(table)}

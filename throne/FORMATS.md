@@ -171,22 +171,35 @@ A level's folder holds:
   9-bit codes, a bit wider each time the table fills its width (to 12),
   lowest bit first, new entries from 256, no clear or end codes; at 4096
   entries the table starts over (9 bits, none past the bytes, the next
-  code a first one). Unpacked: a bit per cell, row by row, the high bit
-  first, 1 blocked — width × height bits exactly, all 110 of the game's
-  files (Mara's lzw.mara and tools/walk.py agree on them, open cell for
-  open cell). The rows run from the level's far end (the first row is the
-  one lowest on the screen).
+  code a first one). Unpacked: a bit per cell, row by row, the low bit
+  of each byte first (as the codes go), 1 blocked — width × height bits
+  exactly, all 110 of the game's files (Mara's lzw.mara and tools/walk.py
+  agree on them, open cell for open cell). The rows run from the level's
+  far end (the first row is the one lowest on the screen).
+  (Read high bit first, every run of 8 cells comes out backwards: the
+  shrine's floor showed a blocked band 4 cells in from its bottom-right
+  edge, an open strip 4 cells past its bottom-left wall, and furniture's
+  blocks beside the furniture. Lowest first, its open cells are one piece
+  that fills the room to its walls' feet on all four sides.)
   A cell is a 32 × 16 diamond of the level's pixels: cell gx of row up
   (counted from the far end) has its middle at x0 + (gx − up) × 16,
   y0 + (gx + up) × 8. Where (x0, y0) lies isn't known yet: for the shrine
-  it's (1552, −256), fitted on its back walls' outlines (the walls meet
-  within 6 pixels of the open area's corner), its named spots (all on
-  open cells) and its floor tiles (tools/walk.py draws it). Fitted by
-  tools/walk_fit.py on walls and spots alone it comes out within a cell
-  of that; the Oda shrine's comes out about 7 cells along from it, so
-  the corner is each level's own — in a field not decoded yet (the lex
-  header holds only 800, 600, 4; `IGRL` is 0). mp and sp
-  differ a little: multiplayer and single player (guess).
+  it's (1612, −215), fitted by tools/walk_fit.py on the outlines' wall
+  lines (open on the room's side) and its named spots, and checked by
+  eye with tools/walk.py: the open area meets the back walls' outlines
+  and the front edges' (the shrine's last OCOL, 133,1094 – 1148,1602 –
+  2175,1090) all round. The Citadel02 shrine (the same 200 × 200) fits
+  at (1612, −200), but the Citadel03 shrine at (1482, 500): each level
+  has its own corner, or it follows something not found yet (the lex
+  header holds only 800, 600, 4; `IGRL` is 0).
+  The shrine's grid blocks two table-sized spots of bare floor just in
+  front of its two low tables (in both mp and sp): the game's own data —
+  the tables moved after the grid was made, perhaps. Most furniture
+  isn't in the grid at all (chests, screens, the rack, the tables
+  themselves): their outlines (OCOL) may be what stops one there. mp and
+  sp differ a little (the shrine: 17 cells, the folding screen by the
+  front corner blocked in sp only): multiplayer and single player
+  (guess).
 - **.stripped.mp / .sp**: named spots: u32 0, u32 count, then each a u8
   name length, its name, i32 x, i32 y in the level's pixels (the shrine's:
   `1` at 813, 689; `DIAMYOITEM01` at 878, 782, beside the dead body;

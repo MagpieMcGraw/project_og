@@ -4,9 +4,10 @@
 // The file: u32 0, u32 width, u32 height (cells), then blocks, each a byte
 // (its size less 1: 0xFF for 256) and its bytes, to the file's end. The
 // blocks' bytes together are LZW (og's lzw.mara), from their bit 3.
-// Unpacked: the rows, a bit a cell, the high bit first — width x height
-// bits exactly (so all 110 of the game's). The rows are stored from the
-// level's far end: the first row is the one furthest down the screen.
+// Unpacked: the rows, a bit a cell, the low bit of each byte first (as the
+// LZW's codes go) — width x height bits exactly (so all 110 of the game's).
+// The rows are stored from the level's far end: the first row is the one
+// furthest down the screen.
 //
 // A cell is a 32 x 16 diamond of the level's pixels: cell gx of row
 // (counted from the far end) up has its middle at
@@ -30,7 +31,7 @@ CELL_HEIGHT :: 16.0
 WALK_HEAD :: 12
 // The levels whose grid's corner is known (fitted), and where it lies.
 WALK_CORNER_LEVELS :: ["Citadel1_Shrine"]
-WALK_CORNERS :: [8!][2!]f32{{1552, -256}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}}
+WALK_CORNERS :: [8!][2!]f32{{1612, -215}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}}
 
 Walk_Error :: error {
 	Not_A_Grid    // too short, a block running past its end, or too big for WALK_ROOM
@@ -95,7 +96,7 @@ walk_read :: fun(grid: ^Walk_Grid, file: []byte, x0: f32, y0: f32, stream: ^[]by
 cell_blocked :: fun(grid: ^Walk_Grid, gx: i64, up: i64) -> bool {
 	if gx < 0 or up < 0 or gx >= grid.width or up >= grid.height do return true
 	k := (grid.height - 1 - up) * grid.width + gx
-	return (i64(grid.bits[k >> 3]) >> (7 - (k & 7))) & 1 == 1
+	return (i64(grid.bits[k >> 3]) >> (k & 7)) & 1 == 1
 }
 
 // The cell a level point is in: gx, up.
