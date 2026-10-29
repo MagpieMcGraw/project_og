@@ -17,8 +17,8 @@ of that game's code.
 
 | Project | Game | Folder | Game data | Port |
 |---|---|---|---|---|
-| sooblivion | The Elder Scrolls IV: Oblivion (3D) | C:\Code\project_og\sooblivion | D:\SteamLibrary\steamapps\common\Oblivion\Data | 27100 |
-| sothrone | Throne of Darkness (2D sprites) | C:\Code\project_og\sothrone | D:\Games\Disciples 2\Throne of Darkness\LotFiles | 27200 |
+| sooblivion | The Elder Scrolls IV: Oblivion (3D) | C:\Code\project_og\oblivion | D:\SteamLibrary\steamapps\common\Oblivion\Data | 27100 |
+| sothrone | Throne of Darkness (2D sprites) | C:\Code\project_og\throne | D:\Games\Disciples 2\Throne of Darkness\LotFiles | 27200 |
 
 The port is the one a game hosts on: different, so both can run at once.
 

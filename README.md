@@ -9,8 +9,8 @@ names `../og`), so og/ and one game's folder are all of that game's code.
 | Folder | What it is |
 |---|---|
 | og | the modules the ports share (its README lists them) |
-| sooblivion | The Elder Scrolls IV: Oblivion |
-| sothrone | Throne of Darkness |
+| oblivion | sooblivion: The Elder Scrolls IV: Oblivion |
+| throne | sothrone: Throne of Darkness |
 
 project_og.md says what each port has that the others can use, what's
 still to be shared, and the ways of working the ports have in common.
