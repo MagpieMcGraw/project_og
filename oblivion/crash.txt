@@ -14,3 +14,12 @@ tree_picture.mara:98:2 runtime error: slice len 2097152 not in [0, 0] (cap) for 
 2026-10-28 09:36:46
 npc.mara:527:15 runtime error: take overflows storage: 262144 of 1 bytes at 2097152 exceed cap 2097152 for 'skin_storage'
 
+2026-10-29 10:54:11
+world.mara:297:15 runtime error: slice [875117:1917886400] of 'bytes' out of bounds: needs 0 <= low <= high <= 277504985
+
+2026-10-29 10:56:55
+inflate.mara:383:4 runtime error: slice assignment of 6 elements into 'room', from a value of 0
+
+2026-10-29 10:56:55
+inflate.mara:383:4 runtime error: slice assignment of 6 elements into 'room', from a value of 0
+
