@@ -1,0 +1,401 @@
+// sothrone: a source port of Throne of Darkness (Click Entertainment,
+// 2001), written in Mara. It will run on the game's own files (its
+// LotFiles\*.lot archives: FORMATS.md says what's in them).
+//
+// For now it is the game's skeleton: a window, and players in one room,
+// each walking where they click, the world kept by a server (server and
+// client from the start). Opened twice, the second joins the first's game.
+//
+//     sothrone                          the game: joins one on this machine, else hosts
+//     sothrone connect <address>        the game, joining the one at an address
+//     sothrone serve [port] [seconds] [open]   a server alone, no window
+//     sothrone bot [seconds] [address]  a player with no window, walking about
+//     sothrone picture <out.png> [seconds] [address]   the game unseen, its last frame written
+module sothrone
+
+use mara.core
+use mara.os
+use mara.math
+use mara.memory
+use mara.time
+use mara.string
+use mara.sdl
+use mara.open_gl
+use world_state
+use world_server
+use world_copy
+use game_link
+use wire
+use sdl_platform
+use png
+use logging
+
+#allocator Arena_Basic(256 * MB)
+
+// The window's size at first, in pixels; frames a second, at most.
+WINDOW_WIDTH :: 800
+WINDOW_HEIGHT :: 600
+FRAME_RATE :: 60.0
+// A player as drawn: a square this many room pixels across.
+PLAYER_SIZE :: 24.0
+
+// The journal: a log file, the first of sothrone.log, sothrone_2.log, …
+// that no other copy of the game is writing; the console only when none.
+open_journal :: fun() -> Journal {
+	for copy in 1..8 {
+		path : str64
+		&path + "sothrone"
+		if copy > 1 {
+			&path + "_"
+			&path + int_text(copy)
+		}
+		&path + ".log"
+		file, open_error := file_open_write(path)
+		if not open_error do return Journal{file = file, started = time_now(), line = []}
+	}
+	print("no journal file can be written: the console only")
+	return Journal{file = NO_FILE, started = time_now(), line = []}
+}
+
+// ---- the game ---------------------------------------------------------------
+
+// Where the room is drawn in the window: its top left, and window pixels
+// to a room pixel (the room as big as fits, in the middle).
+View :: struct {
+	left: f32
+	top: f32
+	scale: f32
+}
+
+view_of :: fun(platform: ^Platform) -> View {
+	scale := min(f32(platform.width) / f32(ROOM_WIDTH), f32(platform.height) / f32(ROOM_HEIGHT))
+	return View{left = (f32(platform.width) - f32(ROOM_WIDTH) * scale) / 2, top = (f32(platform.height) - f32(ROOM_HEIGHT) * scale) / 2, scale = scale}
+}
+
+// A player's colour, by their number: the first eight told apart.
+PLAYER_COLOURS :: [8!][3!]f32{{0.9, 0.75, 0.2}, {0.3, 0.6, 0.95}, {0.85, 0.3, 0.3}, {0.35, 0.8, 0.4},
+	{0.75, 0.45, 0.9}, {0.95, 0.55, 0.2}, {0.3, 0.85, 0.85}, {0.9, 0.9, 0.9}}
+
+// Fills a rectangle of the window (pixels from its top left) with a
+// colour: the scissor box cleared.
+fill :: fun(platform: ^Platform, x: f32, y: f32, width: f32, height: f32, colour: [3!]f32) {
+	Scissor(i32(x), i32(f32(platform.height) - y - height), i32(width), i32(height))
+	ClearColor(colour[0], colour[1], colour[2], 1)
+	Clear(COLOR_BUFFER_BIT)
+}
+
+// Draws the world as the server's told it: the room, and each player a
+// square of their colour (ours with a light edge).
+draw_world :: fun(platform: ^Platform, seen: ^World_Copy) {
+	Disable(SCISSOR_TEST)
+	ClearColor(0.04, 0.04, 0.05, 1)
+	Clear(COLOR_BUFFER_BIT)
+	Enable(SCISSOR_TEST)
+	view := view_of(platform)
+	fill(platform, view.left, view.top, f32(ROOM_WIDTH) * view.scale, f32(ROOM_HEIGHT) * view.scale, [3!]f32{0.16, 0.13, 0.1})
+	half := f32(PLAYER_SIZE) / 2 * view.scale
+	for player in seen.players {
+		x := view.left + player.x * view.scale
+		y := view.top + player.y * view.scale
+		if player.id == seen.me do fill(platform, x - half - 2, y - half - 2, half * 2 + 4, half * 2 + 4, [3!]f32{1, 1, 0.85})
+		colour := PLAYER_COLOURS[(player.id - 1) % 8]
+		fill(platform, x - half, y - half, half * 2, half * 2, colour)
+	}
+	Disable(SCISSOR_TEST)
+}
+
+// One frame of the game: where the left mouse button is pressed the player
+// walks to (held, they follow it), the link run, the world drawn.
+game_frame :: fun(platform: ^Platform, input: ^Input, link: ^Link, journal: ^Journal) {
+	if input.mouse_held[1] {
+		view := view_of(platform)
+		send_go(outgoing(link), (input.mouse_x - view.left) / view.scale, (input.mouse_y - view.top) / view.scale)
+	}
+	link_run(link, journal)
+	Viewport(0, 0, i32(platform.width), i32(platform.height))
+	draw_world(platform, &link.seen)
+}
+
+// The game in a window: joining the game at an address, or with none, the
+// one hosted on this machine, else hosting it. Escape or closing the window
+// ends it. False when it couldn't start (and it says why).
+command_play :: fun(address: []utf8) -> bool {
+	journal := open_journal()
+	defer journal_close(&journal)
+	link : Link
+	link_error := link_open(&link, &journal, address)
+	if link_error {
+		note(&journal, "couldn't join the game: ")
+		note_error(&journal, link_error)
+		note_end(&journal)
+		return false
+	}
+	defer link_close(&link)
+	platform, open_error := platform_open("sothrone", WINDOW_WIDTH, WINDOW_HEIGHT)
+	if open_error {
+		note(&journal, "couldn't open the window: ")
+		note_error(&journal, open_error)
+		note_end(&journal)
+		return false
+	}
+	defer platform_close(&platform)
+	input : Input
+	for true {
+		work := Timer()
+		read_input(&platform, &input)
+		if input.quit or input.pressed[Escape] do break
+		game_frame(&platform, &input, &link, &journal)
+		_ = present(&platform)
+		sleep(work, FRAME_RATE)
+	}
+	return true
+}
+
+// `sothrone picture <out.png> [seconds] [address]`: the game as a player
+// opening it sees it (linked as command_play links), in a window that's
+// never shown, for that many seconds (2 unless told); its player clicked
+// to walk toward the room's bottom right at the start. The last frame is
+// written to out.png. For looking at what the game draws without a window.
+command_picture :: fun(path: []utf8, seconds: f64, address: []utf8) {
+	journal := open_journal()
+	defer journal_close(&journal)
+	link : Link
+	link_error := link_open(&link, &journal, address)
+	if link_error {
+		print("couldn't join the game: %", link_error)
+		return
+	}
+	defer link_close(&link)
+	platform, open_error := platform_open("sothrone", WINDOW_WIDTH, WINDOW_HEIGHT, true)
+	if open_error {
+		print("couldn't open the window: %", open_error)
+		return
+	}
+	defer platform_close(&platform)
+	input : Input
+	start := time_now()
+	for true {
+		work := Timer()
+		gone := f64(time_now() - start) / 1000000000
+		input.mouse_held[1] = gone > 0.1 and gone < 0.2
+		input.mouse_x = f32(platform.width) * 0.8
+		input.mouse_y = f32(platform.height) * 0.8
+		game_frame(&platform, &input, &link, &journal)
+		if gone >= seconds {
+			save_frame(&platform, path, &journal)
+			break
+		}
+		_ = present(&platform)
+		sleep(work, FRAME_RATE)
+	}
+	bot_status(&link, &journal)
+}
+
+// What's been drawn this frame (not shown yet), written to a PNG at path.
+save_frame :: fun(platform: ^Platform, path: []utf8, journal: ^Journal) {
+	pixels : [16 * MB]byte = void
+	read_pixels(platform.width, platform.height, &pixels)
+	if pixels.len == 0 {
+		note(journal, "no picture: no room for its pixels")
+		note_end(journal)
+		return
+	}
+	// The rows from the top down, as a PNG has them.
+	upright : [16 * MB]byte = void
+	upright.len = pixels.len
+	row := platform.width * 4
+	for y in 0:platform.height {
+		from := (platform.height - 1 - y) * row
+		for k in 0:row do upright[y * row + k] = pixels[from + k]
+		for x in 0:platform.width do upright[y * row + x * 4 + 3] = u8(255)
+	}
+	png_storage : [16 * MB]byte = void
+	row_storage : [32 * MB]byte = void
+	encode_png(upright, platform.width, platform.height, &png_storage, &row_storage)
+	write_error := write_entire_file(path, png_storage)
+	if write_error {
+		note(journal, "couldn't write the picture: ")
+		note_error(journal, write_error)
+		note_end(journal)
+		return
+	}
+	note(journal, "picture written to ")
+	note(journal, path)
+	note_end(journal)
+}
+
+write_entire_file :: fun(path: []utf8, data: []byte) -> err {
+	file := file_open_write(path)?
+	defer file_close(file)
+	rest := data
+	for rest.len > 0 {
+		written := file_write(file, rest)?
+		if written <= 0 do return Write_Failed
+		rest = rest[written : rest.len]
+	}
+}
+
+// ---- without a window -------------------------------------------------------
+
+// `sothrone serve [port] [seconds] [open]`: the game's server alone, no
+// window, players connecting to it (`sothrone connect`): on this machine's
+// own address only, or open to others; for that many seconds (0: till it's
+// stopped). Who joins and leaves is told.
+command_serve :: fun(port: i64, seconds: f64, open: bool) {
+	server : World_Server
+	server_start(&server, true)
+	listen_error := server_listen(&server, u16(port), open)
+	if listen_error {
+		print("couldn't listen on port %: %", port, listen_error)
+		return
+	}
+	defer server_stop(&server)
+	print("serving the game on port % (%)", port, if open do "open to others" else "this machine's only")
+	start := time_now()
+	for seconds <= 0 or f64(time_now() - start) / 1000000000 < seconds {
+		server_run(&server)
+		sleep_ms(2)
+	}
+	print("served % ticks", server.state.ticks)
+}
+
+// How often a bot picks somewhere new to walk to, and says what it sees
+// (seconds).
+BOT_WALK_EVERY :: 2.0
+BOT_STATUS_EVERY :: 1.0
+
+// `sothrone bot [seconds] [address]`: a player with no window, linked as
+// the game links (game_link: the game at the address, or the one on this
+// machine, else hosting), walking somewhere new every BOT_WALK_EVERY
+// seconds, for that many seconds (10 unless told). Every second it says
+// where it is and whom it sees.
+command_bot :: fun(seconds: f64, address: []utf8) {
+	journal := open_journal()
+	defer journal_close(&journal)
+	link : Link
+	link_error := link_open(&link, &journal, address)
+	if link_error {
+		print("bot couldn't join the game: %", link_error)
+		return
+	}
+	defer link_close(&link)
+	start := time_now()
+	walks : u64 = 0
+	next_walk : f64 = 0.5
+	next_status : f64 = BOT_STATUS_EVERY
+	most_seen : i64 = 0
+	for true {
+		gone := f64(time_now() - start) / 1000000000
+		if gone >= seconds do break
+		link_run(&link, &journal)
+		seen := &link.seen
+		if seen.me != 0 and gone >= next_walk {
+			// Somewhere in the room, by chance this player and that walk alone have.
+			chance := (seen.seed ~ (u64(seen.me) *% 0x9E3779B97F4A7C15) ~ (walks *% 0xBF58476D1CE4E5B9)) *% 0x94D049BB133111EB
+			send_go(outgoing(&link), f32(chance % u64(ROOM_WIDTH)), f32((chance >> 32) % u64(ROOM_HEIGHT)))
+			walks += 1
+			next_walk += BOT_WALK_EVERY
+		}
+		if gone >= next_status {
+			bot_status(&link, &journal)
+			next_status += BOT_STATUS_EVERY
+		}
+		most_seen = max(most_seen, seen.players.len)
+		sleep_ms(5)
+	}
+	note(&journal, "bot done: player ")
+	note(&journal, link.seen.me)
+	note(&journal, if link.hosting do ", hosted" else ", joined")
+	note(&journal, "; most players seen at once: ")
+	note(&journal, most_seen)
+	note_end(&journal)
+}
+
+// A line in the journal: which player the bot is, whether it hosts, and
+// every player it's been told of, where they are.
+bot_status :: fun(link: ^Link, journal: ^Journal) {
+	seen := &link.seen
+	note(journal, "bot: player ")
+	note(journal, seen.me)
+	note(journal, if link.hosting do " (hosting)" else " (joined)")
+	if link.server_lost do note(journal, " (server lost)")
+	note(journal, "; players:")
+	for player in seen.players {
+		note(journal, " ")
+		note(journal, player.id)
+		note(journal, " at ")
+		note(journal, i64(player.x))
+		note(journal, ",")
+		note(journal, i64(player.y))
+		if player.walking do note(journal, " walking")
+	}
+	note_end(journal)
+}
+
+// ---- starting -----------------------------------------------------------------
+
+usage :: fun() {
+	print("sothrone                                 the game: joins one on this machine, else hosts")
+	print("sothrone connect <address[:port]>        the game, joining the one at an address")
+	print("sothrone serve [port] [seconds] [open]   a server alone, no window (port %)", GAME_PORT)
+	print("sothrone bot [seconds] [address]         a player with no window, walking about")
+	print("sothrone picture <out.png> [seconds] [address]   the game unseen, its last frame written")
+}
+
+wait_for_enter :: fun() {
+	print("press Enter to close")
+	line : [256]byte
+	_ = file_read(standard_input(), &line)   // (what's typed, or nothing: done either way)
+}
+
+main :: (args: [][]utf8) {
+	if args.len < 2 {
+		// Double-clicked, most likely: the console window goes when the
+		// program does, so a message about not starting is waited on.
+		if not command_play("") do wait_for_enter()
+		return
+	}
+	command := args[1]
+	if command == "help" {
+		usage()
+	elif command == "connect" and args.len > 2
+		if not command_play(args[2]) do wait_for_enter()
+	elif command == "serve"
+		port : i64 = GAME_PORT
+		seconds : f64 = 0
+		open := false
+		numbers : i64 = 0
+		for k in 2:args.len {
+			if args[k] == "open" {
+				open = true
+				continue
+			}
+			number, is_number := parse_number(args[k])
+			if not is_number do continue
+			if numbers == 0 do port = i64(number)
+			else do seconds = number
+			numbers += 1
+		}
+		command_serve(port, seconds, open)
+	elif command == "picture" and args.len > 2
+		seconds : f64 = 2
+		address := args[1][0:0]
+		if args.len > 3 {
+			number, is_number := parse_number(args[3])
+			if is_number do seconds = number
+		}
+		if args.len > 4 do address = args[4]
+		command_picture(args[2], seconds, address)
+	elif command == "bot"
+		seconds : f64 = 10
+		address := args[1][0:0]
+		if args.len > 2 {
+			number, is_number := parse_number(args[2])
+			if is_number do seconds = number
+		}
+		if args.len > 3 do address = args[3]
+		command_bot(seconds, address)
+	else
+		usage()
+	}
+}

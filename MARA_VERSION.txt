@@ -1,0 +1,4 @@
+Mara 6bbdec03 (2026-10-29 10:46): A slicing of a list or a slice keeps its len
+commit 6bbdec03e22f50356a08cd43c25533434bbd2190
+released 2026-10-29 10:52 by release.sh: Mara.exe built -o:speed from a clean tree
+suite with this Mara.exe and stdlib: pass=394  xfail=283  skip=20  mismatches=0

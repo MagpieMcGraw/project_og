@@ -1,0 +1,182 @@
+// Messages between a game's server and its clients, as bytes: in a queue
+// in one program (Wire_Queue: the host's own player), or over the network
+// (mara.os's TCP: wire_connect, wire_send, wire_receive). A message is its
+// kind and its body's size (u32 each), then its body: a plain value's
+// bytes, or a list's count (i64) and then its items'.
+//
+// What's taken off a queue is checked before it's used: a message that
+// says it's bigger than a queue holds breaks the queue (its connection's
+// let go), a list that doesn't fit its message isn't read — from a network
+// it may be anything. Off a network a message may come in parts: one not
+// all come yet waits for the rest (wire_receive, wire_send).
+//
+// Shared with sooblivion (its wire.mara as of 83fce8a, less its own
+// messages): what kinds of messages there are is each game's own.
+module wire
+
+use mara.core
+use mara.math
+use mara.memory
+use logging
+use mara.os
+use mara.string
+
+// A queue's room: what can wait in it at once.
+WIRE_ROOM :: 1 * MB
+// A message's head: its kind and its body's size.
+WIRE_HEAD :: 8
+
+// Messages waiting, from read_at to len; whether what's come can't be
+// messages (broken: from a network, its connection's to go).
+Wire_Queue :: struct {
+	bytes: [WIRE_ROOM]byte
+	read_at: i64
+	broken: bool
+}
+
+// A message taken off a queue: its kind, and its body (a view of the queue:
+// read it before putting more).
+Wire_Message :: struct {
+	kind: u32
+	body: []byte
+}
+
+// An empty queue.
+wire_start :: fun(queue: ^Wire_Queue) {
+	queue.bytes.len = 0
+	queue.read_at = 0
+	queue.broken = false
+}
+
+// Puts a message of a kind on a queue: a value's bytes for its body. (A
+// queue that's full drops it, the full log told.)
+wire_put :: fun(queue: ^Wire_Queue, kind: u32, value: $T) {
+	at := wire_head(queue, kind, size_of(T))
+	if at < 0 do return
+	queue.bytes[at] = value
+}
+
+// Puts a message of a kind on a queue: a list for its body, its count then
+// its items.
+wire_put_list :: fun(queue: ^Wire_Queue, kind: u32, items: []$T) {
+	at := wire_head(queue, kind, 8 + items.len * size_of(T))
+	if at < 0 do return
+	queue.bytes[at] = items.len
+	for item, k in items do queue.bytes[at + 8 + k * size_of(T)] = item
+}
+
+// Makes room on a queue for a message's head and a body of size bytes,
+// the head written: where the body goes; -1 when there's no room.
+wire_head :: fun(queue: ^Wire_Queue, kind: u32, size: i64) -> i64 {
+	if not fits(queue.bytes.len + WIRE_HEAD + size, queue.bytes.cap) do return -1
+	at := queue.bytes.len
+	queue.bytes.len += WIRE_HEAD + size
+	queue.bytes[at] = kind
+	queue.bytes[at + 4] = u32(size)
+	return at + WIRE_HEAD
+}
+
+// The next message on a queue, taken off it; false when there's none whole
+// yet (the rest of one may come: it waits), or the queue's broken. Once
+// all are taken the queue is empty again (the last one's body still there
+// till the next take).
+wire_take :: fun(queue: ^Wire_Queue) -> Wire_Message, bool {
+	none := Wire_Message{kind = 0, body = queue.bytes[0:0]}
+	if queue.broken do return none, false
+	if queue.read_at == queue.bytes.len {
+		queue.bytes.len = 0
+		queue.read_at = 0
+		return none, false
+	}
+	if queue.read_at + WIRE_HEAD > queue.bytes.len do return none, false
+	kind : u32 = queue.bytes[queue.read_at]
+	size : u32 = queue.bytes[queue.read_at + 4]
+	if i64(size) > WIRE_ROOM - WIRE_HEAD {
+		queue.broken = true
+		return none, false
+	}
+	body_at := queue.read_at + WIRE_HEAD
+	if body_at + i64(size) > queue.bytes.len do return none, false
+	queue.read_at = body_at + i64(size)
+	return Wire_Message{kind = kind, body = queue.bytes[body_at : body_at + i64(size)]}, true
+}
+
+// Moves what's still to be read to the front of a queue, for more to come
+// in after it.
+wire_compact :: fun(queue: ^Wire_Queue) {
+	if queue.read_at == 0 do return
+	left := queue.bytes.len - queue.read_at
+	for k in 0:left do queue.bytes[k] = queue.bytes[queue.read_at + k]
+	queue.bytes.len = left
+	queue.read_at = 0
+}
+
+// No connection: the host's own player's (its queues passed directly).
+no_connection :: fun() -> Tcp_Connection {
+	return Tcp_Connection{id = NO_SOCKET, v4 = false, peer = net_any(0)}
+}
+
+// Connects to a server at an address — a name or an IP address's text,
+// then :port, else the game's own port — tried for 2 seconds (a server just
+// started may not be listening yet).
+wire_connect :: fun(address_and_port: []utf8, game_port: u16) -> Tcp_Connection, err {
+	address := address_and_port
+	port := game_port
+	for c, k in address {
+		if c != ':' do continue
+		number, is_number := parse_number(address[k + 1 : address.len])
+		if is_number do port = u16(number)
+		address = address[0:k]
+		break
+	}
+	to := net_lookup(address, port)?
+	connection := no_connection()
+	connect_error : err
+	for try in 0:20 {
+		connection, connect_error = tcp_connect(to)
+		if not connect_error do break
+		sleep_ms(100)
+	}
+	return connection, connect_error
+}
+
+// Takes in what's come over a connection, after what's waiting. Closed when
+// the other side's gone (or what's come can't be messages: Bad_Messages).
+wire_receive :: fun(queue: ^Wire_Queue, connection: ^Tcp_Connection) -> err {
+	if queue.broken do return Bad_Messages
+	wire_compact(queue)
+	room := queue.bytes[queue.bytes.len : queue.bytes.cap]
+	open := tcp_receive(connection, &room)?
+	queue.bytes.len += room.len
+	if not open do return Closed
+}
+
+// Sends what's waiting over a connection, all of it (waiting while the
+// system has no room for more). Send_Failed when the other side's gone.
+wire_send :: fun(queue: ^Wire_Queue, connection: ^Tcp_Connection) -> err {
+	if queue.read_at == queue.bytes.len do return
+	tcp_send(connection, queue.bytes[queue.read_at : queue.bytes.len])?
+	queue.bytes.len = 0
+	queue.read_at = 0
+}
+
+Wire_Error :: error {
+	Bad_Messages    // what's come over a connection can't be messages
+	Closed          // the other side's gone
+}
+
+// A message's body as a value of a type; false when it's too short to be one.
+wire_value :: fun(message: Wire_Message, otherwise: $T) -> T, bool {
+	if message.body.len < size_of(T) do return otherwise, false
+	value : T = message.body[0]
+	return value, true
+}
+
+// A list message's count of items of a type, if its body holds them all
+// (and at most most of them); else 0 and false.
+wire_count :: fun(message: Wire_Message, item_size: i64, most: i64) -> i64, bool {
+	if message.body.len < 8 do return 0, false
+	count : i64 = message.body[0]
+	if count < 0 or count > most or 8 + count * item_size > message.body.len do return 0, false
+	return count, true
+}

@@ -1,0 +1,180 @@
+// The game's server: the world (World_State), stepped on its ticks, its
+// clients' messages taken in and the world told back to them (wire.mara).
+// A client's the host's own (in the same program: its queues passed to it
+// directly), or one connected over the network: for the server they're the
+// same, but for how their messages travel. (sooblivion's world_server, cut
+// down to what Throne has so far.)
+module world_server
+
+use mara.core
+use mara.math
+use mara.time
+use mara.string
+use mara.os
+use world_state
+use wire
+use logging
+
+// A client of the server, in a slot by its player's: whether one's here;
+// its connection (its id NO_SOCKET: the host's own); what it's said, and
+// what it's to be told.
+Server_Client :: struct {
+	here: bool
+	connection: Tcp_Connection
+	from_client: Wire_Queue
+	to_client: Wire_Queue
+}
+
+World_Server :: struct {
+	state: World_State
+	clients: [MAX_PLAYERS!]Server_Client
+	listener: Tcp_Listener   // where others connect (its id NO_SOCKET: none: only the host plays)
+	next_id: i64             // the next player's number
+	ticked_at: u64           // when its last tick was due
+	players_due: bool        // every client's to be told where everyone is
+	alone: bool              // a server alone (serve): it says who joins and leaves on the console
+}
+
+// A server starting: its world (world_start), no clients, not listening.
+// Hosted in a player's game, its joins and leaves are told to the players
+// (their journals); alone, on the console too.
+server_start :: fun(server: ^World_Server, alone: bool = false) {
+	server.alone = alone
+	world_start(&server.state)
+	for &client in server.clients {
+		client.here = false
+		client.connection = no_connection()
+		wire_start(&client.from_client)
+		wire_start(&client.to_client)
+	}
+	server.listener = Tcp_Listener{id = NO_SOCKET, v4 = false, port = 0}
+	server.next_id = 1
+	server.ticked_at = time_now()
+	server.players_due = true
+}
+
+// Has others connect to the server at a port: on this machine only, or
+// from others too (open). Port_Taken when another program has it.
+server_listen :: fun(server: ^World_Server, port: u16, open: bool) -> err {
+	server.listener = tcp_listen(if open do net_any(port) else net_local(port))?
+}
+
+server_stop :: fun(server: ^World_Server) {
+	tcp_listen_stop(&server.listener)
+	for &client in server.clients {
+		if client.here do tcp_close(&client.connection)
+		client.here = false
+	}
+}
+
+// A client joining, on a connection (no_connection: the host's own): its
+// slot, -1 when they're all taken. It's told which player it is; the
+// others, that it joined.
+server_join :: fun(server: ^World_Server, connection: Tcp_Connection) -> i64 {
+	for &client, slot in server.clients {
+		if client.here do continue
+		client.here = true
+		client.connection = connection
+		wire_start(&client.from_client)
+		wire_start(&client.to_client)
+		player := &server.state.players[slot]
+		player_clear(player, server.next_id, slot)
+		server.next_id += 1
+		wire_put(&client.to_client, MESSAGE_WELCOME, Welcome_Message{player = player.id, seed = server.state.seed})
+		server_tell_about(server, slot, " joined")
+		server.players_due = true
+		return slot
+	}
+	return -1
+}
+
+// A client gone (its connection closed), and why; its player with it.
+server_leave :: fun(server: ^World_Server, slot: i64, reason: err) {
+	client := &server.clients[slot]
+	if server.alone do print("player % left: %", server.state.players[slot].id, reason)
+	server_tell_about(server, slot, " left")
+	tcp_close(&client.connection)
+	client.here = false
+	player_clear(&server.state.players[slot], 0, slot)
+	server.players_due = true
+}
+
+// Runs the server as far as now: the connections made taken in, what its
+// clients have said taken in, the world's ticks due by now stepped
+// (WORLD_TICK each; MOST_TICKS_AT_ONCE at most, the rest let go), and each
+// client told where everyone is and sent what's waiting for it.
+server_run :: fun(server: ^World_Server) {
+	if server.listener.id != NO_SOCKET {
+		for true {
+			connection := no_connection()
+			connected, accept_error := tcp_accept(&server.listener, &connection)
+			if accept_error do print("couldn't take a connection: %", accept_error)
+			if not connected do break
+			slot := server_join(server, connection)
+			if slot < 0 {
+				print("a player couldn't join: the game's full")
+				tcp_close(&connection)
+				continue
+			}
+			if server.alone do print("player % joined", server.state.players[slot].id)
+		}
+	}
+	for &client, slot in server.clients {
+		if not client.here do continue
+		if client.connection.id != NO_SOCKET {
+			receive_error := wire_receive(&client.from_client, &client.connection)
+			if receive_error {
+				server_leave(server, slot, receive_error)
+				continue
+			}
+		}
+		for true {
+			message, has_message := wire_take(&client.from_client)
+			if not has_message do break
+			server_take(server, slot, message)
+		}
+	}
+	tick := u64(WORLD_TICK * 1000000000)
+	now := time_now()
+	ticks : i64 = 0
+	for now - server.ticked_at >= tick {
+		if ticks == MOST_TICKS_AT_ONCE {
+			server.ticked_at = now
+			break
+		}
+		world_step(&server.state)
+		server.ticked_at += tick
+		ticks += 1
+		server.players_due = true
+	}
+	seen := players_seen(&server.state)
+	for &client, slot in server.clients {
+		if not client.here do continue
+		if server.players_due do wire_put_list(&client.to_client, MESSAGE_PLAYERS, seen)
+		if client.connection.id != NO_SOCKET {
+			send_error := wire_send(&client.to_client, &client.connection)
+			if send_error do server_leave(server, slot, send_error)
+		}
+	}
+	server.players_due = false
+}
+
+// A message from the client in a slot, acted on.
+server_take :: fun(server: ^World_Server, slot: i64, message: Wire_Message) {
+	if message.kind == MESSAGE_GO {
+		go, whole := wire_value(message, Go_Message{x = 0, y = 0})
+		if whole do player_go(&server.state.players[slot], go.x, go.y)
+	}
+}
+
+// Tells every client but the one in a slot about its player: "player 2"
+// and what (" joined").
+server_tell_about :: fun(server: ^World_Server, slot: i64, what: []utf8) {
+	told := Note_Message{text = []}
+	&told.text + "player "
+	&told.text + int_text(server.state.players[slot].id)
+	&told.text + what
+	for &client, other_slot in server.clients {
+		if client.here and other_slot != slot do wire_put(&client.to_client, MESSAGE_NOTE, told)
+	}
+}
