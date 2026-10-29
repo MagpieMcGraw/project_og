@@ -41,7 +41,7 @@ use game_settings
 use indexing
 use random
 use game_sound
-use ui_layer
+use sprite_layer
 gl :: use mara.open_gl
 render :: use render
 
@@ -735,7 +735,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		shown.lights_changed = false
 	}
 	hud_start := time_now()
-	ui_begin(&viewer.renderer.ui)
+	layer_begin(&viewer.renderer.ui)
 	draw_hud(&viewer.hud, &viewer.book, &viewer.renderer, &viewer.archives, platform.width, platform.height, camera.yaw,
 		viewer.menu_open == 0)
 	draw_open_menu(viewer, platform.width, platform.height)

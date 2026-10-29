@@ -19,7 +19,7 @@ use sdl_platform
 use mara.string
 use logging
 use game_sound
-use ui_layer
+use sprite_layer
 render :: use render
 
 // The menus here (after game_menus' MENU_STATS and MENU_MAP).
@@ -311,7 +311,7 @@ menu_only_frame :: fun(viewer: ^Viewer) {
 	}
 	if input.pressed[Escape] do menu_back(viewer)
 	system_menu_input(viewer)
-	ui_begin(&viewer.renderer.ui)
+	layer_begin(&viewer.renderer.ui)
 	book_frame(&viewer.book)
 	draw_open_menu(viewer, platform.width, platform.height)
 	shown := &viewer.shown

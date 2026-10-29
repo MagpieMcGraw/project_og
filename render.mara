@@ -43,7 +43,7 @@ use sky
 use particles
 use logging
 use indexing
-use ui_layer
+use sprite_layer
 
 // ---- sizes ---------------------------------------------------------------------
 
@@ -1726,9 +1726,9 @@ Renderer :: struct {
 
 	// The scene's lights as the mesh programs read them (binding 3).
 	light_buffer: u32
-	// The screen's 2D layer (og's ui_layer: the HUD, menus), drawn over the
-	// frame last.
-	ui: Ui_Layer
+	// The screen's 2D layer (og's sprite_layer: the HUD, menus), drawn
+	// over the frame last.
+	ui: Sprite_Layer
 	// Rigged parts' vertices' influences (binding 4), each part's after the
 	// last's; this frame's palette they're posed with (binding 5), made by
 	// pose_npcs.
@@ -1802,7 +1802,7 @@ renderer_init :: fun(renderer: ^Renderer, storage: ^[]byte) -> err {
 	make_tree_program(&renderer.tree_programs[0], false)?
 	make_grass_program(&renderer.grass_programs[0], false)?
 	make_particle_program(&renderer.particle_program)?
-	ui_layer_open(&renderer.ui)?
+	layer_open(&renderer.ui)?
 	make_precipitation_program(&renderer.precipitation_program)?
 	if renderer.bindless_available {
 		make_tree_program(&renderer.tree_programs[1], true)?
@@ -1934,9 +1934,9 @@ compile_program :: fun(vertex_body: []utf8, fragment_body: []utf8, bindless: boo
 	vertex_shader := gl_compile_shader(VERTEX_SHADER, source)
 	shader_source(shared, fragment_body, bindless, &source)
 	fragment_shader := gl_compile_shader(FRAGMENT_SHADER, source)
-	if vertex_shader == 0 or fragment_shader == 0 do return 0, Shader_Failed
+	if vertex_shader == 0 or fragment_shader == 0 do return 0, Render_Error.Shader_Failed
 	program := gl_link_program(vertex_shader, fragment_shader)
-	if program == 0 do return 0, Shader_Failed
+	if program == 0 do return 0, Render_Error.Shader_Failed
 	return program
 }
 
@@ -3515,7 +3515,9 @@ draw_frame :: fun(renderer: ^Renderer, models: ^[]Gpu_Model, instances: ^[]Insta
 	ActiveTexture(TEXTURE0)
 	BindVertexArray(0)
 	// The 2D layer over it all.
-	draw_ui(&renderer.ui, width, height)
+	layer_draw(&renderer.ui, width, height)
+	Enable(CULL_FACE)
+	Enable(DEPTH_TEST)
 	// The frame into the window.
 	if soft {
 		BindFramebuffer(READ_FRAMEBUFFER, renderer.scene_framebuffer)
