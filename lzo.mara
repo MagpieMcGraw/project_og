@@ -1,0 +1,135 @@
+// LZO1X unpacking, the standard format (as lzo1x_decompress_safe reads
+// it): runs of bytes copied as they are (literals), between copies of
+// what's already been unpacked (matches: how far back, how many). A match
+// that reaches 16 KB back with a distance of 0 ends it: the bytes 11 00 00.
+//
+// Every read is checked against the packed bytes, every write against the
+// room given, and every match against what this unpacking has written:
+// bad data fails (Bad_Data), it never reads or writes outside.
+module lzo
+
+use mara.core
+
+Lzo_Error :: error {
+	Bad_Data      // the packed bytes end early, or a match reaches before the start
+	Out_Of_Room   // the unpacked bytes don't fit
+}
+
+// Where in the packed bytes the unpacking is.
+Lzo_Reader :: struct {
+	packed: []byte
+	at: i64
+}
+
+// Unpacks LZO1X data from packed onto the end of out (up to its cap): how
+// many of the packed bytes it took, up to and with its end.
+lzo_unpack :: fun(packed: []byte, out: ^[]byte) -> i64, err {
+	reader := Lzo_Reader{packed = packed, at = 0}
+	start := out.len
+	// The literals copied since the last match: none, 1 to 3, or a run
+	// (4: at least 4, or the long run that comes after a match's three).
+	literals : i64 = 0
+	first := next_byte(&reader)?
+	if first > 17 {
+		copy_literals(&reader, out, first - 17)?
+		literals = if first - 17 >= 4 do 4 else first - 17
+	else
+		reader.at = 0
+	}
+	for true {
+		code := next_byte(&reader)?
+		distance : i64 = 0
+		length : i64 = 0
+		trailing : i64 = 0
+		if code < 16 {
+			if literals == 0 {
+				// A run of literals: 3 more than its count.
+				count := long_count(&reader, code, 15)?
+				copy_literals(&reader, out, count + 3)?
+				literals = 4
+				continue
+			}
+			high := next_byte(&reader)?
+			if literals == 4 {
+				// After a run of literals: three bytes from 2 KB back or more.
+				distance = 1 + 0x800 + (code >> 2) + (high << 2)
+				length = 3
+			else
+				distance = 1 + (code >> 2) + (high << 2)
+				length = 2
+			}
+			trailing = code & 3
+		elif code >= 64
+			// A short match: up to 8 bytes, up to 2 KB back.
+			high := next_byte(&reader)?
+			distance = 1 + ((code >> 2) & 7) + (high << 3)
+			length = (code >> 5) + 1
+			trailing = code & 3
+		elif code >= 32
+			// A match up to 16 KB back.
+			count := long_count(&reader, code & 31, 31)?
+			pair := next_pair(&reader)?
+			distance = 1 + (pair >> 2)
+			length = count + 2
+			trailing = pair & 3
+		else
+			// A match 16 KB back or more, or the end.
+			count := long_count(&reader, code & 7, 7)?
+			pair := next_pair(&reader)?
+			far := ((code & 8) << 11) + (pair >> 2)
+			if far == 0 do return reader.at
+			distance = far + 0x4000
+			length = count + 2
+			trailing = pair & 3
+		}
+		copy_match(out, start, distance, length)?
+		copy_literals(&reader, out, trailing)?
+		literals = trailing
+	}
+	return reader.at
+}
+
+next_byte :: fun(reader: ^Lzo_Reader) -> i64, err {
+	if reader.at >= reader.packed.len do return 0, Bad_Data
+	value := i64(reader.packed[reader.at])
+	reader.at += 1
+	return value
+}
+
+// Two bytes, the low one first.
+next_pair :: fun(reader: ^Lzo_Reader) -> i64, err {
+	low := next_byte(reader)?
+	high := next_byte(reader)?
+	return low | (high << 8)
+}
+
+// A count from a code's low bits: when they're 0, it goes on in the bytes
+// after — 255 for each 0 byte, then the first that isn't, plus base.
+long_count :: fun(reader: ^Lzo_Reader, bits: i64, base: i64) -> i64, err {
+	if bits != 0 do return bits
+	count : i64 = 0
+	for true {
+		value := next_byte(reader)?
+		if value != 0 do return count + base + value
+		count += 255
+	}
+	return count
+}
+
+// Copies count bytes as they are from the packed bytes onto out.
+copy_literals :: fun(reader: ^Lzo_Reader, out: ^[]byte, count: i64) -> err {
+	if reader.at + count > reader.packed.len do return Bad_Data
+	if out.len + count > out.cap do return Out_Of_Room
+	for k in 0:count do out + reader.packed[reader.at + k]
+	reader.at += count
+}
+
+// Copies length bytes onto out from distance back in it — byte by byte, as
+// a match may copy what it's just copied. Not before start: this
+// unpacking's first byte.
+copy_match :: fun(out: ^[]byte, start: i64, distance: i64, length: i64) -> err {
+	from := out.len - distance
+	if from < start do return Bad_Data
+	if out.len + length > out.cap do return Out_Of_Room
+	for k in 0:length do out + out[from + k]
+}
