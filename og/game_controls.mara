@@ -1,0 +1,378 @@
+// A game's controls: what its player can do (its actions, the game's own
+// list, each a name) and what does each (its bindings: keys, mouse buttons,
+// the wheel turned; up to CONTROL_BINDINGS an action). The game asks after
+// its actions, not keys, so what does what can be changed: in a text file
+// the player edits (controls_read, controls_write), or while the game runs
+// (controls_bind, controls_unbind; controls_listen binds the next thing
+// pressed, for a controls menu's "press a key").
+//
+// The file: a line an action, `name = binding, binding` (none after the =:
+// nothing does it). A binding by its name: a key by SDL's (A, F2, Space,
+// Escape, LShift, Num1, Kp0, Left, …), Mouse_Left, Mouse_Middle,
+// Mouse_Right, Mouse_Back, Mouse_Forward, Wheel_Up, Wheel_Down. `//` starts
+// a comment. An action the file doesn't name keeps what the game gave it
+// (so a game's new actions come with theirs); a line not understood — an
+// action the game hasn't, a binding with no such name, more bindings than
+// there's room for — is passed over, its action keeping what it had, and
+// its number given back.
+//
+// Each frame (controls_update, after sdl_platform's read_input) an action
+// is down while anything that does it is held, pressed the frame one of
+// them went down, released the frame the last let go. A turn of the wheel
+// is a press, down that frame only.
+module game_controls
+
+use mara.core
+use mara.os
+use mara.memory
+use mara.math
+use mara.string
+use mara.sdl
+use sdl_platform
+use logging
+
+CONTROL_ACTIONS :: 64
+CONTROL_BINDINGS :: 4
+// Room for a controls file.
+CONTROLS_FILE_ROOM :: 16 * KB
+
+// What a binding is: nothing, a key (its code SDL's scancode), a mouse
+// button (SDL's number: 1 left, 2 middle, 3 right, 4 back, 5 forward), the
+// wheel (its code 1: turned up, -1: down).
+BINDING_NONE :: 0
+BINDING_KEY :: 1
+BINDING_MOUSE :: 2
+BINDING_WHEEL :: 3
+MOUSE_NAMES :: ["Mouse_Left", "Mouse_Middle", "Mouse_Right", "Mouse_Back", "Mouse_Forward"]
+
+// What the file says of itself, after the game's title: for the player
+// who opens it.
+CONTROLS_FILE_HELP :: ": an action a line, then what does it — several split by commas, nothing after
+// the = for none. Keys by SDL's names (A, F2, Space, Escape, LShift, Num1, Kp0,
+// Left, …); Mouse_Left, Mouse_Middle, Mouse_Right, Mouse_Back, Mouse_Forward;
+// Wheel_Up, Wheel_Down. An action left out keeps the game's own; a line not
+// understood is passed over (the game's journal says which)."
+
+Controls_Error :: error {
+	Too_Many_Actions   // more than CONTROL_ACTIONS
+	Bad_Default        // a default binding with no such name (the game's own mistake)
+}
+
+Binding :: struct {
+	kind: i64
+	code: i64
+}
+
+// An action: its name, what does it, and how it is this frame.
+Control :: struct {
+	name: [32]utf8
+	bindings: [CONTROL_BINDINGS]Binding
+	down: bool
+	pressed: bool
+	released: bool
+}
+
+// A game's actions (action k is the k-th it added), and
+// listening: the action the next thing pressed is bound to (-1: none), in
+// place of its binding listening_slot. heard is what listening bound last
+// (nothing while it listens), heard_also another action that binding does
+// too (-1: none), for a menu to say so.
+Controls :: struct {
+	actions: [CONTROL_ACTIONS]Control
+	listening: i64
+	listening_slot: i64
+	heard: Binding
+	heard_also: i64
+}
+
+// No actions yet (controls_add adds the game's), nothing listened for.
+controls_start :: fun(controls: ^Controls) {
+	controls.actions.len = 0
+	controls.listening = -1
+	controls.listening_slot = 0
+	controls.heard = Binding{kind = BINDING_NONE, code = 0}
+	controls.heard_also = -1
+}
+
+// One of the game's actions, by name, and what does it to start with, as
+// the file writes it ("Mouse_Left, Space"; "" for nothing): its number
+// (the actions number from 0, as they're added).
+controls_add :: fun(controls: ^Controls, name: []utf8, defaults: []utf8) -> i64, err {
+	if controls.actions.len == controls.actions.cap do return -1, Too_Many_Actions
+	bindings, known := parse_bindings(defaults)
+	if not known do return -1, Bad_Default
+	action := next(&controls.actions)
+	action.name.len = 0
+	add_what_fits(&action.name, name)
+	action.bindings = bindings
+	action.down = false
+	action.pressed = false
+	action.released = false
+	return controls.actions.len - 1
+}
+
+// Whether an action is down: something that does it held.
+action_down :: fun(controls: ^Controls, action: i64) -> bool {
+	return controls.actions[action].down
+}
+
+// Whether an action started this frame: something that does it went down.
+action_pressed :: fun(controls: ^Controls, action: i64) -> bool {
+	return controls.actions[action].pressed
+}
+
+// Whether an action stopped this frame: the last thing doing it let go.
+action_released :: fun(controls: ^Controls, action: i64) -> bool {
+	return controls.actions[action].released
+}
+
+// The actions as this frame's input has them (sdl_platform's read_input:
+// what's held, what went down). While listening, the first thing pressed
+// is bound instead (Escape: nothing is), and no action is down.
+controls_update :: fun(controls: ^Controls, input: ^Input) {
+	listening := controls.listening >= 0
+	if listening do listen(controls, input)
+	for &action in controls.actions {
+		was_down := action.down
+		action.down = false
+		action.pressed = false
+		if not listening {
+			for binding in action.bindings {
+				held, went_down := binding_state(binding, input)
+				if held do action.down = true
+				if went_down do action.pressed = true
+			}
+		}
+		action.released = was_down and not action.down
+	}
+}
+
+// Whether a binding is held this frame, and whether it went down.
+binding_state :: fun(binding: Binding, input: ^Input) -> bool, bool {
+	if binding.kind == BINDING_KEY do return input.held[binding.code], input.pressed[binding.code]
+	if binding.kind == BINDING_MOUSE do return input.mouse_held[binding.code], input.mouse_pressed[binding.code]
+	if binding.kind == BINDING_WHEEL {
+		turned := (binding.code > 0 and input.wheel > 0) or (binding.code < 0 and input.wheel < 0)
+		return turned, turned
+	}
+	return false, false
+}
+
+// Listens for the next thing pressed (a key, a mouse button, the wheel):
+// it's bound to the action in place of its binding slot (past its
+// bindings: added after them), at the next controls_update. heard says
+// what was bound once it is.
+controls_listen :: fun(controls: ^Controls, action: i64, slot: i64) {
+	controls.listening = action
+	controls.listening_slot = slot
+	controls.heard = Binding{kind = BINDING_NONE, code = 0}
+	controls.heard_also = -1
+}
+
+// This frame's first thing pressed bound to the action listened for;
+// Escape stops listening, binding nothing.
+listen :: fun(controls: ^Controls, input: ^Input) {
+	if input.pressed[Scancode.Escape] {
+		controls.listening = -1
+		return
+	}
+	heard := Binding{kind = BINDING_NONE, code = 0}
+	for k in 0:512 {
+		if input.pressed[k] and named_key(k) {
+			heard = Binding{kind = BINDING_KEY, code = k}
+			break
+		}
+	}
+	if heard.kind == BINDING_NONE {
+		for button in 1:6 {
+			if input.mouse_pressed[button] {
+				heard = Binding{kind = BINDING_MOUSE, code = button}
+				break
+			}
+		}
+	}
+	if heard.kind == BINDING_NONE and input.wheel > 0 do heard = Binding{kind = BINDING_WHEEL, code = 1}
+	if heard.kind == BINDING_NONE and input.wheel < 0 do heard = Binding{kind = BINDING_WHEEL, code = -1}
+	if heard.kind == BINDING_NONE do return
+	controls.heard_also = controls_bind(controls, controls.listening, controls.listening_slot, heard)
+	controls.heard = heard
+	controls.listening = -1
+}
+
+// Whether a key's code is one mara.sdl names: SDL's numbers have gaps
+// (those it doesn't use), and a key with no name couldn't be written.
+named_key :: fun(code: i64) -> bool {
+	return (code >= 4 and code <= 129) or (code >= 133 and code <= 164) or (code >= 176 and code <= 221) or
+		(code >= 224 and code <= 231) or (code >= 257 and code <= 290)
+}
+
+// Binds an action's binding slot (past its bindings: added after them) to
+// a binding: another action that binding does too given back (-1: none),
+// for the game to say so or unbind it there.
+controls_bind :: fun(controls: ^Controls, action: i64, slot: i64, binding: Binding) -> i64 {
+	bindings := &controls.actions[action].bindings
+	// (Already the action's own: moved to the slot, not doubled.)
+	for k in 0:bindings.len {
+		if same_binding(bindings[k], binding) {
+			controls_unbind(controls, action, k)
+			break
+		}
+	}
+	if slot < bindings.len {
+		bindings[slot] = binding
+	elif bindings.len < bindings.cap
+		bindings + binding
+	else
+		bindings[bindings.len - 1] = binding
+	}
+	for other, k in controls.actions {
+		if k == action do continue
+		for its in other.bindings {
+			if same_binding(its, binding) do return k
+		}
+	}
+	return -1
+}
+
+// Takes an action's binding slot off it (those after it move up).
+controls_unbind :: fun(controls: ^Controls, action: i64, slot: i64) {
+	bindings := &controls.actions[action].bindings
+	if slot < 0 or slot >= bindings.len do return
+	for k in slot:bindings.len - 1 do bindings[k] = bindings[k + 1]
+	bindings.len -= 1
+}
+
+same_binding :: fun(a: Binding, b: Binding) -> bool {
+	return a.kind == b.kind and a.code == b.code
+}
+
+// The action of a name: its number, -1 when the game has none of it.
+action_named :: fun(controls: ^Controls, name: []utf8) -> i64 {
+	for action, k in controls.actions {
+		if same_name(action.name, name) do return k
+	}
+	return -1
+}
+
+same_name :: fun(a: []utf8, b: []utf8) -> bool {
+	if a.len != b.len do return false
+	for c, k in a {
+		if b[k] != c do return false
+	}
+	return true
+}
+
+// A binding's name, as the file writes it.
+binding_name :: fun(binding: Binding) -> str64 {
+	name : str64
+	if binding.kind == BINDING_MOUSE {
+		&name + MOUSE_NAMES[binding.code - 1]
+	elif binding.kind == BINDING_WHEEL
+		if binding.code > 0 do &name + "Wheel_Up"
+		else do &name + "Wheel_Down"
+	elif binding.kind == BINDING_KEY
+		&name + Scancode(binding.code).text()
+	}
+	return name
+}
+
+// The binding a name stands for: false when none does.
+binding_named :: fun(word: []utf8) -> Binding, bool {
+	for name, k in MOUSE_NAMES {
+		if same_name(name, word) do return Binding{kind = BINDING_MOUSE, code = k + 1}, true
+	}
+	if same_name("Wheel_Up", word) do return Binding{kind = BINDING_WHEEL, code = 1}, true
+	if same_name("Wheel_Down", word) do return Binding{kind = BINDING_WHEEL, code = -1}, true
+	key := Scancode.from_text(word)
+	if key == Scancode.Unknown do return Binding{kind = BINDING_NONE, code = 0}, false
+	return Binding{kind = BINDING_KEY, code = i64(key)}, true
+}
+
+// Bindings as the file writes them ("Mouse_Left, Space"; blank: none):
+// false when one has no such name or there are more than there's room for.
+parse_bindings :: fun(text: []utf8) -> [CONTROL_BINDINGS]Binding, bool {
+	bindings : [CONTROL_BINDINGS]Binding
+	start : i64 = 0
+	for at in 0..text.len {
+		if at < text.len and text[at] != ',' do continue
+		word := trimmed(text[start : at])
+		start = at + 1
+		if word.len == 0 do continue
+		binding, known := binding_named(word)
+		if not known or bindings.len == bindings.cap do return bindings, false
+		&bindings + binding
+	}
+	return bindings, true
+}
+
+// An action's bindings as the file writes them ("Mouse_Left, Space";
+// empty: none).
+bindings_text :: fun(controls: ^Controls, action: i64) -> str256 {
+	text : str256
+	for binding, k in controls.actions[action].bindings {
+		if k > 0 do &text + ", "
+		&text + binding_name(binding)
+	}
+	return text
+}
+
+// The controls a file sets, over what they are: a line naming an action
+// gives it the bindings after its =. The numbers of the lines not
+// understood (counting from 1) into not_understood (as many as fit).
+controls_read :: fun(controls: ^Controls, path: []utf8, not_understood: ^[]i64) -> err {
+	not_understood.len = 0
+	storage : [CONTROLS_FILE_ROOM]byte = void
+	storage.len = 0
+	data := read_entire_file(path, &storage)?
+	text : []utf8 = data
+	start : i64 = 0
+	line_number : i64 = 0
+	for at in 0..text.len {
+		if at < text.len and text[at] != '\n' do continue
+		line := text[start : at]
+		start = at + 1
+		line_number += 1
+		// (A comment, from // on, left out.)
+		for k in 0:max(line.len - 1, 0) {
+			if line[k] == '/' and line[k + 1] == '/' {
+				line = line[0 : k]
+				break
+			}
+		}
+		line = trimmed(line)
+		if line.len == 0 do continue
+		understood := false
+		equals, has_equals := find_byte(line, '=')
+		if has_equals {
+			action := action_named(controls, trimmed(line[0 : equals]))
+			bindings, known := parse_bindings(line[equals + 1 : line.len])
+			if action >= 0 and known {
+				controls.actions[action].bindings = bindings
+				understood = true
+			}
+		}
+		if not understood and not_understood.len < not_understood.cap do not_understood + line_number
+	}
+}
+
+// The controls written to a file, over what was there: a comment of what
+// the file is (its title the game's: "Throne's controls"), then a line an
+// action.
+controls_write :: fun(controls: ^Controls, path: []utf8, title: []utf8) -> err {
+	text : [CONTROLS_FILE_ROOM]utf8
+	add_what_fits(&text, "// ")
+	add_what_fits(&text, title)
+	add_what_fits(&text, CONTROLS_FILE_HELP)
+	add_what_fits(&text, "\n")
+	for action, k in controls.actions {
+		add_what_fits(&text, action.name)
+		add_what_fits(&text, " =")
+		bindings := bindings_text(controls, k)
+		if bindings.len > 0 do add_what_fits(&text, " ")
+		add_what_fits(&text, bindings)
+		add_what_fits(&text, "\n")
+	}
+	file := file_open_write(path)?
+	defer file_close(file)
+	file_write_text(file, text)?
+}

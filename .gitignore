@@ -1,2 +1,4 @@
 # The one Mara compiler every game builds with (update_compiler.bat).
 compiler/
+*_controls.txt
+crash.txt

@@ -66,11 +66,13 @@ next build: rebuild each and rerun its checks after one.
 | file_cache | files unpacked from a game's archives kept on disk (append-only, safe against crashes), found by key | oblivion, unchanged but for Key_Index's module |
 | xml | XML a piece at a time (`next_piece`, `read_tag`): a tag's name as written and any attributes (`attribute(text, &tag, name)`, any case; values as places in the text), text between, comments passed over; `trim_xml_text` | oblivion's menus.mara tokenizer, which kept only three attributes and lowered names |
 | settings_file | settings kept as a Mara struct literal, `name = number` lines (`read_settings_file`, `write_settings_file`) | oblivion's game_settings.mara, its volumes left there |
+| game_controls | a game's actions and what does each, remappable: the game adds its actions with defaults (`controls_start`, `controls_add(name, "Mouse_Left, Space")`), asks after actions each frame (`controls_update` after read_input; `action_down`, `action_pressed`, `action_released`); keys by SDL's names, Mouse_Left…Mouse_Forward, Wheel_Up/Down, up to 4 an action; a text file the player edits (`controls_read` gives back the lines it couldn't take, `controls_write`); remapping as the game runs (`controls_bind`, `controls_unbind`, `controls_listen` for a menu's "press a key": `heard`, `heard_also` for a clash) | written for throne (2026-10-30); `throne controls check` tries it |
 
 Which ports use og:
 
 - **throne:** all of them, through og (build.mara `dirs = ["../og"]`).
-- **oblivion:** all of them but lzo, through og (build.mara `dirs =
+- **oblivion:** all of them but lzo, lzw and game_controls (written for
+  throne; game_controls could take over its keys), through og (build.mara `dirs =
   ["../og"]`, since 2026-10-29), keeping no copies. Its messages and
   DEFAULT_PORT are in its world_state. What stays its own on top of og's
   modules: game_sound (SOUN records, their loudness and pitch, placed
@@ -186,6 +188,10 @@ notes; GL errors noted once each.
 - In `for &x in list`, x is already a pointer: pass `x`, not `&x`.
 - Big locals: `x : [N * MB]byte = void` then `x.len = 0`, or they're
   cleared every call.
+- Open in throne's MARA_ISSUES.md: a constant array of text handed whole
+  to a `[][]utf8` param arrives garbled (the callee reads its text as
+  pointers; Mara 373ba2b7). Index or loop over it and hand the texts over
+  one at a time (game_controls' `controls_add`).
 - Open in oblivion's MARA_ISSUES.md: an untyped constant array of numbers
   (`TURNS :: [180, 135, -135]`) can't be indexed or looped. A typed one
   indexes fine in throne (`PLAYER_COLOURS :: [8!][3!]f32{…}`, Mara

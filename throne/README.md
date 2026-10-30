@@ -47,6 +47,15 @@ walk grid's blocked cells at the edge of where one can walk (red), and
 the layout's outlines — things' footprints (yellow), plain collision
 lines (orange), areas that set off events (blue), named spots (pink).
 
+The controls are actions (og's game_controls): walk (the left button,
+held: following the mouse), strike (the right), show_collision (F2), quit
+(Escape). What does each is in throne_controls.txt beside the journal,
+written with the game's own the first time and read every start after:
+change a line (`strike = Mouse_Right, Space`; keys by SDL's names, up to 4
+an action, nothing after the = for none) and it's so from the next start;
+a line it can't take is passed over, and the journal says which. Pictures
+and checks use the game's own, never the file.
+
     throne                            the game: joins one on this machine, else hosts
     throne connect <address[:port]>   the game, joining the one at an address
     throne serve [port] [seconds] [open]   a server alone, no window
@@ -55,6 +64,7 @@ lines (orange), areas that set off events (blue), named spots (pink).
     throne sprite <archive> <path | folder> <out.png>   a sprite's frames as the game's atlas lays them out
     throne walk-grid <level>          a level's walk grid: its size and open cells
     throne music-cache <track>        a track ("music\castle.mp3") unpacked where the game plays it from
+    throne controls [check]           what each action is on (the file written when there's none); check: og's game_controls tried on made-up input
 
 Opened twice, the second copy joins the first's game (port 27200, this
 machine only). Each run writes a journal: the first of throne.log,
@@ -72,8 +82,10 @@ pictures on the card), `walk_grid` (where one can walk, and routes),
 game's fonts, text drawn), `throne` (the commands, the window). From
 ../og, the modules the ports share
 (build.mara names the folder): `wire`, `logging`, `disk`,
-`sdl_platform`, `png`, `inflate`, `lzo`, `lzw`, `sprite_layer`,
-`audio` (the mixer and music), `mp3`, `indexing`, `random`.
+`sdl_platform`, `game_controls` (actions and what does each), `png`,
+`inflate`, `lzo`, `lzw`, `sprite_layer`, `audio` (the mixer and music),
+`mp3`, `indexing`, `random`. Mara problems met here are in
+MARA_ISSUES.md.
 
 
 ## What sooblivion already has

@@ -39,6 +39,8 @@ use audio
 use music_cache
 use text
 use png
+use disk
+use game_controls
 use logging
 
 #allocator Arena_Basic(256 * MB)
@@ -51,6 +53,19 @@ FRAME_RATE :: 60.0
 PLAYER_SIZE :: 24.0
 // How far above a player's feet their name is drawn (level pixels).
 NAME_HEIGHT :: 128.0
+
+// What a player does (og's game_controls), and what does each unless the
+// controls file (CONTROLS_FILE, beside the journal) says otherwise: walking
+// where the mouse is (held, following it), striking toward it, showing
+// what stops one, leaving.
+CONTROL_WALK :: 0
+CONTROL_STRIKE :: 1
+CONTROL_SHOW_COLLISION :: 2
+CONTROL_QUIT :: 3
+CONTROL_NAMES :: ["walk", "strike", "show_collision", "quit"]
+CONTROL_DEFAULTS :: ["Mouse_Left", "Mouse_Right", "F2", "Escape"]
+CONTROLS_FILE :: "throne_controls.txt"
+CONTROLS_TITLE :: "Throne's controls"
 
 // The journal: a log file, the first of throne.log, throne_2.log, …
 // that no other copy of the game is writing; the console only when none.
@@ -375,16 +390,75 @@ rectangle :: fun(view: ^Game_View, x: f32, y: f32, width: f32, height: f32, colo
 	layer_image(&view.layer, view.white, x, y, width, height, 0, 0, 1, 1, colour)
 }
 
-// One frame of the game: where the left mouse button is pressed the player
-// walks to (held, they follow it), the link run, the world drawn.
-game_frame :: fun(platform: ^Platform, input: ^Input, link: ^Link, journal: ^Journal, view: ^Game_View) {
+// The controls a player starts with: the game's own, then what the controls
+// file changes (the journal says which lines it couldn't take). With no
+// file, one's written with the game's own, for the player to change. Not
+// from the file: the game's own alone (for pictures and checks, the same
+// every time).
+open_controls :: fun(controls: ^Controls, journal: ^Journal, from_file: bool) {
+	start_error := game_own_controls(controls)
+	if start_error {
+		note(journal, "the game's own controls don't read: ")
+		note_error(journal, start_error)
+		note_end(journal)
+		return
+	}
+	if not from_file do return
+	_, missing := file_stamp(CONTROLS_FILE)
+	if missing {
+		write_error := controls_write(controls, CONTROLS_FILE, CONTROLS_TITLE)
+		note(journal, "no controls file: ")
+		if write_error {
+			note(journal, "couldn't write one: ")
+			note_error(journal, write_error)
+		else
+			note(journal, "written with the game's own, ")
+			note(journal, CONTROLS_FILE)
+		}
+		note_end(journal)
+		return
+	}
+	not_understood : [16]i64
+	read_error := controls_read(controls, CONTROLS_FILE, &not_understood)
+	if read_error {
+		note(journal, "couldn't read the controls file (the game's own kept): ")
+		note_error(journal, read_error)
+		note_end(journal)
+		return
+	}
+	note(journal, "controls from ")
+	note(journal, CONTROLS_FILE)
+	if not_understood.len > 0 {
+		note(journal, "; lines not understood (passed over):")
+		for line in not_understood {
+			note(journal, " ")
+			note(journal, line)
+		}
+	}
+	note_end(journal)
+}
+
+// The game's actions, each on what the game puts it on (CONTROL_NAMES and
+// CONTROL_DEFAULTS: action CONTROL_WALK is the first, and so on).
+game_own_controls :: fun(controls: ^Controls) -> err {
+	controls_start(controls)
+	for name, k in CONTROL_NAMES {
+		// (Each by itself: a list of constant texts handed over whole as a
+		// [][]utf8 arrives garbled, compiler 373ba2b7.)
+		_ = controls_add(controls, name, CONTROL_DEFAULTS[k])?
+	}
+}
+
+// One frame of the game, as the controls have it: walking where the mouse
+// is (held, following it), striking toward it, what stops one shown or
+// not; the link run, the world drawn.
+game_frame :: fun(platform: ^Platform, input: ^Input, controls: ^Controls, link: ^Link, journal: ^Journal, view: ^Game_View) {
 	room := view_of(platform, view.camera_x, view.camera_y)
 	mouse_x := (input.mouse_x - room.left) / room.scale
 	mouse_y := (input.mouse_y - room.top) / room.scale
-	if input.mouse_held[1] do send_go(outgoing(link), mouse_x, mouse_y)
-	// The right button strikes toward the mouse.
-	if input.mouse_pressed[3] do send_strike(outgoing(link), mouse_x, mouse_y)
-	if input.pressed[F2] do view.show_collision = not view.show_collision
+	if action_down(controls, CONTROL_WALK) do send_go(outgoing(link), mouse_x, mouse_y)
+	if action_pressed(controls, CONTROL_STRIKE) do send_strike(outgoing(link), mouse_x, mouse_y)
+	if action_pressed(controls, CONTROL_SHOW_COLLISION) do view.show_collision = not view.show_collision
 	link_run(link, journal)
 	take_level(&link.seen, view, journal)
 	ease_players(&link.seen, view)
@@ -476,8 +550,9 @@ read_walk_grid :: fun(world: ^Lot, info: ^Level_Info, walk: ^Walk_Grid, file: ^[
 }
 
 // The game in a window: joining the game at an address, or with none, the
-// one hosted on this machine, else hosting it. Escape or closing the window
-// ends it. False when it couldn't start (and it says why).
+// one hosted on this machine, else hosting it. Quitting (Escape, unless
+// the controls file says otherwise) or closing the window ends it. False
+// when it couldn't start (and it says why).
 command_play :: fun(address: []utf8) -> bool {
 	journal := open_journal()
 	defer journal_close(&journal)
@@ -503,12 +578,15 @@ command_play :: fun(address: []utf8) -> bool {
 	view : Game_View
 	view_open(&view, &journal, true)
 	defer audio_close(&view.mixer)
+	controls : Controls
+	open_controls(&controls, &journal, true)
 	input : Input
 	for true {
 		work := Timer()
 		read_input(&platform, &input)
-		if input.quit or input.pressed[Escape] do break
-		game_frame(&platform, &input, &link, &journal, &view)
+		controls_update(&controls, &input)
+		if input.quit or action_pressed(&controls, CONTROL_QUIT) do break
+		game_frame(&platform, &input, &controls, &link, &journal, &view)
 		_ = present(&platform)
 		sleep(work, FRAME_RATE)
 	}
@@ -544,6 +622,9 @@ command_picture :: fun(path: []utf8, seconds: f64, address: []utf8, click_x: f32
 	view : Game_View
 	view_open(&view, &journal, false)
 	view.show_collision = collision
+	// (The game's own controls: the mouse's buttons, as a player's would be.)
+	controls : Controls
+	open_controls(&controls, &journal, false)
 	input : Input
 	struck := false
 	start := time_now()
@@ -556,7 +637,8 @@ command_picture :: fun(path: []utf8, seconds: f64, address: []utf8, click_x: f32
 		if input.mouse_pressed[3] do struck = true
 		input.mouse_x = f32(platform.width) * click_x
 		input.mouse_y = f32(platform.height) * click_y
-		game_frame(&platform, &input, &link, &journal, &view)
+		controls_update(&controls, &input)
+		game_frame(&platform, &input, &controls, &link, &journal, &view)
 		if gone >= seconds {
 			save_frame(&platform, path, &journal)
 			break
@@ -717,6 +799,130 @@ bot_status :: fun(link: ^Link, journal: ^Journal) {
 	note_end(journal)
 }
 
+// `throne controls [check]`: the controls a player would start with (the
+// game's own, then the controls file's: written with the game's own when
+// there's none), each action and what does it. check: og's game_controls
+// tried on made-up input — a file read, written back and read again,
+// actions held and let go, listening for a key, the wheel — saying what
+// didn't come out as it should.
+command_controls :: fun(check: bool) {
+	if check {
+		check_controls()
+		return
+	}
+	journal := open_journal()
+	defer journal_close(&journal)
+	controls : Controls
+	open_controls(&controls, &journal, true)
+	for action, k in controls.actions do print("% = %", action.name, bindings_text(&controls, k))
+}
+
+// Where check_controls writes its file.
+CONTROLS_CHECK_FILE :: "cache/controls_check.txt"
+
+check_controls :: fun() {
+	failures := 0
+	controls : Controls
+	start_error := game_own_controls(&controls)
+	failures += expect(not start_error, "the game's own controls read")
+	failures += expect(same_text(bindings_text(&controls, CONTROL_WALK), "Mouse_Left"), "walk starts on Mouse_Left")
+	// A file: a comment, walk on two, strike on none, and three lines it
+	// can't take (an action and a key with no such name, a line with no =).
+	make_folder("cache")
+	sample := "// a comment\nwalk = Space, Mouse_Left   // two of them\nstrike =\nfly = F3\nshow_collision = F99\nquit\n"
+	sample_error := write_text_file(CONTROLS_CHECK_FILE, sample)
+	failures += expect(not sample_error, "the sample file written")
+	not_understood : [16]i64
+	read_error := controls_read(&controls, CONTROLS_CHECK_FILE, &not_understood)
+	failures += expect(not read_error, "the sample file read")
+	failures += expect(same_text(bindings_text(&controls, CONTROL_WALK), "Space, Mouse_Left"), "walk on Space and Mouse_Left")
+	failures += expect(same_text(bindings_text(&controls, CONTROL_STRIKE), ""), "strike on nothing")
+	failures += expect(same_text(bindings_text(&controls, CONTROL_SHOW_COLLISION), "F2"), "show_collision kept on F2 (F99 is no key)")
+	failures += expect(same_text(bindings_text(&controls, CONTROL_QUIT), "Escape"), "quit kept on Escape (its line has no =)")
+	failures += expect(not_understood.len == 3 and not_understood[0] == 4 and not_understood[1] == 5 and not_understood[2] == 6,
+		"lines 4, 5 and 6 not understood")
+	// Written back and read again: the same, every line understood.
+	write_error := controls_write(&controls, CONTROLS_CHECK_FILE, "The check's controls")
+	failures += expect(not write_error, "the controls written back")
+	again : Controls
+	_ = game_own_controls(&again)
+	again_error := controls_read(&again, CONTROLS_CHECK_FILE, &not_understood)
+	failures += expect(not again_error and not_understood.len == 0, "the written file read back, every line")
+	for k in 0:controls.actions.len {
+		failures += expect(same_text(bindings_text(&again, k), bindings_text(&controls, k)), "an action the same read back")
+	}
+	// Space held three frames, then let go.
+	input : Input
+	input.pressed[Scancode.Space] = true
+	input.held[Scancode.Space] = true
+	controls_update(&controls, &input)
+	failures += expect(action_down(&controls, CONTROL_WALK) and action_pressed(&controls, CONTROL_WALK), "walk pressed with Space")
+	input.pressed[Scancode.Space] = false
+	controls_update(&controls, &input)
+	failures += expect(action_down(&controls, CONTROL_WALK) and not action_pressed(&controls, CONTROL_WALK), "walk held, not pressed again")
+	input.held[Scancode.Space] = false
+	controls_update(&controls, &input)
+	failures += expect(not action_down(&controls, CONTROL_WALK) and action_released(&controls, CONTROL_WALK), "walk released")
+	controls_update(&controls, &input)
+	failures += expect(not action_released(&controls, CONTROL_WALK), "released one frame only")
+	// Listening: G pressed is bound to strike, and does nothing that frame.
+	controls_listen(&controls, CONTROL_STRIKE, 0)
+	input.pressed[Scancode.G] = true
+	input.held[Scancode.G] = true
+	controls_update(&controls, &input)
+	failures += expect(same_text(bindings_text(&controls, CONTROL_STRIKE), "G"), "strike listened onto G")
+	failures += expect(not action_pressed(&controls, CONTROL_STRIKE), "the key listened for strikes nothing")
+	failures += expect(controls.listening < 0 and controls.heard.kind == BINDING_KEY and controls.heard_also < 0, "heard G, no other action on it")
+	controls_update(&controls, &input)
+	failures += expect(action_down(&controls, CONTROL_STRIKE), "strike down with G after")
+	// F2 listened onto strike's second place: show_collision has it too.
+	input.pressed[Scancode.G] = false
+	input.held[Scancode.G] = false
+	controls_listen(&controls, CONTROL_STRIKE, 1)
+	input.pressed[Scancode.F2] = true
+	controls_update(&controls, &input)
+	input.pressed[Scancode.F2] = false
+	failures += expect(same_text(bindings_text(&controls, CONTROL_STRIKE), "G, F2"), "strike on G and F2")
+	failures += expect(controls.heard_also == CONTROL_SHOW_COLLISION, "F2 said to show collision too")
+	// Escape stops listening, binding nothing.
+	controls_listen(&controls, CONTROL_WALK, 0)
+	input.pressed[Scancode.Escape] = true
+	controls_update(&controls, &input)
+	input.pressed[Scancode.Escape] = false
+	failures += expect(controls.listening < 0 and same_text(bindings_text(&controls, CONTROL_WALK), "Space, Mouse_Left"), "Escape listens no more")
+	// The wheel turned down quits, that frame only.
+	wheel, _ := binding_named("Wheel_Down")
+	_ = controls_bind(&controls, CONTROL_QUIT, 1, wheel)
+	input.wheel = -1
+	controls_update(&controls, &input)
+	failures += expect(action_pressed(&controls, CONTROL_QUIT), "the wheel turned down quits")
+	input.wheel = 0
+	controls_update(&controls, &input)
+	failures += expect(not action_down(&controls, CONTROL_QUIT), "the wheel down that frame only")
+	// A mouse button listened for.
+	controls_listen(&controls, CONTROL_SHOW_COLLISION, 0)
+	input.mouse_pressed[2] = true
+	controls_update(&controls, &input)
+	input.mouse_pressed[2] = false
+	failures += expect(same_text(bindings_text(&controls, CONTROL_SHOW_COLLISION), "Mouse_Middle"), "show_collision listened onto Mouse_Middle")
+	if failures == 0 do print("controls check: all as they should be")
+	else do print("controls check: % failed", failures)
+}
+
+// A check's outcome: 1 when it failed (and it says so), else 0.
+expect :: fun(ok: bool, what: []utf8) -> i64 {
+	if ok do return 0
+	print("failed: %", what)
+	return 1
+}
+
+// Text written to a file, over what was there.
+write_text_file :: fun(path: []utf8, contents: []utf8) -> err {
+	file := file_open_write(path)?
+	defer file_close(file)
+	file_write_text(file, contents)?
+}
+
 // ---- starting -----------------------------------------------------------------
 
 usage :: fun() {
@@ -728,6 +934,7 @@ usage :: fun() {
 	print("throne sprite <archive> <path | folder> <out.png>   a sprite's frames as the game's atlas lays them out")
 	print("throne walk-grid <level>               a level's walk grid: its size and open cells")
 	print("throne music-cache <track>             a track (\"music\\castle.mp3\") unpacked where the game plays it from")
+	print("throne controls [check]                what each action is on (from %); check: the controls tried", CONTROLS_FILE)
 }
 
 // `throne music-cache <track>`: a music track, as World.ini names it,
@@ -917,6 +1124,8 @@ main :: (args: [][]utf8) {
 		command_picture(args[2], seconds, address, click_x, click_y, strike, collision)
 	elif command == "walk-grid" and args.len > 2
 		command_walk_grid(args[2])
+	elif command == "controls"
+		command_controls(args.len > 2 and args[2] == "check")
 	elif command == "music-cache" and args.len > 2
 		command_music_cache(args[2])
 	elif command == "sprite" and args.len > 4
