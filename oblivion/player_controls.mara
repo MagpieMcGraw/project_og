@@ -15,6 +15,7 @@ use mara.core
 use mara.os
 use mara.memory
 use mara.time
+use mara.string
 use mara.sdl
 use disk
 use sdl_platform
@@ -64,6 +65,50 @@ oblivion_controls :: fun(controls: ^Controls) -> Actions, err {
 	actions.toggle_vsync = controls_add(controls, "toggle_vsync", "V")?
 	actions.toggle_bindless = controls_add(controls, "toggle_bindless", "B")?
 	return actions
+}
+
+// A binding as the controls menu shows it, shorter than the file writes
+// it: a key by SDL's name, a mouse button by its number (Mouse 1 the left,
+// 2 the right, 3 the middle), the wheel turned up or down.
+binding_label :: fun(binding: Binding) -> str64 {
+	label : str64
+	match binding.kind {
+	unbound
+	keyboard
+		&label + Scancode(binding.code).text()
+	mouse_button
+		// (SDL numbers the middle 2, the right 3: shown the other way round.)
+		number := binding.code
+		if number == 2 do number = 3
+		elif number == 3 do number = 2
+		&label + "Mouse "
+		&label + int_text(number)
+	mouse_wheel
+		&label + (if binding.code > 0 do "Wheel Up" else "Wheel Down")
+	}
+	return label
+}
+
+// An action's bindings as its row in the controls menu shows them: their
+// labels, split by commas; when they're more than the row's room
+// (CONTROL_ROW_ROOM letters), the first alone; "-" for none.
+CONTROL_ROW_ROOM :: 11
+control_row_text :: fun(controls: ^Controls, action: i64) -> str64 {
+	text : str64
+	bindings := controls.actions[action].bindings
+	if bindings.len == 0 {
+		&text + "-"
+		return text
+	}
+	for binding, k in bindings {
+		if k > 0 do add_what_fits(&text, ", ")
+		add_what_fits(&text, binding_label(binding))
+	}
+	if text.len > CONTROL_ROW_ROOM {
+		text.len = 0
+		&text + binding_label(bindings[0])
+	}
+	return text
 }
 
 // An action's name as the controls menu shows it: its words, each begun in

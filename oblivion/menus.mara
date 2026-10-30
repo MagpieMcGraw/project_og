@@ -1148,14 +1148,18 @@ find_target :: fun(book: ^Menu_Book, tile: i64, parent_x: f32, parent_y: f32, pa
 	left := parent_x + trait_number(book, tile, "x", renderer, archives)
 	top := parent_y + trait_number(book, tile, "y", renderer, archives)
 	depth := parent_depth + trait_number(book, tile, "depth", renderer, archives)
+	width := trait_number(book, tile, "width", renderer, archives)
+	height := trait_number(book, tile, "height", renderer, archives)
+	inside := x >= left and x < left + width and y >= top and y < top + height
 	if trait_number(book, tile, "target", renderer, archives) == MENU_TRUE {
-		width := trait_number(book, tile, "width", renderer, archives)
-		height := trait_number(book, tile, "height", renderer, archives)
-		if x >= left and x < left + width and y >= top and y < top + height and depth >= found_depth^ {
+		if inside and depth >= found_depth^ {
 			found^ = tile
 			found_depth^ = depth
 		}
 	}
+	// What's in a window (a list's rows) is hit only within it: one
+	// scrolled past it isn't there to point at.
+	if not inside and trait_number(book, tile, "clipwindow", renderer, archives) == MENU_TRUE do return
 	child := book.tiles[tile].first_child
 	for child >= 0 {
 		find_target(book, child, left, top, depth, x, y, renderer, archives, found, found_depth)

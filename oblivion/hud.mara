@@ -75,6 +75,7 @@ Hud :: struct {
 	weapon_icon: [160]utf8
 	name: str256
 	named: u32
+	named_talks: bool   // what it names can be talked to (an NPC, another player; not a creature)
 	activate: i64
 	subtitle: [256]utf8
 	subtitle_until: u64
@@ -116,6 +117,7 @@ load_hud :: fun(hud: ^Hud, book: ^Menu_Book, archives: ^Archives, weapon_icon: [
 	add_what_fits(&hud.weapon_icon, weapon_icon)
 	hud.name.len = 0
 	hud.named = 0
+	hud.named_talks = false
 	hud.activate = 0
 	hud.ready = true
 }

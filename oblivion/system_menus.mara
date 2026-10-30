@@ -404,6 +404,16 @@ make_control_rows :: fun(viewer: ^Viewer) {
 	blue := trait_number(book, viewer.controls_menu, "blue", &viewer.renderer, &viewer.archives)
 	// (A row's height: the menu's user1, the list's over how many show.)
 	row_height := trait_number(book, viewer.controls_menu, "user1", &viewer.renderer, &viewer.archives)
+	// (A row's keys centered between the column's lines: the template's
+	// own center is right of that, and a long key ran over the line.)
+	keys_middle : f32 = -1
+	column_left := named_child(book, viewer.controls_menu, "controls_border_middle", true)
+	column_right := named_child(book, viewer.controls_menu, "controls_border_right", true)
+	if column_left >= 0 and column_right >= 0 {
+		left := trait_number(book, column_left, "x", &viewer.renderer, &viewer.archives) +
+			trait_number(book, column_left, "width", &viewer.renderer, &viewer.archives)
+		keys_middle = (left + trait_number(book, column_right, "x", &viewer.renderer, &viewer.archives)) / 2
+	}
 	for k in 0:viewer.controls.actions.len {
 		if not fits(viewer.control_rows.len + 1, viewer.control_rows.cap) do break
 		row := copy_template(book, viewer.controls_menu, "controls_template", pane)
@@ -415,18 +425,17 @@ make_control_rows :: fun(viewer: ^Viewer) {
 		tile_set(book, row, "green", green)
 		tile_set(book, row, "blue", blue)
 		tile_set(book, row, "height", row_height)
+		if keys_middle >= 0 do tile_set(book, row, "user2", keys_middle)
 	}
 	tile_set(book, pane, "childcount", f32(viewer.control_rows.len))
 	viewer.controls_scroll = 0
 	scroll_controls(viewer, 0)
 }
 
-// Each row's bindings shown as they are ("W, Up"; "-" for none).
+// Each row's bindings shown as they are (control_row_text: "W, Up";
+// "Mouse 1"; "-" for none).
 show_control_rows :: fun(viewer: ^Viewer) {
-	for row, k in viewer.control_rows {
-		bindings := bindings_text(&viewer.controls, k)
-		tile_set_text(&viewer.book, row, "user3", if bindings.len > 0 do bindings[0 : bindings.len] else "-")
-	}
+	for row, k in viewer.control_rows do tile_set_text(&viewer.book, row, "user3", control_row_text(&viewer.controls, k))
 }
 
 // Scrolls the list by rows (up, below 0), as far as it goes either way.

@@ -677,7 +677,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	viewer.targeted = if person != 0 do person else targeted
 	viewer.hud.activate = 0
 	if usable do viewer.hud.activate = ICON_DOOR
-	if person != 0 do viewer.hud.activate = ICON_TALK
+	if person != 0 and person == viewer.hud.named and viewer.hud.named_talks do viewer.hud.activate = ICON_TALK
 	if action_pressed(controls, actions.activate) and usable {
 		if leading >= 0 {
 			// Its opening sound, heard on after going through, where the door
@@ -987,6 +987,15 @@ take_first_person :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 		note_error(&viewer.journal, hud_error)
 		note_end(&viewer.journal)
 	}
+}
+
+// Whether one can talk to what a reference is: an NPC placed (ACHR), or
+// another player's body; not a creature, nor a thing.
+talks_to :: fun(plugin: ^Plugin, reference: u32) -> bool {
+	if reference == 0 do return false
+	if reference & 0xFF000000 == OTHER_PLAYER_KEY do return true
+	at, found := index_get(&plugin.records, u64(reference))
+	return found and record_header_at(plugin, at).kind == "ACHR"
 }
 
 // Plays a sound of the player's (a SOUN record's form id) where they are.
@@ -2366,6 +2375,7 @@ explore :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 		if viewer.targeted != viewer.hud.named {
 			viewer.hud.named = viewer.targeted
 			viewer.hud.name = reference_name(plugin, viewer.targeted)
+			viewer.hud.named_talks = talks_to(plugin, viewer.targeted)
 		}
 		// A swing's sounds, when step_first_person has them begin: its swish,
 		// its blow's on someone or something. The blow told of as it lands.
