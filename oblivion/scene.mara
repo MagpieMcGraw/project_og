@@ -159,12 +159,16 @@ Swinging_Door :: struct {
 	fresh: bool      // just placed: put open or shut as the world has it, not swung there
 }
 
+// The skeletons a scene keeps, at most (each about 1.7 MB).
+NPC_SKELETONS :: 64
+
 // What loading a model can fail with, beyond reading its file.
 Load_Error :: error {
 	Not_In_Archive     // no file of that path in the archives
 	No_Room_For_Models // the scene's models are all taken
 	No_Parts           // a part of a mesh with nothing to draw
-	No_Skeleton        // an NPC's skeleton (or its idle) couldn't be read
+	No_Skeleton        // a creature's record names no skeleton
+	Too_Many_Skeletons // the skeletons the scene keeps are all taken (NPC_SKELETONS)
 }
 
 // A model's collision: its points in the scene's collision, three a triangle.
@@ -297,8 +301,9 @@ Scene :: struct {
 	ready_keys: [2048]u64
 	ready_models_next: i64
 	ready_started: u64
-	// Skeletons NPCs are posed on (npc_model), their poses kept.
-	npc_skeletons: [4]Npc_Skeleton
+	// Skeletons NPCs and creatures are posed on (npc_model), their poses
+	// kept: every one met (the game has 45: the people's 2, 43 creatures').
+	npc_skeletons: [NPC_SKELETONS]Npc_Skeleton
 	// NPCs' models made for the card to move (assemble_npc, rigged): each
 	// one's skeleton, height and palette entries; found by their model + 1
 	// (an index's keys can't be 0), as their place + 1.

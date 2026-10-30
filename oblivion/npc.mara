@@ -132,7 +132,7 @@ Npc_Skeleton :: struct {
 	bones: [MAX_POSE_BONES]Pose_Bone
 	rig: [MAX_POSE_BONES]Rig_Bone
 	tracks: [256]Track
-	track_room: [1 * MB]byte
+	track_room: [320 * KB]byte
 	start: f32
 	stop: f32
 	walk: Npc_Motion
@@ -148,7 +148,7 @@ Npc_Skeleton :: struct {
 // feet don't slide; 0 when it doesn't move, posed by time).
 Npc_Motion :: struct {
 	tracks: [256]Track
-	room: [1 * MB]byte
+	room: [256 * KB]byte
 	rig: [MAX_POSE_BONES]Rig_Bone
 	start: f32
 	stop: f32
@@ -486,24 +486,22 @@ archive_path_under :: fun(folder: []utf8, name: []utf8, path: ^[256]utf8) {
 	}
 }
 
-// The pose of a skeleton (its path), as its idle animation starts: read
-// the first time it's asked for, then kept. Empty when it can't be read.
-// The skeleton at path (its index among the scene's kept ones): read the
-// first time it's asked for, then kept. -1 when it can't be read.
-npc_skeleton :: fun(scene: ^Scene, loader: Loader, look: ^Npc_Look) -> i64 {
+// A look's skeleton (its index among the scene's kept ones): read the
+// first time it's asked for, then kept. Failing, why: its skeleton or
+// idle couldn't be read, or the skeletons kept are all taken.
+npc_skeleton :: fun(scene: ^Scene, loader: Loader, look: ^Npc_Look) -> i64, err {
 	path := look.skeleton
 	for &kept, k in scene.npc_skeletons {
 		if kept.path == path do return k
 	}
-	if not fits(scene.npc_skeletons.len + 1, scene.npc_skeletons.cap) do return -1
+	if not fits(scene.npc_skeletons.len + 1, scene.npc_skeletons.cap) do return -1, Too_Many_Skeletons
 	kept := next(&scene.npc_skeletons)
 	kept.path.len = 0
 	&kept.path + path
 	skeleton_error := read_skeleton(loader.archives, loader.room, look, kept)
 	if skeleton_error {
-		note_failure(scene, path, skeleton_error)
 		scene.npc_skeletons.len -= 1
-		return -1
+		return -1, skeleton_error
 	}
 	if kept.motion_failure do note_failure(scene, "a walk or a run", kept.motion_failure)
 	return scene.npc_skeletons.len - 1
@@ -671,7 +669,7 @@ npc_model :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, npc_id: u32) ->
 	if found do return known - 1
 	model_index, build_error := build_npc_model(scene, plugin, loader, npc_id)
 	if build_error {
-		note_failure(scene, "an NPC", build_error)
+		note_failure(scene, "an NPC's or a creature's model", build_error)
 		model_index = -1
 	}
 	_ = index_put(&scene.paths, key, model_index + 1)
@@ -690,8 +688,7 @@ build_npc_model :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, npc_id: u
 	}
 	look : Npc_Look
 	read_actor_look(plugin, loader.archives, npc_id, &look)?
-	skeleton := npc_skeleton(scene, loader, &look)
-	if skeleton < 0 do return -1, No_Skeleton
+	skeleton := npc_skeleton(scene, loader, &look)?
 	pose : []Pose_Bone = scene.npc_skeletons[skeleton].bones
 	report := Npc_Report{failures = 0, first = [], reason = Not_In_Archive}
 	skins : [4]Face_Skin

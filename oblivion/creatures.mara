@@ -2,7 +2,8 @@
 // puts it together, headless — its look read, its skeleton and
 // animations, its meshes made — and what couldn't be, counted: how many
 // of each kind of failure, and the first creature with each. To see what
-// the game's creatures need that isn't read yet.
+// the game's creatures need that isn't read yet. `oblivion creatures
+// placed`: where Tamriel's are placed (creatures_placed).
 module oblivion
 
 use mara.core
@@ -15,6 +16,8 @@ use bsa
 use world
 use scene
 use logging
+use indexing
+use esm
 
 // A kind of failure the sweep counted: what failed (its stage) and why,
 // how many creatures, the first's editor id.
@@ -25,7 +28,7 @@ Creature_Failure :: struct {
 	first: str64
 }
 
-command_creatures :: fun() {
+command_creatures :: fun(placed: bool) {
 	index_storage : [96 * MB]byte
 	plugin, load_error := load_oblivion(&index_storage)
 	if load_error {
@@ -40,6 +43,10 @@ command_creatures :: fun() {
 		return
 	}
 	defer close_archives(&archives)
+	if placed {
+		creatures_placed(&plugin)
+		return
+	}
 	file_room : [16 * MB]byte = void
 	block_room : [16 * MB]byte = void
 	model_room : [64 * MB]byte = void
@@ -91,6 +98,56 @@ command_creatures :: fun() {
 	}
 	print("% creatures in % ms: % put together whole; % walk, % run", creatures, elapsed_ms(started), whole_ones, walking, running)
 	for failure in failures do print("  % (%): % creatures, the first %", failure.stage, failure.reason, failure.count, failure.first)
+}
+
+// Where Tamriel's creatures are placed: its cells' creature references
+// (and its persistent cell's), how many are disabled (a quest brings them
+// in), how many leveled ones come to none (their list's chance of none),
+// and how many cells have any — the creatures a player meets outside.
+creatures_placed :: fun(plugin: ^Plugin) {
+	scratch : [64 * KB]byte = void
+	scratch.len = 0
+	tamriel := find_world(plugin, "Tamriel", &scratch)
+	if tamriel == 0 {
+		print("no world Tamriel")
+		return
+	}
+	cells : i64 = 0
+	cells_with : i64 = 0
+	placed : i64 = 0
+	disabled : i64 = 0
+	leveled : i64 = 0
+	none : i64 = 0
+	references : [16384]Reference = void
+	for key, slot in plugin.exterior_cells.keys {
+		if key == 0 or u32(key >> 32) != tamriel do continue
+		cells += 1
+		references.len = 0
+		_ = cell_references(plugin, plugin.exterior_cells.values[slot], &references)
+		here : i64 = 0
+		for reference in references {
+			at, found := index_get(&plugin.records, u64(reference.base))
+			if not found do continue
+			kind := record_header_at(plugin, at).kind
+			if kind != "CREA" and kind != "LVLC" do continue
+			placed += 1
+			if reference.flags & RECORD_DISABLED != 0 {
+				disabled += 1
+				continue
+			}
+			if kind == "LVLC" {
+				leveled += 1
+				if leveled_form(plugin, reference.base, u64(reference.form_id)) == 0 {
+					none += 1
+					continue
+				}
+			}
+			here += 1
+		}
+		if here > 0 do cells_with += 1
+	}
+	print("Tamriel: % cells; % creatures placed in them (% disabled), % leveled (% of those come to none); % cells with one",
+		cells, placed, disabled, leveled, none, cells_with)
 }
 
 // Counts a creature's failure with those of its stage and reason.
