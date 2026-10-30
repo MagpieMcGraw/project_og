@@ -1,0 +1,112 @@
+// `oblivion creatures`: every creature (CREA) put together as the viewer
+// puts it together, headless — its look read, its skeleton and
+// animations, its meshes made — and what couldn't be, counted: how many
+// of each kind of failure, and the first creature with each. To see what
+// the game's creatures need that isn't read yet.
+module oblivion
+
+use mara.core
+use mara.os
+use mara.math
+use mara.memory
+use mara.time
+use mara.string
+use bsa
+use world
+use scene
+use logging
+
+// A kind of failure the sweep counted: what failed (its stage) and why,
+// how many creatures, the first's editor id.
+Creature_Failure :: struct {
+	stage: str64
+	reason: err
+	count: i64
+	first: str64
+}
+
+command_creatures :: fun() {
+	index_storage : [96 * MB]byte
+	plugin, load_error := load_oblivion(&index_storage)
+	if load_error {
+		print("couldn't load the plugins: %", load_error)
+		return
+	}
+	directory_storage : [64 * MB]byte
+	archives : Archives
+	open_error := open_all_archives(&archives, &directory_storage)
+	if open_error {
+		print("couldn't open the archives: %", open_error)
+		return
+	}
+	defer close_archives(&archives)
+	file_room : [16 * MB]byte = void
+	block_room : [16 * MB]byte = void
+	model_room : [64 * MB]byte = void
+	texture_room : [1 * KB]byte = void
+	file_room.len = 0
+	block_room.len = 0
+	model_room.len = 0
+	texture_room.len = 0
+	room := load_room(&file_room, &block_room, &model_room, &texture_room)
+	failures : [32]Creature_Failure
+	creatures : i64 = 0
+	whole_ones : i64 = 0
+	walking : i64 = 0
+	running : i64 = 0
+	scratch : [64 * KB]byte = void
+	skeleton : Npc_Skeleton = void
+	started := time_now()
+	for key, slot in plugin.records.keys {
+		if key == 0 do continue
+		if record_header_at(&plugin, i64(plugin.records.values[slot])).kind != "CREA" do continue
+		creatures += 1
+		scratch.len = 0
+		record, _ := record_at(&plugin, i64(plugin.records.values[slot]), &scratch)
+		name : str64
+		add_what_fits(&name, editor_id(record.data))
+		look : Npc_Look
+		look_error := read_actor_look(&plugin, &archives, u32(key), &look)
+		if look_error {
+			count_failure(&failures, "its look", look_error, name)
+			continue
+		}
+		skeleton_error := read_skeleton(&archives, &room, &look, &skeleton)
+		if skeleton_error {
+			count_failure(&failures, "its skeleton or idle", skeleton_error, name)
+			continue
+		}
+		if skeleton.motion_failure do count_failure(&failures, "a walk or a run", skeleton.motion_failure, name)
+		if skeleton.walk.rig.len > 0 do walking += 1
+		if skeleton.run.rig.len > 0 do running += 1
+		report := Npc_Report{failures = 0, first = [], reason = Not_In_Archive}
+		skins : [4]Face_Skin
+		skin_storage : [1 * KB]byte
+		_ = assemble_npc(&archives, &room, &look, skeleton.bones, true, &report, &skins, &skin_storage)
+		if report.failures > 0 {
+			count_failure(&failures, "a mesh", report.reason, name)
+			continue
+		}
+		whole_ones += 1
+	}
+	print("% creatures in % ms: % put together whole; % walk, % run", creatures, elapsed_ms(started), whole_ones, walking, running)
+	for failure in failures do print("  % (%): % creatures, the first %", failure.stage, failure.reason, failure.count, failure.first)
+}
+
+// Counts a creature's failure with those of its stage and reason.
+count_failure :: fun(failures: ^[]Creature_Failure, stage: []utf8, reason: err, name: []utf8) {
+	for &failure in failures {
+		if failure.stage == stage and failure.reason == reason {
+			failure.count += 1
+			return
+		}
+	}
+	if not fits(failures.len + 1, failures.cap) do return
+	failure := next(failures)
+	failure.stage.len = 0
+	add_what_fits(&failure.stage, stage)
+	failure.reason = reason
+	failure.count = 1
+	failure.first.len = 0
+	add_what_fits(&failure.first, name)
+}

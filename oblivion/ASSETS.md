@@ -70,6 +70,14 @@ Oblivion.esm and the base game's archives; sizes are as stored.
   decoded by og's mp3), by the place's kind: an interior cell's XCMT, a
   world's SNAM (the cities public, Oblivion's planes dungeon), a region's
   RDMD.
+- **Creatures, standing:** the creatures placed (ACRE), a leveled one
+  (LVLC) as the one its list gives that placing at level 10 (the server
+  picks, so every player sees the same), put together as NPCs are: their
+  skeleton (MODL), the meshes beside it (NIFZ), their size (BNAM),
+  skinned and playing the `idle.kf` beside their skeleton; their walk
+  (`forward.kf`) and run (`fastforward.kf`, else `runforward.kf`) read.
+  `oblivion creatures` puts every one together headless: 959 of 992
+  whole (see below for the rest).
 - **Animation:** Idle sequences' movement, scrolling textures, glow and
   opacity changes, NPCs' idle (see below for what's left).
 
@@ -83,7 +91,8 @@ Oblivion.esm and the base game's archives; sizes are as stored.
 | Faces' age and expressions | the age maps (`headhuman{m,f}{10..60}.dds` and their normal maps: the skin shader's FaceGenMap1, times 4), which `facegen\si.ctl`'s age control picks; `.tri` 85 (expressions, the mouth for speech); the bodies' `.egt` | shapes and skins are used (see above); the skin is as if of no age |
 | Weapons and shields worn | WEAP, their models on the back or side (a mesh's `Prn` names the bone: SideWeapon, BackWeapon) | the player holds one in first person |
 | Combat | WEAP damage and reach, health, NPC reactions (stagger, recoil `.kf`), blocking, power attacks, the player's gear and inventory | a blow finds whom or what it meets, and sounds; nothing comes of it yet |
-| Creatures | ACRE 1,473 placed; CREA 914; 34 creature folders | none drawn |
+| Creatures moving, fighting, their sounds | CREA's AI packages, attacks (`handtohandattack*.kf`, `attackforward*.kf`), sound lists (CSCR, CSDT) | they stand, breathing; walked round as a person is (an upright cylinder 56 across: a horse's too, a rat's too) |
+| Creatures not put together | 28 whose NIFZ names a mesh the archives haven't by that name (Knights of the Nine's: `MinionHead.NIF` where Knights.bsa has `ndminionhead.nif`), 5 templates with no skeleton (MS16OgreCreatureTemplate…) | how the game finds those meshes isn't known yet |
 | Animations | `.kf` 1,843 (creatures 1,068, characters 775); IDLE 650 | read (B-splines too, and text keys); NPCs play idle.kf; the player's first-person idle and two attacks |
 | Voices | Voices1/2 BSAs: 38,898 `.mp3` + `.lip`, 1.7 GB; DIAL 3,817, INFO 19,278 | og's mp3 decodes them (checked against ffmpeg); `.lip` drives FaceGen mouth morphs |
 

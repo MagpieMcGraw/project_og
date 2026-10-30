@@ -355,7 +355,8 @@ Reference :: struct {
 	flags: u32         // RECORD_*: disabled, persistent…
 }
 
-// The references in a cell (REFR records, and the NPCs placed, ACHR), into
+// The references in a cell (REFR records, the NPCs placed, ACHR, and the
+// creatures, ACRE), into
 // references: from each plugin file's group for the cell, each reference
 // as the last file to have it has it (a later one may move it to another
 // cell, or delete it).
@@ -374,7 +375,7 @@ cell_references :: fun(plugin: ^Plugin, cell: u32, references: ^[]Reference) -> 
 			}
 			next_at := at + HEADER_SIZE + i64(header.size)
 			if next_at > end do return Broken_Group
-			placed := header.kind == "REFR" or header.kind == "ACHR"
+			placed := header.kind == "REFR" or header.kind == "ACHR" or header.kind == "ACRE"
 			if placed and fits(references.len + 1, references.cap) and winning_copy(plugin, file, header, at) {
 				body := plugin_bytes(plugin, at + HEADER_SIZE, i64(header.size))
 				references + read_reference(plugin, file, header, body)
@@ -800,6 +801,71 @@ area_around :: fun(x: i64, y: i64) -> Grid_Area {
 	return Grid_Area{everywhere = false,
 		low_x = x - EXTERIOR_RADIUS, low_y = y - EXTERIOR_RADIUS,
 		high_x = x + EXTERIOR_RADIUS, high_y = y + EXTERIOR_RADIUS}
+}
+
+// ---- leveled lists --------------------------------------------------------------
+
+// The player's level leveled lists are taken at: a middling one's.
+GEAR_LEVEL :: 10
+
+// What a form comes to: itself, or for a leveled list (LVLI of items,
+// LVLC of creatures), one of its entries at GEAR_LEVEL — of those at the
+// highest level it reaches, or of all it reaches (its flag 1), picked by a
+// number from a seed (an NPC carrying it, a creature's placing) and the
+// list, the same each time — itself resolved; 0 for none (the list's
+// chance of none came up, or none of its entries is at the level).
+leveled_form :: fun(plugin: ^Plugin, form: u32, seed: u64) -> u32 {
+	return leveled_pick(plugin, form, seed, 0)
+}
+
+leveled_pick :: fun(plugin: ^Plugin, item: u32, seed: u64, depth: i64) -> u32 {
+	if depth > 4 do return 0
+	scratch : [64 * KB]byte
+	record, record_error := find_record(plugin, item, &scratch)
+	if record_error do return 0
+	if record.header.kind != "LVLI" and record.header.kind != "LVLC" do return item
+	flags : u8 = 0
+	chance_none : u8 = 0
+	best_level : i64 = -1
+	count : i64 = 0
+	fields := Fields{data = record.data, at = 0, broken = false}
+	for field in next_field(&fields) {
+		if field.kind == "LVLF" and field.data.len >= 1 do flags = field.data[0]
+		if field.kind == "LVLD" and field.data.len >= 1 do chance_none = field.data[0]
+	}
+	every_level := flags & 1 != 0
+	// The entries that count: their levels, then their number.
+	fields = Fields{data = record.data, at = 0, broken = false}
+	for field in next_field(&fields) {
+		if field.kind != "LVLO" or field.data.len < 8 do continue
+		level : i16 = field.data[0]
+		if i64(level) > GEAR_LEVEL do continue
+		if every_level {
+			count += 1
+		elif i64(level) > best_level
+			best_level = i64(level)
+			count = 1
+		elif i64(level) == best_level
+			count += 1
+		}
+	}
+	if count == 0 do return 0
+	pick := (seed *% 0x9E3779B97F4A7C15 + u64(item)) *% 0xBF58476D1CE4E5B9
+	if i64((pick >> 33) % 100) < i64(chance_none) do return 0
+	chosen := i64((pick >> 17) % u64(count))
+	seen : i64 = 0
+	fields = Fields{data = record.data, at = 0, broken = false}
+	for field in next_field(&fields) {
+		if field.kind != "LVLO" or field.data.len < 8 do continue
+		level : i16 = field.data[0]
+		if i64(level) > GEAR_LEVEL or (not every_level and i64(level) != best_level) do continue
+		if seen == chosen {
+			raw : u32 = field.data[4]
+			return leveled_pick(plugin, record_form(plugin, record, raw), seed, depth + 1)
+		}
+		seen += 1
+	}
+	return 0
 }
 
 // ---- exterior cells ------------------------------------------------------------

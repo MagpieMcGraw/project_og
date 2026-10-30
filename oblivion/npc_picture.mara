@@ -53,7 +53,7 @@ command_npc_picture :: fun(name: []utf8, out_path: []utf8) {
 	texture_room : [1 * KB]byte
 	room := load_room(&file_room, &block_room, &model_room, &texture_room)
 	skeleton : Npc_Skeleton
-	skeleton_error := read_skeleton(&archives, &room, look.skeleton, &skeleton)
+	skeleton_error := read_skeleton(&archives, &room, &look, &skeleton)
 	if skeleton_error {
 		print("couldn't read its skeleton: %", skeleton_error)
 		return

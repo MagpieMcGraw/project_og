@@ -694,8 +694,9 @@ add_cell :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32, area: Grid_Area, plac
 			}
 			continue
 		}
-		// An NPC: the world's, shown where it has them (queue_actors).
-		if base.header.kind == "NPC_" do continue
+		// An NPC or a creature: the world's, shown where it has them
+		// (queue_actors).
+		if base.header.kind == "NPC_" or base.header.kind == "CREA" or base.header.kind == "LVLC" do continue
 		path := model_path(base)
 		if path.len == 0 or is_marker(path) do continue
 		// A door that opens in place, of a kind loaded: its pieces.
@@ -1984,7 +1985,7 @@ queue_ready_models :: fun(scene: ^Scene, plugin: ^Plugin, cell: u32) {
 			// (Not checked for: its model is the one of its seed the
 			// reference picks, known once its kind is read.)
 			tree = reference.base
-		elif base.header.kind == "NPC_"
+		elif base.header.kind == "NPC_" or base.header.kind == "CREA"
 			npc = reference.base
 			key = u64(npc) | NPC_MODEL_KEY
 			_, known := index_get(&scene.paths, key)

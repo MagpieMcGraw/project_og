@@ -61,8 +61,6 @@ SLOT_HAND :: 0x10
 SLOT_FOOT :: 0x20
 SLOT_TAIL :: 0x8000
 
-// The player's level leveled lists of gear are taken at: a middling one's.
-GEAR_LEVEL :: 10
 
 // The bone the head's parts (eyes, ears, mouth…) and hair hang from.
 HEAD_BONE :: "Bip01 Head"
@@ -96,12 +94,18 @@ Npc_Part :: struct {
 	without: [16]utf8 // a node of its mesh left out, empty for none (a drawn weapon's scabbard: Scb)
 }
 
-// What an NPC is put together from: whether she's a woman, how tall (a
-// share of the skeleton's height: the race's), the skeleton, the parts.
+// What an NPC (or a creature) is put together from: whether she's a
+// woman, how tall (a share of the skeleton's height: the race's, the
+// creature's), the skeleton, the parts; its animations — standing,
+// walking, running, swinging (empty: it has none).
 Npc_Look :: struct {
 	female: bool
 	height: f32
 	skeleton: [256]utf8
+	idle: [256]utf8
+	walk: [256]utf8
+	run: [256]utf8
+	attack: [256]utf8
 	parts: [NPC_PARTS]Npc_Part
 	has_face: bool        // its face values read (all NPCs have them)
 	face: Face_Values     // how its head and what sits on it are shaped (facegen.mara)
@@ -184,14 +188,11 @@ MAX_POSE_BONES :: 128
 
 // What an NPC looks like, from its NPC_ record and its race's: into look.
 read_npc_look :: fun(plugin: ^Plugin, npc_id: u32, look: ^Npc_Look) -> err {
-	look.parts.len = 0
-	look.female = false
-	look.height = 1
-	look.skeleton.len = 0
-	look.has_face = false
-	look.face = Face_Values{0}
-	look.npc_id = npc_id
-	look.face_maps.len = 0
+	look_start(look, npc_id)
+	&look.idle + IDLE_ANIMATION
+	&look.walk + WALK_ANIMATION
+	&look.run + RUN_ANIMATION
+	&look.attack + ATTACK_ANIMATION
 	scratch : [256 * KB]byte
 	npc := find_record(plugin, npc_id, &scratch)?
 	// Its face maps, as the game names them: after the plugin it's from
@@ -250,7 +251,7 @@ read_npc_look :: fun(plugin: ^Plugin, npc_id: u32, look: ^Npc_Look) -> err {
 	// taken at GEAR_LEVEL) whose slots aren't taken yet, in the order carried.
 	taken : u32 = 0
 	for item in carried {
-		worn_id := level_item(plugin, item, npc_id, 0)
+		worn_id := leveled_form(plugin, item, u64(npc_id))
 		if worn_id == 0 do continue
 		worn_scratch : [64 * KB]byte
 		worn, worn_error := find_record(plugin, worn_id, &worn_scratch)
@@ -363,6 +364,86 @@ read_npc_look :: fun(plugin: ^Plugin, npc_id: u32, look: ^Npc_Look) -> err {
 	}
 }
 
+// A look with nothing in it yet, for an actor (its form id).
+look_start :: fun(look: ^Npc_Look, actor_id: u32) {
+	look.parts.len = 0
+	look.female = false
+	look.height = 1
+	look.skeleton.len = 0
+	look.idle.len = 0
+	look.walk.len = 0
+	look.run.len = 0
+	look.attack.len = 0
+	look.has_face = false
+	look.face = Face_Values{0}
+	look.npc_id = actor_id
+	look.face_maps.len = 0
+}
+
+// What an actor looks like: an NPC's (read_npc_look) or a creature's
+// (read_creature_look, its animations looked for in the archives), by its
+// record's kind.
+read_actor_look :: fun(plugin: ^Plugin, archives: ^Archives, actor_id: u32, look: ^Npc_Look) -> err {
+	at, found := index_get(&plugin.records, u64(actor_id))
+	if found and record_header_at(plugin, at).kind == "CREA" do return read_creature_look(plugin, archives, actor_id, look)
+	read_npc_look(plugin, actor_id, look)?
+}
+
+// What a creature looks like, from its CREA record: its skeleton (MODL),
+// the meshes it's put together from (NIFZ: their names, beside the
+// skeleton, each ended by a 0), how big (BNAM: a share of its skeleton's
+// size), and its animations, beside its skeleton as well: idle.kf
+// standing, forward.kf walking, fastforward.kf or runforward.kf running.
+// (Those its folder hasn't, it doesn't do.)
+read_creature_look :: fun(plugin: ^Plugin, archives: ^Archives, creature_id: u32, look: ^Npc_Look) -> err {
+	look_start(look, creature_id)
+	scratch : [64 * KB]byte
+	creature := find_record(plugin, creature_id, &scratch)?
+	meshes : []byte = scratch[0:0]
+	fields := Fields{data = creature.data, at = 0, broken = false}
+	for field in next_field(&fields) {
+		if field.kind == "MODL" {
+			archive_path_under("meshes\\", field_text(field.data), &look.skeleton)
+		elif field.kind == "NIFZ"
+			meshes = field.data
+		elif field.kind == "BNAM" and field.data.len >= 4
+			scale : f32 = field.data[0]
+			if scale > 0 do look.height = scale
+		}
+	}
+	if look.skeleton.len == 0 do return No_Skeleton
+	// Its folder: the skeleton's path up to its last backslash.
+	folder_end : i64 = 0
+	for c, k in look.skeleton {
+		if c == '\\' do folder_end = k + 1
+	}
+	folder := look.skeleton[0 : folder_end]
+	start : i64 = 0
+	for at in 0..meshes.len {
+		if at < meshes.len and meshes[at] != 0 do continue
+		name : []utf8 = meshes[start : at]
+		start = at + 1
+		if name.len == 0 do continue
+		mesh : [256]utf8
+		archive_path_under(folder, name, &mesh)
+		add_npc_part(look, mesh, "", "", 0)
+	}
+	animation_beside(archives, folder, "idle.kf", &look.idle)
+	animation_beside(archives, folder, "forward.kf", &look.walk)
+	animation_beside(archives, folder, "fastforward.kf", &look.run)
+	if look.run.len == 0 do animation_beside(archives, folder, "runforward.kf", &look.run)
+}
+
+// An animation's path in a folder, into path, when the archives have it
+// (else path is left empty).
+animation_beside :: fun(archives: ^Archives, folder: []utf8, name: []utf8, path: ^[256]utf8) {
+	path.len = 0
+	path + folder
+	path + name
+	_, found := find_archived(archives, path^)
+	if not found do path.len = 0
+}
+
 // Whether a race's body section (2 a man's, 3 a woman's) is the one for
 // an NPC.
 own_body_section :: fun(section: i64, female: bool) -> bool {
@@ -405,65 +486,12 @@ archive_path_under :: fun(folder: []utf8, name: []utf8, path: ^[256]utf8) {
 	}
 }
 
-// What an item an NPC carries comes to: itself, or for a leveled list
-// (LVLI), one of its entries at GEAR_LEVEL — of those at the highest level
-// it reaches, or of all it reaches (its flag 1), picked by a number from
-// the NPC and the list (the same each time) — itself resolved; 0 for none.
-level_item :: fun(plugin: ^Plugin, item: u32, npc_id: u32, depth: i64) -> u32 {
-	if depth > 4 do return 0
-	scratch : [64 * KB]byte
-	record, record_error := find_record(plugin, item, &scratch)
-	if record_error do return 0
-	if record.header.kind != "LVLI" do return item
-	flags : u8 = 0
-	chance_none : u8 = 0
-	best_level : i64 = -1
-	count : i64 = 0
-	fields := Fields{data = record.data, at = 0, broken = false}
-	for field in next_field(&fields) {
-		if field.kind == "LVLF" and field.data.len >= 1 do flags = field.data[0]
-		if field.kind == "LVLD" and field.data.len >= 1 do chance_none = field.data[0]
-	}
-	every_level := flags & 1 != 0
-	// The entries that count: their levels, then their number.
-	fields = Fields{data = record.data, at = 0, broken = false}
-	for field in next_field(&fields) {
-		if field.kind != "LVLO" or field.data.len < 8 do continue
-		level : i16 = field.data[0]
-		if i64(level) > GEAR_LEVEL do continue
-		if every_level {
-			count += 1
-		elif i64(level) > best_level
-			best_level = i64(level)
-			count = 1
-		elif i64(level) == best_level
-			count += 1
-		}
-	}
-	if count == 0 do return 0
-	pick := (u64(npc_id) *% 0x9E3779B97F4A7C15 + u64(item)) *% 0xBF58476D1CE4E5B9
-	if i64((pick >> 33) % 100) < i64(chance_none) do return 0
-	chosen := i64((pick >> 17) % u64(count))
-	seen : i64 = 0
-	fields = Fields{data = record.data, at = 0, broken = false}
-	for field in next_field(&fields) {
-		if field.kind != "LVLO" or field.data.len < 8 do continue
-		level : i16 = field.data[0]
-		if i64(level) > GEAR_LEVEL or (not every_level and i64(level) != best_level) do continue
-		if seen == chosen {
-			raw : u32 = field.data[4]
-			return level_item(plugin, record_form(plugin, record, raw), npc_id, depth + 1)
-		}
-		seen += 1
-	}
-	return 0
-}
-
 // The pose of a skeleton (its path), as its idle animation starts: read
 // the first time it's asked for, then kept. Empty when it can't be read.
 // The skeleton at path (its index among the scene's kept ones): read the
 // first time it's asked for, then kept. -1 when it can't be read.
-npc_skeleton :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64 {
+npc_skeleton :: fun(scene: ^Scene, loader: Loader, look: ^Npc_Look) -> i64 {
+	path := look.skeleton
 	for &kept, k in scene.npc_skeletons {
 		if kept.path == path do return k
 	}
@@ -471,7 +499,7 @@ npc_skeleton :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64 {
 	kept := next(&scene.npc_skeletons)
 	kept.path.len = 0
 	&kept.path + path
-	skeleton_error := read_skeleton(loader.archives, loader.room, path, kept)
+	skeleton_error := read_skeleton(loader.archives, loader.room, look, kept)
 	if skeleton_error {
 		note_failure(scene, path, skeleton_error)
 		scene.npc_skeletons.len -= 1
@@ -481,11 +509,12 @@ npc_skeleton :: fun(scene: ^Scene, loader: Loader, path: []utf8) -> i64 {
 	return scene.npc_skeletons.len - 1
 }
 
-// A skeleton (at path) and its idle animation (IDLE_ANIMATION), read into
-// skeleton (see Npc_Skeleton): the idle's tracks and span first, then the
-// skeleton's bones, posed as the idle starts and as a rig. (Their files
-// go through room.)
-read_skeleton :: fun(archives: ^Archives, room: ^Load_Room, path: []utf8, skeleton: ^Npc_Skeleton) -> err {
+// A look's skeleton and its idle animation, read into skeleton (see
+// Npc_Skeleton): the idle's tracks and span first, then the skeleton's
+// bones, posed as the idle starts and as a rig (with no idle, as the
+// skeleton's made). (Their files go through room.)
+read_skeleton :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, skeleton: ^Npc_Skeleton) -> err {
+	path := look.skeleton
 	skeleton.bones.len = 0
 	skeleton.rig.len = 0
 	skeleton.tracks.len = 0
@@ -494,14 +523,16 @@ read_skeleton :: fun(archives: ^Archives, room: ^Load_Room, path: []utf8, skelet
 	skeleton.stop = 0
 	room.file.len = 0
 	room.blocks.len = 0
-	idle := read_archived_nif(archives, IDLE_ANIMATION, &room.file, &room.blocks)?
-	for &block, index in idle.blocks {
-		match block^ {
-		Sequence sequence
-			read_tracks(&idle, index, &skeleton.tracks, &skeleton.track_room, true)
-			skeleton.start, skeleton.stop = sequence_span(&idle, index)
-			break
-		else
+	if look.idle.len > 0 {
+		idle := read_archived_nif(archives, look.idle, &room.file, &room.blocks)?
+		for &block, index in idle.blocks {
+			match block^ {
+			Sequence sequence
+				read_tracks(&idle, index, &skeleton.tracks, &skeleton.track_room, true)
+				skeleton.start, skeleton.stop = sequence_span(&idle, index)
+				break
+			else
+			}
 		}
 	}
 	room.file.len = 0
@@ -511,16 +542,16 @@ read_skeleton :: fun(archives: ^Archives, room: ^Load_Room, path: []utf8, skelet
 	rig_nodes(&mesh, &skeleton.tracks, &skeleton.rig)
 	// Walking, running and swinging (failing, they're shown standing:
 	// motion_failure).
-	walk_error := read_motion(archives, room, path, WALK_ANIMATION, &skeleton.walk)
-	run_error := read_motion(archives, room, path, RUN_ANIMATION, &skeleton.run)
-	attack_error := read_motion(archives, room, path, ATTACK_ANIMATION, &skeleton.attack)
+	walk_error := read_motion(archives, room, path, look.walk, &skeleton.walk)
+	run_error := read_motion(archives, room, path, look.run, &skeleton.run)
+	attack_error := read_motion(archives, room, path, look.attack, &skeleton.attack)
 	skeleton.motion_failure = attack_error
 	if run_error do skeleton.motion_failure = run_error
 	if walk_error do skeleton.motion_failure = walk_error
 }
 
 // A way of moving: its animation (at motion_path) read, and the skeleton
-// (at path) rigged to it.
+// (at path) rigged to it. With no path, none (it doesn't move that way).
 read_motion :: fun(archives: ^Archives, room: ^Load_Room, path: []utf8, motion_path: []utf8, motion: ^Npc_Motion) -> err {
 	motion.tracks.len = 0
 	motion.room.len = 0
@@ -529,6 +560,7 @@ read_motion :: fun(archives: ^Archives, room: ^Load_Room, path: []utf8, motion_p
 	motion.stop = 0
 	motion.root = -1
 	motion.stride = 0
+	if motion_path.len == 0 do return
 	room.file.len = 0
 	room.blocks.len = 0
 	moves := read_archived_nif(archives, motion_path, &room.file, &room.blocks)?
@@ -657,8 +689,8 @@ build_npc_model :: fun(scene: ^Scene, plugin: ^Plugin, loader: Loader, npc_id: u
 		return scene.models.len - 1
 	}
 	look : Npc_Look
-	read_npc_look(plugin, npc_id, &look)?
-	skeleton := npc_skeleton(scene, loader, look.skeleton)
+	read_actor_look(plugin, loader.archives, npc_id, &look)?
+	skeleton := npc_skeleton(scene, loader, &look)
 	if skeleton < 0 do return -1, No_Skeleton
 	pose : []Pose_Bone = scene.npc_skeletons[skeleton].bones
 	report := Npc_Report{failures = 0, first = [], reason = Not_In_Archive}

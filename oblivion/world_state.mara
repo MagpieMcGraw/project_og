@@ -432,7 +432,8 @@ player_take_area :: fun(player: ^Player_State, plugin: ^Plugin, world_id: u32, x
 	return first_error
 }
 
-// Adds a cell's people (those not disabled) in an area and not in kept.
+// Adds a cell's people and creatures (those not disabled) in an area and
+// not in kept: a leveled creature as the one its list gives that placing.
 add_actors :: fun(player: ^Player_State, plugin: ^Plugin, cell: u32, area: Grid_Area, kept: Grid_Area) -> err {
 	references : [16384]Reference = void
 	references.len = 0
@@ -441,9 +442,16 @@ add_actors :: fun(player: ^Player_State, plugin: ^Plugin, cell: u32, area: Grid_
 		if reference.flags & RECORD_DISABLED != 0 do continue
 		if not area_holds(area, reference.position) or area_holds(kept, reference.position) do continue
 		base_at, found := index_get(&plugin.records, u64(reference.base))
-		if not found or record_header_at(plugin, base_at).kind != "NPC_" do continue
+		if not found do continue
+		kind := record_header_at(plugin, base_at).kind
+		if kind != "NPC_" and kind != "CREA" and kind != "LVLC" do continue
+		// A leveled creature: the one its list gives this placing (none, at
+		// times: then nothing's there).
+		actor := reference
+		if kind == "LVLC" do actor.base = leveled_form(plugin, reference.base, u64(reference.form_id))
+		if actor.base == 0 do continue
 		if not fits(player.actors.len + 1, player.actors.cap) do break
-		&player.actors + reference
+		&player.actors + actor
 	}
 }
 

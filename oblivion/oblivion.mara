@@ -2915,6 +2915,7 @@ usage :: fun() {
 	print("                                 drawn shapes lying on one another near a point (flicker)")
 	print("oblivion mp3 <file> [raw]        decodes an MP3 (into raw floats, if given)")
 	print("oblivion music <kind> [raw]      a kind's first track through the mix, no sound device (explore, public, dungeon)")
+	print("oblivion creatures                every creature put together headless, what failed counted")
 	print("oblivion controls [check]        the controls as controls.txt has them (check: game_controls tried)")
 	print("oblivion help                    this")
 }
@@ -3159,9 +3160,10 @@ command_skin :: fun(what: []utf8, animation_path: []utf8) {
 	print("  posed by the skeleton (% bones): from % to %", posed_bones.len, posed.bounds_min, posed.bounds_max)
 }
 
-// `oblivion npc <editor id>`: an NPC as the viewer puts it together: its
-// parts (each mesh, the texture it's drawn with, the bone it hangs from),
-// then its model made (no window): how many shapes, the box round them.
+// `oblivion npc <editor id>`: an NPC (or a creature) as the viewer puts
+// it together: its parts (each mesh, the texture it's drawn with, the bone
+// it hangs from), then its model made (no window): how many shapes, the
+// box round them.
 command_npc :: fun(name: []utf8) {
 	index_storage : [96 * MB]byte
 	plugin, load_error := load_oblivion(&index_storage)
@@ -3175,14 +3177,6 @@ command_npc :: fun(name: []utf8) {
 		print("no record %", name)
 		return
 	}
-	look : Npc_Look
-	look_error := read_npc_look(&plugin, npc_id, &look)
-	if look_error {
-		print("couldn't read its look: %", look_error)
-		return
-	}
-	print("% (%), skeleton %, height %", name, if look.female do "a woman" else "a man", look.skeleton, look.height)
-	for &part in look.parts do print("  % % %", part.mesh, part.texture, part.bone)
 	directory_storage : [64 * MB]byte
 	archives : Archives
 	open_error := open_all_archives(&archives, &directory_storage)
@@ -3191,13 +3185,22 @@ command_npc :: fun(name: []utf8) {
 		return
 	}
 	defer close_archives(&archives)
+	look : Npc_Look
+	look_error := read_actor_look(&plugin, &archives, npc_id, &look)
+	if look_error {
+		print("couldn't read its look: %", look_error)
+		return
+	}
+	print("% (%), skeleton %, height %; idle %, walk %, run %", name, if look.female do "female" else "male", look.skeleton, look.height,
+		look.idle, look.walk, look.run)
+	for &part in look.parts do print("  % % %", part.mesh, part.texture, part.bone)
 	file_room : [16 * MB]byte
 	block_room : [16 * MB]byte
 	model_room : [64 * MB]byte
 	texture_room : [1 * KB]byte
 	room := load_room(&file_room, &block_room, &model_room, &texture_room)
 	skeleton : Npc_Skeleton
-	skeleton_error := read_skeleton(&archives, &room, look.skeleton, &skeleton)
+	skeleton_error := read_skeleton(&archives, &room, &look, &skeleton)
 	if skeleton_error {
 		print("couldn't read its skeleton: %", skeleton_error)
 		return
@@ -3824,6 +3827,8 @@ main :: (args: [][]utf8) {
 		command_npc_picture(args[2], args[3])
 	elif command == "skin" and args.len > 2
 		command_skin(args[2], if args.len > 3 do args[3] else "meshes/characters/_male/idle.kf")
+	elif command == "creatures"
+		command_creatures()
 	elif command == "controls"
 		command_controls(args.len > 2 and args[2] == "check")
 	elif command == "music" and args.len > 2

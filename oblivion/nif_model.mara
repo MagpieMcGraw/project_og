@@ -72,6 +72,8 @@ Block_Type :: union {
 	NiTransformInterpolator
 	NiBSplineTransformInterpolator
 	NiBSplineCompTransformInterpolator
+	NiBSplineFloatInterpolator
+	NiBSplineCompFloatInterpolator
 	NiBSplineData
 	NiBSplineBasisData
 	NiPathInterpolator
@@ -780,6 +782,10 @@ read_block :: fun(reader: ^Nif_Reader, block_type: Block_Type) -> Block {
 		return read_spline_interpolator(reader, false)
 	NiBSplineCompTransformInterpolator
 		return read_spline_interpolator(reader, true)
+	NiBSplineFloatInterpolator
+		return read_spline_float_interpolator(reader, false)
+	NiBSplineCompFloatInterpolator
+		return read_spline_float_interpolator(reader, true)
 	NiBSplineData
 		return read_spline_data(reader)
 	NiBSplineBasisData

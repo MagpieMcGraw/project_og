@@ -368,9 +368,10 @@ track_pose :: fun(track: ^Track, time: f32) -> Mat4 {
 }
 
 // Where a time falls among keys' times: the key before it and how far
-// toward the next (0 to 1); the first or last key past either end.
+// toward the next (0 to 1); the first or last key past either end. With
+// no times (a creature's track has keys but none), the first key.
 key_between :: fun(times: ^[]f32, time: f32) -> i64, f32 {
-	if times.len == 1 or time <= times[0] do return 0, 0
+	if times.len <= 1 or time <= times[0] do return 0, 0
 	last := times.len - 1
 	if time >= times[last] do return last, 0
 	// The last key at or before it, halving the keys between.

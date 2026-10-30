@@ -182,6 +182,25 @@ read_spline_interpolator :: fun(reader: ^Nif_Reader, compressed: bool) -> Block 
 		compressed = compressed, offsets = offsets, half_ranges = half_ranges}}
 }
 
+// NiBSplineFloatInterpolator, NiBSplineCompFloatInterpolator: a number
+// over time as a B-spline (a creature's running has one): read past, not
+// played. Its span, its spline data and basis, its value where the spline
+// says nothing, its handle in the data, and compressed, its offset and
+// half range.
+read_spline_float_interpolator :: fun(reader: ^Nif_Reader, compressed: bool) -> Block {
+	_ = read_f32(reader)
+	_ = read_f32(reader)
+	_ = read_ref(reader)
+	_ = read_ref(reader)
+	_ = read_f32(reader)
+	_ = read_u32(reader)
+	if compressed {
+		_ = read_f32(reader)
+		_ = read_f32(reader)
+	}
+	return .Other
+}
+
 read_spline_data :: fun(reader: ^Nif_Reader) -> Block {
 	float_count := i64(read_u32(reader))
 	floats := read_view(reader, float_count * 4)
