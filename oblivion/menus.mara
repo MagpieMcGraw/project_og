@@ -781,6 +781,20 @@ book_set_text :: fun(book: ^Menu_Book, tile_name: []utf8, trait_name: []utf8, te
 	return true
 }
 
+// Sets a trait of a tile (by index) to text, as tile_set does a number:
+// for tiles named alike (a list's items, copies of one template).
+tile_set_text :: fun(book: ^Menu_Book, tile: i64, trait_name: []utf8, text: []utf8) {
+	trait := find_trait(book, tile, trait_name)
+	if trait < 0 do trait = new_trait(book, tile, trait_name)
+	if trait < 0 do return
+	held := &book.traits[trait]
+	held.set = true
+	held.value.number = 0
+	held.value.is_text = true
+	held.value.text.len = 0
+	add_what_fits(&held.value.text, text)
+}
+
 // The trait of a tile by name, made when it hasn't one; -1 for no tile.
 settable_trait :: fun(book: ^Menu_Book, tile_name: []utf8, trait_name: []utf8) -> i64 {
 	tile : i64 = -1
@@ -1025,7 +1039,8 @@ tile_font :: fun(book: ^Menu_Book, tile: i64, renderer: ^render.Renderer, archiv
 	return &book.fonts[number - 1]
 }
 
-// A text tile drawn: its lines justified about its x (left, middle, right).
+// A text tile drawn: its lines justified about its x (left, middle, right),
+// cut to its window (a list's rows scrolled past it).
 draw_menu_text :: fun(book: ^Menu_Book, item: Menu_Drawn, renderer: ^render.Renderer, archives: ^Archives, scale: f32) {
 	tile := item.tile
 	color := tile_color(book, tile, renderer, archives)
@@ -1039,12 +1054,14 @@ draw_menu_text :: fun(book: ^Menu_Book, item: Menu_Drawn, renderer: ^render.Rend
 	most_lines := trait_number(book, tile, "wraplines", renderer, archives)
 	if most_lines > 0 and f32(lines.len) > most_lines do lines.len = i64(most_lines)
 	justify := i64(trait_number(book, tile, "justify", renderer, archives))
+	clip := NO_CLIP
+	if item.clip_right >= item.clip_left do clip = [item.clip_left * scale, item.clip_top * scale, item.clip_right * scale, item.clip_bottom * scale]
 	top := item.y
 	for line in lines {
 		left := item.x
 		if justify == JUSTIFY_CENTER do left -= line.width / 2
 		if justify == JUSTIFY_RIGHT do left -= line.width
-		draw_text(renderer, font, text[line.start : line.stop], left * scale, top * scale, scale, color)
+		draw_text_clipped(renderer, font, text[line.start : line.stop], left * scale, top * scale, scale, color, clip)
 		top += font.line_height
 	}
 }

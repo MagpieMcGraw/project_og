@@ -1,8 +1,9 @@
 // The player's controls, on og's game_controls: Oblivion's actions (named
 // as its controls menu names them, where it has them), what does each to
 // start with, and the file the player can change them in (CONTROLS_FILE,
-// beside the game). Menus and the keys for looking into the engine (V,
-// B) read the keyboard and mouse themselves, as does Escape.
+// beside the game; or the controls menu: system_menus.mara). The engine's
+// own (vsync, bindless drawing) are actions as well. Menus read the
+// keyboard and mouse themselves, as does Escape.
 //
 // `oblivion controls`: the controls as the file has them.
 // `oblivion controls check`: game_controls tried headless, Oblivion's
@@ -39,6 +40,8 @@ Actions :: struct {
 	hurry_time: i64      // the day goes by faster while held
 	character_menu: i64
 	map_menu: i64
+	toggle_vsync: i64    // the frames wait for the display's refresh, or not
+	toggle_bindless: i64 // textures drawn bindless, or bound (where the card can)
 }
 
 // Oblivion's actions, each on what the game puts it on: their numbers.
@@ -58,7 +61,26 @@ oblivion_controls :: fun(controls: ^Controls) -> Actions, err {
 	actions.hurry_time = controls_add(controls, "hurry_time", "T")?
 	actions.character_menu = controls_add(controls, "character_menu", "F1")?
 	actions.map_menu = controls_add(controls, "map_menu", "F4")?
+	actions.toggle_vsync = controls_add(controls, "toggle_vsync", "V")?
+	actions.toggle_bindless = controls_add(controls, "toggle_bindless", "B")?
 	return actions
+}
+
+// An action's name as the controls menu shows it: its words, each begun in
+// capitals ("slide_left": "Slide Left").
+action_label :: fun(name: []utf8) -> str64 {
+	label : str64
+	word_start := true
+	for c in name {
+		if c == '_' {
+			&label + ' '
+			word_start = true
+			continue
+		}
+		&label + (if word_start and c >= 'a' and c <= 'z' do utf8(i64(c) - 32) else c)
+		word_start = false
+	}
+	return label
 }
 
 // The player's controls: Oblivion's, then as CONTROLS_FILE has them. With

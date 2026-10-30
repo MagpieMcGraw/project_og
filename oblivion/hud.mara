@@ -240,13 +240,53 @@ text_width :: fun(font: ^Font, text: []utf8) -> f32 {
 // Puts a line of text on the 2D layer, in a font, its top left at x, y
 // (pixels), its glyphs scale pixels to a unit, tinted color.
 draw_text :: fun(renderer: ^render.Renderer, font: ^Font, text: []utf8, x: f32, y: f32, scale: f32, color: [4!]f32) {
+	draw_text_clipped(renderer, font, text, x, y, scale, color, NO_CLIP)
+}
+
+// A window drawing is cut to (pixels: left, top, right, bottom); NO_CLIP
+// (its right left of its left) for none.
+NO_CLIP :: [4!]f32{0, 0, -1, -1}
+
+// Text drawn as draw_text does, cut to a window (clip; NO_CLIP for none):
+// each glyph's rectangle, and its part of the font's texture, cut to it.
+draw_text_clipped :: fun(renderer: ^render.Renderer, font: ^Font, text: []utf8, x: f32, y: f32, scale: f32, color: [4!]f32,
+	clip: [4!]f32)
+{
 	pen := x
 	baseline := y + font.ascent * scale
 	for c in text {
 		glyph := &font.glyphs[i64(c)]
 		if glyph.width > 0 and glyph.height > 0 {
-			layer_image(&renderer.ui, renderer.textures[font.texture].id, pen + glyph.before * scale, baseline - glyph.above * scale,
-				glyph.width * scale, glyph.height * scale, glyph.u0, glyph.v0, glyph.u1, glyph.v1, color)
+			left := pen + glyph.before * scale
+			top := baseline - glyph.above * scale
+			width := glyph.width * scale
+			height := glyph.height * scale
+			u0 := glyph.u0
+			v0 := glyph.v0
+			u1 := glyph.u1
+			v1 := glyph.v1
+			shown := true
+			if clip[2] >= clip[0] {
+				cut_left := max_f32(left, clip[0])
+				cut_top := max_f32(top, clip[1])
+				cut_right := min_f32(left + width, clip[2])
+				cut_bottom := min_f32(top + height, clip[3])
+				if cut_right <= cut_left or cut_bottom <= cut_top {
+					shown = false
+				else
+					across := (u1 - u0) / width
+					down := (v1 - v0) / height
+					u0 += (cut_left - left) * across
+					v0 += (cut_top - top) * down
+					u1 -= (left + width - cut_right) * across
+					v1 -= (top + height - cut_bottom) * down
+					left = cut_left
+					top = cut_top
+					width = cut_right - cut_left
+					height = cut_bottom - cut_top
+				}
+			}
+			if shown do layer_image(&renderer.ui, renderer.textures[font.texture].id, left, top, width, height, u0, v0, u1, v1, color)
 		}
 		pen += (glyph.before + glyph.width + glyph.after) * scale
 	}

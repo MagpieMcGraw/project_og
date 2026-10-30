@@ -2990,6 +2990,7 @@ command_picture :: fun(args: [][]utf8) {
 		if page == "pause" do picture.menu = MENU_PAUSE
 		if page == "options" do picture.menu = MENU_OPTIONS
 		if page == "audio" do picture.menu = MENU_AUDIO
+		if page == "controls" do picture.menu = MENU_CONTROLS
 		view = view[0 : view.len - 2]
 	}
 	if view.len >= 4 and view[view.len - 3] == "held" {

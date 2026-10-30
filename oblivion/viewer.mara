@@ -84,6 +84,9 @@ SUMMARY_EVERY :: 10000000000
 // Where the viewer's journal goes, in the folder it's run from; taking a
 // picture, where it goes instead (the game's log left as it is).
 LOG_PATH :: "oblivion.log"
+// How far the camera turns for a pixel the mouse moves (radians), at the
+// game's own sensitivity (game_settings' mouse_turn scales it).
+MOUSE_TURN :: 0.003
 PICTURE_LOG_PATH :: "picture.log"
 
 // A picture taken in place of showing the window (`oblivion picture`):
@@ -319,12 +322,24 @@ Viewer :: struct {
 	pause_menu: i64
 	options_menu: i64
 	audio_menu: i64
+	controls_menu: i64
 	options_from: i64
 	menu_choice: i64
 	hovered: [16]i64
 	dragged_slider: i64
 	main_menu_since: u64
 	book_ready: bool
+	// The controls menu's: its list's rows (a tile for each action), how
+	// far it's scrolled (rows), the action whose key is listened for (-1 for
+	// none) and what it had first.
+	control_rows: [64]i64
+	controls_scroll: i64
+	listening_row: i64
+	listening_old: Binding
+	// How the mouse turns the camera: its sensitivity (game_settings'
+	// mouse_turn), whether up looks down.
+	mouse_sensitivity: f32
+	invert_y: bool
 	// The player's stats, and the map of the world shown (map_world's).
 	player_stats: Player_Stats
 	world_map: World_Map
@@ -388,6 +403,8 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	settings, settings_error := read_settings()
 	viewer.volumes = settings.volumes
 	set_volumes(&viewer.audio, viewer.volumes)
+	viewer.mouse_sensitivity = settings.mouse_sensitivity
+	viewer.invert_y = settings.invert_y
 	if settings_error and settings_error != File_Error.Open_Failed {
 		note(&viewer.journal, "couldn't read the settings: the defaults instead; ")
 		note_error(&viewer.journal, settings_error)
@@ -424,6 +441,11 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 	viewer.pause_menu = -1
 	viewer.options_menu = -1
 	viewer.audio_menu = -1
+	viewer.controls_menu = -1
+	viewer.control_rows.len = 0
+	viewer.controls_scroll = 0
+	viewer.listening_row = -1
+	viewer.listening_old = no_binding()
 	viewer.options_from = MENU_PAUSE
 	viewer.menu_choice = CHOSE_NOTHING
 	viewer.hovered.len = 0
@@ -595,6 +617,8 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 
 	read_input(platform, input)
 	if input.quit do return .quit
+	// (While a control's key is listened for, Escape and clicks are its.)
+	listening := controls.listening >= 0
 	// A picture's click, once it's settled.
 	if viewer.picture.click and viewer.picture_settled == 1 {
 		input.mouse_x = viewer.picture.click_x
@@ -608,12 +632,12 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	// keyboard or mouse reaches the game: no action is down.
 	if action_pressed(controls, actions.character_menu) do toggle_menu(viewer, MENU_STATS)
 	if action_pressed(controls, actions.map_menu) do toggle_menu(viewer, MENU_MAP)
-	if input.pressed[Escape] {
+	if input.pressed[Escape] and not listening {
 		if viewer.menu_open == 0 do open_system_menu(viewer, MENU_PAUSE)
 		else do menu_back(viewer)
 	}
 	if viewer.menu_open != 0 {
-		if viewer.menu_open >= MENU_MAIN do system_menu_input(viewer)
+		if viewer.menu_open >= MENU_MAIN do system_menu_input(viewer, not listening)
 		elif input.mouse_pressed[1] do click_menu(viewer, input.mouse_x, input.mouse_y)
 		if viewer.menu_choice == CHOSE_QUIT do return .quit
 		for &down in input.held do down^ = false
@@ -627,7 +651,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		controls_let_go(controls)
 	}
 	if action_pressed(controls, actions.mouse_look) do set_mouse_look(platform, not platform.mouse_look)
-	if input.pressed[V] {
+	if action_pressed(controls, actions.toggle_vsync) {
 		set_vsync(platform, not platform.vsync)
 		viewer.next_frame = time_now()
 		note(&viewer.journal, "vsync ")
@@ -635,7 +659,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		note_end(&viewer.journal)
 		update_title(viewer)
 	}
-	if input.pressed[B] and viewer.renderer.bindless_available {
+	if action_pressed(controls, actions.toggle_bindless) and viewer.renderer.bindless_available {
 		viewer.renderer.use_bindless = not viewer.renderer.use_bindless
 		note(&viewer.journal, if viewer.renderer.use_bindless do "drawing bindless" else "drawing with bound textures")
 		note_end(&viewer.journal)
@@ -680,8 +704,9 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	viewer.frame_start = now
 
 	if platform.mouse_look {
-		camera.yaw += input.mouse_moved_x * 0.003
-		camera.pitch -= input.mouse_moved_y * 0.003
+		turn := MOUSE_TURN * mouse_turn(viewer.mouse_sensitivity)
+		camera.yaw += input.mouse_moved_x * turn
+		camera.pitch -= input.mouse_moved_y * turn * (if viewer.invert_y do -1 else 1)
 		if camera.pitch > 1.5 do camera.pitch = 1.5
 		if camera.pitch < -1.5 do camera.pitch = -1.5
 	}
@@ -955,6 +980,7 @@ take_first_person :: fun(viewer: ^Viewer, plugin: ^Plugin) {
 		page := f32(viewer.picture.menu_page)
 		if page > 0 and viewer.picture.menu == MENU_STATS do _ = book_set(&viewer.book, "StatsMenu", "user0", page)
 		if page > 0 and viewer.picture.menu == MENU_MAP do _ = book_set(&viewer.book, "map_background", "user0", page)
+		if page > 0 and viewer.picture.menu == MENU_CONTROLS do set_controls_page(viewer, i64(page))
 	}
 	if hud_error {
 		note(&viewer.journal, "no HUD: ")

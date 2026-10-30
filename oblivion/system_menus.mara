@@ -1,11 +1,17 @@
 // The game's own menus round play: the main menu (shown before a world is
 // loaded, over a backdrop: New plays, Options, Exit), the pause menu
-// (Escape in a world: Return, Options, Quit), the options menu (Audio, so
-// far) and the audio menu — its five volume sliders, clicked or dragged,
-// each volume heard at once and kept in the settings when the menu's left
-// (game_settings.mara). What the game can't do yet (saves, the credits,
-// the other options) is hidden. The mouse lights what it's over, as the
-// game's menus have it (their tiles' mouseover).
+// (Escape in a world: Return, Options, Quit), the options menu (Audio and
+// Controls, so far), the audio menu — its five volume sliders, clicked or
+// dragged, each volume heard at once — and the controls menu: its first
+// page the mouse's sensitivity (a slider) and whether up looks down, its
+// second a list of the player's controls (player_controls.mara), a click
+// on one listening for the key or button to put it on (one another
+// control had goes to it in place of the old: they swap), Defaults putting
+// back the game's own. The settings are kept when their menu's left
+// (game_settings.mara), the controls in their file. What the game can't
+// do yet (saves, the credits, the other options, a controller's settings)
+// is hidden. The mouse lights what it's over, as the game's menus have it
+// (their tiles' mouseover).
 module oblivion
 
 use mara.core
@@ -19,6 +25,7 @@ use sdl_platform
 use mara.string
 use logging
 use game_sound
+use game_controls
 use sprite_layer
 render :: use render
 
@@ -27,6 +34,18 @@ MENU_MAIN :: 3
 MENU_PAUSE :: 4
 MENU_OPTIONS :: 5
 MENU_AUDIO :: 6
+MENU_CONTROLS :: 7
+
+// The controls menu's pages (its ControlsMenu's user0): the mouse's, and
+// the list of controls; and how many of the list's rows show at once (its
+// scroll bar's user8).
+CONTROLS_PAGE_MOUSE :: 1
+CONTROLS_PAGE_LIST :: 2
+CONTROLS_SHOWN :: 6
+// What's hidden of the controls menu: a controller's settings.
+CONTROLLER_ONLY :: ["controls_swap_button", "controls_left_stick_label", "controls_left_stick_setting", "controls_right_stick_label",
+	"controls_right_stick_setting", "controls_device_activate_highlight", "controls_device_toggle_floating",
+	"controls_device_toggle_left", "controls_device_text", "controls_device_toggle_right"]
 
 // What the player's chosen that the game answers: nothing yet, to play
 // (the main menu's New), to quit.
@@ -39,6 +58,11 @@ CHOSE_QUIT :: 2
 VOLUME_SLIDERS :: ["audio_master_slider", "audio_voice_slider", "audio_effect_slider", "audio_foot_slider", "audio_music_slider"]
 VOLUME_ROWS :: ["audio_master_slider_marker", "audio_voice_slider_marker", "audio_effect_slider_marker", "audio_foot_slider_marker",
 	"audio_music_slider_marker"]
+// The controls menu's mouse sensitivity slider, after the volumes', and
+// its row.
+SENSITIVITY_SLIDER :: 5
+SENSITIVITY_SLIDER_NAME :: "controls_sensitivity_slider"
+SENSITIVITY_ROW_NAME :: "controls_sensitivity_slider_marker"
 // A slider's marker's width (its XML's): a slider's value is where the
 // marker's middle is along it. A click on a slider's arrow moves it this
 // much (hundredths).
@@ -50,12 +74,13 @@ LOGO_FADE :: 3
 
 // What's hidden of the menus: what the game can't do yet.
 NOT_YET :: ["main_continue", "main_load", "main_credits", "pause_save_button", "pause_load_button", "options_gameplay_button",
-	"options_video_button", "options_controls_button", "options_downloads_button"]
+	"options_video_button", "options_downloads_button"]
 
 // Opens one of the menus here, read the first time it's opened (what can't
 // be done yet hidden), the mouse a cursor while it's open. Options opened
 // from the main or pause menu goes back to it; the audio menu shows the
-// volumes as they are.
+// volumes as they are, the controls menu the mouse's settings (its first
+// page) and the controls (its rows made the first time).
 open_system_menu :: fun(viewer: ^Viewer, which: i64) {
 	book_error := open_book(viewer)
 	if book_error {
@@ -77,10 +102,19 @@ open_system_menu :: fun(viewer: ^Viewer, which: i64) {
 		if which == MENU_MAIN do viewer.main_menu = read
 		if which == MENU_PAUSE do viewer.pause_menu = read
 		if which == MENU_OPTIONS do viewer.options_menu = read
-		if which == MENU_AUDIO do viewer.audio_menu = read
+			if which == MENU_AUDIO do viewer.audio_menu = read
+		if which == MENU_CONTROLS do viewer.controls_menu = read
 		for k in 0:NOT_YET.len do _ = book_set(&viewer.book, NOT_YET[k], "visible", MENU_FALSE)
-		// (The options' Audio where Gameplay was, next after Return.)
-		if which == MENU_OPTIONS do _ = book_set(&viewer.book, "options_audio_button", "listindex", 1)
+		// (The options' Audio where Gameplay was, next after Return;
+		// Controls after it.)
+		if which == MENU_OPTIONS {
+			_ = book_set(&viewer.book, "options_audio_button", "listindex", 1)
+			_ = book_set(&viewer.book, "options_controls_button", "listindex", 2)
+		}
+		if which == MENU_CONTROLS {
+			for k in 0:CONTROLLER_ONLY.len do _ = book_set(&viewer.book, CONTROLLER_ONLY[k], "visible", MENU_FALSE)
+			make_control_rows(viewer)
+		}
 		// (The main menu has nothing behind it: its backdrop shown.)
 		if which == MENU_MAIN do _ = book_set(&viewer.book, "backdrop", "visible", MENU_TRUE)
 	}
@@ -90,6 +124,11 @@ open_system_menu :: fun(viewer: ^Viewer, which: i64) {
 	viewer.dragged_slider = -1
 	set_mouse_look(&viewer.platform, false)
 	if which == MENU_AUDIO do show_volumes(viewer)
+	if which == MENU_CONTROLS {
+		set_controls_page(viewer, CONTROLS_PAGE_MOUSE)
+		show_mouse_settings(viewer)
+		show_control_rows(viewer)
+	}
 }
 
 // The root tile of a menu here, -1 till it's read.
@@ -98,6 +137,7 @@ system_menu_tile :: fun(viewer: ^Viewer, which: i64) -> i64 {
 	if which == MENU_PAUSE do return viewer.pause_menu
 	if which == MENU_OPTIONS do return viewer.options_menu
 	if which == MENU_AUDIO do return viewer.audio_menu
+	if which == MENU_CONTROLS do return viewer.controls_menu
 	return -1
 }
 
@@ -106,6 +146,7 @@ system_menu_path :: fun(which: i64) -> str64 {
 	if which == MENU_MAIN do return "menus\\options\\main_menu.xml"
 	if which == MENU_PAUSE do return "menus\\options\\pause_menu.xml"
 	if which == MENU_OPTIONS do return "menus\\options\\options_menu.xml"
+	if which == MENU_CONTROLS do return "menus\\options\\controls_menu.xml"
 	return "menus\\options\\audio_menu.xml"
 }
 
@@ -119,13 +160,21 @@ open_book :: fun(viewer: ^Viewer) -> err {
 }
 
 // Goes back a menu (Escape, or a Return): from the audio menu to the
-// options (the volumes kept in the settings), from the options to the
-// menu they were opened from, from the pause menu (or the stats or map
-// menu) to the game. The main menu stays.
+// options (the volumes kept in the settings), from the controls' list to
+// their first page, from that to the options (the mouse's settings kept,
+// the controls in their file), from the options to the menu they were
+// opened from, from the pause menu (or the stats or map menu) to the game.
+// The main menu stays.
 menu_back :: fun(viewer: ^Viewer) {
 	which := viewer.menu_open
 	if which == MENU_AUDIO {
-		keep_volumes(viewer)
+		keep_settings(viewer)
+		open_system_menu(viewer, MENU_OPTIONS)
+	elif which == MENU_CONTROLS and controls_page(viewer) == CONTROLS_PAGE_LIST
+		set_controls_page(viewer, CONTROLS_PAGE_MOUSE)
+	elif which == MENU_CONTROLS
+		keep_settings(viewer)
+		keep_controls(viewer)
 		open_system_menu(viewer, MENU_OPTIONS)
 	elif which == MENU_OPTIONS
 		open_system_menu(viewer, viewer.options_from)
@@ -137,8 +186,10 @@ menu_back :: fun(viewer: ^Viewer) {
 // The mouse in a menu here: what it's over lit (that tile's mouseover,
 // and the tiles it's in), a click on a button answered, a slider set where
 // it's clicked and following the mouse while it's dragged (a click on its
-// arrows moves it a step).
-system_menu_input :: fun(viewer: ^Viewer) {
+// arrows moves it a step); the controls' list scrolled by the wheel or its
+// arrows, a click on a control listening for its key. With clicks false
+// (the frame a key was listened for), a click is passed over.
+system_menu_input :: fun(viewer: ^Viewer, clicks: bool) {
 	input := &viewer.input
 	book := &viewer.book
 	menu := system_menu_tile(viewer, viewer.menu_open)
@@ -159,12 +210,25 @@ system_menu_input :: fun(viewer: ^Viewer) {
 		else do viewer.dragged_slider = -1
 		return
 	}
-	if not input.mouse_pressed[1] or target < 0 do return
-	// What the click's on: the tile, or a slider or button it's in.
+	if viewer.menu_open == MENU_CONTROLS and input.wheel != 0 do scroll_controls(viewer, if input.wheel > 0 do -1 else 1)
+	if not clicks or not input.mouse_pressed[1] or target < 0 do return
+	// What the click's on: the tile, or a slider, button or control it's in.
 	own : []utf8 = book.tiles[target].name
+	if own == "vertical_scroll_top" {
+		scroll_controls(viewer, -1)
+		return
+	}
+	if own == "vertical_scroll_bottom" {
+		scroll_controls(viewer, 1)
+		return
+	}
 	at := target
 	for at >= 0 {
 		name : []utf8 = book.tiles[at].name
+		if name == "controls_template_item" and viewer.controls.listening < 0 {
+			listen_for_control(viewer, i64(trait_number(book, at, "user0", &viewer.renderer, &viewer.archives)))
+			return
+		}
 		slider := slider_named(name)
 		if slider >= 0 {
 			if own == "horizontal_scroll_left" {
@@ -193,31 +257,52 @@ press_button :: fun(viewer: ^Viewer, name: []utf8) -> bool {
 		open_system_menu(viewer, MENU_OPTIONS)
 	elif name == "options_audio_button"
 		open_system_menu(viewer, MENU_AUDIO)
-	elif name == "pause_return_button" or name == "options_return_button" or name == "audio_return_button"
+	elif name == "options_controls_button"
+		open_system_menu(viewer, MENU_CONTROLS)
+	elif name == "pause_return_button" or name == "options_return_button" or name == "audio_return_button" or
+		name == "controls_return_button" or name == "controls_return_button_2"
 		menu_back(viewer)
 	elif name == "audio_defaults_button"
 		viewer.volumes = full_volumes()
 		set_volumes(&viewer.audio, viewer.volumes)
 		show_volumes(viewer)
+	elif name == "controls_more_button"
+		set_controls_page(viewer, CONTROLS_PAGE_LIST)
+	elif name == "controls_invert_y_button"
+		viewer.invert_y = not viewer.invert_y
+		show_mouse_settings(viewer)
+	elif name == "controls_defaults_button"
+		controls_reset(&viewer.controls)
+		show_control_rows(viewer)
 	else
 		return false
 	}
 	return true
 }
 
-// The volume slider a tile is (or its row), by Volumes' order; -1 for none.
+// The slider a tile is (or its row): a volume's, by Volumes' order, or
+// SENSITIVITY_SLIDER; -1 for none.
 slider_named :: fun(name: []utf8) -> i64 {
 	for k in 0:VOLUME_SLIDERS.len {
 		if name == VOLUME_SLIDERS[k] or name == VOLUME_ROWS[k] do return k
 	}
+	if name == SENSITIVITY_SLIDER_NAME or name == SENSITIVITY_ROW_NAME do return SENSITIVITY_SLIDER
 	return -1
 }
 
-// Sets a volume slider to where x (the menus' units) is along it: its
-// marker's middle there.
+// A slider's tile's name.
+slider_name :: fun(slider: i64) -> str64 {
+	name : str64
+	if slider == SENSITIVITY_SLIDER do &name + SENSITIVITY_SLIDER_NAME
+	else do &name + VOLUME_SLIDERS[slider]
+	return name
+}
+
+// Sets a slider to where x (the menus' units) is along it: its marker's
+// middle there.
 set_slider_at :: fun(viewer: ^Viewer, slider: i64, x: f32) {
 	book := &viewer.book
-	tile := named_child(book, viewer.audio_menu, VOLUME_SLIDERS[slider], true)
+	tile := named_child(book, system_menu_tile(viewer, viewer.menu_open), slider_name(slider), true)
 	if tile < 0 do return
 	left := tile_left(book, tile, &viewer.renderer, &viewer.archives)
 	travel := trait_number(book, tile, "width", &viewer.renderer, &viewer.archives) - SLIDER_MARKER_WIDTH
@@ -225,15 +310,22 @@ set_slider_at :: fun(viewer: ^Viewer, slider: i64, x: f32) {
 	set_volume(viewer, slider, (x - left - SLIDER_MARKER_WIDTH / 2) / travel)
 }
 
-// Moves a volume slider a step (hundredths: up, or down below 0).
+// Moves a slider a step (hundredths: up, or down below 0).
 step_slider :: fun(viewer: ^Viewer, slider: i64, step: f32) {
-	set_volume(viewer, slider, volume_of(viewer.volumes, slider) + step / 100)
+	now := if slider == SENSITIVITY_SLIDER do viewer.mouse_sensitivity else volume_of(viewer.volumes, slider)
+	set_volume(viewer, slider, now + step / 100)
 }
 
-// Sets a volume (by Volumes' order; 0 to 1, what's past either kept to
-// it): heard so at once, its slider showing it.
+// Sets a slider's setting (0 to 1, what's past either kept to it): a
+// volume (by Volumes' order), heard so at once, or the mouse's sensitivity,
+// felt so at once; its slider showing it.
 set_volume :: fun(viewer: ^Viewer, slider: i64, volume: f32) {
 	kept := max(0, min(1, volume))
+	if slider == SENSITIVITY_SLIDER {
+		viewer.mouse_sensitivity = kept
+		show_mouse_settings(viewer)
+		return
+	}
 	volumes := &viewer.volumes
 	if slider == 0 do volumes.master = kept
 	if slider == 1 do volumes.voice = kept
@@ -258,9 +350,11 @@ show_volumes :: fun(viewer: ^Viewer) {
 	for k in 0:VOLUME_SLIDERS.len do _ = book_set(&viewer.book, VOLUME_SLIDERS[k], "user5", volume_of(viewer.volumes, k) * 100)
 }
 
-// Keeps the volumes in the settings (failing, the journal says why).
-keep_volumes :: fun(viewer: ^Viewer) {
-	write_error := write_settings(Game_Settings{volumes = viewer.volumes})
+// Keeps the volumes and the mouse's settings in the settings file
+// (failing, the journal says why).
+keep_settings :: fun(viewer: ^Viewer) {
+	write_error := write_settings(Game_Settings{volumes = viewer.volumes, mouse_sensitivity = viewer.mouse_sensitivity,
+		invert_y = viewer.invert_y})
 	if write_error {
 		note(&viewer.journal, "couldn't keep the settings: ")
 		note_error(&viewer.journal, write_error)
@@ -268,11 +362,132 @@ keep_volumes :: fun(viewer: ^Viewer) {
 	}
 }
 
+// Keeps the controls in their file (failing, the journal says why).
+keep_controls :: fun(viewer: ^Viewer) {
+	write_error := controls_write(&viewer.controls, CONTROLS_FILE, CONTROLS_TITLE)
+	if write_error {
+		note(&viewer.journal, "couldn't keep the controls: ")
+		note_error(&viewer.journal, write_error)
+		note_end(&viewer.journal)
+	}
+}
+
+// ---- the controls menu ----------------------------------------------------------
+
+// The controls menu's page (CONTROLS_PAGE_*).
+controls_page :: fun(viewer: ^Viewer) -> i64 {
+	return i64(trait_number(&viewer.book, viewer.controls_menu, "user0", &viewer.renderer, &viewer.archives))
+}
+
+set_controls_page :: fun(viewer: ^Viewer, page: i64) {
+	_ = book_set(&viewer.book, "ControlsMenu", "user0", f32(page))
+}
+
+// The mouse's settings shown: the sensitivity slider where it is, invert
+// Y's button saying On or Off.
+show_mouse_settings :: fun(viewer: ^Viewer) {
+	_ = book_set(&viewer.book, SENSITIVITY_SLIDER_NAME, "user5", viewer.mouse_sensitivity * 100)
+	_ = book_set_text(&viewer.book, "controls_invert_y_button", "string", if viewer.invert_y do "On" else "Off")
+}
+
+// The list's rows: a copy of its template for each action, in the list
+// pane, the action's name on it, as tall as the menu says a row is (their
+// tiles kept: control_rows); the
+// pane told how many it holds, the list scrolled to its top.
+make_control_rows :: fun(viewer: ^Viewer) {
+	book := &viewer.book
+	viewer.control_rows.len = 0
+	pane := named_child(book, viewer.controls_menu, "controls_list_pane", true)
+	if pane < 0 do return
+	red := trait_number(book, viewer.controls_menu, "red", &viewer.renderer, &viewer.archives)
+	green := trait_number(book, viewer.controls_menu, "green", &viewer.renderer, &viewer.archives)
+	blue := trait_number(book, viewer.controls_menu, "blue", &viewer.renderer, &viewer.archives)
+	// (A row's height: the menu's user1, the list's over how many show.)
+	row_height := trait_number(book, viewer.controls_menu, "user1", &viewer.renderer, &viewer.archives)
+	for k in 0:viewer.controls.actions.len {
+		if not fits(viewer.control_rows.len + 1, viewer.control_rows.cap) do break
+		row := copy_template(book, viewer.controls_menu, "controls_template", pane)
+		if row < 0 do break
+		&viewer.control_rows + row
+		tile_set(book, row, "user0", f32(k))
+		tile_set_text(book, row, "user1", action_label(viewer.controls.actions[k].name))
+		tile_set(book, row, "red", red)
+		tile_set(book, row, "green", green)
+		tile_set(book, row, "blue", blue)
+		tile_set(book, row, "height", row_height)
+	}
+	tile_set(book, pane, "childcount", f32(viewer.control_rows.len))
+	viewer.controls_scroll = 0
+	scroll_controls(viewer, 0)
+}
+
+// Each row's bindings shown as they are ("W, Up"; "-" for none).
+show_control_rows :: fun(viewer: ^Viewer) {
+	for row, k in viewer.control_rows {
+		bindings := bindings_text(&viewer.controls, k)
+		tile_set_text(&viewer.book, row, "user3", if bindings.len > 0 do bindings[0 : bindings.len] else "-")
+	}
+}
+
+// Scrolls the list by rows (up, below 0), as far as it goes either way.
+scroll_controls :: fun(viewer: ^Viewer, by: i64) {
+	most := max(0, viewer.control_rows.len - CONTROLS_SHOWN)
+	viewer.controls_scroll = max(0, min(most, viewer.controls_scroll + by))
+	scroll := named_child(&viewer.book, viewer.controls_menu, "controls_vertical_scroll", true)
+	if scroll >= 0 do tile_set(&viewer.book, scroll, "user7", f32(viewer.controls_scroll))
+}
+
+// Listens for the key or button to put an action on (its row clicked): in
+// place of its first; what it had kept, to give to another action that had
+// the new one. The menu says so, its buttons hidden till it's heard.
+listen_for_control :: fun(viewer: ^Viewer, action: i64) {
+	if action < 0 or action >= viewer.controls.actions.len do return
+	bindings := viewer.controls.actions[action].bindings
+	viewer.listening_old = if bindings.len > 0 do bindings[0] else no_binding()
+	viewer.listening_row = action
+	controls_listen(&viewer.controls, action, 0)
+	_ = book_set(&viewer.book, "ControlsMenu", "user4", MENU_FALSE)
+	text : str256
+	&text + "Press a key or button for "
+	&text + action_label(viewer.controls.actions[action].name)
+	&text + ". Escape leaves it as it is."
+	_ = book_set_text(&viewer.book, "controls_instructions", "string", text)
+	if action < viewer.control_rows.len do tile_set_text(&viewer.book, viewer.control_rows[action], "user3", "...")
+}
+
+// Once what was listened for is heard (or Escape stopped it): another
+// action that had it takes what this one had in its place (they swap; it
+// loses it, if this one had none), the rows shown again, the menu's
+// buttons back.
+finish_listening :: fun(viewer: ^Viewer) {
+	if viewer.listening_row < 0 or viewer.controls.listening >= 0 do return
+	controls := &viewer.controls
+	heard := controls.heard
+	other := controls.heard_also
+	if heard.kind != .unbound and other >= 0 {
+		bindings := &controls.actions[other].bindings
+		for slot in 0:bindings.len {
+			if not same_binding(bindings[slot], heard) do continue
+			if binding_usable(viewer.listening_old) and not same_binding(viewer.listening_old, heard) {
+				bindings[slot] = viewer.listening_old
+			else
+				controls_unbind(controls, other, slot)
+			}
+			break
+		}
+	}
+	viewer.listening_row = -1
+	_ = book_set(&viewer.book, "ControlsMenu", "user4", MENU_TRUE)
+	show_control_rows(viewer)
+}
+
 // What the game sets in the menus here each frame: the main menu's logo
 // fading in from the other; the pause menu's Options right after Return
-// (Save and Load hidden: Load put where Return is, Options following it).
+// (Save and Load hidden: Load put where Return is, Options following it);
+// the controls menu's control, once it's heard.
 fill_system_menu :: fun(viewer: ^Viewer) {
 	book := &viewer.book
+	if viewer.menu_open == MENU_CONTROLS do finish_listening(viewer)
 	if viewer.menu_open == MENU_MAIN {
 		since := f32(time_now() - viewer.main_menu_since) / 1000000000
 		_ = book_set(book, "MainMenu", "user3", 255 * max(0, 1 - since / LOGO_FADE))
@@ -309,8 +524,11 @@ menu_only_frame :: fun(viewer: ^Viewer) {
 		viewer.menu_choice = CHOSE_QUIT
 		return
 	}
-	if input.pressed[Escape] do menu_back(viewer)
-	system_menu_input(viewer)
+	// (While a control's key is listened for, Escape and clicks are its.)
+	listening := viewer.controls.listening >= 0
+	controls_update(&viewer.controls, input)
+	if input.pressed[Escape] and not listening do menu_back(viewer)
+	system_menu_input(viewer, not listening)
 	layer_begin(&viewer.renderer.ui)
 	book_frame(&viewer.book)
 	draw_open_menu(viewer, platform.width, platform.height)

@@ -1,8 +1,9 @@
-// The player's settings, kept between runs in SETTINGS_PATH: for now the
-// volumes the audio menu sets. The file is written as Mara, a Game_Settings
-// value (og's settings_file: a `name = value` line a setting, a volume in
-// hundredths): a line it doesn't know is passed over, a setting missing
-// keeps its default.
+// The player's settings, kept between runs in SETTINGS_PATH: the volumes
+// the audio menu sets, and how the mouse turns the camera (the controls
+// menu's). The file is written as Mara, a Game_Settings value (og's
+// settings_file: a `name = value` line a setting, shares in hundredths):
+// a line it doesn't know is passed over, a setting missing keeps its
+// default.
 module game_settings
 
 use mara.core
@@ -14,16 +15,32 @@ use game_sound
 // Where the settings are kept: beside the game.
 SETTINGS_PATH :: "settings.txt"
 
-// The player's settings: how loud each kind of sound is.
+// The player's settings: how loud each kind of sound is; how fast the
+// mouse turns the camera (0 to 1: a half the game's own speed, 0 a quarter
+// of it, 1 four times it: mouse_turn) and whether moving it up looks down.
 Game_Settings :: struct {
 	volumes: Volumes
+	mouse_sensitivity: f32
+	invert_y: bool
 }
 
-// The settings as SETTINGS_PATH has them, the defaults (every sound as
-// loud as it's made) for those it doesn't. With no file yet, all of them
-// the defaults (why given back: File_Error.Open_Failed).
+// The settings with nothing set: every sound as loud as it's made, the
+// mouse at the game's own speed, up looking up.
+default_settings :: fun() -> Game_Settings {
+	return Game_Settings{volumes = full_volumes(), mouse_sensitivity = 0.5, invert_y = false}
+}
+
+// How much faster than the game's own the mouse turns the camera at a
+// sensitivity (0 to 1): a quarter to four times, the game's own at 0.5.
+mouse_turn :: fun(sensitivity: f32) -> f32 {
+	return pow_f32(4, sensitivity * 2 - 1)
+}
+
+// The settings as SETTINGS_PATH has them, the defaults for those it
+// doesn't. With no file yet, all of them the defaults (why given back:
+// File_Error.Open_Failed).
 read_settings :: fun() -> Game_Settings, err {
-	settings := Game_Settings{volumes = full_volumes()}
+	settings := default_settings()
 	found : [32]Setting
 	read_error := read_settings_file(SETTINGS_PATH, &found)
 	if read_error do return settings, read_error
@@ -34,6 +51,8 @@ read_settings :: fun() -> Game_Settings, err {
 		if setting.name == "effect_volume" do settings.volumes.effects = share
 		if setting.name == "footstep_volume" do settings.volumes.footsteps = share
 		if setting.name == "music_volume" do settings.volumes.music = share
+		if setting.name == "mouse_sensitivity" do settings.mouse_sensitivity = share
+		if setting.name == "invert_y" do settings.invert_y = setting.number != 0
 	}
 	return settings
 }
@@ -42,10 +61,12 @@ read_settings :: fun() -> Game_Settings, err {
 write_settings :: fun(settings: Game_Settings) -> err {
 	volumes := settings.volumes
 	write_settings_file(SETTINGS_PATH,
-		"// oblivion's settings, as the game last wrote them: read at its start.\n// The volumes are in hundredths, 0 to 100.\nsettings :: Game_Settings{\n",
+		"// oblivion's settings, as the game last wrote them: read at its start.\n// Shares are in hundredths, 0 to 100; invert_y 1 for on.\nsettings :: Game_Settings{\n",
 		[Setting{name = "master_volume", number = f64(volumes.master) * 100},
 		Setting{name = "voice_volume", number = f64(volumes.voice) * 100},
 		Setting{name = "effect_volume", number = f64(volumes.effects) * 100},
 		Setting{name = "footstep_volume", number = f64(volumes.footsteps) * 100},
-		Setting{name = "music_volume", number = f64(volumes.music) * 100}])?
+		Setting{name = "music_volume", number = f64(volumes.music) * 100},
+		Setting{name = "mouse_sensitivity", number = f64(settings.mouse_sensitivity) * 100},
+		Setting{name = "invert_y", number = if settings.invert_y do 1 else 0}])?
 }
