@@ -1,0 +1,209 @@
+// The player's controls, on og's game_controls: Oblivion's actions (named
+// as its controls menu names them, where it has them), what does each to
+// start with, and the file the player can change them in (CONTROLS_FILE,
+// beside the game). Menus and the keys for looking into the engine (V,
+// B) read the keyboard and mouse themselves, as does Escape.
+//
+// `oblivion controls`: the controls as the file has them.
+// `oblivion controls check`: game_controls tried headless, Oblivion's
+// actions and the file's ways (names in any case, quotes, the literal's
+// own lines), what's refused, defaults put back, a frame let go or held.
+module oblivion
+
+use mara.core
+use mara.os
+use mara.memory
+use mara.time
+use mara.sdl
+use disk
+use sdl_platform
+use game_controls
+use logging
+
+CONTROLS_FILE :: "controls.txt"
+CONTROLS_TITLE :: "Oblivion's controls"
+
+// The actions' numbers in the player's controls (oblivion_controls adds
+// them).
+Actions :: struct {
+	forward: i64
+	back: i64
+	slide_left: i64
+	slide_right: i64
+	run: i64
+	jump: i64
+	activate: i64
+	attack: i64
+	mouse_look: i64      // the mouse turns the camera, or not
+	fly: i64             // walking, or the camera flying free
+	hurry_time: i64      // the day goes by faster while held
+	character_menu: i64
+	map_menu: i64
+}
+
+// Oblivion's actions, each on what the game puts it on: their numbers.
+oblivion_controls :: fun(controls: ^Controls) -> Actions, err {
+	controls_start(controls)
+	actions : Actions
+	actions.forward = controls_add(controls, "forward", "W")?
+	actions.back = controls_add(controls, "back", "S")?
+	actions.slide_left = controls_add(controls, "slide_left", "A")?
+	actions.slide_right = controls_add(controls, "slide_right", "D")?
+	actions.run = controls_add(controls, "run", "LShift")?
+	actions.jump = controls_add(controls, "jump", "Space")?
+	actions.activate = controls_add(controls, "activate", "E")?
+	actions.attack = controls_add(controls, "attack", "Mouse_Left")?
+	actions.mouse_look = controls_add(controls, "mouse_look", "Mouse_Right")?
+	actions.fly = controls_add(controls, "fly", "F")?
+	actions.hurry_time = controls_add(controls, "hurry_time", "T")?
+	actions.character_menu = controls_add(controls, "character_menu", "F1")?
+	actions.map_menu = controls_add(controls, "map_menu", "F4")?
+	return actions
+}
+
+// The player's controls: Oblivion's, then as CONTROLS_FILE has them. With
+// no file yet, it's written with the game's own (not for a picture: it
+// leaves no files); the lines it doesn't understand, and why it couldn't
+// be read or written, go in the journal.
+open_controls :: fun(controls: ^Controls, journal: ^Journal, write_missing: bool) -> Actions, err {
+	actions := oblivion_controls(controls)?
+	not_understood : [16]i64
+	read_error := controls_read(controls, CONTROLS_FILE, &not_understood)
+	if read_error == File_Error.Open_Failed {
+		if not write_missing do return actions
+		write_error := controls_write(controls, CONTROLS_FILE, CONTROLS_TITLE)
+		if write_error {
+			note(journal, "couldn't write the controls: ")
+			note_error(journal, write_error)
+			note_end(journal)
+		}
+		return actions
+	}
+	if read_error {
+		note(journal, "couldn't read the controls (the game's own instead): ")
+		note_error(journal, read_error)
+		note_end(journal)
+		return actions
+	}
+	if not_understood.len > 0 {
+		note(journal, CONTROLS_FILE)
+		note(journal, ": lines not understood (left as they were):")
+		for line in not_understood {
+			note(journal, " ")
+			note(journal, line)
+		}
+		note_end(journal)
+	}
+	return actions
+}
+
+// `oblivion controls [check]`.
+command_controls :: fun(check: bool) {
+	if check {
+		check_controls()
+		return
+	}
+	journal := Journal{file = NO_FILE, started = time_now(), line = []}   // (the console only: the game's log is left be)
+	controls : Controls
+	_, open_error := open_controls(&controls, &journal, false)
+	if open_error {
+		print("couldn't set the controls up: %", open_error)
+		return
+	}
+	for action, k in controls.actions do print("% = %", action.name, bindings_text(&controls, k))
+}
+
+// Where check_controls writes its file.
+CONTROLS_CHECK_FILE :: "cache\\controls_check.txt"
+
+check_controls :: fun() {
+	failures : i64 = 0
+	controls : Controls
+	actions, start_error := oblivion_controls(&controls)
+	failures += expect(not start_error, "Oblivion's actions added")
+	failures += expect(bindings_text(&controls, actions.forward) == "W", "forward starts on W")
+
+	// What controls_add refuses.
+	_, twice := controls_add(&controls, "Forward", "Up")
+	failures += expect(twice == Controls_Error.Duplicate_Action, "an action's name again, in another case")
+	_, spaced := controls_add(&controls, "two words", "")
+	failures += expect(spaced == Controls_Error.Bad_Name, "a name with a space")
+	_, empty := controls_add(&controls, "", "")
+	failures += expect(empty == Controls_Error.Bad_Name, "an empty name")
+	_, long := controls_add(&controls, "a_name_longer_than_thirty_two_bytes", "")
+	failures += expect(long == Controls_Error.Bad_Name, "a name past 32 bytes")
+	_, wrong := controls_add(&controls, "sneak", "Control")
+	failures += expect(wrong == Controls_Error.Bad_Default, "a default no key is")
+	_, many := controls_add(&controls, "sneak", "A, B, C, D, E")
+	failures += expect(many == Controls_Error.Bad_Default, "more defaults than there's room for")
+
+	// A file in the literal's form, names in other cases, quoted and not,
+	// one binding written twice; and lines it can't take.
+	make_folder("cache")
+	sample := "// a comment\ncontrols :: Controls{\n\tFORWARD = \"w, up\"\n\tjump = space\n\tattack = \"mouse_left, MOUSE_LEFT\"\n\tsneak = C\n\tback = \"Kp2, Nothing\"\n\tactivate = \"\"\n}\n"
+	sample_error := write_entire_file(CONTROLS_CHECK_FILE, sample)
+	failures += expect(not sample_error, "the sample file written")
+	not_understood : [16]i64
+	read_error := controls_read(&controls, CONTROLS_CHECK_FILE, &not_understood)
+	failures += expect(not read_error, "the sample file read")
+	failures += expect(bindings_text(&controls, actions.forward) == "W, Up", "forward on W and Up, written in any case")
+	failures += expect(bindings_text(&controls, actions.jump) == "Space", "jump on Space, unquoted")
+	failures += expect(bindings_text(&controls, actions.attack) == "Mouse_Left", "attack on Mouse_Left once")
+	failures += expect(bindings_text(&controls, actions.back) == "S", "back kept on S (Nothing is no key)")
+	failures += expect(bindings_text(&controls, actions.activate) == "", "activate on nothing")
+	failures += expect(not_understood.len == 2 and not_understood[0] == 6 and not_understood[1] == 7,
+		"lines 6 and 7 not understood (sneak, Nothing); the literal's own lines passed over")
+
+	// Written back and read again: the same, every line understood.
+	write_error := controls_write(&controls, CONTROLS_CHECK_FILE, "The check's controls")
+	failures += expect(not write_error, "the controls written back")
+	again : Controls
+	_, again_start_error := oblivion_controls(&again)
+	failures += expect(not again_start_error, "Oblivion's actions added again")
+	again_error := controls_read(&again, CONTROLS_CHECK_FILE, &not_understood)
+	failures += expect(not again_error and not_understood.len == 0, "the written file read back, every line")
+	for k in 0:controls.actions.len {
+		failures += expect(bindings_text(&again, k) == bindings_text(&controls, k), "an action the same read back")
+	}
+
+	// A binding no key has isn't bound.
+	other := controls_bind(&controls, actions.jump, 0, Binding{kind = .keyboard, code = 3})
+	failures += expect(other < 0 and bindings_text(&controls, actions.jump) == "Space", "a key code no key has refused")
+	// The game's own back.
+	controls_reset(&controls)
+	failures += expect(bindings_text(&controls, actions.forward) == "W" and bindings_text(&controls, actions.activate) == "E",
+		"every action on the game's own again")
+
+	// W held: forward pressed, then a menu's frame lets it go; held by hand.
+	input : Input
+	input.pressed[Scancode.W] = true
+	input.held[Scancode.W] = true
+	controls_update(&controls, &input)
+	failures += expect(action_pressed(&controls, actions.forward), "forward pressed with W")
+	input.pressed[Scancode.W] = false
+	controls_update(&controls, &input)
+	controls_let_go(&controls)
+	failures += expect(not action_down(&controls, actions.forward) and action_released(&controls, actions.forward),
+		"a menu's frame: forward let go")
+	input.held[Scancode.W] = false
+	controls_update(&controls, &input)
+	controls_hold(&controls, actions.forward)
+	failures += expect(action_down(&controls, actions.forward) and action_pressed(&controls, actions.forward),
+		"forward held by hand: pressed")
+	controls_update(&controls, &input)
+	controls_hold(&controls, actions.forward)
+	failures += expect(action_down(&controls, actions.forward) and not action_pressed(&controls, actions.forward),
+		"held by hand again: not pressed again")
+	controls_update(&controls, &input)
+	failures += expect(action_released(&controls, actions.forward), "no longer held: released")
+
+	if failures == 0 do print("controls check: all as they should be")
+	else do print("controls check: % failed", failures)
+}
+
+// 0 when it is, 1 (and why, printed) when it isn't.
+expect :: fun(holds: bool, what: []utf8) -> i64 {
+	if holds do return 0
+	print("not as it should be: %", what)
+	return 1
+}

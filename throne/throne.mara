@@ -872,7 +872,7 @@ check_controls :: fun() {
 	controls_update(&controls, &input)
 	failures += expect(same_text(bindings_text(&controls, CONTROL_STRIKE), "G"), "strike listened onto G")
 	failures += expect(not action_pressed(&controls, CONTROL_STRIKE), "the key listened for strikes nothing")
-	failures += expect(controls.listening < 0 and controls.heard.kind == BINDING_KEY and controls.heard_also < 0, "heard G, no other action on it")
+	failures += expect(controls.listening < 0 and controls.heard.kind == .keyboard and controls.heard_also < 0, "heard G, no other action on it")
 	controls_update(&controls, &input)
 	failures += expect(action_down(&controls, CONTROL_STRIKE), "strike down with G after")
 	// F2 listened onto strike's second place: show_collision has it too.

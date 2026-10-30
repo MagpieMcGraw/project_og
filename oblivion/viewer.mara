@@ -42,6 +42,7 @@ use indexing
 use random
 use game_sound
 use sprite_layer
+use game_controls
 gl :: use mara.open_gl
 render :: use render
 
@@ -163,6 +164,10 @@ Viewer :: struct {
 	camera: render.Camera
 	speed: f32          // how fast the camera flies, in units a second
 	input: Input
+	// The player's controls (player_controls.mara): what does each of
+	// Oblivion's actions, and the actions' numbers in them.
+	controls: Controls
+	actions: Actions
 	journal: Journal
 	place: str256       // what's shown, for the window's title
 	chosen_door: i64    // the door view_frame stopped for
@@ -388,6 +393,7 @@ viewer_open :: fun(viewer: ^Viewer, directory_storage: ^[]byte, table_storage: ^
 		note_error(&viewer.journal, settings_error)
 		note_end(&viewer.journal)
 	}
+	viewer.actions = open_controls(&viewer.controls, &viewer.journal, not taking_picture)?
 	viewer.told_tracks = 0
 	if taking_picture {
 		note(&viewer.journal, "no sound: taking a picture")
@@ -584,6 +590,8 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	camera := &viewer.camera
 	shown := &viewer.shown
 	input := &viewer.input
+	controls := &viewer.controls
+	actions := viewer.actions
 
 	read_input(platform, input)
 	if input.quit do return .quit
@@ -593,12 +601,13 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		input.mouse_y = viewer.picture.click_y
 		input.mouse_pressed[1] = true
 	}
-	// The menus: F1 the character's, F4 the map (its key again, or Escape,
-	// closes it); Escape with none open, the pause menu (its Quit quits).
-	// While one is open the mouse is its, and nothing else of the keyboard
-	// or mouse reaches the game.
-	if input.pressed[F1] do toggle_menu(viewer, MENU_STATS)
-	if input.pressed[F4] do toggle_menu(viewer, MENU_MAP)
+	controls_update(controls, input)
+	// The menus: the character's (F1), the map (F4) — its control again, or
+	// Escape, closes it; Escape with none open, the pause menu (its Quit
+	// quits). While one is open the mouse is its, and nothing else of the
+	// keyboard or mouse reaches the game: no action is down.
+	if action_pressed(controls, actions.character_menu) do toggle_menu(viewer, MENU_STATS)
+	if action_pressed(controls, actions.map_menu) do toggle_menu(viewer, MENU_MAP)
 	if input.pressed[Escape] {
 		if viewer.menu_open == 0 do open_system_menu(viewer, MENU_PAUSE)
 		else do menu_back(viewer)
@@ -615,8 +624,9 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		}
 		input.mouse_moved_x = 0
 		input.mouse_moved_y = 0
+		controls_let_go(controls)
 	}
-	if input.mouse_pressed[3] do set_mouse_look(platform, not platform.mouse_look)
+	if action_pressed(controls, actions.mouse_look) do set_mouse_look(platform, not platform.mouse_look)
 	if input.pressed[V] {
 		set_vsync(platform, not platform.vsync)
 		viewer.next_frame = time_now()
@@ -631,7 +641,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		note_end(&viewer.journal)
 		update_title(viewer)
 	}
-	// What the reticle is on: E uses it — a door that leads somewhere is
+	// What the reticle is on: activating uses it — a door that leads somewhere is
 	// gone through, one that opens in place opens or closes.
 	targeted := targeted_reference(shown, camera^)
 	leading := leading_door(shown, targeted)
@@ -644,7 +654,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	viewer.hud.activate = 0
 	if usable do viewer.hud.activate = ICON_DOOR
 	if person != 0 do viewer.hud.activate = ICON_TALK
-	if input.pressed[E] and usable {
+	if action_pressed(controls, actions.activate) and usable {
 		if leading >= 0 {
 			// Its opening sound, heard on after going through, where the door
 			// was. (A door that opens in place sounds as it swings.)
@@ -656,7 +666,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		// (Asked of the server: the door swings when it says, follow_door_states.)
 		send_use_door(outgoing(viewer), targeted)
 	}
-	if input.pressed[E] and not usable {
+	if action_pressed(controls, actions.activate) and not usable {
 		viewer.missed = true
 		viewer.missed_target = targeted
 	}
@@ -664,7 +674,7 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	seconds, now := time_since(viewer.frame_start)
 	// A picture's walk: forward till its seconds have gone.
 	if viewer.picture_walked < viewer.picture.walk_for {
-		input.held[W] = true
+		controls_hold(controls, actions.forward)
 		viewer.picture_walked += f32(seconds)
 	}
 	viewer.frame_start = now
@@ -675,19 +685,19 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 		if camera.pitch > 1.5 do camera.pitch = 1.5
 		if camera.pitch < -1.5 do camera.pitch = -1.5
 	}
-	if input.pressed[F] do set_walking(viewer, not viewer.walking)
+	if action_pressed(controls, actions.fly) do set_walking(viewer, not viewer.walking)
 	if viewer.walking {
 		// Across the ground, the way the camera faces; the camera at the eyes.
 		ahead := Vec3{sin_f32(camera.yaw), cos_f32(camera.yaw), 0}
 		side := Vec3{cos_f32(camera.yaw), -sin_f32(camera.yaw), 0}
 		going := Vec3{0, 0, 0}
-		if input.held[W] do going = going + ahead
-		if input.held[S] do going = going - ahead
-		if input.held[D] do going = going + side
-		if input.held[A] do going = going - side
-		if vec3_length(going) > 0 do going = vec3_normalize(going) * (if input.held[LShift] do RUN_SPEED else WALK_SPEED)
+		if action_down(controls, actions.forward) do going = going + ahead
+		if action_down(controls, actions.back) do going = going - ahead
+		if action_down(controls, actions.slide_right) do going = going + side
+		if action_down(controls, actions.slide_left) do going = going - side
+		if vec3_length(going) > 0 do going = vec3_normalize(going) * (if action_down(controls, actions.run) do RUN_SPEED else WALK_SPEED)
 		step_seconds := min_f32(f32(seconds), LONGEST_STEP)
-		walk(&viewer.walker, shown, going, input.pressed[Space], step_seconds)
+		walk(&viewer.walker, shown, going, action_pressed(controls, actions.jump), step_seconds)
 		// The feet climb a step in a frame; the eyes follow over a few, so
 		// stairs are a slope to them. Falling and jumping, they keep up.
 		feet := viewer.walker.position
@@ -701,21 +711,21 @@ view_frame :: fun(viewer: ^Viewer) -> View_Event {
 	else
 		forward, right, up := camera_axes(camera^)
 		step := f32(seconds) * viewer.speed
-		if input.held[LShift] do step *= 4
-		if input.held[W] do camera.position = camera.position + forward * step
-		if input.held[S] do camera.position = camera.position - forward * step
-		if input.held[D] do camera.position = camera.position + right * step
-		if input.held[A] do camera.position = camera.position - right * step
+		if action_down(controls, actions.run) do step *= 4
+		if action_down(controls, actions.forward) do camera.position = camera.position + forward * step
+		if action_down(controls, actions.back) do camera.position = camera.position - forward * step
+		if action_down(controls, actions.slide_right) do camera.position = camera.position + right * step
+		if action_down(controls, actions.slide_left) do camera.position = camera.position - right * step
 	}
 
-	report_player(viewer, input.held[T], f32(seconds))
+	report_player(viewer, action_down(controls, actions.hurry_time), f32(seconds))
 	show_time(viewer, f32(seconds))
 	noises : [16]Door_Noise
 	follow_door_states(shown, &viewer.seen)
 	swing_doors(shown, f32(seconds), &noises)
 	move_pieces(shown, viewer.look.time)
-	// The people posed, the player's arms too: a left click swings.
-	step_first_person(viewer, input.mouse_pressed[1])
+	// The people posed, the player's arms too: attacking swings.
+	step_first_person(viewer, action_pressed(controls, actions.attack))
 	viewer.renderer.palette.len = 0
 	follow_actors(viewer)
 	movers : [MAX_PLAYERS]Npc_Mover

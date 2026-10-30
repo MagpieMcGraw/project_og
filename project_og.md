@@ -66,15 +66,16 @@ next build: rebuild each and rerun its checks after one.
 | file_cache | files unpacked from a game's archives kept on disk (append-only, safe against crashes), found by key | oblivion, unchanged but for Key_Index's module |
 | xml | XML a piece at a time (`next_piece`, `read_tag`): a tag's name as written and any attributes (`attribute(text, &tag, name)`, any case; values as places in the text), text between, comments passed over; `trim_xml_text` | oblivion's menus.mara tokenizer, which kept only three attributes and lowered names |
 | settings_file | settings kept as a Mara struct literal, `name = number` lines (`read_settings_file`, `write_settings_file`) | oblivion's game_settings.mara, its volumes left there |
-| game_controls | a game's actions and what does each, remappable: the game adds its actions with defaults (`controls_start`, `controls_add(name, "Mouse_Left, Space")`), asks after actions each frame (`controls_update` after read_input; `action_down`, `action_pressed`, `action_released`); keys by SDL's names, Mouse_Left…Mouse_Forward, Wheel_Up/Down, up to 4 an action; a text file the player edits (`controls_read` gives back the lines it couldn't take, `controls_write`); remapping as the game runs (`controls_bind`, `controls_unbind`, `controls_listen` for a menu's "press a key": `heard`, `heard_also` for a clash) | written for throne (2026-10-30); `throne controls check` tries it |
+| game_controls | a game's actions and what does each, remappable: the game adds its actions with defaults (`controls_start`, `controls_add(name, "Mouse_Left, Space")`), asks after actions each frame (`controls_update` after read_input; `action_down`, `action_pressed`, `action_released`); keys by SDL's names, Mouse_Left…Mouse_Forward, Wheel_Up/Down, any case, up to 4 an action (a `Binding` of a `Binding_Kind`: unbound, keyboard, mouse_button, mouse_wheel); a file the player edits, a Mara literal (`controls :: Controls{` `forward = "W, Up"` `}`, quotes optional; `controls_read` gives back the lines it couldn't take, `controls_write`); remapping as the game runs (`controls_bind` refuses codes no key has, `controls_unbind`, `controls_listen` for a menu's "press a key" — after the frame's controls_update: `heard`, `heard_also` for a clash; `controls_reset` to the game's own); a frame whose input went to a menu (`controls_let_go`), an action held by hand (`controls_hold`); `controls_add` refuses a name twice, or one not letters, digits and _ (up to 32) | written for throne (2026-10-30), made sturdier for oblivion the same day; `throne controls check` and `oblivion controls check` try it |
 
 Which ports use og:
 
 - **throne:** all of them, through og (build.mara `dirs = ["../og"]`).
-- **oblivion:** all of them but lzo, lzw and game_controls (written for
-  throne; game_controls could take over its keys), through og (build.mara `dirs =
-  ["../og"]`, since 2026-10-29), keeping no copies. Its messages and
-  DEFAULT_PORT are in its world_state. What stays its own on top of og's
+- **oblivion:** all of them but lzo and lzw, through og (build.mara `dirs =
+  ["../og"]`, since 2026-10-29), keeping no copies. Its gameplay keys are
+  game_controls actions (player_controls.mara, controls.txt beside it).
+  Its messages and DEFAULT_PORT are in its world_state. What stays its
+  own on top of og's
   modules: game_sound (SOUN records, their loudness and pitch, placed
   sounds, the menu's Volumes, music kinds as folders of Data\Music),
   game_settings (its keys), menus (the menu dialect, lowering tag names
@@ -179,6 +180,11 @@ notes; GL errors noted once each.
 - A project's folder can't be in another's dirs when both have a
   build.mara: `module build` is then in two folders. A check program in a
   scratch folder copies the project modules it needs instead.
+- An enum's variants are names in every file that uses its module: a
+  local or param of the same name there is an error (`variable 'wheel'
+  would hide the variant`). Name variants so they won't meet a local
+  (game_controls' Binding_Kind: unbound, keyboard, mouse_button,
+  mouse_wheel).
 - An error variant two error types used together both have is ambiguous
   where it's written bare (`Shader_Failed`: sprite_layer's and
   oblivion's Render_Error): write `Render_Error.Shader_Failed`.

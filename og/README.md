@@ -18,7 +18,7 @@ here, and the ways of working the ports share.
 | logging | the journal (a log file and the console, lines stamped with the time); full.log for lists found full |
 | disk | files opened to read and write, folders made, file stamps, a view filled whole (Windows, ASCII paths) |
 | sdl_platform | the window, its OpenGL 4.5 context, keyboard and mouse; a hidden window for pictures |
-| game_controls | a game's actions and what does each (keys, mouse buttons, the wheel), remappable in a file the player edits or as the game runs (listening for the next key pressed) |
+| game_controls | a game's actions and what does each (keys, mouse buttons, the wheel), remappable in a file the player edits (a Mara literal, names in any case) or as the game runs (listening for the next key pressed), the game's own put back on asking |
 | inflate | deflate (zlib) decoding |
 | png | PNG writing |
 | lzo | LZO1X unpacking, every read and write checked |
