@@ -166,6 +166,21 @@ A level's folder holds:
     when entered (`TriggerEvent`, its event's name: `SQ01_ShrineRoom`).
     `throne picture … collision` (F2 in the game) draws them all: things'
     outlines yellow, plain lines orange, events' areas blue, spots pink.
+  - Stairs, a level's ways to the next: a group (`EGRP`) with two
+    properties (each a u8 length and its name, a u8 length and its value
+    in quotes) — `TheDestLevel "Citadel1_Bedroom"`, `TheDestPointName
+    "BottomOfStairs"` — then a script record, `ESRT` `TriggerStairs`
+    (u32 2, its params `DestLevel ::TheDestLevel`, `DestPointName
+    ::TheDestPointName`), then the bytes 0, 1, 0, 1 and its place, i32 x,
+    y, on the stairs' picture (the shrine's: 1564,1287; the stairwell
+    at 1527,1233 is the picture after it). The Mori citadel's rooms are a
+    chain by them: Ground Floor ↔ Throne Room ↔ Dining Room ↔ Bedroom ↔
+    Shrine, each way arriving at the named spot BottomOfStairs or
+    TopOfStairs, 80 to 120 pixels from the stairs back. The Ground Floor's
+    door to the outer citadel (INSIDEOFDOOR, OUTSIDEOFDOOR) is something
+    else, not found yet. How the game set the stairs off (walking onto
+    them, a click) isn't known: throne takes them when a player walks into
+    40 pixels of the place, and moves the whole party.
   - `ELIT` lights (x, y, a radius?), `ESND` sounds, `ESRT`, `EGRP`
     (groups?), `EMLT` (things with states: the portal; `ParentGenerator
     "Chest#A"` before each of the shrine's two chests, which are animations
@@ -205,6 +220,14 @@ A level's folder holds:
   at (1612, −200), but the Citadel03 shrine at (1482, 500): each level
   has its own corner, or it follows something not found yet (the lex
   header holds only 800, 600, 4; `IGRL` is 0).
+  tools/walk_fit.py now takes each wall line's open side from what its
+  outline belongs to (a picture's wall foot: open below; a plain ECOL
+  front edge: open above), and finds the shrine again (1608, −213). The
+  bedroom (200 × 300, two rooms in an L) won't fit: one corner puts the
+  tatami room right and the other room off its walls, another (63 cells
+  along) the other room right and the tatami room off — something about
+  a grid that isn't square isn't understood yet (its axes?), so it and
+  the other rooms are walked anywhere.
   The shrine's grid blocks two table-sized spots of bare floor just in
   front of its two low tables (in both mp and sp): the game's own data —
   the tables moved after the grid was made, perhaps. Most furniture

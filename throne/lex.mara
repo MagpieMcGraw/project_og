@@ -34,6 +34,22 @@ TAG_PICTURE :: 0x41524745     // EGRA
 TAG_ANIMATION :: 0x494E4145   // EANI
 TAG_OUTLINE :: 0x4C4F434F     // OCOL
 TAG_COLLISION :: 0x4C4F4345   // ECOL
+TAG_SCRIPT :: 0x54525345      // ESRT
+LEX_EXITS :: 64
+
+// A way out of the level: stairs. A group (EGRP) gives two properties —
+// TheDestLevel "Citadel1_Bedroom", TheDestPointName "BottomOfStairs" (each
+// a u8 length and its name, a u8 length and its value in quotes) — then a
+// script record (ESRT) "TriggerStairs" that takes them (u32 2, its params:
+// DestLevel ::TheDestLevel, DestPointName ::TheDestPointName), then 4
+// bytes (0, 1, 0, 1) and its place, i32 x, y: on the stairs, near the
+// level's named spot where one arrives coming back up or down them.
+Lex_Exit :: struct {
+	x: i64
+	y: i64
+	to_level: [48]utf8    // World.ini's name
+	to_spot: [48]utf8     // a named spot there (.stripped.sp's, any case)
+}
 
 // What an outline belongs to, by the record before it: a picture or an
 // animation placed (where it stands: a wall's foot, a piece of
@@ -93,6 +109,7 @@ Layout :: struct {
 	placed: [LEX_PLACED]Placed
 	outlines: [LEX_OUTLINES]Outline
 	outline_points: [LEX_OUTLINE_POINTS]Outline_Point
+	exits: [LEX_EXITS]Lex_Exit
 	// The box round all that's placed (their canvases).
 	left: i64
 	top: i64
@@ -106,6 +123,7 @@ lex_read :: fun(layout: ^Layout, bytes: []byte) -> err {
 	layout.placed.len = 0
 	layout.outlines.len = 0
 	layout.outline_points.len = 0
+	layout.exits.len = 0
 	// The table's start: IRES, in the header's room.
 	table : i64 = -1
 	for at in 0:min(bytes.len - 4, 4096) {
@@ -149,15 +167,37 @@ lex_read :: fun(layout: ^Layout, bytes: []byte) -> err {
 	layout_box(layout)
 }
 
-// The pictures and animations placed and the outlines, from at on: each
-// record found by its tag, kept when its fields check.
+// The pictures and animations placed, the outlines and the stairs, from at
+// on: each record found by its tag, kept when its fields check.
 read_records :: fun(layout: ^Layout, bytes: []byte, from: i64) -> err {
 	at := from
-	// What the next outline belongs to, by the records so far.
+	// What the next outline belongs to, by the records so far; where the
+	// next stairs lead, by the last group's properties.
 	owner := OUTLINE_OTHER
+	to_level : [48]utf8
+	to_spot : [48]utf8
 	for at + 8 <= bytes.len {
+		if i64(bytes[at]) == 12 and text_at(bytes, at + 1, "TheDestLevel") {
+			to_level = quoted_value(bytes, at + 13)
+		elif i64(bytes[at]) == 16 and text_at(bytes, at + 1, "TheDestPointName")
+			to_spot = quoted_value(bytes, at + 17)
+		}
 		tag : u32 = bytes[at]
-		if tag == TAG_PICTURE and at + 28 <= bytes.len {
+		if tag == TAG_SCRIPT and at + 18 <= bytes.len and i64(bytes[at + 4]) == 13 and text_at(bytes, at + 5, "TriggerStairs") {
+			// (Its place: past its params, after the bytes 0, 1, 0, 1.)
+			for mark in at + 18:max(min(at + 160, bytes.len - 12), at + 18) {
+				if i64(bytes[mark]) == 0 and i64(bytes[mark + 1]) == 1 and i64(bytes[mark + 2]) == 0 and i64(bytes[mark + 3]) == 1 {
+					x : i32 = bytes[mark + 4]
+					y : i32 = bytes[mark + 8]
+					if to_level.len > 0 and layout.exits.len < layout.exits.cap {
+						&layout.exits + Lex_Exit{x = i64(x), y = i64(y), to_level = to_level, to_spot = to_spot}
+					}
+					break
+				}
+			}
+			to_level.len = 0
+			to_spot.len = 0
+		elif tag == TAG_PICTURE and at + 28 <= bytes.len
 			x : i32 = bytes[at + 4]
 			y : i32 = bytes[at + 8]
 			resource : i32 = bytes[at + 20]
@@ -208,6 +248,29 @@ read_records :: fun(layout: ^Layout, bytes: []byte, from: i64) -> err {
 		}
 		at += 1
 	}
+}
+
+// Whether the bytes at at spell text.
+text_at :: fun(bytes: []byte, at: i64, text: []utf8) -> bool {
+	if at < 0 or at + text.len > bytes.len do return false
+	for c, k in text {
+		if utf8(bytes[at + k]) != c do return false
+	}
+	return true
+}
+
+// A value at at (a u8 length, then its letters), its quotes left out:
+// "Citadel1_Bedroom" as Citadel1_Bedroom.
+quoted_value :: fun(bytes: []byte, at: i64) -> [48]utf8 {
+	value : [48]utf8
+	if at >= bytes.len do return value
+	size := i64(bytes[at])
+	for k in 0:size {
+		if at + 1 + k >= bytes.len do break
+		c := utf8(bytes[at + 1 + k])
+		if c != '"' and value.len < value.cap do &value + c
+	}
+	return value
 }
 
 // Whether text is in the span bytes from at (as far as the bytes go).

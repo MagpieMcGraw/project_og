@@ -35,6 +35,7 @@ use lex
 use level
 use level_art
 use walk_grid
+use world_level
 use audio
 use music_cache
 use text
@@ -468,85 +469,11 @@ game_frame :: fun(platform: ^Platform, input: ^Input, controls: ^Controls, link:
 	if view.sound do mix_ahead(&view.mixer)
 }
 
-// The level a game starts in (START_LEVEL), its area, and its walk grid
-// into walk (when its corner is known: walk_grid.mara), read from the
-// game's World.lot: a server hosting the game needs them. When they can't
-// be read, no level (empty), a bare room's area, no grid; the journal says
-// why.
-start_level :: fun(journal: ^Journal, walk: ^Walk_Grid) -> [48]utf8, Area {
-	walk.ready = false
-	name : [48]utf8
-	world : Lot
-	directory : [1 * MB]byte = void
-	open_error := lot_open(&world, lot_file_path(WORLD_ARCHIVE), &directory)
-	if open_error {
-		note(journal, "couldn't open the world's archive (no level, a bare room): ")
-		note_error(journal, open_error)
-		note_end(journal)
-		return name, no_level_area()
-	}
-	defer lot_close(&world)
-	layout : Layout
-	file : [LEVEL_FILE_ROOM]byte = void
-	info, level_error := read_level(&world, START_LEVEL, &layout, &file)
-	if level_error {
-		note(journal, "couldn't read the level " )
-		note(journal, START_LEVEL)
-		note(journal, " (no level, a bare room): ")
-		note_error(journal, level_error)
-		note_end(journal)
-		return name, no_level_area()
-	}
-	&name + START_LEVEL
-	read_walk_grid(&world, &info, walk, &file, journal)
-	area := Area{left = f32(layout.left), top = f32(layout.top), right = f32(layout.right), bottom = f32(layout.bottom),
-		start_x = f32(layout.left + layout.right) / 2, start_y = f32(layout.top + layout.bottom) / 2}
-	shrine_x, shrine_y, has_shrine := level_shrine(&world, &info, &file)
-	if has_shrine {
-		area.start_x = shrine_x
-		area.start_y = shrine_y
-		note(journal, "players start at the level's shrine, ")
-		note(journal, i64(shrine_x))
-		note(journal, ", ")
-		note(journal, i64(shrine_y))
-		note_end(journal)
-	}
-	return name, area
-}
-
-// A level's walk grid (its .walk.sp) into walk, when its corner is known;
-// the journal says which it is.
-read_walk_grid :: fun(world: ^Lot, info: ^Level_Info, walk: ^Walk_Grid, file: ^[]byte, journal: ^Journal) {
-	known, read_error := read_level_walk(world, info, walk, file)
-	if read_error {
-		note(journal, "couldn't read the walk grid of ")
-		note(journal, info.name)
-		note(journal, " (walking anywhere in it): ")
-		note_error(journal, read_error)
-		note_end(journal)
-		return
-	}
-	if not known {
-		note(journal, "no walk grid for ")
-		note(journal, info.name)
-		note(journal, " (where its grid lies isn't known yet): walking anywhere in it")
-		note_end(journal)
-		return
-	}
-	open : i64 = 0
-	for up in 0:walk.height {
-		for gx in 0:walk.width {
-			if not cell_blocked(walk, gx, up) do open += 1
-		}
-	}
-	note(journal, "walk grid ")
-	note(journal, walk.width)
-	note(journal, " x ")
-	note(journal, walk.height)
-	note(journal, ", ")
-	note(journal, open)
-	note(journal, " cells open")
-	note_end(journal)
+// The level a game starts in (START_LEVEL), its area, its walk grid into
+// walk and its ways out into exits (world_level.mara): a server hosting
+// the game needs them. Players start at its shrine.
+start_level :: fun(journal: ^Journal, walk: ^Walk_Grid, exits: ^[]Exit) -> [48]utf8, Area {
+	return read_world_level(START_LEVEL, "", walk, exits, journal)
 }
 
 // The game in a window: joining the game at an address, or with none, the
@@ -557,9 +484,10 @@ command_play :: fun(address: []utf8) -> bool {
 	journal := open_journal()
 	defer journal_close(&journal)
 	walk : Walk_Grid
-	level_name, area := start_level(&journal, &walk)
+	exits : [WORLD_EXITS]Exit
+	level_name, area := start_level(&journal, &walk, &exits)
 	link : Link
-	link_error := link_open(&link, &journal, address, level_name, area, &walk)
+	link_error := link_open(&link, &journal, address, level_name, area, &walk, exits)
 	if link_error {
 		note(&journal, "couldn't join the game: ")
 		note_error(&journal, link_error)
@@ -605,9 +533,10 @@ command_picture :: fun(path: []utf8, seconds: f64, address: []utf8, click_x: f32
 	journal := open_journal()
 	defer journal_close(&journal)
 	walk : Walk_Grid
-	level_name, area := start_level(&journal, &walk)
+	exits : [WORLD_EXITS]Exit
+	level_name, area := start_level(&journal, &walk, &exits)
 	link : Link
-	link_error := link_open(&link, &journal, address, level_name, area, &walk)
+	link_error := link_open(&link, &journal, address, level_name, area, &walk, exits)
 	if link_error {
 		print("couldn't join the game: %", link_error)
 		return
@@ -703,9 +632,10 @@ command_serve :: fun(port: i64, seconds: f64, open: bool) {
 	journal := open_journal()
 	defer journal_close(&journal)
 	walk : Walk_Grid
-	level_name, area := start_level(&journal, &walk)
+	exits : [WORLD_EXITS]Exit
+	level_name, area := start_level(&journal, &walk, &exits)
 	server : World_Server
-	server_start(&server, level_name, area, &walk, true)
+	server_start(&server, level_name, area, &walk, exits, true)
 	listen_error := server_listen(&server, u16(port), open)
 	if listen_error {
 		print("couldn't listen on port %: %", port, listen_error)
@@ -715,7 +645,7 @@ command_serve :: fun(port: i64, seconds: f64, open: bool) {
 	print("serving the game on port % (%)", port, if open do "open to others" else "this machine's only")
 	start := time_now()
 	for seconds <= 0 or f64(time_now() - start) / 1000000000 < seconds {
-		server_run(&server)
+		server_run(&server, &journal)
 		sleep_ms(2)
 	}
 	print("served % ticks", server.state.ticks)
@@ -735,9 +665,10 @@ command_bot :: fun(seconds: f64, address: []utf8) {
 	journal := open_journal()
 	defer journal_close(&journal)
 	walk : Walk_Grid
-	level_name, area := start_level(&journal, &walk)
+	exits : [WORLD_EXITS]Exit
+	level_name, area := start_level(&journal, &walk, &exits)
 	link : Link
-	link_error := link_open(&link, &journal, address, level_name, area, &walk)
+	link_error := link_open(&link, &journal, address, level_name, area, &walk, exits)
 	if link_error {
 		print("bot couldn't join the game: %", link_error)
 		return
@@ -909,6 +840,60 @@ check_controls :: fun() {
 	else do print("controls check: % failed", failures)
 }
 
+// `throne stairs`: the party (one player) walked down the shrine's stairs
+// and back up, on the server's world alone (no window, no network): where
+// they arrive each way, and that walking about beside the stairs they came
+// by doesn't take them back.
+command_stairs :: fun() {
+	journal := open_journal()
+	defer journal_close(&journal)
+	failures := 0
+	state : World_State
+	walk : Walk_Grid
+	exits : [WORLD_EXITS]Exit
+	level_name, area := start_level(&journal, &walk, &exits)
+	world_start(&state, level_name, area, &walk, exits)
+	player := &state.players[0]
+	player_clear(player, 1, 0, &state)
+	failures += expect(state.exits.len == 1 and same_text(state.exits[0].to_level, "Citadel1_Bedroom"), "the shrine's one way out, to the bedroom")
+	if state.exits.len == 0 {
+		print("stairs check: % failed", failures)
+		return
+	}
+	walk_to(&state, player, state.exits[0].x, state.exits[0].y)
+	failures += expect(take_stairs(&state, &journal), "the shrine's stairs taken")
+	failures += expect(same_text(state.level, "Citadel1_Bedroom"), "down in the bedroom")
+	print("down: player at %, %", i64(player.x), i64(player.y))
+	// A step about beside the stairs back up: not taken.
+	walk_to(&state, player, player.x + 24, player.y + 12)
+	failures += expect(state.exit_taken < 0, "a step beside the stairs back doesn't take them")
+	up := -1
+	for exit, k in state.exits {
+		if same_text(exit.to_level, "Citadel1_Shrine") do up = k
+	}
+	failures += expect(up >= 0, "the bedroom's stairs up to the shrine")
+	if up >= 0 {
+		// Away from them, then onto them.
+		walk_to(&state, player, state.exits[up].x - 200, state.exits[up].y + 100)
+		walk_to(&state, player, state.exits[up].x, state.exits[up].y)
+		failures += expect(state.exit_taken == up, "the stairs up taken")
+		failures += expect(take_stairs(&state, &journal) and same_text(state.level, "Citadel1_Shrine"), "back up in the shrine")
+		print("up: player at %, %", i64(player.x), i64(player.y))
+	}
+	if failures == 0 do print("stairs check: all as they should be")
+	else do print("stairs check: % failed", failures)
+}
+
+// A player walked to a spot, the world stepped till they're there, stopped
+// or a way out's taken (20 seconds at most).
+walk_to :: fun(state: ^World_State, player: ^Player_State, x: f32, y: f32) {
+	player_go(player, x, y, state)
+	for tick in 0:i64(20.0 / WORLD_TICK) {
+		world_step(state)
+		if not player.walking or state.exit_taken >= 0 do break
+	}
+}
+
 // A check's outcome: 1 when it failed (and it says so), else 0.
 expect :: fun(ok: bool, what: []utf8) -> i64 {
 	if ok do return 0
@@ -935,6 +920,7 @@ usage :: fun() {
 	print("throne walk-grid <level>               a level's walk grid: its size and open cells")
 	print("throne music-cache <track>             a track (\"music\\castle.mp3\") unpacked where the game plays it from")
 	print("throne controls [check]                what each action is on (from %); check: the controls tried", CONTROLS_FILE)
+	print("throne stairs                          the party down the shrine's stairs and back, on the world alone: where they arrive")
 }
 
 // `throne music-cache <track>`: a music track, as World.ini names it,
@@ -1126,6 +1112,8 @@ main :: (args: [][]utf8) {
 		command_walk_grid(args[2])
 	elif command == "controls"
 		command_controls(args.len > 2 and args[2] == "check")
+	elif command == "stairs"
+		command_stairs()
 	elif command == "music-cache" and args.len > 2
 		command_music_cache(args[2])
 	elif command == "sprite" and args.len > 4

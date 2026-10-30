@@ -7,7 +7,7 @@ Lines inside the room (screens, chests) count too, on whichever side the
 room's middle falls, so the best score is well short of all; for the Mori
 shrine it gives (1612, -215), the corner the overlay (walk.py) checks.
 Where the corner comes from in the game's files isn't known yet."""
-import sys, os, math
+import sys, os, math, re
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lot, walk
 data = open('D:/Games/Disciples 2/Throne of Darkness/LotFiles/World.lot', 'rb').read()
@@ -25,20 +25,30 @@ def i32(d, at):
 
 
 def wall_lines(layout):
-    """Every outline's lines sloping as walls do: (left x, right x, slope,
-    where it meets x = 0)."""
+    """The outlines' lines sloping as walls do: (left x, right x, slope,
+    where it meets x = 0, the open side: 1 down the screen, -1 up). An
+    outline belongs to the record before it (lex.mara): a picture's or an
+    animation's is a wall's foot (walls drawn are the far ones, the floor in
+    front of them: open below); a plain ECOL's is a front edge (no wall
+    drawn: open above); an event's area (ECOL TriggerEvent) is left out."""
+    tags = sorted((m.start(), m.group()) for m in re.finditer(rb'EGRA|EANI|ECOL|OCOL', layout))
+    owner = None
     lines = []
-    at = layout.find(b'OCOL')
-    while at >= 0:
-        count = i32(layout, at + 4)
-        if 1 < count < 200:
+    for at, tag in tags:
+        if tag in (b'EGRA', b'EANI'):
+            owner = 'thing'
+        elif tag == b'ECOL':
+            owner = 'trigger' if b'TriggerEvent' in layout[at + 4:at + 36] else 'line'
+        else:
+            count = i32(layout, at + 4)
+            if not 1 < count < 200 or owner not in ('thing', 'line'):
+                continue
             points = [(i32(layout, at + 8 + 8 * k), i32(layout, at + 12 + 8 * k)) for k in range(count)]
             for (x1, y1), (x2, y2) in zip(points, points[1:]):
                 if abs(x1 - x2) >= 48 and all(-1000 < v < 20000 for v in (x1, y1, x2, y2)):
                     slope = (y2 - y1) / (x2 - x1)
                     if abs(abs(slope) - 0.5) < 0.06:
-                        lines.append((min(x1, x2), max(x1, x2), slope, y1 - slope * x1))
-        at = layout.find(b'OCOL', at + 4)
+                        lines.append((min(x1, x2), max(x1, x2), slope, y1 - slope * x1, 1 if owner == 'thing' else -1))
     return lines
 
 
@@ -59,14 +69,8 @@ def fit(folder, name):
     spots_path = folder + name.lower() + '.stripped.sp'
     spots = spots_of(read(spots_path)) if spots_path in files else []
     width, height, rows = walk.walk_grid(read(folder + name.lower() + '.walk.sp'))
-    # The room's middle: the middle of the lines' ends; each line's open
-    # side is the middle's (1: down the screen).
-    ends = [(x, slope * x + c) for lo, hi, slope, c in lines for x in (lo, hi)]
-    middle_x = sum(e[0] for e in ends) / len(ends)
-    middle_y = sum(e[1] for e in ends) / len(ends)
     samples = []
-    for lo, hi, slope, c in lines:
-        inward = 1 if middle_y > slope * middle_x + c else -1
+    for lo, hi, slope, c, inward in lines:
         for px in range(int(lo), int(hi) + 1, 16):
             samples.append((px, slope * px + c, inward))
 

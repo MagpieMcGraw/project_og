@@ -12,6 +12,7 @@ use mara.time
 use mara.string
 use mara.os
 use world_state
+use world_level
 use walk_grid
 use wire
 use logging
@@ -37,12 +38,12 @@ World_Server :: struct {
 }
 
 // A server starting: its world in a level (World.ini's name; empty: none)
-// and that level's area (world_start), no clients, not listening. Hosted in
-// a player's game, its joins and leaves are told to the players (their
-// journals); alone, on the console too.
-server_start :: fun(server: ^World_Server, level: []utf8, area: Area, walk: ^Walk_Grid, alone: bool = false) {
+// and that level's area, walk grid and ways out (world_start), no clients,
+// not listening. Hosted in a player's game, its joins and leaves are told
+// to the players (their journals); alone, on the console too.
+server_start :: fun(server: ^World_Server, level: []utf8, area: Area, walk: ^Walk_Grid, exits: []Exit, alone: bool = false) {
 	server.alone = alone
-	world_start(&server.state, level, area, walk)
+	world_start(&server.state, level, area, walk, exits)
 	for &client in server.clients {
 		client.here = false
 		client.connection = no_connection()
@@ -104,9 +105,10 @@ server_leave :: fun(server: ^World_Server, slot: i64, reason: err) {
 
 // Runs the server as far as now: the connections made taken in, what its
 // clients have said taken in, the world's ticks due by now stepped
-// (WORLD_TICK each; MOST_TICKS_AT_ONCE at most, the rest let go), and each
-// client told where everyone is and sent what's waiting for it.
-server_run :: fun(server: ^World_Server) {
+// (WORLD_TICK each; MOST_TICKS_AT_ONCE at most, the rest let go), the party
+// moved when a player's taken the stairs (the journal says where), and
+// each client told where everyone is and sent what's waiting for it.
+server_run :: fun(server: ^World_Server, journal: ^Journal) {
 	if server.listener.id != NO_SOCKET {
 		for true {
 			connection := no_connection()
@@ -150,6 +152,7 @@ server_run :: fun(server: ^World_Server) {
 		ticks += 1
 		server.players_due = true
 	}
+	if server.state.exit_taken >= 0 do server_take_stairs(server, journal)
 	seen := players_seen(&server.state)
 	for &client, slot in server.clients {
 		if not client.here do continue
@@ -160,6 +163,22 @@ server_run :: fun(server: ^World_Server) {
 		}
 	}
 	server.players_due = false
+}
+
+// The party taken down (or up) the stairs a player's reached: the level
+// they lead to read (world_level), everyone moved there to the spot they
+// lead to, and every client welcomed into it again (its Welcome: the level
+// and its area, their player the same). When it can't be read, the party
+// stays where it is (the journal says why).
+server_take_stairs :: fun(server: ^World_Server, journal: ^Journal) {
+	if not take_stairs(&server.state, journal) do return
+	for &client, slot in server.clients {
+		if not client.here do continue
+		wire_put(&client.to_client, MESSAGE_WELCOME, Welcome_Message{player = server.state.players[slot].id, seed = server.state.seed,
+			level = server.state.level, area = server.state.area})
+	}
+	if server.alone do print("the party took the stairs to %", server.state.level)
+	server.players_due = true
 }
 
 // A message from the client in a slot, acted on.

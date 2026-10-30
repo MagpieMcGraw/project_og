@@ -63,6 +63,20 @@ MESSAGE_WELCOME :: 10    // which player the client is, the level (Welcome_Messa
 MESSAGE_PLAYERS :: 11    // every player, where they are (a list of Player_Seens)
 MESSAGE_NOTE :: 12       // something to tell the player (Note_Message)
 
+// A way out of the level, its stairs (lex.mara's Lex_Exit): where it's
+// taken — by a player walking into EXIT_REACH of it, from outside (one who
+// arrives within it, beside the stairs they came by, must leave and come
+// back), and the whole party goes (a guess at how the game moved them) —
+// the level it leads to and the named spot there they arrive at.
+Exit :: struct {
+	x: f32
+	y: f32
+	to_level: [48]utf8
+	to_spot: [48]utf8
+}
+WORLD_EXITS :: 16
+EXIT_REACH :: 40.0
+
 // A level's area: where its players may go.
 Area :: struct {
 	left: f32
@@ -128,6 +142,7 @@ Player_State :: struct {
 	strikes: i64
 	facing: i64
 	look: i64
+	near_exit: i64      // the way out they're within reach of (-1: none)
 }
 
 // How long a strike takes (seconds): the player stands in it, and each
@@ -135,13 +150,16 @@ Player_State :: struct {
 STRIKE_SECONDS :: 0.75
 
 // The world: its level, its area and walk grid (and room to search it for
-// routes), its players in slots (a client's slot is its player's), the
-// steps it's taken, its seed.
+// routes), its ways out (and the one a player's just taken: -1 none, till
+// the server's moved the party), its players in slots (a client's slot is
+// its player's), the steps it's taken, its seed.
 World_State :: struct {
 	level: [48]utf8
 	area: Area
 	walk: Walk_Grid
 	search: Route_Search
+	exits: [WORLD_EXITS]Exit
+	exit_taken: i64
 	players: [MAX_PLAYERS!]Player_State
 	ticks: i64
 	seed: u64
@@ -153,27 +171,57 @@ no_level_area :: fun() -> Area {
 		start_y = f32(NO_LEVEL_HEIGHT) / 2}
 }
 
-// A world starting in a level (empty: none), its area and its walk grid
-// (copied; not ready: walk anywhere): nobody in it.
-world_start :: fun(state: ^World_State, level: []utf8, area: Area, walk: ^Walk_Grid) {
-	state.level.len = 0
-	for c in level {
-		if state.level.len < state.level.cap do &state.level + c
-	}
-	state.area = area
-	state.walk = walk^
+// A world starting in a level (empty: none), its area, its walk grid
+// (copied; not ready: walk anywhere) and its ways out: nobody in it.
+world_start :: fun(state: ^World_State, level: []utf8, area: Area, walk: ^Walk_Grid, exits: []Exit) {
+	world_take_level(state, level, area, walk, exits)
 	route_search_start(&state.search)
 	for &player, slot in state.players do player_clear(player, 0, slot, state)
 	state.ticks = 0
 	state.seed = time_now()
 }
 
+// The world's level, area, walk grid and ways out, in place of what they were.
+world_take_level :: fun(state: ^World_State, level: []utf8, area: Area, walk: ^Walk_Grid, exits: []Exit) {
+	state.level.len = 0
+	for c in level {
+		if state.level.len < state.level.cap do &state.level + c
+	}
+	state.area = area
+	state.walk = walk^
+	state.exits.len = 0
+	for exit in exits {
+		if state.exits.len < state.exits.cap do &state.exits + exit
+	}
+	state.exit_taken = -1
+}
+
+// The party moved to another level, by its stairs: the level, its area
+// (its start where they arrive), walk grid and ways out in place of the
+// old; each player standing round where they arrive, as at a start (their
+// numbers, looks and strikes kept).
+world_move_party :: fun(state: ^World_State, level: []utf8, area: Area, walk: ^Walk_Grid, exits: []Exit) {
+	world_take_level(state, level, area, walk, exits)
+	for &player, slot in state.players {
+		if player.id != 0 do player_place(player, slot, state)
+	}
+}
+
 // A slot's player made afresh: the player numbered id (0: none), standing
-// at their slot's start, round the area's start (its shrine), a little apart
-// from the others' — on the open cell nearest it.
+// at their slot's start (player_place).
 player_clear :: fun(player: ^Player_State, id: i64, slot: i64, state: ^World_State) {
-	area := state.area
 	player.id = id
+	player_place(player, slot, state)
+	player.facing = FACING_DOWN
+	player.look = if id > 0 do (id - 1) % LOOKS else 0
+	player.strikes = 0
+}
+
+// A player standing still at their slot's start: round the area's start
+// (its shrine, or where they arrived), a little apart from the others' — on
+// the open cell nearest it.
+player_place :: fun(player: ^Player_State, slot: i64, state: ^World_State) {
+	area := state.area
 	start_x := area.start_x + f32(slot % 4) * f32(START_SPACING) - f32(START_SPACING) * 1.5
 	start_y := area.start_y + f32(slot / 4) * f32(START_SPACING) - f32(START_SPACING) * 0.5
 	player.x, player.y = nearest_open(&state.walk, start_x, start_y)
@@ -182,10 +230,18 @@ player_clear :: fun(player: ^Player_State, id: i64, slot: i64, state: ^World_Sta
 	player.to_x = player.x
 	player.to_y = player.y
 	player.walking = false
-	player.facing = FACING_DOWN
-	player.look = if id > 0 do (id - 1) % LOOKS else 0
 	player.strike_left = 0
-	player.strikes = 0
+	player.near_exit = exit_within(state, player.x, player.y)
+}
+
+// The way out a level point is within reach of: its number, -1 when none.
+exit_within :: fun(state: ^World_State, x: f32, y: f32) -> i64 {
+	for exit, k in state.exits {
+		across := exit.x - x
+		down := exit.y - y
+		if across * across + down * down <= f32(EXIT_REACH * EXIT_REACH) do return k
+	}
+	return -1
 }
 
 // Which way someone faces going across and down (screen pixels, down
@@ -242,7 +298,9 @@ player_go :: fun(player: ^Player_State, x: f32, y: f32, state: ^World_State) {
 // The world one step on: each walking player a step nearer the next point
 // of their route (or where they're going, with none), on to the next once
 // there, stopped at the last. A step onto a blocked cell slides along it
-// (across, or down, alone), or the player stops.
+// (across, or down, alone), or the player stops. A walking player who comes
+// within EXIT_REACH of a way out takes it: the world says which
+// (exit_taken), for the server to move the party.
 world_step :: fun(state: ^World_State) {
 	step := f32(WALK_SPEED * WORLD_TICK)
 	for &player in state.players {
@@ -284,6 +342,12 @@ world_step :: fun(state: ^World_State) {
 		else
 			player.walking = false
 		}
+		near := exit_within(state, player.x, player.y)
+		if near >= 0 and near != player.near_exit and state.exit_taken < 0 {
+			state.exit_taken = near
+			player.walking = false
+		}
+		player.near_exit = near
 	}
 	state.ticks += 1
 }

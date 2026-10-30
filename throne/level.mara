@@ -136,36 +136,72 @@ read_level :: fun(world: ^Lot, name: []utf8, layout: ^Layout, file: ^[]byte) -> 
 	return info
 }
 
-// A level's shrine, where players start in it: the first of its named
-// spots (<LEX>.stripped.sp: u32 0, u32 count, then each a u8 name length,
-// its name, i32 x, i32 y) whose name ends with SHRINE ("MORISHRINE");
-// false when it has none. file is room to read the spots in.
-level_shrine :: fun(world: ^Lot, info: ^Level_Info, file: ^[]byte) -> f32, f32, bool {
+// A level's named spot (its .stripped.sp): its name, where it is in the
+// level. What the scripts point at: the shrine, the stairs' tops and
+// bottoms, doors.
+LEVEL_SPOTS :: 64
+Named_Spot :: struct {
+	name: [48]utf8
+	x: f32
+	y: f32
+}
+
+// A level's named spots (<LEX>.stripped.sp: u32 0, u32 count, then each a
+// u8 name length, its name, i32 x, i32 y) into spots (as many as fit);
+// none when it has no such file or it can't be read. file is room to read
+// them in.
+read_spots :: fun(world: ^Lot, info: ^Level_Info, file: ^[]byte, spots: ^[]Named_Spot) {
+	spots.len = 0
 	path : [256]utf8
 	&path + info.folder
 	&path + info.layout_name
 	&path + ".stripped.sp"
 	spots_file, found := lot_find(world, path)
-	if not found do return 0, 0, false
+	if not found do return
 	read_error := lot_read(world, spots_file, file)
-	if read_error or file.len < 8 do return 0, 0, false
+	if read_error or file.len < 8 do return
 	count : u32 = file[4]
 	at : i64 = 8
 	for k in 0:i64(count) {
-		if at >= file.len do break
+		if at >= file.len or spots.len == spots.cap do break
 		size := i64(file[at])
 		if at + 1 + size + 8 > file.len do break
 		x : i32 = file[at + 1 + size]
 		y : i32 = file[at + 5 + size]
-		ending := "SHRINE"
-		if size >= ending.len {
-			is_shrine := true
-			for c, j in ending {
-				if lower(letter(file^, at + 1 + size - ending.len + j)) != lower(c) do is_shrine = false
-			}
-			if is_shrine do return f32(x), f32(y), true
+		spot := Named_Spot{name = [], x = f32(x), y = f32(y)}
+		for j in 0:size {
+			if spot.name.len < spot.name.cap do &spot.name + letter(file^, at + 1 + j)
 		}
+		spots + spot
 		at += 1 + size + 8
+	}
+}
+
+// Where the spot named name is (any case: the scripts write BottomOfStairs,
+// the spots BOTTOMOFSTAIRS); false when there's none of that name.
+spot_named :: fun(spots: []Named_Spot, name: []utf8) -> f32, f32, bool {
+	for spot in spots {
+		if spot.name.len != name.len do continue
+		same := true
+		for c, k in name {
+			if lower(spot.name[k]) != lower(c) do same = false
+		}
+		if same do return spot.x, spot.y, true
+	}
+	return 0, 0, false
+}
+
+// A level's shrine, where players start in it: the first of its named
+// spots whose name ends with SHRINE ("MORISHRINE"); false when it has none.
+level_shrine :: fun(spots: []Named_Spot) -> f32, f32, bool {
+	ending := "SHRINE"
+	for spot in spots {
+		if spot.name.len < ending.len do continue
+		is_shrine := true
+		for c, j in ending {
+			if lower(spot.name[spot.name.len - ending.len + j]) != lower(c) do is_shrine = false
+		}
+		if is_shrine do return spot.x, spot.y, true
 	}
 	return 0, 0, false
 }

@@ -47,6 +47,14 @@ walk grid's blocked cells at the edge of where one can walk (red), and
 the layout's outlines — things' footprints (yellow), plain collision
 lines (orange), areas that set off events (blue), named spots (pink).
 
+The rooms join by their stairs, as the game's layouts say (FORMATS.md):
+a player who walks onto a staircase takes the whole party to the room it
+leads to, arriving at the spot the stairs name (the shrine's go down to
+the bedroom's foot of the stairs; from there the dining room, the throne
+room, the ground floor). The server reads the new room and tells every
+window, which draws it. Only the shrine's walk grid is known: in the
+other rooms players walk anywhere for now.
+
 The controls are actions (og's game_controls): walk (the left button,
 held: following the mouse), strike (the right), show_collision (F2), quit
 (Escape). What does each is in throne_controls.txt beside the journal,
@@ -67,6 +75,7 @@ Pictures and checks use the game's own, never the file.
     throne walk-grid <level>          a level's walk grid: its size and open cells
     throne music-cache <track>        a track ("music\castle.mp3") unpacked where the game plays it from
     throne controls [check]           what each action is on (the file written when there's none); check: og's game_controls tried on made-up input
+    throne stairs                     the party down the shrine's stairs and back up, on the world alone: where they arrive
 
 Opened twice, the second copy joins the first's game (port 27200, this
 machine only). Each run writes a journal: the first of throne.log,
@@ -74,7 +83,7 @@ throne_2.log, … not in use. The game's files are read from
 `D:\Games\Disciples 2\Throne of Darkness\LotFiles` (art.mara's
 LOT_FOLDER).
 
-The modules: `world_state` (the world and its messages), `world_server`,
+The modules: `world_state` (the world and its messages), `world_level` (a level as the server reads it: area, grid, stairs, where players start), `world_server`,
 `world_copy` (a client's view of the world), `game_link` (join or host),
 `lot` (the archives), `spr8` (the sprites), `art` (the samurai's
 pictures on the card), `rex` (a level's bundles), `lex` (a level's

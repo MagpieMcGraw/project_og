@@ -1,0 +1,147 @@
+// A level as a game's server needs it, read from the game's World.lot: its
+// area (the box round all it shows), its walk grid (when where the grid
+// lies is known: walk_grid.mara), its ways out (its stairs: lex.mara), and
+// where players start in it — the named spot they arrive at (coming by
+// stairs: BottomOfStairs, TopOfStairs), else its shrine, else its middle.
+// For a game's start, and each time the party takes the stairs.
+module world_level
+
+use mara.core
+use mara.memory
+use lot
+use level
+use lex
+use art
+use walk_grid
+use world_state
+use logging
+
+// A level read into walk (its grid) and exits (its ways out): its name and
+// area, players starting at the spot named arrive_at (empty: the level's
+// shrine). The journal says how it went. When the level can't be read: no
+// level (its name empty), a bare room's area, no grid, no ways out.
+read_world_level :: fun(name: []utf8, arrive_at: []utf8, walk: ^Walk_Grid, exits: ^[]Exit, journal: ^Journal) -> [48]utf8, Area {
+	walk.ready = false
+	exits.len = 0
+	level_name : [48]utf8
+	world : Lot
+	directory : [1 * MB]byte = void
+	open_error := lot_open(&world, lot_file_path(WORLD_ARCHIVE), &directory)
+	if open_error {
+		note(journal, "couldn't open the world's archive (no level, a bare room): ")
+		note_error(journal, open_error)
+		note_end(journal)
+		return level_name, no_level_area()
+	}
+	defer lot_close(&world)
+	layout : Layout
+	file : [LEVEL_FILE_ROOM]byte = void
+	info, level_error := read_level(&world, name, &layout, &file)
+	if level_error {
+		note(journal, "couldn't read the level " )
+		note(journal, name)
+		note(journal, " (no level, a bare room): ")
+		note_error(journal, level_error)
+		note_end(journal)
+		return level_name, no_level_area()
+	}
+	for c in name {
+		if level_name.len < level_name.cap do &level_name + c
+	}
+	read_walk_grid(&world, &info, walk, &file, journal)
+	for exit in layout.exits {
+		if exits.len == exits.cap do break
+		exits + Exit{x = f32(exit.x), y = f32(exit.y), to_level = exit.to_level, to_spot = exit.to_spot}
+	}
+	area := Area{left = f32(layout.left), top = f32(layout.top), right = f32(layout.right), bottom = f32(layout.bottom),
+		start_x = f32(layout.left + layout.right) / 2, start_y = f32(layout.top + layout.bottom) / 2}
+	spots : [LEVEL_SPOTS]Named_Spot
+	read_spots(&world, &info, &file, &spots)
+	arrive_x, arrive_y, has_spot := spot_named(spots, arrive_at)
+	if arrive_at.len > 0 and not has_spot {
+		note(journal, "no spot ")
+		note(journal, arrive_at)
+		note(journal, " in ")
+		note(journal, name)
+		note_end(journal)
+	}
+	if not has_spot do arrive_x, arrive_y, has_spot = level_shrine(spots)
+	if has_spot {
+		area.start_x = arrive_x
+		area.start_y = arrive_y
+	}
+	note(journal, "level ")
+	note(journal, name)
+	note(journal, ": players start at ")
+	note(journal, i64(area.start_x))
+	note(journal, ", ")
+	note(journal, i64(area.start_y))
+	if arrive_at.len > 0 and has_spot {
+		note(journal, " (")
+		note(journal, arrive_at)
+		note(journal, ")")
+	}
+	note(journal, "; ")
+	note(journal, exits.len)
+	note(journal, " ways out")
+	for exit in exits^ {
+		note(journal, ", to ")
+		note(journal, exit.to_level)
+	}
+	note_end(journal)
+	return level_name, area
+}
+
+// The party taken down (or up) the stairs a player's reached (the world's
+// exit_taken): the level they lead to read, everyone moved there to the
+// spot they lead to. False when it can't be read: the party stays where it
+// is (the journal says why).
+take_stairs :: fun(state: ^World_State, journal: ^Journal) -> bool {
+	if state.exit_taken < 0 do return false
+	exit := state.exits[state.exit_taken]
+	state.exit_taken = -1
+	walk : Walk_Grid
+	exits : [WORLD_EXITS]Exit
+	level_name, area := read_world_level(exit.to_level, exit.to_spot, &walk, &exits, journal)
+	if level_name.len == 0 do return false
+	world_move_party(state, level_name, area, &walk, exits)
+	note(journal, "the party took the stairs to ")
+	note(journal, level_name)
+	note_end(journal)
+	return true
+}
+
+// A level's walk grid (its .walk.sp) into walk, when its corner is known;
+// the journal says which it is.
+read_walk_grid :: fun(world: ^Lot, info: ^Level_Info, walk: ^Walk_Grid, file: ^[]byte, journal: ^Journal) {
+	known, read_error := read_level_walk(world, info, walk, file)
+	if read_error {
+		note(journal, "couldn't read the walk grid of ")
+		note(journal, info.name)
+		note(journal, " (walking anywhere in it): ")
+		note_error(journal, read_error)
+		note_end(journal)
+		return
+	}
+	if not known {
+		note(journal, "no walk grid for ")
+		note(journal, info.name)
+		note(journal, " (where its grid lies isn't known yet): walking anywhere in it")
+		note_end(journal)
+		return
+	}
+	open : i64 = 0
+	for up in 0:walk.height {
+		for gx in 0:walk.width {
+			if not cell_blocked(walk, gx, up) do open += 1
+		}
+	}
+	note(journal, "walk grid ")
+	note(journal, walk.width)
+	note(journal, " x ")
+	note(journal, walk.height)
+	note(journal, ", ")
+	note(journal, open)
+	note(journal, " cells open")
+	note_end(journal)
+}
