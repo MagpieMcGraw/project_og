@@ -50,11 +50,13 @@ lines (orange), areas that set off events (blue), named spots (pink).
 The controls are actions (og's game_controls): walk (the left button,
 held: following the mouse), strike (the right), show_collision (F2), quit
 (Escape). What does each is in throne_controls.txt beside the journal,
-written with the game's own the first time and read every start after:
-change a line (`strike = Mouse_Right, Space`; keys by SDL's names, up to 4
-an action, nothing after the = for none) and it's so from the next start;
-a line it can't take is passed over, and the journal says which. Pictures
-and checks use the game's own, never the file.
+written with the game's own the first time and read every start after.
+It's written as a Mara value (`controls :: Controls{`, a line an action,
+`}`): change a line (`strike = "Mouse_Right, Space"`; keys by SDL's
+names, any case, up to 4 an action, `""` for none) and it's so from the
+next start; a line it can't take is passed over, and the journal says
+which. (A file from before, its lines unquoted, reads the same.)
+Pictures and checks use the game's own, never the file.
 
     throne                            the game: joins one on this machine, else hosts
     throne connect <address[:port]>   the game, joining the one at an address
