@@ -77,6 +77,11 @@ PERSON_HEIGHT :: 128
 // Parts an NPC is made of, at most; shapes its model has, at most.
 NPC_PARTS :: 32
 NPC_MODEL_PARTS :: 128
+// The flipbooks (a flame atronach's fire) and motions (a texture moved, a
+// glow changing) an NPC's or a creature's model keeps from its parts, at
+// most.
+NPC_FLIPS :: 8
+NPC_MOTIONS :: 32
 
 // One mesh an NPC is put together from: the texture its shapes are drawn
 // with in place of their own (empty: their own), the bone it hangs from if
@@ -739,6 +744,8 @@ assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose
 	// (The parts' list in the model's room, as their vertices are.)
 	built := slice([:NPC_MODEL_PARTS]Model_Part, &room.model)
 	palette := slice([:if rigged do NPC_PALETTE else 0]Palette_Entry, &room.model)
+	flips := slice([:NPC_FLIPS]Model_Flip, &room.model)
+	motions := slice([:NPC_MOTIONS]Model_Motion, &room.model)
 	low := Vec3{1000000, 1000000, 1000000}
 	high := Vec3{-1000000, -1000000, -1000000}
 	morph_file : [2 * MB]byte
@@ -807,8 +814,19 @@ assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose
 			continue
 		}
 		for entry in made.palette do &palette + entry
+		// Its flipbooks and motions kept, their parts' numbers moved on to
+		// where its parts go in the model's.
+		part_base := built.len
+		flip_base := flips.len
+		for &flip in made.flips {
+			if fits(flips.len + 1, flips.cap) do &flips + flip^
+		}
 		for &made_part, made_index in made.parts {
 			if not fits(built.len + 1, built.cap) do break
+			if made_part.flip >= 0 {
+				made_part.flip += flip_base
+				if made_part.flip >= flips.len do made_part.flip = -1
+			}
 			for &influence in made_part.influences {
 				for k in 0:4 do influence.entries[k] += u16(palette_base)
 			}
@@ -851,6 +869,11 @@ assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose
 			}
 			&built + made_part^
 		}
+		for &motion in made.motions {
+			moved := motion^
+			moved.part += part_base
+			if moved.part < built.len and fits(motions.len + 1, motions.cap) do &motions + moved
+		}
 		for axis in 0:3 {
 			low[axis] = min(low[axis], made.bounds_min[axis])
 			high[axis] = max(high[axis], made.bounds_max[axis])
@@ -867,7 +890,7 @@ assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose
 		low = low * look.height
 		high = high * look.height
 	}
-	return Model{parts = built, flips = [], particles = [], motions = [], bounds_min = low, bounds_max = high, palette = palette}
+	return Model{parts = built, flips = flips, particles = [], motions = motions, bounds_min = low, bounds_max = high, palette = palette}
 }
 
 // How far a part's vertices move for a face, into moves: by its morphs,
