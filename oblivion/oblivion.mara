@@ -2915,7 +2915,7 @@ usage :: fun() {
 	print("                                 drawn shapes lying on one another near a point (flicker)")
 	print("oblivion mp3 <file> [raw]        decodes an MP3 (into raw floats, if given)")
 	print("oblivion music <kind> [raw]      a kind's first track through the mix, no sound device (explore, public, dungeon)")
-	print("oblivion creatures [placed]       every creature put together headless (placed: where Tamriel's are)")
+	print("oblivion creatures [placed [id]]  every creature put together headless (placed: where Tamriel's are)")
 	print("oblivion controls [check]        the controls as controls.txt has them (check: game_controls tried)")
 	print("oblivion help                    this")
 }
@@ -3829,7 +3829,7 @@ main :: (args: [][]utf8) {
 	elif command == "skin" and args.len > 2
 		command_skin(args[2], if args.len > 3 do args[3] else "meshes/characters/_male/idle.kf")
 	elif command == "creatures"
-		command_creatures(args.len > 2 and args[2] == "placed")
+		command_creatures(args.len > 2 and args[2] == "placed", if args.len > 3 do args[3] else args[0][0:0])
 	elif command == "controls"
 		command_controls(args.len > 2 and args[2] == "check")
 	elif command == "music" and args.len > 2

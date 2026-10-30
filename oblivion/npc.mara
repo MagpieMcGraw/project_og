@@ -107,6 +107,7 @@ Npc_Look :: struct {
 	run: [256]utf8
 	attack: [256]utf8
 	parts: [NPC_PARTS]Npc_Part
+	npc: bool             // an NPC's, not a creature's: its head's parts are in FaceGen's head space (head_hang)
 	has_face: bool        // its face values read (all NPCs have them)
 	face: Face_Values     // how its head and what sits on it are shaped (facegen.mara)
 	npc_id: u32           // (its skins are named after it: Face_Skin)
@@ -189,6 +190,7 @@ MAX_POSE_BONES :: 128
 // What an NPC looks like, from its NPC_ record and its race's: into look.
 read_npc_look :: fun(plugin: ^Plugin, npc_id: u32, look: ^Npc_Look) -> err {
 	look_start(look, npc_id)
+	look.npc = true
 	&look.idle + IDLE_ANIMATION
 	&look.walk + WALK_ANIMATION
 	&look.run + RUN_ANIMATION
@@ -374,6 +376,7 @@ look_start :: fun(look: ^Npc_Look, actor_id: u32) {
 	look.walk.len = 0
 	look.run.len = 0
 	look.attack.len = 0
+	look.npc = false
 	look.has_face = false
 	look.face = Face_Values{0}
 	look.npc_id = actor_id
@@ -769,7 +772,9 @@ assemble_npc :: fun(archives: ^Archives, room: ^Load_Room, look: ^Npc_Look, pose
 			if bone.len == 0 do bone = hanging_bone(&mesh)
 			if bone.len > 0 {
 				place, posed := pose_place(pose, bone)
-				if compare_folded(bone, HEAD_BONE) == 0 do place, posed = head_hang(&mesh, pose)
+				// (An NPC's head parts are in FaceGen's head space; a creature's,
+				// as any other's, in its bone's.)
+				if look.npc and compare_folded(bone, HEAD_BONE) == 0 do place, posed = head_hang(&mesh, pose)
 				if posed do hang = place
 				hang_bone = pose_index(pose, bone)
 			}

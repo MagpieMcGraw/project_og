@@ -3,7 +3,7 @@
 // animations, its meshes made — and what couldn't be, counted: how many
 // of each kind of failure, and the first creature with each. To see what
 // the game's creatures need that isn't read yet. `oblivion creatures
-// placed`: where Tamriel's are placed (creatures_placed).
+// placed [editor id]`: where Tamriel's are placed (creatures_placed).
 module oblivion
 
 use mara.core
@@ -28,7 +28,7 @@ Creature_Failure :: struct {
 	first: str64
 }
 
-command_creatures :: fun(placed: bool) {
+command_creatures :: fun(placed: bool, wanted: []utf8) {
 	index_storage : [96 * MB]byte
 	plugin, load_error := load_oblivion(&index_storage)
 	if load_error {
@@ -44,7 +44,7 @@ command_creatures :: fun(placed: bool) {
 	}
 	defer close_archives(&archives)
 	if placed {
-		creatures_placed(&plugin)
+		creatures_placed(&plugin, wanted)
 		return
 	}
 	file_room : [16 * MB]byte = void
@@ -104,7 +104,9 @@ command_creatures :: fun(placed: bool) {
 // (and its persistent cell's), how many are disabled (a quest brings them
 // in), how many leveled ones come to none (their list's chance of none),
 // and how many cells have any — the creatures a player meets outside.
-creatures_placed :: fun(plugin: ^Plugin) {
+// Given a creature's editor id, also where it stands (the first 10), a
+// leveled one as its list gives that placing.
+creatures_placed :: fun(plugin: ^Plugin, wanted: []utf8) {
 	scratch : [64 * KB]byte = void
 	scratch.len = 0
 	tamriel := find_world(plugin, "Tamriel", &scratch)
@@ -118,6 +120,7 @@ creatures_placed :: fun(plugin: ^Plugin) {
 	disabled : i64 = 0
 	leveled : i64 = 0
 	none : i64 = 0
+	shown_at : i64 = 0
 	references : [16384]Reference = void
 	for key, slot in plugin.exterior_cells.keys {
 		if key == 0 or u32(key >> 32) != tamriel do continue
@@ -135,14 +138,25 @@ creatures_placed :: fun(plugin: ^Plugin) {
 				disabled += 1
 				continue
 			}
+			creature := reference.base
 			if kind == "LVLC" {
 				leveled += 1
-				if leveled_form(plugin, reference.base, u64(reference.form_id)) == 0 {
+				creature = leveled_form(plugin, reference.base, u64(reference.form_id))
+				if creature == 0 {
 					none += 1
 					continue
 				}
 			}
 			here += 1
+			if wanted.len > 0 and shown_at < 10 {
+				scratch.len = 0
+				record, record_error := find_record(plugin, creature, &scratch)
+				if not record_error and editor_id(record.data) == wanted {
+					cell_key := key & 0xFFFFFFFF
+					print("  % at % (grid % %)", wanted, reference.position, i64(i16(u16(cell_key >> 16))), i64(i16(u16(cell_key & 0xFFFF))))
+					shown_at += 1
+				}
+			}
 		}
 		if here > 0 do cells_with += 1
 	}
