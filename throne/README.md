@@ -42,13 +42,16 @@ they're going, and tells everyone where everyone is and which level
 they're in. Without the game's files the level is a bare room, open
 everywhere, and the players coloured squares. Only the shrine's grid is
 used: where a level's grid lies on it is known for the shrine alone
-(fitted: walk_grid.mara).
+(fitted: walk_grid.mara). F2 shows what stops one, over the level: the
+walk grid's blocked cells at the edge of where one can walk (red), and
+the layout's outlines — things' footprints (yellow), plain collision
+lines (orange), areas that set off events (blue), named spots (pink).
 
     throne                            the game: joins one on this machine, else hosts
     throne connect <address[:port]>   the game, joining the one at an address
     throne serve [port] [seconds] [open]   a server alone, no window
     throne bot [seconds] [address]    a player with no window, walking about
-    throne picture <out.png> [seconds] [address] [click x y] [strike]   the game in a window never shown (silent), its last frame written (strike: the click is a right-click)
+    throne picture <out.png> [seconds] [address] [click x y] [strike] [collision]   the game in a window never shown (silent), its last frame written (strike: the click is a right-click; collision: drawn as F2 shows it)
     throne sprite <archive> <path | folder> <out.png>   a sprite's frames as the game's atlas lays them out
     throne walk-grid <level>          a level's walk grid: its size and open cells
     throne music-cache <track>        a track ("music\castle.mp3") unpacked where the game plays it from

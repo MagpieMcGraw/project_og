@@ -143,6 +143,24 @@ layer_image :: fun(layer: ^Sprite_Layer, texture: u32, x: f32, y: f32, width: f3
 	runs[runs.len - 1].count += 6
 }
 
+// The corners of a four-cornered shape, as its two triangles take them.
+QUAD_CORNERS :: [6!]i64{0, 1, 2, 0, 2, 3}
+
+// Puts a four-cornered shape on the layer: its corners in order round it
+// (pixels from the window's top left), each showing the texture at its
+// u, v (0 to 1 across it), tinted as layer_image's are. For what isn't an
+// upright rectangle: a slanting line, a diamond.
+layer_quad :: fun(layer: ^Sprite_Layer, texture: u32, corners: [4!][2!]f32, uvs: [4!][2!]f32, color: [4!]f32) {
+	if not fits(layer.vertices.len + 6, layer.vertices.cap) do return
+	runs := &layer.runs
+	if runs.len == 0 or runs[runs.len - 1].texture != texture {
+		if not fits(runs.len + 1, runs.cap) do return
+		runs + Sprite_Run{texture = texture, first = layer.vertices.len, count = 0}
+	}
+	for k in QUAD_CORNERS do &layer.vertices + Sprite_Vertex{position = corners[k], uv = uvs[k], color = color}
+	runs[runs.len - 1].count += 6
+}
+
 // Draws what's been put over what's drawn, in the order it was put,
 // blended by its opacity, on a window width by height pixels.
 layer_draw :: fun(layer: ^Sprite_Layer, width: i64, height: i64) {

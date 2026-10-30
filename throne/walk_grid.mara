@@ -21,6 +21,8 @@ use mara.core
 use mara.math
 use mara.memory
 use lzw
+use lot
+use level
 
 // Room for a grid's bits (the biggest, the Toyotomi wilderness's, 345,000
 // bytes), and for its file.
@@ -35,6 +37,7 @@ WALK_CORNERS :: [8!][2!]f32{{1612, -215}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}
 
 Walk_Error :: error {
 	Not_A_Grid    // too short, a block running past its end, or too big for WALK_ROOM
+	No_Grid       // the level's folder has no <LEX>.walk.sp
 }
 
 Walk_Grid :: struct {
@@ -47,9 +50,9 @@ Walk_Grid :: struct {
 }
 
 // The grid's corner for a level, if it's known.
-walk_corner :: fun(level: []utf8) -> f32, f32, bool {
+walk_corner :: fun(level_name: []utf8) -> f32, f32, bool {
 	for name, k in WALK_CORNER_LEVELS {
-		if same_letters(name, level) do return WALK_CORNERS[k][0], WALK_CORNERS[k][1], true
+		if same_letters(name, level_name) do return WALK_CORNERS[k][0], WALK_CORNERS[k][1], true
 	}
 	return 0, 0, false
 }
@@ -91,12 +94,40 @@ walk_read :: fun(grid: ^Walk_Grid, file: []byte, x0: f32, y0: f32, stream: ^[]by
 	grid.ready = true
 }
 
+// A level's walk grid (<LEX>.walk.sp in its folder of the world's archive)
+// into grid, when where it lies on the level is known (walk_corner): false
+// when it isn't, the grid left not ready. file is room to read it in.
+read_level_walk :: fun(world: ^Lot, info: ^Level_Info, grid: ^Walk_Grid, file: ^[]byte) -> bool, err {
+	grid.ready = false
+	x0, y0, known := walk_corner(info.name)
+	if not known do return false
+	path : [256]utf8
+	&path + info.folder
+	&path + info.layout_name
+	&path + ".walk.sp"
+	grid_file, found := lot_find(world, path)
+	if not found do return true, No_Grid
+	lot_read(world, grid_file, file)?
+	stream : [WALK_FILE_ROOM]byte = void
+	walk_read(grid, file^, x0, y0, &stream)?
+	return true
+}
+
 // Whether a cell (gx, and up counted from the far end) is blocked; outside
 // the grid is.
 cell_blocked :: fun(grid: ^Walk_Grid, gx: i64, up: i64) -> bool {
 	if gx < 0 or up < 0 or gx >= grid.width or up >= grid.height do return true
 	k := (grid.height - 1 - up) * grid.width + gx
 	return (i64(grid.bits[k >> 3]) >> (k & 7)) & 1 == 1
+}
+
+// Whether one of the eight cells round a cell is open: a blocked one that
+// has is at the edge of where one can walk.
+borders_open :: fun(grid: ^Walk_Grid, gx: i64, up: i64) -> bool {
+	for k in 0:8 {
+		if not cell_blocked(grid, gx + STEP_GX[k], up + STEP_UP[k]) do return true
+	}
+	return false
 }
 
 // The cell a level point is in: gx, up.

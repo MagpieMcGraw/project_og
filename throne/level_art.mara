@@ -2,7 +2,9 @@
 // places (lex.mara) — a picture with the palette it names, or an
 // animation with its own — read from the level's bundles (rex.mara) and put
 // on the card, drawn in the layout's order (its ground first). A picture
-// or palette pair placed several times is put on the card once.
+// or palette pair placed several times is put on the card once. What stops
+// one in the level can be drawn over it (draw_collision): its walk grid's
+// edges and its layout's outlines.
 module level_art
 
 use mara.core
@@ -15,6 +17,7 @@ use lex
 use level
 use spr8
 use art
+use walk_grid
 use sprite_layer
 use logging
 
@@ -48,6 +51,11 @@ Level_Art :: struct {
 	pieces: [LEX_PLACED]Level_Piece
 	textures: [LEVEL_TEXTURES]Level_Texture
 	missing: i64                 // things placed whose pictures weren't found
+	outlines: [LEX_OUTLINES]Outline                     // the layout's (lex.mara)
+	outline_points: [LEX_OUTLINE_POINTS]Outline_Point
+	walk: Walk_Grid              // where one can walk: not ready when it isn't known or couldn't be read
+	walk_known: bool             // where its grid lies is known (walk_grid.mara's corners)
+	walk_error: err              // why it couldn't be read
 	ready: bool
 }
 
@@ -68,6 +76,9 @@ load_level_art :: fun(view: ^Level_Art, name: []utf8) -> err {
 	file : [LEVEL_FILE_ROOM]byte = void
 	info := read_level(&world, name, &layout, &file)?
 	view.music = info.music
+	view.outlines = layout.outlines
+	view.outline_points = layout.outline_points
+	view.walk_known, view.walk_error = read_level_walk(&world, &info, &view.walk, &file)
 	for thing in layout.placed do &view.pieces + Level_Piece{texture = -1, x = f32(thing.x), y = f32(thing.y), speed = thing.speed}
 	bundle_bytes : [BUNDLE_ROOM]byte = void
 	image : [ATLAS_ROOM]byte = void
@@ -143,4 +154,95 @@ draw_level :: fun(layer: ^Sprite_Layer, view: ^Level_Art, left: f32, top: f32, s
 		u1 := f32((column + 1) * atlas.cell_width) / f32(atlas.width)
 		layer_image(layer, atlas.texture, x, y, cell_width, cell_height, u0, 0, u1, 1, [4!]f32{1, 1, 1, 1})
 	}
+}
+
+// How what stops one is drawn: the walk grid's blocked cells at the edge
+// of where one can walk, red; outlines by what they belong to (lex.mara's
+// OUTLINE_*): a thing's yellow, a plain line orange, an event's area blue, a
+// named spot (a small diamond) pink, anything else grey; lines this thick
+// (level pixels).
+BLOCKED_COLOUR :: [4!]f32{0.95, 0.15, 0.1, 0.45}
+OUTLINE_COLOURS :: [5!][4!]f32{{1, 0.85, 0.1, 0.95}, {1, 0.5, 0.1, 0.95}, {0.25, 0.75, 1, 0.9}, {1, 0.35, 0.85, 1},
+	{0.7, 0.7, 0.7, 0.8}}
+OUTLINE_THICKNESS :: 2.0
+SPOT_SIZE :: 6.0
+// Where in the white texture a shape's corners are (anywhere: it's one pixel).
+WHITE_CORNERS :: [4!][2!]f32{{0, 0}, {1, 0}, {1, 1}, {0, 1}}
+
+// Puts what stops one in the level on the layer, over what's drawn, as it
+// shows in a window width by height (the level's pixel x, y at left + x *
+// scale, top + y * scale): its walk grid's blocked cells beside open ones,
+// as diamonds, and its outlines, as lines. white is a texture of one white
+// pixel.
+draw_collision :: fun(layer: ^Sprite_Layer, view: ^Level_Art, white: u32, left: f32, top: f32, scale: f32, width: i64, height: i64) {
+	grid := &view.walk
+	if grid.ready {
+		// The cells round the window: between those its corners are in.
+		lowest_gx := grid.width
+		highest_gx : i64 = -1
+		lowest_up := grid.height
+		highest_up : i64 = -1
+		for corner in 0:4 {
+			x := (f32((corner % 2) * width) - left) / scale
+			y := (f32((corner / 2) * height) - top) / scale
+			gx, up := cell_of(grid, x, y)
+			lowest_gx = min(lowest_gx, gx - 1)
+			highest_gx = max(highest_gx, gx + 1)
+			lowest_up = min(lowest_up, up - 1)
+			highest_up = max(highest_up, up + 1)
+		}
+		half_width := f32(CELL_WIDTH / 2) * scale
+		half_height := f32(CELL_HEIGHT / 2) * scale
+		for up in max(lowest_up, 0)..min(highest_up, grid.height - 1) {
+			for gx in max(lowest_gx, 0)..min(highest_gx, grid.width - 1) {
+				if not cell_blocked(grid, gx, up) or not borders_open(grid, gx, up) do continue
+				x, y := cell_middle(grid, gx, up)
+				middle_x := left + x * scale
+				middle_y := top + y * scale
+				if middle_x + half_width < 0 or middle_y + half_height < 0 or middle_x - half_width > f32(width) or middle_y - half_height > f32(height) {
+					continue
+				}
+				put_diamond(layer, white, middle_x, middle_y, half_width, half_height, BLOCKED_COLOUR)
+			}
+		}
+	}
+	for outline in view.outlines {
+		colour := OUTLINE_COLOURS[outline.kind]
+		if outline.count == 1 {
+			spot := view.outline_points[outline.first]
+			put_diamond(layer, white, left + f32(spot.x) * scale, top + f32(spot.y) * scale, f32(SPOT_SIZE) * scale, f32(SPOT_SIZE) * scale, colour)
+			continue
+		}
+		for k in outline.first:outline.first + outline.count - 1 {
+			from := view.outline_points[k]
+			to := view.outline_points[k + 1]
+			put_line(layer, white, left + f32(from.x) * scale, top + f32(from.y) * scale, left + f32(to.x) * scale, top + f32(to.y) * scale,
+				f32(OUTLINE_THICKNESS) * scale, colour, width, height)
+		}
+	}
+}
+
+// Puts a diamond on the layer: its middle and half its width and height
+// (window pixels), the white texture tinted.
+put_diamond :: fun(layer: ^Sprite_Layer, white: u32, x: f32, y: f32, half_width: f32, half_height: f32, colour: [4!]f32) {
+	layer_quad(layer, white, [4!][2!]f32{{x, y - half_height}, {x + half_width, y}, {x, y + half_height}, {x - half_width, y}},
+		WHITE_CORNERS, colour)
+}
+
+// Puts a line from one point to another (window pixels), thickness across,
+// on the layer, the white texture tinted: when it shows in a window width
+// by height.
+put_line :: fun(layer: ^Sprite_Layer, white: u32, from_x: f32, from_y: f32, to_x: f32, to_y: f32, thickness: f32, colour: [4!]f32,
+	width: i64, height: i64)
+{
+	if max(from_x, to_x) < 0 or max(from_y, to_y) < 0 or min(from_x, to_x) > f32(width) or min(from_y, to_y) > f32(height) do return
+	across := to_x - from_x
+	down := to_y - from_y
+	span := sqrt(across * across + down * down)
+	if span < 0.01 do return
+	// Half the thickness, square to the line.
+	side_x := -down / span * thickness / 2
+	side_y := across / span * thickness / 2
+	layer_quad(layer, white, [4!][2!]f32{{from_x + side_x, from_y + side_y}, {to_x + side_x, to_y + side_y}, {to_x - side_x, to_y - side_y},
+		{from_x - side_x, from_y - side_y}}, WHITE_CORNERS, colour)
 }

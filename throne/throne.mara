@@ -10,7 +10,7 @@
 //     throne connect <address>        the game, joining the one at an address
 //     throne serve [port] [seconds] [open]   a server alone, no window
 //     throne bot [seconds] [address]  a player with no window, walking about
-//     throne picture <out.png> [seconds] [address]   the game unseen, its last frame written
+//     throne picture <out.png> [seconds] [address] [click x y] [strike] [collision]   the game unseen, its last frame written
 module throne
 
 use mara.core
@@ -120,6 +120,7 @@ Game_View :: struct {
 	sound: bool         // the mixer's open: it's mixed every frame
 	mixer: Mixer
 	mixer_storage: [AUDIO_STORAGE]byte
+	show_collision: bool   // what stops one drawn over the level (F2 turns it on and off)
 }
 
 // The view made ready (a GL context current), and its sound opened when
@@ -134,6 +135,7 @@ view_open :: fun(view: ^Game_View, journal: ^Journal, sound: bool) {
 	view.shown.len = 0
 	view.eased_at = time_now()
 	view.sound = false
+	view.show_collision = false
 	if sound {
 		view.mixer_storage.len = 0
 		audio_init(&view.mixer, AUDIO_CLIP_ROOM, &view.mixer_storage)
@@ -215,6 +217,15 @@ take_level :: fun(seen: ^World_Copy, view: ^Game_View, journal: ^Journal) {
 		note(journal, ", ")
 		note(journal, view.level.missing)
 		note(journal, " not found")
+	}
+	note(journal, "; ")
+	note(journal, view.level.outlines.len)
+	note(journal, " outlines")
+	if view.level.walk_error {
+		note(journal, "; its walk grid couldn't be read: ")
+		note_error(journal, view.level.walk_error)
+	elif not view.level.walk_known
+		note(journal, "; no walk grid to show (where it lies isn't known)")
 	}
 	note_end(journal)
 }
@@ -300,7 +311,8 @@ follow_player :: fun(seen: ^World_Copy, view: ^Game_View) {
 // Draws the world as the server's told it: the level (or its bare area,
 // without its pictures), and each player — a samurai, those higher on the
 // screen first so lower ones stand in front; ours with a light mark at its
-// feet. (Squares, without the samurai.)
+// feet. (Squares, without the samurai.) Over it all, what stops one, when
+// it's shown (show_collision).
 draw_world :: fun(platform: ^Platform, seen: ^World_Copy, view: ^Game_View) {
 	Disable(SCISSOR_TEST)
 	ClearColor(0.04, 0.04, 0.05, 1)
@@ -352,6 +364,9 @@ draw_world :: fun(platform: ^Platform, seen: ^World_Copy, view: ^Game_View) {
 		draw_text(&view.layer, &view.font, name, x - text_width(&view.font, name, name_scale) / 2, y - f32(NAME_HEIGHT) * room.scale, name_scale,
 			name_colour)
 	}
+	if view.show_collision and view.level.ready {
+		draw_collision(&view.layer, &view.level, view.white, room.left, room.top, room.scale, platform.width, platform.height)
+	}
 	layer_draw(&view.layer, platform.width, platform.height)
 }
 
@@ -369,6 +384,7 @@ game_frame :: fun(platform: ^Platform, input: ^Input, link: ^Link, journal: ^Jou
 	if input.mouse_held[1] do send_go(outgoing(link), mouse_x, mouse_y)
 	// The right button strikes toward the mouse.
 	if input.mouse_pressed[3] do send_strike(outgoing(link), mouse_x, mouse_y)
+	if input.pressed[F2] do view.show_collision = not view.show_collision
 	link_run(link, journal)
 	take_level(&link.seen, view, journal)
 	ease_players(&link.seen, view)
@@ -427,30 +443,19 @@ start_level :: fun(journal: ^Journal, walk: ^Walk_Grid) -> [48]utf8, Area {
 // A level's walk grid (its .walk.sp) into walk, when its corner is known;
 // the journal says which it is.
 read_walk_grid :: fun(world: ^Lot, info: ^Level_Info, walk: ^Walk_Grid, file: ^[]byte, journal: ^Journal) {
-	x0, y0, known := walk_corner(info.name)
+	known, read_error := read_level_walk(world, info, walk, file)
+	if read_error {
+		note(journal, "couldn't read the walk grid of ")
+		note(journal, info.name)
+		note(journal, " (walking anywhere in it): ")
+		note_error(journal, read_error)
+		note_end(journal)
+		return
+	}
 	if not known {
 		note(journal, "no walk grid for ")
 		note(journal, info.name)
 		note(journal, " (where its grid lies isn't known yet): walking anywhere in it")
-		note_end(journal)
-		return
-	}
-	path : [256]utf8
-	&path + info.folder
-	&path + info.layout_name
-	&path + ".walk.sp"
-	grid_file, found := lot_find(world, path)
-	read_error : err
-	if found do read_error = lot_read(world, grid_file, file)
-	stream : [WALK_FILE_ROOM]byte = void
-	if found and not read_error do read_error = walk_read(walk, file^, x0, y0, &stream)
-	if not found or read_error {
-		note(journal, "couldn't read the walk grid ")
-		note(journal, path)
-		if read_error {
-			note(journal, ": ")
-			note_error(journal, read_error)
-		}
 		note_end(journal)
 		return
 	}
@@ -510,13 +515,15 @@ command_play :: fun(address: []utf8) -> bool {
 	return true
 }
 
-// `throne picture <out.png> [seconds] [address] [click x y]`: the game as
-// a player opening it sees it (linked as command_play links), in a window
-// that's never shown, for that many seconds (2 unless told); its player
-// clicked at the start to walk to a spot — x and y shares of the window
-// across and down, 0.8 0.8 unless told. The last frame is written to
+// `throne picture <out.png> [seconds] [address] [click x y] [strike]
+// [collision]`: the game as a player opening it sees it (linked as
+// command_play links), in a window that's never shown, for that many
+// seconds (2 unless told); its player clicked at the start to walk to a
+// spot — x and y shares of the window across and down, 0.8 0.8 unless
+// told (strike: right-clicked, to strike toward it); collision: what stops
+// one drawn over the level, as F2 shows it. The last frame is written to
 // out.png. For looking at what the game draws without a window.
-command_picture :: fun(path: []utf8, seconds: f64, address: []utf8, click_x: f32, click_y: f32, strike: bool) {
+command_picture :: fun(path: []utf8, seconds: f64, address: []utf8, click_x: f32, click_y: f32, strike: bool, collision: bool) {
 	journal := open_journal()
 	defer journal_close(&journal)
 	walk : Walk_Grid
@@ -536,6 +543,7 @@ command_picture :: fun(path: []utf8, seconds: f64, address: []utf8, click_x: f32
 	defer platform_close(&platform)
 	view : Game_View
 	view_open(&view, &journal, false)
+	view.show_collision = collision
 	input : Input
 	struck := false
 	start := time_now()
@@ -716,7 +724,7 @@ usage :: fun() {
 	print("throne connect <address[:port]>        the game, joining the one at an address")
 	print("throne serve [port] [seconds] [open]   a server alone, no window (port %)", GAME_PORT)
 	print("throne bot [seconds] [address]         a player with no window, walking about")
-	print("throne picture <out.png> [seconds] [address] [click x y]   the game unseen, its last frame written")
+	print("throne picture <out.png> [seconds] [address] [click x y] [strike] [collision]   the game unseen, its last frame written")
 	print("throne sprite <archive> <path | folder> <out.png>   a sprite's frames as the game's atlas lays them out")
 	print("throne walk-grid <level>               a level's walk grid: its size and open cells")
 	print("throne music-cache <track>             a track (\"music\\castle.mp3\") unpacked where the game plays it from")
@@ -878,10 +886,16 @@ main :: (args: [][]utf8) {
 		click_x : f32 = 0.8
 		click_y : f32 = 0.8
 		strike := false
+		collision := false
 		k := 3
 		for k < args.len {
 			if args[k] == "strike" {
 				strike = true
+				k += 1
+				continue
+			}
+			if args[k] == "collision" {
+				collision = true
 				k += 1
 				continue
 			}
@@ -900,7 +914,7 @@ main :: (args: [][]utf8) {
 			else do address = args[k]
 			k += 1
 		}
-		command_picture(args[2], seconds, address, click_x, click_y, strike)
+		command_picture(args[2], seconds, address, click_x, click_y, strike, collision)
 	elif command == "walk-grid" and args.len > 2
 		command_walk_grid(args[2])
 	elif command == "music-cache" and args.len > 2

@@ -154,12 +154,25 @@ A level's folder holds:
     and some a count after (1–3) with as many `OCOL`s following.
   - `EANI`, an animation placed: i32 x, y, its kind (u8 length, text:
     `AnimRunLooped`), 7 bytes, its resource, its speed (f32, 1.0), 1, 0.
-  - `OCOL` looks like a collision outline: a count of points, the points
-    (a wall's runs along its picture's foot), more after.
-  - `ELIT` lights (x, y, a radius?), `ESND` sounds, `ESRT`, `ECOL`, `EGRP`
-    (groups?), `SNDJ`, `CHRW`: not worked out; some hold text and parts of
-    their own, so their sizes aren't known yet. The picture and animation
-    records are found by their tags, each checked against the table.
+  - `OCOL`, an outline: u32 count, the points (i32 x, y each), more after
+    (not worked out). It belongs to the record before it: after a picture
+    or animation it's where that stands (a wall's runs along its foot, a
+    piece of furniture's footprint, the portal's disc); after an `ECOL` it's
+    that record's. Not closed: a polygon's last point isn't joined back.
+  - `ECOL`, a collision record of its own, with an `OCOL`: plain (no
+    properties: the shrine's front edges, 133,1094 – 1148,1602 –
+    2175,1090, where no wall is drawn), a named spot (`Name "MORISHRINE"`:
+    one point, the .stripped.sp spots), or an area that sets off an event
+    when entered (`TriggerEvent`, its event's name: `SQ01_ShrineRoom`).
+    `throne picture … collision` (F2 in the game) draws them all: things'
+    outlines yellow, plain lines orange, events' areas blue, spots pink.
+  - `ELIT` lights (x, y, a radius?), `ESND` sounds, `ESRT`, `EGRP`
+    (groups?), `EMLT` (things with states: the portal; `ParentGenerator
+    "Chest#A"` before each of the shrine's two chests, which are animations
+    placed), `SNDJ`, `CHRW`: not worked out; some hold text and parts of
+    their own, so their sizes aren't known yet. The picture, animation and
+    outline records are found by their tags, each checked against the
+    table or the file's size.
   Checked by drawing the shrine (tools/level.py, then the game): every
   picture where it belongs, the walls on their outlines, nothing missing.
   The busiest layout (the Oda wilderness) places 8,439 pictures.
